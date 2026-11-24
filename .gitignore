@@ -1,0 +1,42 @@
+# Daten (Rohdateien, Live-Spool, DB-Dumps) – nie ins Repo
+data/
+*.dump
+*.sql.gz
+
+# Abhängigkeiten / Builds
+node_modules/
+dist/
+build/
+.svelte-kit/
+coverage/
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets / lokale Konfiguration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Werkzeug-Caches
+*.tsbuildinfo
+.vite/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Web-Fixtures (aus data/ erzeugt, nur Entwicklung)
+apps/web/fixtures/
+
+# DuckDB / Teildownloads
+*.duckdb
+*.duckdb.wal
+*.part

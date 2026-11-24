@@ -1,0 +1,7 @@
+DROP TABLE IF EXISTS verify_run;
+DROP TABLE IF EXISTS data_minute_issue;
+DROP TABLE IF EXISTS data_day;
+DROP TABLE IF EXISTS raw_day;
+DROP TABLE IF EXISTS raw_file;
+DROP TABLE IF EXISTS symbol_tick_history;
+DROP TABLE IF EXISTS symbol;

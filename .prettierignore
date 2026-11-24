@@ -1,0 +1,9 @@
+data/
+node_modules/
+dist/
+build/
+coverage/
+verifier/
+docs/
+package-lock.json
+*.sql

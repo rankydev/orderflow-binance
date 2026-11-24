@@ -1,0 +1,53 @@
+{
+  "name": "orderflow-binance",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Orderflow-Charting f\u00fcr Binance USDT-M Futures (Footprint, Volume Profile, TPO, Big Trades)",
+  "engines": {
+    "node": ">=24.22.0 <25"
+  },
+  "packageManager": "npm@11.19.1",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint . && prettier --check .",
+    "format": "prettier --write .",
+    "test": "vitest run --project unit",
+    "test:watch": "vitest --project unit",
+    "test:db": "node --env-file-if-exists=.env node_modules/vitest/vitest.mjs run --project db",
+    "test:golden": "vitest run --project golden",
+    "test:py": "verifier/.venv/bin/python -m pytest verifier/tests",
+    "test:py:slow": "OF_VERIFIER_SLOW=1 verifier/.venv/bin/python -m pytest verifier/tests",
+    "lint:py": "verifier/.venv/bin/ruff check verifier && verifier/.venv/bin/ruff format --check verifier",
+    "verify": "PYTHONPATH=verifier/src verifier/.venv/bin/python -m orderflow_verifier",
+    "build": "npm run build --workspaces --if-present",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build",
+    "py:setup": "python3 -m venv verifier/.venv && verifier/.venv/bin/python -m pip install --require-virtualenv -r verifier/requirements-dev.txt",
+    "db:up": "docker compose up -d --wait db",
+    "db:down": "docker compose down",
+    "db:destroy": "docker compose down --volumes",
+    "db:logs": "docker compose logs -f db",
+    "db:psql": "docker compose exec db sh -c 'psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\"'",
+    "db:migrate": "node --env-file-if-exists=.env packages/db/src/cli.ts up",
+    "db:rollback": "node --env-file-if-exists=.env packages/db/src/cli.ts down",
+    "db:status": "node --env-file-if-exists=.env packages/db/src/cli.ts status",
+    "db:reset": "node --env-file-if-exists=.env packages/db/src/cli.ts reset --yes",
+    "import": "node --env-file-if-exists=.env apps/importer/src/main.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint": "10.15.0",
+    "eslint-config-prettier": "10.1.8",
+    "eslint-plugin-svelte": "3.24.1",
+    "globals": "17.14.0",
+    "prettier": "3.10.1",
+    "prettier-plugin-svelte": "4.2.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.74.0",
+    "vitest": "5.1.1"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "@orderflow/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Datenbankzugriff: Verbindung, Migrationen (SQL-Dateien), CLI",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@orderflow/core": "0.0.0",
+    "postgres": "4.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2"
+  }
+}

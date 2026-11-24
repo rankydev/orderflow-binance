@@ -1,0 +1,49 @@
+# Lokale Entwicklungsdatenbank: PostgreSQL 17 + TimescaleDB Community (KONZEPT §2.4, §2.6).
+# Gepinnt auf dieselbe Version wie später auf dem VPS (dort bei Installation festlegen/angleichen).
+# Nur auf 127.0.0.1 und einem Nicht-Standard-Port erreichbar; Daten im benannten Volume.
+name: orderflow-binance
+
+services:
+  db:
+    image: timescale/timescaledb:2.31.2-pg17
+    container_name: orderflow-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${OF_DB_USER:-of_admin}
+      POSTGRES_PASSWORD: ${OF_DB_PASSWORD:?OF_DB_PASSWORD in .env setzen (siehe .env.example)}
+      POSTGRES_DB: ${OF_DB_NAME:-orderflow}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - '127.0.0.1:${OF_DB_PORT:-54320}:5432'
+    volumes:
+      - of_pgdata:/var/lib/postgresql/data
+    shm_size: 512mb
+    # Moderate Werte für den Mac; die VPS-Werte stehen in KONZEPT §2.4.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - max_connections=30
+      - -c
+      - timescaledb.max_background_workers=4
+      - -c
+      - timescaledb.telemetry_level=off
+      - -c
+      - timezone=UTC
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  of_pgdata:
+    name: orderflow-binance_pgdata
