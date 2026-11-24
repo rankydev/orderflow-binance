@@ -1,6 +1,7 @@
 // GET /api/v1/symbols, /api/v1/bars, /api/v1/footprint – Vertrag in docs/TILE-FORMAT.md.
 import {
   encodeTile,
+  TILE_MAX_CELLS,
   TIMEFRAMES,
   type BarColumns,
   type LevelColumns,
@@ -212,7 +213,8 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     });
     const ver = versionOf(parts, d0, d1, (d) => days.get(d));
     if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
-    if (levels.row.length > deps.cfg.maxCells) {
+    // Kacheln folgen der Grenze aus TILE-FORMAT.md (60 000), nicht OF_API_MAX_CELLS (nur Profile)
+    if (levels.row.length > TILE_MAX_CELLS) {
       // Zwischen Import und Neuberechnung möglich (TILE-FORMAT.md): neu berechnen, dann 409.
       await deps.catalog.refresh();
       const now = deps.catalog.symbol(s.name);

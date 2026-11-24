@@ -29,7 +29,7 @@ export interface ApiConfig {
   pollMs: number;
   /** Höchstzahl geschätzter Quellzeilen je Anfrage (KONZEPT §1.4). */
   maxSourceRows: number;
-  /** Harte Zellgrenze je Antwort (KONZEPT §1.4). */
+  /** Harte Zeilengrenze je Profil-Antwort (KONZEPT §1.4); Kacheln folgen TILE-FORMAT.md (60 000). */
   maxCells: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
 }

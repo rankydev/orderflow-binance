@@ -24,13 +24,7 @@ import {
 } from '@orderflow/core';
 import { int, readTx, type ReadTx, type Sql } from './db.ts';
 import { tsLit } from './queries.ts';
-import {
-  BAR_TABLES,
-  barTableFor,
-  FP_TABLE_NAMES,
-  type BarTable,
-  type RowsOn,
-} from './plan.ts';
+import { BAR_TABLES, barTableFor, FP_TABLE_NAMES, type BarTable, type RowsOn } from './plan.ts';
 import { DAY_MS, SYMBOL_RE } from './params.ts';
 
 /** Größte angebotene Zeilengröße einer Footprint-Kachel in Ticks (wie die Fixtures). */
@@ -406,4 +400,3 @@ export function dayStates(s: SymbolState, d0: number, d1: number): (DayInfo | nu
   for (let d = d0; d <= d1; d++) out.push(s.days.get(d) ?? null);
   return out;
 }
-

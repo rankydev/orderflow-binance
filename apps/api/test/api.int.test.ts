@@ -1,0 +1,803 @@
+// Integrationstests der API gegen "<OF_DB_NAME>_test" (`npm run db:up && npm run test:db`), mit
+// synthetischen Daten (seed.ts) und der nur lesenden Rolle of_api. Die Entwicklungsdatenbank wird nie
+// berührt. Beweist:
+//  - /symbols, /bars, /footprint sind für den Web-Client gültig (dessen eigene Prüfungen: checkSymbolsResponse,
+//    BarStore/FootprintStore.addEncoded mit Erwartung) und decodierbar (decodeTile);
+//  - Vorbedingung Kachel = /bars (gleiche Bars, gleiche buy+sell je Bar) für jede angebotene (tf, R);
+//  - Footprint aus jeder Quelltabelle = Re-Binning der Basistabelle fp_1m;
+//  - Profile (Range und je Tag, mit Offsets) exakt = Summe über fp_1m, neu gebinnt, über Chunk- und
+//    Tagesgrenzen; Notional exakt (> 2^53, nie über Number);
+//  - final/immutable, ETag, 304, Cache-Treffer, Versionswechsel eines Tages, 409 bei veralteter cfg
+//    (und dieselbe cfg nach Rücknahme bzw. Neustart), 422 (nicht angeboten, Grenzen mit Vorschlag),
+//    400/404, Abbruch der DB-Abfrage bei Client-Abbruch, lock_timeout mit Wiederholung, 503 bei Überlast.
+import {
+  checkDailyProfiles,
+  checkRangeProfile,
+  decodeTile,
+  fpTableGrid,
+  parseConfig,
+  profileMarks,
+  rollupBars,
+  TIMEFRAMES,
+  type Bar,
+  type DailyProfilesResponse,
+  type DbConfig,
+  type FpTableName,
+  type RangeProfileResponse,
+} from '@orderflow/core';
+import { connect, dropAndCreateDatabase, migrateUp, type Sql } from '@orderflow/db';
+import { randomBytes } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { checkSymbolsResponse } from '../../web/src/lib/api.ts';
+import { BarStore } from '../../web/src/lib/bar-store.ts';
+import { FootprintStore } from '../../web/src/lib/footprint-store.ts';
+import { parseApiConfig, type ApiConfig } from '../src/config.ts';
+import { createPool, readTx } from '../src/db.ts';
+import { startApi, type RunningApi } from '../src/main.ts';
+import { FP_TABLE_NAMES } from '../src/plan.ts';
+import { queryLevels } from '../src/queries.ts';
+import {
+  BAD_DAY,
+  DAY_MS,
+  FIRST_DAY,
+  generate,
+  LAST_DAY,
+  MINUTE_MS,
+  PROVISIONAL_DAY,
+  seed,
+  SYM_ID,
+  TICK,
+  type Seeded,
+} from './seed.ts';
+
+const base = parseConfig(process.env).db;
+const testDb = `${base.database}_test`;
+const adminCfg: DbConfig = { ...base, database: testDb };
+const HOUR = 3_600_000;
+interface SymJson {
+  tileConfigVersion: number;
+  tiles: Record<string, Record<string, number>>;
+}
+let admin: Sql;
+let data: Seeded;
+const apiPassword = process.env.OF_API_DB_PASSWORD?.trim() || randomBytes(18).toString('hex');
+
+function apiCfg(over: Partial<ApiConfig> = {}): ApiConfig {
+  const c = parseApiConfig({
+    ...process.env,
+    OF_DB_NAME: testDb,
+    OF_API_DB_USER: 'of_api',
+    OF_API_DB_PASSWORD: apiPassword,
+  });
+  return { ...c, port: 0, pollMs: 100, ...over };
+}
+
+async function start(over: Partial<ApiConfig> = {}): Promise<RunningApi> {
+  return startApi(apiCfg(over), { logger: false });
+}
+
+async function get(api: RunningApi, path: string, init: RequestInit = {}) {
+  const res = await fetch(api.url + path, init);
+  const buf = new Uint8Array(await res.arrayBuffer());
+  return {
+    res,
+    buf,
+    json: () => JSON.parse(new TextDecoder().decode(buf)) as Record<string, unknown>,
+  };
+}
+
+// ---------------------------------------------------------------- Referenzrechnung (nur fp_1m/bar_1m)
+
+/** Level-Summen aus fp_1m über [from, to), gebucketet auf (tfSec, w); sortiert nach (t, row). */
+function refLevels(tfSec: number, w: number, from: number, to: number) {
+  const fp = data.fp.fp_1m;
+  const m = new Map<string, [number, number, number, number, number, number]>();
+  for (let i = 0; i < fp.n; i++) {
+    const ts = fp.ts[i]!;
+    if (ts < from || ts >= to) continue;
+    const t = (ts - (ts % (tfSec * 1000))) / 1000;
+    const px = fp.px[i]!;
+    const row = (px - (px % w)) / w;
+    const k = `${t}|${row}`;
+    const e = m.get(k) ?? [t, row, 0, 0, 0, 0];
+    e[2] += fp.buyQ[i]!;
+    e[3] += fp.sellQ[i]!;
+    e[4] += fp.buyA[i]!;
+    e[5] += fp.sellA[i]!;
+    m.set(k, e);
+  }
+  return [...m.values()].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+}
+
+function refBars(tfSec: number, from: number, to: number): Bar[] {
+  const all = tfSec === 60 ? data.bars1m : rollupBars(data.bars1m, tfSec / 60);
+  return all.filter((b) => b.ts >= from && b.ts < to);
+}
+
+/** Dichtes Profil aus fp_1m über [from, to) bei Breite w. */
+function refProfile(from: number, to: number, w: number) {
+  const fp = data.fp.fp_1m;
+  const rows = new Map<number, [number, number]>();
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let i = 0; i < fp.n; i++) {
+    const ts = fp.ts[i]!;
+    if (ts < from || ts >= to) continue;
+    const px = fp.px[i]!;
+    const r = (px - (px % w)) / w;
+    const e = rows.get(r) ?? [0, 0];
+    e[0] += fp.buyQ[i]!;
+    e[1] += fp.sellQ[i]!;
+    rows.set(r, e);
+    lo = Math.min(lo, r);
+    hi = Math.max(hi, r);
+  }
+  if (lo === Infinity) return { rowLo: null, buy: [] as number[], sell: [] as number[] };
+  const buy: number[] = [];
+  const sell: number[] = [];
+  for (let r = lo; r <= hi; r++) {
+    buy.push(rows.get(r)?.[0] ?? 0);
+    sell.push(rows.get(r)?.[1] ?? 0);
+  }
+  return { rowLo: lo, buy, sell };
+}
+
+function refNotional(from: number, to: number): bigint {
+  let n = 0n;
+  for (const b of data.bars1m) if (b.ts >= from && b.ts < to) n += b.notional;
+  return n;
+}
+
+/** Erwartetes `final`: alle überdeckten UTC-Tage existieren und sind unveränderlich. */
+function expFinal(from: number, to: number): boolean {
+  const d0 = Math.floor(from / DAY_MS);
+  const d1 = Math.floor((to - 1) / DAY_MS);
+  return d0 >= FIRST_DAY && d1 < PROVISIONAL_DAY;
+}
+
+const dataFrom = FIRST_DAY * DAY_MS;
+const dataTo = (LAST_DAY + 1) * DAY_MS;
+
+beforeAll(async () => {
+  await dropAndCreateDatabase(adminCfg);
+  admin = connect(adminCfg);
+  await migrateUp(admin);
+  // Rolle ist clusterweit: dasselbe Passwort wie die lokale .env (sonst ein zufälliges, z. B. in CI)
+  await admin.unsafe(`ALTER ROLE of_api PASSWORD '${apiPassword.replace(/'/g, "''")}'`);
+  data = generate();
+  await seed(admin, data);
+}, 120_000);
+
+afterAll(async () => {
+  await admin?.end();
+});
+
+describe('Rolle of_api', () => {
+  it('liest (auch Columnstore-Chunks), schreibt nie', async () => {
+    const sql = createPool(apiCfg());
+    try {
+      const [c] = await sql`SELECT count(*)::int AS n FROM fp_1m WHERE sym_id = ${SYM_ID}`;
+      expect(c!.n).toBe(data.fp.fp_1m.n);
+      await expect(sql`DELETE FROM data_day`).rejects.toThrow(/read-only|permission/);
+      await expect(sql.begin('read write', (tx) => tx`DELETE FROM data_day`)).rejects.toThrow(
+        /permission/,
+      );
+    } finally {
+      await sql.end();
+    }
+  });
+});
+
+describe('Endpunkte gegen den Web-Client', () => {
+  let api: RunningApi;
+  let sym: {
+    tileConfigVersion: number;
+    tiles: Record<string, Record<string, number>>;
+    dataFrom: number;
+    dataTo: number;
+  };
+  beforeAll(async () => {
+    api = await start();
+    const { res, json } = await get(api, '/api/v1/symbols');
+    expect(res.status).toBe(200);
+    const body = json();
+    expect(checkSymbolsResponse(body)).toEqual([]);
+    sym = (body.symbols as (typeof sym & { name: string })[])[0]!;
+  });
+  afterAll(async () => api?.close());
+
+  it('/symbols: Form, Datenbereich, angebotene Kombinationen, Cache-Header', async () => {
+    const { res, json } = await get(api, '/api/v1/symbols');
+    expect(res.headers.get('cache-control')).toBe('no-cache');
+    expect(res.headers.get('etag')).toMatch(/^".+"$/);
+    const s = (json().symbols as Record<string, unknown>[])[0]!;
+    expect(s).toMatchObject({
+      name: 'BTCUSDT',
+      priceDecimals: 2,
+      qtyDecimals: 3,
+      tickRefUnits: TICK,
+      tickUnits: TICK,
+      dataFrom,
+      dataTo,
+    });
+    // jede Quelltabelle ist für mindestens eine angebotene Kombination die gewählte
+    expect(Object.keys(sym.tiles)).toEqual(Object.keys(TIMEFRAMES));
+    const etag = res.headers.get('etag')!;
+    const again = await get(api, '/api/v1/symbols', { headers: { 'If-None-Match': etag } });
+    expect(again.res.status).toBe(304);
+  });
+
+  it('/bars: ausgerichtete 1 000er-Abschnitte, Header-Zeitraum exakt, Bars = Referenz', async () => {
+    for (const tf of Object.keys(TIMEFRAMES)) {
+      const tfSec = TIMEFRAMES[tf as keyof typeof TIMEFRAMES];
+      const span = 1000 * tfSec * 1000;
+      const store = new BarStore(`BTCUSDT|${tf}`, 2);
+      for (let c = Math.floor(dataFrom / span); c * span < dataTo; c++) {
+        const from = c * span;
+        const to = from + span;
+        const { res, buf } = await get(
+          api,
+          `/api/v1/bars?sym=BTCUSDT&tf=${tf}&from=${from}&to=${to}`,
+        );
+        expect(res.status, `${tf} ${c}`).toBe(200);
+        expect(res.headers.get('content-type')).toBe('application/octet-stream');
+        store.addEncoded(c, buf.slice().buffer, { sym: 'BTCUSDT', tf, from, to }); // Client-Prüfung
+        const dec = decodeTile(buf);
+        expect(dec.header).toMatchObject({
+          kind: 'bars',
+          sym: 'BTCUSDT',
+          tf,
+          tfSec,
+          from,
+          to,
+          R: null,
+        });
+        // final nur, wenn jeder überdeckte UTC-Tag existiert und unveränderlich ist
+        expect(dec.header.final).toBe(expFinal(from, to));
+        expect(res.headers.get('cache-control')).toBe(
+          expFinal(from, to) ? 'public, max-age=31536000, immutable' : 'no-cache',
+        );
+        const ref = refBars(tfSec, from, to);
+        expect(dec.header.nBars).toBe(ref.length);
+        ref.forEach((b, i) => {
+          expect([
+            dec.bars.time[i],
+            dec.bars.open[i],
+            dec.bars.high[i],
+            dec.bars.low[i],
+            dec.bars.close[i],
+            dec.bars.buyQ[i],
+            dec.bars.sellQ[i],
+            dec.bars.buyA[i],
+            dec.bars.sellA[i],
+          ]).toEqual([
+            b.ts / 1000,
+            b.open,
+            b.high,
+            b.low,
+            b.close,
+            b.buyQ,
+            b.sellQ,
+            b.buyA,
+            b.sellA,
+          ]);
+        });
+      }
+    }
+  });
+
+  it('/footprint: jede angebotene (tf, R), jede Kachel: Client-Prüfung, = Referenz, = /bars', async () => {
+    const sources = new Set<string>();
+    let tiles = 0;
+    for (const [tf, m] of Object.entries(sym.tiles)) {
+      const tfSec = TIMEFRAMES[tf as keyof typeof TIMEFRAMES];
+      for (const [Rs, n] of Object.entries(m)) {
+        const R = Number(Rs);
+        const w = R * TICK;
+        const span = n * tfSec * 1000;
+        const store = new FootprintStore(3);
+        for (let k = Math.floor(dataFrom / span); k * span < dataTo; k++) {
+          const url = `/api/v1/footprint?sym=BTCUSDT&tf=${tf}&R=${R}&tile=${k}&cfg=${sym.tileConfigVersion}`;
+          const { res, buf } = await get(api, url);
+          expect(res.status, url).toBe(200);
+          sources.add(res.headers.get('x-source')!);
+          tiles++;
+          store.addEncoded(`BTCUSDT|${tf}|${R}`, buf.slice().buffer, {
+            sym: 'BTCUSDT',
+            tf,
+            R,
+            k,
+            n,
+          });
+          const dec = decodeTile(buf);
+          const from = k * span;
+          const to = from + span;
+          expect(dec.header).toMatchObject({
+            kind: 'footprint',
+            from,
+            to,
+            tile: { index: k, n },
+            R,
+          });
+          expect(dec.header.nLevels).toBeLessThanOrEqual(30_000);
+          // Level = Re-Binning von fp_1m
+          const ref = refLevels(tfSec, w, from, to);
+          expect(dec.header.nLevels).toBe(ref.length);
+          let j = 0;
+          for (let i = 0; i < dec.header.nBars; i++) {
+            for (
+              let q = dec.levels!.levelOffset[i]!;
+              q < dec.levels!.levelOffset[i + 1]!;
+              q++, j++
+            ) {
+              const e = ref[j]!;
+              expect([
+                dec.bars.time[i],
+                dec.levels!.row[q],
+                dec.levels!.buy[q],
+                dec.levels!.sell[q],
+              ]).toEqual([e[0], e[1], e[2], e[3]]);
+              expect([dec.levels!.buyA[q], dec.levels!.sellA[q]]).toEqual([e[4], e[5]]);
+            }
+          }
+          // Vorbedingung des Clients: gleiche Bars und gleiche buy+sell wie /bars über denselben Zeitraum
+          const c0 = Math.floor(from / (1000 * tfSec * 1000));
+          const c1 = Math.floor((to - 1) / (1000 * tfSec * 1000));
+          const times: number[] = [];
+          const vols: number[] = [];
+          for (let c = c0; c <= c1; c++) {
+            const b = decodeTile(
+              (
+                await get(
+                  api,
+                  `/api/v1/bars?sym=BTCUSDT&tf=${tf}&from=${c * 1000 * tfSec * 1000}&to=${(c + 1) * 1000 * tfSec * 1000}`,
+                )
+              ).buf,
+            );
+            for (let i = 0; i < b.header.nBars; i++) {
+              const t = b.bars.time[i]!;
+              if (t * 1000 < from || t * 1000 >= to) continue;
+              times.push(t);
+              vols.push(b.bars.buyQ[i]! + b.bars.sellQ[i]!);
+            }
+          }
+          expect(Array.from(dec.bars.time)).toEqual(times);
+          expect(Array.from(dec.bars.buyQ, (v, i) => v + dec.bars.sellQ[i]!)).toEqual(vols);
+        }
+      }
+    }
+    expect(tiles).toBeGreaterThan(100);
+    expect([...sources].sort()).toEqual([...FP_TABLE_NAMES].sort());
+  }, 120_000);
+
+  it('Footprint aus jeder Quelltabelle (alle passenden tf, R) = Re-Binning von fp_1m', async () => {
+    const sql = createPool(apiCfg());
+    try {
+      const ac = new AbortController();
+      let combos = 0;
+      for (const t of FP_TABLE_NAMES as FpTableName[]) {
+        const g = fpTableGrid(t);
+        for (const [tf, tfSec] of Object.entries(TIMEFRAMES)) {
+          if (tfSec % (g.tfMin * 60) !== 0) continue;
+          for (const R of [g.bin, g.bin * 2, g.bin * 5, g.bin * 100]) {
+            const w = R * TICK;
+            const from = dataFrom - DAY_MS;
+            const to = dataTo + DAY_MS;
+            const { value } = await readTx(sql, { signal: ac.signal, lockRetries: 0 }, (tx) =>
+              queryLevels(tx, SYM_ID, t, tfSec, w, TICK, from, to),
+            );
+            const ref = refLevels(tfSec, w, from, to);
+            const got = value.time.map((x, i) => [
+              x,
+              value.row[i],
+              value.buy[i],
+              value.sell[i],
+              value.buyA[i],
+              value.sellA[i],
+            ]);
+            expect(got, `${t} ${tf} R=${R}`).toEqual(ref);
+            combos++;
+          }
+        }
+      }
+      expect(combos).toBeGreaterThan(60);
+    } finally {
+      await sql.end();
+    }
+  }, 120_000);
+
+  it('Range-Profile exakt über Chunk- und Tagesgrenzen (zufällige, nicht ausgerichtete Bereiche)', async () => {
+    let seedv = 7;
+    const rnd = () => (seedv = (seedv * 1_103_515_245 + 12_345) % 2 ** 31) / 2 ** 31;
+    const Rs = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
+    const seen = new Set<string>();
+    for (let k = 0; k < 60; k++) {
+      const start =
+        dataFrom -
+        2 * HOUR +
+        Math.floor(rnd() * ((dataTo - dataFrom + 2 * HOUR) / MINUTE_MS)) * MINUTE_MS;
+      const kind = k % 3;
+      const len =
+        (kind === 0
+          ? 1 + Math.floor(rnd() * 30)
+          : kind === 1
+            ? 60 + Math.floor(rnd() * 600)
+            : 1440 + Math.floor(rnd() * 4000)) * MINUTE_MS;
+      const R = Rs[Math.floor(rnd() * Rs.length)]!;
+      await checkRange(start, start + len, R, seen);
+    }
+    // ausgerichtete Spezialfälle: genau ein Tag, mehrere Tage, Tag ± 1 Minute
+    for (const [a, b] of [
+      [dataFrom, dataFrom + DAY_MS],
+      [dataFrom, dataTo],
+      [dataFrom + DAY_MS - MINUTE_MS, dataFrom + 3 * DAY_MS + MINUTE_MS],
+    ] as const)
+      for (const R of [5, 100, 1000]) await checkRange(a, b, R, seen);
+    // alle Quelltabellen kamen vor
+    expect([...seen].sort()).toEqual([...FP_TABLE_NAMES].sort());
+
+    async function checkRange(from: number, to: number, R: number, tables: Set<string>) {
+      const { res, json } = await get(
+        api,
+        `/api/v1/profile?sym=BTCUSDT&from=${from}&to=${to}&R=${R}`,
+      );
+      expect(res.status, `${from}-${to} R=${R}`).toBe(200);
+      const body = json() as unknown as RangeProfileResponse;
+      expect(checkRangeProfile(body)).toEqual([]);
+      for (const s of body.sources) tables.add(s.table);
+      const ref = refProfile(from, to, R * TICK);
+      expect(body.profile.rowLo).toBe(ref.rowLo);
+      expect(body.profile.buy).toEqual(ref.buy);
+      expect(body.profile.sell).toEqual(ref.sell);
+      expect(BigInt(body.profile.notional)).toBe(refNotional(from, to));
+      const marks = ref.rowLo === null ? null : profileMarks(ref.rowLo, ref.buy, ref.sell, 70);
+      if (marks) expect(body.profile).toMatchObject(marks);
+      const allImmutable = expFinal(from, to);
+      expect(body.final).toBe(allImmutable);
+      expect(res.headers.get('cache-control')).toBe(
+        allImmutable ? 'public, max-age=31536000, immutable' : 'no-cache',
+      );
+    }
+  }, 120_000);
+
+  it('Notional über alle Tage > 2^53 und exakt (Number würde runden)', async () => {
+    const { json } = await get(
+      api,
+      `/api/v1/profile?sym=BTCUSDT&from=${dataFrom}&to=${dataTo}&R=1000`,
+    );
+    const body = json() as unknown as RangeProfileResponse;
+    const n = BigInt(body.profile.notional);
+    expect(n).toBe(refNotional(dataFrom, dataTo));
+    expect(n > 2n ** 53n).toBe(true);
+    expect(BigInt(Number(body.profile.notional)) === n).toBe(false); // Number() verlöre Stellen
+  });
+
+  it('Tagesprofile (Offset 0, +3 h, −7 h) = je Tag Summe über fp_1m', async () => {
+    for (const offsetH of [0, 3, -7]) {
+      for (const R of [5, 10, 100, 1000]) {
+        const off = offsetH * HOUR;
+        const from = dataFrom + off;
+        const to = dataTo + off;
+        const { res, json } = await get(
+          api,
+          `/api/v1/profiles/daily?sym=BTCUSDT&from=${from}&to=${to}&R=${R}&offsetH=${offsetH}`,
+        );
+        expect(res.status).toBe(200);
+        const body = json() as unknown as DailyProfilesResponse;
+        expect(checkDailyProfiles(body)).toEqual([]);
+        if (offsetH !== 0)
+          expect(body.sources.every((s) => !s.table.startsWith('fp_1d'))).toBe(true);
+        else if (R % 100 === 0)
+          expect(body.sources.map((s) => s.table)).toEqual([
+            R % 1000 === 0 ? 'fp_1d_b1000' : 'fp_1d_b100',
+          ]);
+        const expected = [];
+        for (let a = from; a < to; a += DAY_MS) {
+          const ref = refProfile(a, a + DAY_MS, R * TICK);
+          if (ref.rowLo === null) continue;
+          expected.push({ from: a, ...ref, notional: refNotional(a, a + DAY_MS).toString() });
+        }
+        expect(
+          body.days.map((d) => ({
+            from: d.from,
+            rowLo: d.rowLo,
+            buy: d.buy,
+            sell: d.sell,
+            notional: d.notional,
+          })),
+        ).toEqual(expected);
+        for (const d of body.days) {
+          expect(d.final).toBe(expFinal(d.from, d.to));
+          expect(d.day).toBe(new Date(d.from - off).toISOString().slice(0, 10));
+        }
+      }
+    }
+  }, 60_000);
+
+  it('Qualität: Zustände, Minutenklassen, Issue-Minuten (shift nur auf Wunsch)', async () => {
+    const { res, json } = await get(
+      api,
+      `/api/v1/quality?sym=BTCUSDT&from=${dataFrom}&to=${dataTo}`,
+    );
+    expect(res.status).toBe(200);
+    const q = json() as { days: Record<string, unknown>[]; issues: Record<string, unknown>[] };
+    expect(q.days.length).toBe(LAST_DAY - FIRST_DAY + 1);
+    const bad = q.days.find((d) => d.from === BAD_DAY * DAY_MS)!;
+    expect(bad).toMatchObject({
+      state: 'final_bad',
+      immutable: true,
+      version: 2,
+      minutes: { mismatch: 1, missing: 1 },
+    });
+    expect(q.days.find((d) => d.from === PROVISIONAL_DAY * DAY_MS)).toMatchObject({
+      state: 'provisional',
+      immutable: false,
+    });
+    expect(q.issues.map((i) => i.kind)).toEqual(['mismatch', 'missing']);
+    expect(q.issues[0]).toMatchObject({ ts: BAD_DAY * DAY_MS + 2 * MINUTE_MS, dQ: 1500, dB: -700 });
+    const all = await get(api, `/api/v1/quality?sym=BTCUSDT&from=${dataFrom}&to=${dataTo}&shift=1`);
+    expect((all.json().issues as unknown[]).length).toBe(4);
+  });
+
+  it('Fehlercodes: 400 (Parameter), 404 (Symbol/Pfad), 422 (nicht angeboten), 409 (cfg)', async () => {
+    const c = sym.tileConfigVersion;
+    const cases: [string, number][] = [
+      [`/api/v1/footprint?sym=BTCUSDT&tf=1m&R=7&tile=1&cfg=${c}`, 422],
+      [`/api/v1/footprint?sym=BTCUSDT&tf=1m&R=50&tile=1&cfg=${c + 1}`, 409],
+      [`/api/v1/footprint?sym=BTCUSDT&tf=1m&R=50&tile=1`, 400],
+      [`/api/v1/footprint?sym=BTCUSDT&tf=7m&R=50&tile=1&cfg=${c}`, 400],
+      [`/api/v1/footprint?sym=BTCUSDT&tf=1m&R=050&tile=1&cfg=${c}`, 400],
+      [`/api/v1/footprint?sym=XRPUSDT&tf=1m&R=50&tile=1&cfg=${c}`, 404],
+      [`/api/v1/footprint?sym=BTCUSDT&tf=1m&R=50&tile=1&cfg=${c}&x=1`, 400],
+      [`/api/v1/bars?sym=BTCUSDT&tf=5m&from=60000&to=600000`, 400],
+      [`/api/v1/bars?sym=BTCUSDT&tf=1m&from=0&to=600000000`, 400],
+      [`/api/v1/profile?sym=BTCUSDT&from=${dataFrom}&to=${dataTo}&R=3`, 400],
+      [`/api/v1/profile?sym=BTCUSDT&from=${dataFrom + 1}&to=${dataTo}&R=10`, 400],
+      [`/api/v1/profiles/daily?sym=BTCUSDT&from=${dataFrom}&to=${dataTo}&R=10&offsetH=2`, 400],
+      [`/api/v1/nope`, 404],
+    ];
+    for (const [url, status] of cases) {
+      const { res, json } = await get(api, url);
+      expect(res.status, url).toBe(status);
+      expect(typeof json().error).toBe('string');
+    }
+    const r409 = await get(api, `/api/v1/footprint?sym=BTCUSDT&tf=1m&R=50&tile=1&cfg=${c + 1}`);
+    expect(r409.json().tileConfigVersion).toBe(c);
+  });
+
+  it('CORS für erlaubte Ursprünge (Standard: Loopback), sonst kein Header', async () => {
+    const ok = await get(api, '/api/v1/symbols', { headers: { Origin: 'http://127.0.0.1:5174' } });
+    expect(ok.res.headers.get('access-control-allow-origin')).toBe('http://127.0.0.1:5174');
+    const no = await get(api, '/api/v1/symbols', { headers: { Origin: 'https://evil.example' } });
+    expect(no.res.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  it('/health nur lokal ohne Proxy-Header', async () => {
+    expect((await get(api, '/api/v1/health')).res.status).toBe(200);
+    expect(
+      (await get(api, '/api/v1/health', { headers: { 'X-Forwarded-For': '1.2.3.4' } })).res.status,
+    ).toBe(404);
+  });
+});
+
+describe('Grenzen (422 mit Vorschlag)', () => {
+  let api: RunningApi;
+  let cells100: number;
+  beforeAll(async () => {
+    // Grenzen passend zu den synthetischen Daten: Zeilen eines Tages bei R = 100 minus 1
+    cells100 = refProfile(dataFrom, dataFrom + DAY_MS, 100 * TICK).buy.length;
+    api = await start({ maxSourceRows: 3_000, maxCells: cells100 - 1 });
+  });
+  afterAll(async () => api?.close());
+
+  it('Quellzeilen vor der Ausführung geschätzt; Zellen aus dem Preisbereich; Vorschlag für R', async () => {
+    const two = `from=${dataFrom}&to=${dataFrom + 2 * DAY_MS}`;
+    const rows = await get(api, `/api/v1/profile?sym=BTCUSDT&${two}&R=5`);
+    expect(rows.res.status).toBe(422);
+    expect(rows.json().error).toMatch(/Quellzeilen/);
+    expect(Number(rows.res.headers.get('x-rows-estimate'))).toBeGreaterThan(3_000);
+    const sr = rows.json().suggestR as number;
+    expect(sr).toBeGreaterThan(5);
+    const retry = await get(api, `/api/v1/profile?sym=BTCUSDT&${two}&R=${sr}`);
+    expect(Number(retry.res.headers.get('x-rows-estimate'))).toBeLessThanOrEqual(3_000);
+    const day = `from=${dataFrom}&to=${dataFrom + DAY_MS}`;
+    const cells = await get(api, `/api/v1/profile?sym=BTCUSDT&${day}&R=100`);
+    expect(cells.res.status).toBe(422);
+    expect(cells.json().error).toMatch(/Zeilen/);
+    expect(cells.json().suggestR).toBe(200);
+    const ok = await get(api, `/api/v1/profile?sym=BTCUSDT&${day}&R=200`);
+    expect(ok.res.status).toBe(200);
+    expect((ok.json() as unknown as RangeProfileResponse).profile.buy.length).toBeLessThan(
+      cells100,
+    );
+    const daily = await get(api, `/api/v1/profiles/daily?sym=BTCUSDT&${day}&R=100`);
+    expect(daily.res.status).toBe(422);
+  });
+
+  it('angebotene Kombinationen halten die Quellzeilengrenze ein (kein 422 für angebotene Kacheln)', async () => {
+    const s = ((await get(api, '/api/v1/symbols')).json().symbols as SymJson[])[0]!;
+    const tiles = s.tiles;
+    for (const [tf, m] of Object.entries(tiles)) {
+      const tfSec = TIMEFRAMES[tf as keyof typeof TIMEFRAMES];
+      for (const [R, n] of Object.entries(m)) {
+        const k = Math.floor(dataFrom / (n * tfSec * 1000));
+        const r = await get(
+          api,
+          `/api/v1/footprint?sym=BTCUSDT&tf=${tf}&R=${R}&tile=${k}&cfg=${s.tileConfigVersion}`,
+        );
+        expect(r.res.status, `${tf} ${R}`).toBe(200);
+        expect(Number(r.res.headers.get('x-rows-estimate'))).toBeLessThanOrEqual(3_000);
+      }
+    }
+  });
+});
+
+describe('Versionen, Unveränderlichkeit, Cache', () => {
+  let api: RunningApi;
+  const day = FIRST_DAY + 1;
+  let cfg0: number;
+  let url: string;
+  beforeAll(async () => {
+    api = await start();
+    const s = ((await get(api, '/api/v1/symbols')).json().symbols as SymJson[])[0]!;
+    cfg0 = s.tileConfigVersion;
+    const n = s.tiles['1m']!['100']!;
+    url = `/api/v1/footprint?sym=BTCUSDT&tf=1m&R=100&tile=${Math.floor((day * DAY_MS + 5 * HOUR) / (n * 60_000))}&cfg=${cfg0}`;
+  });
+  afterAll(async () => api?.close());
+  const waitCatalog = () => sleep(400);
+
+  it('final → immutable + ETag = dataVersion; Treffer aus dem Cache; 304', async () => {
+    const a = await get(api, url);
+    expect(a.res.status).toBe(200);
+    const h = decodeTile(a.buf).header;
+    expect(h.final).toBe(true);
+    expect(a.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    expect(a.res.headers.get('etag')).toBe(`"${h.dataVersion}"`);
+    expect(a.res.headers.get('x-cache')).toBe('miss');
+    const b = await get(api, url, { headers: { 'Accept-Encoding': 'gzip' } });
+    expect(b.res.headers.get('x-cache')).toBe('hit');
+    expect(Buffer.from(b.buf).equals(Buffer.from(a.buf))).toBe(true);
+    const c = await get(api, url, { headers: { 'If-None-Match': `"${h.dataVersion}"` } });
+    expect(c.res.status).toBe(304);
+  });
+
+  it('neue Tagesversion → neue dataVersion/ETag, kein Treffer; nicht unveränderlich → no-cache', async () => {
+    const before = decodeTile((await get(api, url)).buf).header.dataVersion;
+    await admin`UPDATE data_day SET version = version + 1 WHERE sym_id = ${SYM_ID} AND day = ${new Date(day * DAY_MS).toISOString().slice(0, 10)}::date`;
+    await waitCatalog();
+    const a = await get(api, url);
+    const h = decodeTile(a.buf).header;
+    expect(h.dataVersion).not.toBe(before);
+    expect(a.res.headers.get('x-cache')).toBe('miss');
+    expect(h.final).toBe(true);
+    await admin`UPDATE data_day SET edge_pending = true WHERE sym_id = ${SYM_ID} AND day = ${new Date(day * DAY_MS).toISOString().slice(0, 10)}::date`;
+    await waitCatalog();
+    const b = await get(api, url);
+    expect(decodeTile(b.buf).header.final).toBe(false);
+    expect(b.res.headers.get('cache-control')).toBe('no-cache');
+    expect((await get(api, url)).res.headers.get('x-cache')).toBe('miss');
+    await admin`UPDATE data_day SET edge_pending = false WHERE sym_id = ${SYM_ID} AND day = ${new Date(day * DAY_MS).toISOString().slice(0, 10)}::date`;
+    await waitCatalog();
+  });
+
+  it('geänderte Kachelkonfiguration → 409 auf alte cfg; Rücknahme und Neustart liefern dieselbe cfg', async () => {
+    const d = new Date(day * DAY_MS).toISOString().slice(0, 10);
+    const [b] = await admin<{ ts: Date; high_px: number }[]>`
+      SELECT ts, high_px FROM bar_1m WHERE sym_id = ${SYM_ID} AND ts >= ${d}::date ORDER BY ts LIMIT 1`;
+    // ein Ausreißer-Bar ändert maxRows aller tf → neue Kachellängen
+    await admin`UPDATE bar_1m SET high_px = high_px + 900000 WHERE sym_id = ${SYM_ID} AND ts = ${b!.ts}`;
+    await admin`UPDATE data_day SET version = version + 1 WHERE sym_id = ${SYM_ID} AND day = ${d}::date`;
+    await waitCatalog();
+    const s = ((await get(api, '/api/v1/symbols')).json().symbols as SymJson[])[0]!;
+    expect(s.tileConfigVersion).not.toBe(cfg0);
+    const r = await get(api, url);
+    expect(r.res.status).toBe(409);
+    expect(r.json().tileConfigVersion).toBe(s.tileConfigVersion);
+    await admin`UPDATE bar_1m SET high_px = ${b!.high_px} WHERE sym_id = ${SYM_ID} AND ts = ${b!.ts}`;
+    await admin`UPDATE data_day SET version = version + 1 WHERE sym_id = ${SYM_ID} AND day = ${d}::date`;
+    await waitCatalog();
+    const s2 = ((await get(api, '/api/v1/symbols')).json().symbols as SymJson[])[0]!;
+    expect(s2.tileConfigVersion).toBe(cfg0);
+    const tileA = decodeTile((await get(api, url)).buf).header.dataVersion;
+    const other = await start();
+    try {
+      const s3 = ((await get(other, '/api/v1/symbols')).json().symbols as SymJson[])[0]!;
+      expect(s3.tileConfigVersion).toBe(cfg0);
+      expect(decodeTile((await get(other, url)).buf).header.dataVersion).toBe(tileA);
+    } finally {
+      await other.close();
+    }
+  });
+});
+
+describe('Sperren, Abbruch, Überlast', () => {
+  // eigene Verbindung für die Sperre (admin hat max. 1 Verbindung und fragt pg_stat_activity ab)
+  let locker: Sql;
+  beforeAll(() => {
+    locker = connect(adminCfg);
+  });
+  afterAll(async () => locker?.end());
+  /** Hält eine exklusive Sperre auf fp_1m, bis release() gerufen wird. */
+  async function holdLock(): Promise<() => Promise<void>> {
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const isLocked = new Promise<void>((r) => (locked = r));
+    const done = locker.begin(async (tx) => {
+      await tx`LOCK TABLE fp_1m IN ACCESS EXCLUSIVE MODE`;
+      locked();
+      await released;
+    });
+    await isLocked;
+    return async () => {
+      release();
+      await done;
+    };
+  }
+  // R = 5 liest fp_1m (einzige passende Quelle)
+  const profileUrl = (k: number) =>
+    `/api/v1/profile?sym=BTCUSDT&from=${dataFrom + k * MINUTE_MS}&to=${dataFrom + (k + 30) * MINUTE_MS}&R=5`;
+  const waiting = async () => {
+    const [r] = await admin<{ n: number }[]>`
+      SELECT count(*)::int AS n FROM pg_stat_activity
+       WHERE datname = ${testDb} AND application_name = 'orderflow-api' AND wait_event_type = 'Lock'`;
+    return r!.n;
+  };
+
+  it('Client-Abbruch bricht die wartende DB-Abfrage ab', async () => {
+    const api = await start({ lockTimeoutMs: 20_000 });
+    const release = await holdLock();
+    try {
+      const ac = new AbortController();
+      const p = fetch(api.url + profileUrl(1), { signal: ac.signal }).catch((e: unknown) => e);
+      for (let i = 0; i < 50 && (await waiting()) === 0; i++) await sleep(50);
+      expect(await waiting()).toBe(1);
+      ac.abort();
+      await p;
+      for (let i = 0; i < 40 && (await waiting()) > 0; i++) await sleep(50);
+      expect(await waiting()).toBe(0); // Query.cancel → die API-Sitzung wartet nicht mehr
+    } finally {
+      await release();
+      await api.close();
+    }
+  });
+
+  it('lock_timeout mit Wiederholung: kurze Sperre → Erfolg, lange Sperre → 503 + Retry-After', async () => {
+    const api = await start({ lockTimeoutMs: 100, lockRetries: 3 });
+    try {
+      let release = await holdLock();
+      const t0 = Date.now();
+      const p = get(api, profileUrl(2));
+      await sleep(300);
+      await release();
+      const r = await p;
+      expect(r.res.status).toBe(200);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
+      release = await holdLock();
+      const q = await get(api, profileUrl(3));
+      await release();
+      expect(q.res.status).toBe(503);
+      expect(q.res.headers.get('retry-after')).toBe('2');
+    } finally {
+      await api.close();
+    }
+  });
+
+  it('Gleichzeitigkeitslimit: volle Warteschlange → 503 statt Postgres zu überlasten', async () => {
+    const api = await start({ dbPool: 1, maxQueue: 0, lockTimeoutMs: 20_000 });
+    const release = await holdLock();
+    try {
+      const first = get(api, profileUrl(4));
+      for (let i = 0; i < 50 && (await waiting()) === 0; i++) await sleep(50);
+      const second = await get(api, profileUrl(5));
+      expect(second.res.status).toBe(503);
+      expect(second.res.headers.get('retry-after')).toBe('1');
+      await release();
+      expect((await first).res.status).toBe(200);
+    } finally {
+      await api.close();
+    }
+  });
+});
