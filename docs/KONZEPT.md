@@ -1,8 +1,10 @@
 # orderflow-binance – Konzept
 
-Stand: 2026-11-24 · Fassung 2 · Status: **Entwurf zur Freigabe** (noch kein Anwendungscode)
+Stand: 2026-11-24 · Fassung 3 · Status: **in Umsetzung** (P0 erledigt, P1 in Arbeit, §8)
 
-Dieses Dokument ist die verbindliche Grundlage für Implementierung und Review. Änderungen am Konzept werden hier nachgezogen, bevor Code entsteht, der davon abweicht. Kennzeichnung: **[v1]** = erste Ausbaustufe, **[später]** = geplant, nicht v1, **[nice]** = nur wenn billig. „(unbestätigt)" markiert Angaben über Fremdprodukte, die nicht aus offizieller Doku belegt werden konnten. Fassung 2 arbeitet das Review (`KONZEPT-REVIEW.md`), ein Datenexperiment und Entscheidungen des Nutzers ein; Übersicht in §11.
+Dieses Dokument ist die verbindliche Grundlage für Implementierung und Review. Änderungen am Konzept werden hier nachgezogen, bevor Code entsteht, der davon abweicht. Kennzeichnung: **[v1]** = erste Ausbaustufe, **[später]** = geplant, nicht v1, **[nice]** = nur wenn billig. „(unbestätigt)" markiert Angaben über Fremdprodukte, die nicht aus offizieller Doku belegt werden konnten. Bei Zahlen steht, ob sie **gemessen**, **an Stichproben bewiesen**, **geschätzt/abgeleitet** oder **offen** sind. Fassung 2 arbeitete das Review (`KONZEPT-REVIEW.md`), ein Datenexperiment und Nutzerentscheidungen ein (§11); Fassung 3 übernimmt den gebauten Stand und die Messungen aus Implementierung und Gesamt-Historien-Scan (§12).
+
+Ergänzende, verbindliche Dokumente: [`TILE-FORMAT.md`](TILE-FORMAT.md) (API-Vertrag für `symbols`/`bars`/`footprint`, Kachelformat, Kachellänge), `PROFILE-API.md` (Vertrag des Volume-Profile-Endpunkts, entsteht gerade), [`../README.md`](../README.md) (Bedienung, Werkzeuge). Bei Widerspruch gelten diese Dokumente für ihren Gegenstand; das Konzept beschreibt Regeln und Entscheidungen, nicht den Code.
 
 ---
 
@@ -43,6 +45,8 @@ Zielwerte; „warm" = Daten im Page-Cache/shared_buffers, „kalt" = erster Zugr
 | Speicher Browser-Tab | ≤ 400 MB |
 | Recorder-Verzögerung | Warnung > 30 s, Alarm > 120 s |
 
+Bisherige Messungen gegen diese Budgets (Mac, warm, echte BTC-Daten bzw. Fixtures; VPS-Messung steht aus, M1): §5.8 (API) und §7.2 (Rendering). Sie liegen deutlich innerhalb der Budgets; das ist **kein** Nachweis für den VPS und für kalte Zugriffe.
+
 ### 1.5 Korrektheitsgarantien
 
 | # | Garantie | Wie erzwungen |
@@ -50,13 +54,14 @@ Zielwerte; „warm" = Daten im Page-Cache/shared_buffers, „kalt" = erster Zugr
 | K1 | Jeder Tag mit Status `final_*` stammt aus der offiziellen Binance-Tagesdatei mit geprüfter SHA256 | Manifest; Ersatz erst nach Checksum + vollständigem Parse (§4.3) |
 | K2 | Preise werden ohne Gleitkommafehler auf Ganzzahlen abgebildet | Integer-Parser (§4.4) |
 | K3 | Mengen und Notional werden exakt summiert | Ganzzahlige Lots und ganzzahliges Notional (§3.2) |
-| K4 | Pro Minute stimmen Volumen und Taker-Buy-Volumen mit der Binance-1m-Kline überein oder die Abweichung liegt nachweislich in der engen Minutengrenzen-Hülle (`shift`); Tagessummen exakt bis auf Tagesrand-Straddler | Abgleich nach jedem Import (§4.6) |
+| K4 | Pro Minute stimmen Volumen und Taker-Buy-Volumen mit der Binance-1m-Kline überein oder die Abweichung liegt nachweislich in der engen Minutengrenzen-Hülle (`shift`); Tagessummen exakt bis auf Tagesrand-Straddler. Jede andere Abweichung wird als `mismatch`/`missing` sichtbar – auch wenn die Ursache bei Binance liegt (Quellfehler werden annotiert, nicht weggerechnet) | Abgleich nach jedem Import (§4.6) |
 | K5 | Auf Stichprobentagen ist bewiesen, dass die Klines exakt aus den Einzelfills folgen und unsere Minuten exakt der Produktregel entsprechen | Tiefenprüfung gegen den trades-Dump (§4.7) |
-| K6 | Keine unbemerkten Lücken | aggId-Kontinuität, Tagesstatus, Health + Totmann (§2.5, §4.2) |
+| K6 | Keine unbemerkten Lücken | Live: aggId-Kontinuität. Historie: **der Kline-Abgleich** – die aggId-Kontinuität der Dumps erkennt Löcher nachweislich nicht (§4.5). Dazu Tagesstatus, Health + Totmann (§2.5, §4.2) |
 | K7 | Eine Minute wird vollständig oder gar nicht geschrieben; nie partiell, nie von zwei Schreibern | Zustandsautomat + Single Writer + Replace (§4.3) |
 | K8 | Aggregate sind reproduzierbar | Re-Import erzeugt identische Tages-Digests; Mac und VPS vergleichen Digests (§2.3, §4.8) |
 | K9 | Unabhängige Zweitberechnung stimmt überein | Python/DuckDB-Verifier inkl. aller Rollups und API-Stichprobe (§4.8) |
 | K10 | Die UI zeigt jederzeit, wie verlässlich die angezeigten Daten sind | Qualitätsband + Statusendpunkt (§4.9) |
+| K11 | Daten aus dem Zeitraum mit nachweislich unvollständigen aggTrades-Dumps (bis 2026-06-09) erscheinen nie als geprüft, solange sie nicht repariert sind | Regime-Schnitt (§3.1), v1-Historie ab 2026-06-10, Reparaturphase P7 (§4.11) |
 
 ---
 
@@ -67,10 +72,10 @@ Zielwerte; „warm" = Daten im Page-Cache/shared_buffers, „kalt" = erster Zugr
 | Prozess | Aufgabe | Läuft | Schreibt |
 |---|---|---|---|
 | `recorder` | WebSocket aggTrade je Symbol, Lückenerkennung + REST-Nachholen, Spool-Dateien, fertige Minuten als provisorisch in die DB, lokaler Trade-Feed für die API | VPS, Daemon (`Type=notify`) | Basistabellen nur für Tage im Zustand `provisional`; `ingest_status` |
-| `importer` | Download Tagesdateien (aggTrades + Klines; Erstimport zusätzlich Monatsdateien, §3.1), Checksum, Manifest, Tagesaggregation, atomarer Tages-Ersatz, Abgleich; Backfill-Modus | Mac: Historie/Neuberechnung; VPS: tägliche Finalisierung (Timer) | Aggregate für Tage im Zustand `importing`; `raw_file`, `data_day`, `data_minute_issue`, `kline_1m` |
+| `importer` | Download Tagesdateien (aggTrades + Klines; Erstimport zusätzlich Monatsdateien, §3.1), Checksum, Manifest, Tagesaggregation, atomarer Tages-Ersatz, Abgleich mit Kaskade auf den Folgetag; Modi Dry-Run / DB, `--backfill` / `--online`, `--plan` (§4.1) — **gebaut** | Mac: Historie/Neuberechnung; VPS: tägliche Finalisierung (Timer) | Aggregate für Tage im Zustand `importing`; `raw_file`, `data_day`, `data_minute_issue`, `kline_1m` |
 | `api` | HTTP (Binärdaten), WebSocket (formender Bar), Health-Endpunkt, Big-Trade-Schwellen | VPS, Daemon | nichts (DB-Rolle nur lesend) |
 | `web` | statisches Frontend (Svelte 5 + lightweight-charts) | nginx (VPS), Vite (Mac) | – |
-| `verifier` | unabhängige Neuberechnung (Python + DuckDB), Tiefenprüfung gegen trades-Dump | Mac; leichter Lauf auf VPS | nur `verify_run` |
+| `verifier` | unabhängige Neuberechnung (Python + DuckDB) im Datei- und im DB-Modus (**gebaut**), Tiefenprüfung gegen trades-Dump | Mac; auf dem VPS nur in ruhigen Zeiten (2–4,7 GB RSS je Tag, gemessen; nie parallel zu schweren Abfragen) | nur `verify_run` |
 | `health-ping` | systemd-Timer alle 5 min: ruft Health ab, pingt Totmann-Dienst nur bei `healthy` | VPS | – |
 
 Begründung: Live-Ingestion, Import und Chart-API teilen sich keinen Event-Loop (PulseBot-Lektion); jeder Datenbereich hat genau einen Schreiber. Faktisch sind es zwei Daemons und drei Timer/CLIs.
@@ -95,8 +100,8 @@ Entscheidung: **Das Rohdatenarchiv liegt auf dem Mac**, die Historie wird auf de
 
 | | Mac | VPS |
 |---|---|---|
-| Rohdaten | vollständiges Archiv ab 2025-01-01 (aggTrades + Klines, trades-Dumps nur für Stichprobentage) | letzte 14 Tage aggTrades + Klines (≈ 0,8 GB) |
-| Postgres + Timescale | Docker, gleiche gepinnte Version wie VPS; vollständige DB | Docker; vollständige DB (aus Transfer + tägliche Finalisierung) |
+| Rohdaten | vollständiges Archiv ab 2025-01-01: aggTrades 29,2 GB als ZIP (BTC 12,9 GB, ETH 16,4 GB, gemessen für 2025-01-01…2026-11-23), Klines 87 MB; trades-Dumps für Stichprobentage, für die Reparaturphase P7 zusätzlich ≈ 525 Tage/Symbol (geschätzt 30–50 GB) | letzte 14 Tage aggTrades + Klines (≈ 1 GB, abgeleitet) |
+| Postgres + Timescale | OrbStack (Docker-kompatibel; Docker Desktop vom Nutzer abgelehnt), Image gepinnt `timescale/timescaledb:2.31.2-pg17`, nur `127.0.0.1:54320`; vollständige DB | Docker, gleiche Version; vollständige DB (aus Transfer + tägliche Finalisierung) |
 | Prozesse | importer (Backfill, Neuberechnung, täglicher Nachzug wenn eingeschaltet), verifier, Entwicklung | recorder, api, importer (täglich), health-ping, nginx |
 
 Backup: Archiv auf dem Mac zusätzlich auf eine externe Platte oder einen Cloud-Speicher spiegeln; monatlicher SHA256-Abgleich gegen das Manifest (Skript). Jede Datei ist zudem bei Binance erneut ladbar, solange Binance sie anbietet.
@@ -109,12 +114,12 @@ Backup: Archiv auf dem Mac zusätzlich auf eine externe Platte oder einen Cloud-
 
 **Transferverfahren (Erstübertragung):**
 1. Mac: Backfill im Backfill-Modus (§4.1), alle Chunks außerhalb der letzten 3 Tage sind danach komprimiert.
-2. Mac: `pg_dump -Fd -j 4` (Verzeichnisformat, parallel) der Anwendungsdatenbank. Komprimierte Chunks liegen in Timescales internen komprimierten Tabellen und werden in dieser Form gesichert, d. h. der Dump enthält die Basistabelle nicht entpackt (an einer Test-DB vor dem ersten echten Transfer bestätigen). Erwartete Größe ≈ DB-Größe (6–10 GB).
+2. Mac: `pg_dump -Fd -j 4` (Verzeichnisformat, parallel) der Anwendungsdatenbank. Komprimierte Chunks liegen in Timescales internen komprimierten Tabellen und werden in dieser Form gesichert, d. h. der Dump enthält die Basistabelle nicht entpackt (an einer Test-DB vor dem ersten echten Transfer bestätigen – **offen**). Erwartete Größe ≈ DB-Größe; für v1 (BTC ab 2026-06-10, ≈ 167 Tage) hochgerechnet ≈ 0,8–1,2 GB (abgeleitet aus §3.10).
 3. `rsync` auf den VPS, SHA256 je Dump-Datei vergleichen.
 4. VPS: leere DB mit **identischer** Postgres- und Timescale-Version, `SELECT timescaledb_pre_restore();` → `pg_restore -j 2` → `SELECT timescaledb_post_restore();`. Spitzenbedarf Platte ≈ Dump + DB ≈ 20 GB (von 80 GB frei); Dump danach löschen.
 5. Prüfung: Digest je (Tabelle, Symbol, Tag) auf beiden Seiten identisch; `data_day` identisch. Erst dann wird der VPS-Recorder für die Tage nach dem Transferstand freigeschaltet.
 
-**Transferverfahren (Teilübertragung nach Neuberechnung):** Der Mac exportiert nur die betroffenen Tabellen und Tage als `COPY … TO STDOUT (FORMAT binary)` je (Tabelle, Symbol, Tag) mit Digest. Der VPS spielt sie chunkweise ein: Chunk dekomprimieren → Tage per Delete + COPY ersetzen → `compress_chunk` → nächster Chunk. Es ist also höchstens ein Chunk zur Zeit unkomprimiert (bei `fp_1m` ≈ 1 Tag ≈ 65 MB); **die VPS-Platte hält nie die unkomprimierte Basistabelle.** Danach Digest-Vergleich wie oben.
+**Transferverfahren (Teilübertragung nach Neuberechnung):** Der Mac exportiert nur die betroffenen Tabellen und Tage als `COPY … TO STDOUT (FORMAT binary)` je (Tabelle, Symbol, Tag) mit Digest. Der VPS spielt sie chunkweise ein, mit demselben Weg wie der Importer (§4.3): `convert_to_rowstore` → Tage per Delete + COPY ersetzen → `convert_to_columnstore` → nächster Chunk. Es ist also höchstens ein Chunk zur Zeit unkomprimiert (bei `fp_1m` ≈ 1 Tag ≈ 65 MB); **die VPS-Platte hält nie die unkomprimierte Basistabelle.** Danach Digest-Vergleich wie oben.
 
 ### 2.4 Deployment auf dem geteilten VPS (2 vCPU, 7,8 GB RAM, ~5,9 GB frei, 80 GB Platte frei)
 
@@ -151,12 +156,12 @@ healthchecks.io: der kostenlose „Hobbyist"-Tarif ($0, 20 Checks) besteht laut 
 
 | Bereich | Wahl | Grund |
 |---|---|---|
-| Sprache Backend + Frontend | **TypeScript** (Node.js 24 LTS) | ein Typsystem für API-Encoding und Frontend-Decoding; lightweight-charts ist JS; PulseBot-Module (Parser, Seitenzuordnung, Value Area) sind übertragbar |
+| Sprache Backend + Frontend | **TypeScript** (Node.js 24 LTS; gebaut mit 24.22.3 per nvm, ohne Build-Schritt per Type-Stripping) | ein Typsystem für API-Encoding und Frontend-Decoding; lightweight-charts ist JS; PulseBot-Module (Parser, Seitenzuordnung, Value Area) sind übertragbar |
 | DB-Treiber | `postgres` (porsager) oder `pg` + `pg-copy-streams` | `COPY` für Massenimport |
 | HTTP/WS | Fastify + `ws` | schnell, Schema-Validierung |
 | Frontend | Svelte 5 + Vite, lightweight-charts 5.x (gepinnt) | Svelte bekannt; Chartdaten außerhalb der Reaktivität (§7.3) |
 | Tests | Vitest + fast-check, Playwright | |
-| Verifier | **Python 3.12 + DuckDB + pyarrow** | andere Sprache und Engine. DuckDB liest ZIP nicht direkt: `zipfile` → pyarrow-CSV → DuckDB |
+| Verifier | **Python + DuckDB + pyarrow** (lokal 3.14 im venv, CI 3.12) | andere Sprache und Engine. DuckDB liest ZIP nicht direkt: `zipfile` → pyarrow-CSV → DuckDB |
 | DB | PostgreSQL 17 + TimescaleDB Community, columnstore-API (`enable_columnstore`, `add_columnstore_policy`; die alte Kompressions-API ist deprecated) | Entscheidung gesetzt |
 
 Erwogen und verworfen: **Python/FastAPI als Backend** (zwei Sprachen zwischen Binärformat und Frontend; Aggregation liegt ohnehin in SQL/Importer); **Rust/Go** für Importer/Recorder (neue Sprache, Durchsatzbedarf ≈ 2 Mio. aggTrades/Tag/Symbol ist für Node unkritisch); **React/Solid** (kein Vorteil für Canvas-Rendering); **Continuous Aggregates** (§3.5); **ClickHouse/QuestDB** (Postgres/Timescale ist gesetzt, zusätzlicher Betrieb).
@@ -167,9 +172,16 @@ Erwogen und verworfen: **Python/FastAPI als Backend** (zwei Sprachen zwischen Bi
 
 ### 3.1 Rohdateien (Quelle der Wahrheit)
 
-**Quelle der Wahrheit sind die aggTrades-Dateien von Binance Vision** (vollständig auf allen geprüften Tagen, gleiche Form wie der Live-Stream).
+**Quelle der Wahrheit sind die aggTrades-Dateien von Binance Vision** (gleiche Form wie der Live-Stream). Sie sind **nicht** unbedingt vollständig (§4.5): bis 2026-06-09 fehlen ihnen nachweislich „Tail-Fills", und am 2026-10-27 haben sie ein echtes Loch. Daraus folgen zwei Regime mit festem Schnitt:
 
-- **Erstimport der Historie:** Für abgeschlossene Monate (2025-01 … 2026-10) werden die bereits geladenen und gegen ihre `.CHECKSUM` geprüften **Monatsdateien** verwendet (≈ 12–14 GB). Sie gleichwertig zu nutzen spart einen erneuten Download von ≈ 1 300 Tagesdateien mit denselben Daten. Der Importer zerlegt eine Monatsdatei beim Streamen nach UTC-Tag (`floor(T / 86 400 000)`). Ab da wird jeder Tag **genau wie eine Tagesdatei** behandelt: gleiche Manifest-Einträge je Tag, gleiche Digests, gleiche Klassifikation, gleiche Tagesrand-Behandlung, auch über Monatsgrenzen (Übertrag s(−1) und `continues_prev` vom letzten Tag des Vormonats).
+| Regime | Zeitraum | Befund (§4.5) | Behandlung |
+|---|---|---|---|
+| **A – Tail-Verlust** | 2025-01-01 … 2026-06-09 | an 352 von 692 Tagen je Symbol ≥ 1 `mismatch`-Minute durch fehlende Tail-Fills (bewiesen an Fill-Daten, Gesamtscan) | **nicht in der v1-Historie**; Import erst in der Reparaturphase P7 mit Regel R-A (§4.11) |
+| **B – vollständig bis auf Einzelfälle** | ab 2026-06-10 | 0 Tail-Fälle in 5,5 Monaten (Gesamtscan); ein echtes Loch 2026-10-27 00:02–00:30 UTC | **v1-Historie** (Nutzerentscheidung: zuerst der saubere Zeitraum); das Loch bleibt bis P7 als `final_bad` mit Annotation sichtbar |
+
+Der Schnitt liegt bei 2026-06-10 00:00 UTC (letzter beobachteter Tail-Fall BTC 2026-06-09 02:35:29.755, ETH 02:04:57.889 UTC; der Tag 2026-06-09 gehört zu Regime A). Eine Ankündigung von Binance zu dieser Änderung ist nicht bekannt; der Zeitpunkt ist gemessen, die Ursache offen.
+
+- **Erstimport der Historie:** Für abgeschlossene Monate werden die bereits geladenen und gegen ihre `.CHECKSUM` geprüften **Monatsdateien** verwendet. Tages- und Monatsdateien sind auch bezüglich der fehlenden Tails identisch (gemessen). Sie gleichwertig zu nutzen spart einen erneuten Download von ≈ 1 300 Tagesdateien mit denselben Daten. Der Importer zerlegt eine Monatsdatei beim Streamen nach UTC-Tag (`floor(T / 86 400 000)`). Ab da wird jeder Tag **genau wie eine Tagesdatei** behandelt: gleiche Manifest-Einträge je Tag, gleiche Digests, gleiche Klassifikation, gleiche Tagesrand-Behandlung, auch über Monatsgrenzen (Übertrag s(−1) und `continues_prev` vom letzten Tag des Vormonats).
 - **Laufender Betrieb, VPS-Fenster, Monate ohne Monatsdatei:** ausschließlich Tagesdateien.
 - Es gibt keine Überlappungsprüfung zwischen Monats- und Tagesdateien im Betrieb. Jeder Tag hat genau eine Quelle, die in seinem Manifest steht. Die Gleichwertigkeit wird einmalig in P1 nachgewiesen (§8).
 
@@ -181,9 +193,11 @@ data/raw/binance-vision/futures/um/daily/trades/{SYM}/{SYM}-trades-{YYYY-MM-DD}.
 data/live/{SYM}/{YYYY-MM-DD}/{HH}.csv.zst                                                    # Live-Spool (nur VPS)
 ```
 
-Klines kommen aus den Vision-Dumps (Checksum, reproduzierbar, kein API-Gewicht), nicht per REST.
+Klines kommen grundsätzlich aus den Vision-Dumps (Checksum, reproduzierbar, kein API-Gewicht). **Der Importer verlangt je Tag eine Kline-Datei** (ohne sie kein Abgleich, kein Import). Ausnahme für bekannte Dump-Defekte (§4.5): Weicht ein Kline-Dump von den REST-Klines ab und sind die REST-Klines nachweislich gleich dem trades-Dump, wird für diesen Tag REST verwendet und die Herkunft festgehalten (Regel festgelegt; beide bekannten Fälle liegen in Regime A, Umsetzung daher mit P7). Fehlt Menge in der Kline-Quelle selbst (Dump und REST), wird das als Referenzdefekt annotiert, nicht korrigiert.
 
-Das Manifest besteht aus einem JSON-Sidecar je Datei und den Tabellen `raw_file` (eine Zeile je Datei) und `raw_day` (eine Zeile je Symbol-Tag). Beide Tabellen lassen sich aus den Sidecars rekonstruieren; das Sidecar einer Monatsdatei enthält die Tageseinträge als Liste. Die Felder je Tag sind für beide Herkunftsarten identisch:
+Downloads: Binance drosselt bei 3 parallelen Downloads, 2 laufen problemlos (gemessen); der Downloader nutzt höchstens 2 und hat Zeitlimits gegen hängende Verbindungen.
+
+Das Manifest besteht aus den Tabellen `raw_file` (eine Zeile je Datei, Primärschlüssel = relativer Pfad unter `data/raw/binance-vision/`, mit `origin` daily/monthly und `period`) und `raw_day` (eine Zeile je Symbol, Art und Tag). Ein JSON-Sidecar je Datei schreibt der Importer auf Anforderung (`--sidecar`/`--sidecar-dir`); das Sidecar einer Monatsdatei enthält die Tageseinträge als Liste, und die Tabellen lassen sich daraus rekonstruieren. Die Felder je Tag sind für beide Herkunftsarten identisch:
 
 | Feld | Inhalt |
 |---|---|
@@ -194,6 +208,7 @@ Das Manifest besteht aus einem JSON-Sidecar je Datei und den Tabellen `raw_file`
 | `continues_prev` | `first_agg_id = last_agg_id(Vortag) + 1` |
 | `first_ts`, `last_ts` | müssen im UTC-Tag liegen |
 | `header_present`, `downloaded_at`, `importer_version` | Herkunft |
+| Trade-ID-Sprünge zwischen aggTrades, größte Zeitlücke | **nur Bericht**, nicht Teil der Klassifikation: Loch-IDs sind normal (§4.5), und das Loch vom 2026-10-27 zeigt sich nur hier (Trade-IDs springen um 38 458 bzw. 48 478) und im Kline-Abgleich, nicht in der aggId-Kontinuität |
 
 Live-Spool: der Recorder schreibt jeden empfangenen oder per REST nachgeholten aggTrade im Vision-CSV-Format, gepuffert und **je Sekunde als eigener zstd-Frame** mit fsync. Nach einem Absturz ist höchstens der letzte Frame unvollständig; er wird verworfen und per REST neu geholt. Spool-Dateien werden 7 Tage nach `final_ok` gelöscht.
 
@@ -209,7 +224,7 @@ CREATE TABLE symbol (
   qty_unit       numeric NOT NULL,               -- min(stepSize LOT_SIZE, MARKET_LOT_SIZE) bei Aufnahme (BTC/ETH 0.001, aus exchangeInfo)
   qty_decimals   smallint NOT NULL,
   big_floor_n    bigint,                         -- Untergrenze big_order als ganzzahliges Notional (§3.7), NULL bis P5
-  data_from      date NOT NULL,                  -- 2025-01-01
+  data_from      date NOT NULL,                  -- Beginn der gespeicherten Historie: v1 2026-06-10, nach P7 2025-01-01
   active         boolean NOT NULL DEFAULT true
 );
 CREATE TABLE symbol_tick_history (               -- empirisch je Tag, exchangeInfo nur Gegenprobe
@@ -229,7 +244,7 @@ CREATE TABLE symbol_tick_history (               -- empirisch je Tag, exchangeIn
 
 **Ein aggTrade gehört vollständig zu der UTC-Minute, in die sein Zeitstempel `T` fällt** (`T` = Zeit seines ersten Fills): `minute_ms = T − (T mod 60 000)`, Tag = `floor(T / 86 400 000)`.
 
-Begründung: aggTrades sind die einzige vollständige Quelle; die Zeiten der einzelnen Fills sind darin nicht enthalten. Folge (gemessen, §4.5): 68–197 aggTrades pro Symbol-Tag haben Fills in der Folgeminute; dadurch weicht unser Minutenvolumen in 12–32 % der Minuten geringfügig von der Binance-Kline ab (Volumen P50 ≈ 0,013 BTC, Maximum 15 BTC in einer Minute). Footprint-Summen und Bar-Volumen sind untereinander konsistent (beide nach dieser Regel); die Kline-Trade-Anzahl wird als Referenzwert separat angezeigt.
+Begründung: aggTrades sind die einzige Quelle in Form des Live-Streams; die Zeiten der einzelnen Fills sind darin nicht enthalten. Die Regel ist in beiden Regimen an Fill-Daten bestätigt (T = erster Fill, Spanne ≤ 100 ms, Straddler nur in die Folgeminute). Folge (gemessen, §4.5): 68–197 aggTrades pro Symbol-Tag haben Fills in der Folgeminute; dadurch weicht unser Minutenvolumen in 12–32 % der Minuten geringfügig von der Binance-Kline ab (Volumen P50 ≈ 0,013 BTC, Maximum 15 BTC in einer Minute). Footprint-Summen und Bar-Volumen sind untereinander konsistent (beide nach dieser Regel); die Kline-Trade-Anzahl wird als Referenzwert separat angezeigt.
 
 ### 3.4 Basistabelle: 1 Minute × Preis
 
@@ -249,7 +264,9 @@ ALTER TABLE fp_1m SET (timescaledb.enable_columnstore, timescaledb.segmentby = '
 CALL add_columnstore_policy('fp_1m', after => INTERVAL '3 days');
 ```
 
-Gezählt werden aggTrades, nicht Einzeltrades: `l − f + 1` ist nachweislich keine verlässliche Trade-Anzahl (ID-Löcher ohne Menge innerhalb von aggTrade-Bereichen, §4.5). `integer` reicht für Mengen pro Minute und Preis (Importer prüft Überlauf); Rollups verwenden `bigint`. **Delta = buy_q − sell_q.**
+Gezählt werden aggTrades, nicht Einzeltrades: `l − f + 1` ist nachweislich keine verlässliche Trade-Anzahl (ID-Löcher ohne Menge innerhalb von aggTrade-Bereichen, §4.5). `integer` reicht für Mengen pro Minute und Preis (Importer prüft Überlauf); Rollups verwenden `bigint`. **Delta = buy_q − sell_q.** Gebaut ohne Standardindex auf `ts` (der Primärschlüssel deckt die Abfragen) und ohne Fremdschlüssel auf `symbol` (Kosten je Zeile beim `COPY`).
+
+Gemessen (BTC): ≈ 874 k `fp_1m`-Zeilen an lebhaften Tagen, ≈ 451 k im Oktober-Mittel (Fassung 2 schätzte 650 k). Columnstore-Faktor 16,4 (120 → 7,3 B/Zeile); Datenbank für 34 BTC-Tage 2 252 MB → 174 MB, also ≈ 4,6–5 MB je BTC-Tag komprimiert. ETH ist noch nicht gemessen.
 
 ### 3.5 Bar-Statistik pro Minute
 
@@ -294,7 +311,7 @@ Bins in Ticks (`tick_ref_units`); gespeichert wird `row_px = floor(px / (bin·ti
 
 | Tabelle | Zeit | Bin | BTC | ETH | Zeilen/Tag BTC / ETH (Schätzung außer fp_1m) |
 |---|---|---|---|---|---|
-| `fp_1m` | 1m | Preis (1 Tick) | 0,1 $ | 0,01 $ | 650 k / 290 k (gemessen) |
+| `fp_1m` | 1m | Preis (1 Tick) | 0,1 $ | 0,01 $ | BTC 451 k (Okt.-Mittel) … 874 k (lebhafte Tage), gemessen / ETH ≈ 290 k (Fassung-1-Messung) |
 | `fp_1m_b10` | 1m | 10 | 1 $ | 0,1 $ | ≈ 70 k / 30 k |
 | `fp_5m_b10` | 5m | 10 | 1 $ | 0,1 $ | ≈ 29 k / 12 k |
 | `fp_15m_b100` | 15m | 100 | 10 $ | 1 $ | ≈ 2 k / 1 k |
@@ -348,18 +365,31 @@ CREATE TABLE big_order (
 
 ### 3.8 Qualität, Referenzdaten, Betrieb
 
+Gebaut (Migrationen 0002–0006; hier nur die Bedeutung, Spaltendetails in `packages/db/migrations/`):
+
 ```sql
 CREATE TABLE data_day (
   sym_id smallint, day date, PRIMARY KEY (sym_id, day),
-  state text NOT NULL,       -- Zustandsautomat §4.3
-  version integer NOT NULL DEFAULT 0,   -- +1 bei jedem Ersatz; Basis für Cache-Versionen (§5.4)
+  state text NOT NULL,       -- 'provisional' | 'importing' | 'provisional_import_failed' | 'final_ok' | 'final_bad' (§4.3)
+  version integer NOT NULL DEFAULT 0,   -- +1 bei jedem Ersatz und jeder Neuklassifikation; Basis der Kachelversionen (§5.4)
   source text,               -- 'live' | 'live+rest' | 'vision'
-  raw_sha256 text, rows bigint, first_agg_id bigint, last_agg_id bigint,
-  min_exact int, min_shift int, min_mismatch int, min_missing int, min_gap int, edge_pending boolean,
+  raw_sha256 text, kline_sha256 text, rows bigint, first_agg_id bigint, last_agg_id bigint,
+  min_exact int, min_shift int, min_mismatch int, min_missing int, min_gap int,
+  edge_first_pending boolean, edge_last_pending boolean, edge_pending boolean,   -- Minute 0 / 1439 offen
+  carry_q bigint, carry_b bigint, cand_last_q bigint, cand_last_b bigint,        -- Übertrag s(1439) und cand(1439) für den Folgetag
+  carry_in_q bigint, carry_in_b bigint, carry_in_origin text,                    -- verwendeter Übertrag s(−1): chain | stored | neighbour | estimated
+  prev_last_agg_id bigint,   -- last_agg_id des Vortags, gegen den continues_prev geprüft wurde
+  stale boolean NOT NULL DEFAULT false,   -- Eingaben aus dem Vortag haben sich geändert, Neuklassifikation ausstehend
+  state_before_import text,  -- für die Wiederherstellung nach Absturz während `importing`
+  digest text,               -- Daten-Digest über alle Tabellen (§4.8)
+  quality_digest text,       -- Digest der Klassen je Minute (D, s)
+  rules_version text, importer_version text,   -- Herkunft; „fertig" hängt NICHT davon ab (§4.1)
   deep_check text,           -- NULL | 'passed' | 'failed' | 'reference_unusable'
-  digest text,               -- §4.8
-  importer_version text, imported_at timestamptz, verified_at timestamptz
+  immutable boolean GENERATED ALWAYS AS (state IN ('final_ok','final_bad') AND NOT coalesce(edge_pending, true) AND NOT stale) STORED,
+  imported_at timestamptz, verified_at timestamptz
 );
+-- geplant (P7): regime ('A' | 'B'), tail_status ('n/a' | 'unverified' | 'repaired'),
+--               kline_origin ('vision' | 'rest'), Zeilenquelle 'synthetic' (§4.11)
 CREATE TABLE data_minute_issue (
   sym_id smallint, ts timestamptz, kind text,  -- 'shift' | 'mismatch' | 'missing' | 'gap'
   d_q bigint, d_b bigint, cand_q bigint, cand_b bigint, carry_q bigint, carry_b bigint,
@@ -377,7 +407,11 @@ CREATE TABLE raw_file ( … Dateifelder wie Manifest §3.1 … );
 CREATE TABLE raw_day  ( … Tagesfelder wie Manifest §3.1, PK (sym_id, kind, day) … );
 CREATE TABLE verify_run ( run_id serial, host text, started_at timestamptz, scope text,
   checks int, mismatches int, report jsonb );
+-- geplant: source_annotation (sym_id, from_ts, to_ts, kind, note) für bekannte Quell- und Referenzdefekte:
+--   'aggtrades_hole' | 'kline_dump_defect' | 'kline_source_gap' | 'exchange_outage' | 'trades_dump_lossy'
 ```
+
+`ingest_status` und die DB-Rollen kommen mit dem Recorder (P3), `size_hist_*`/`big_order` mit P5; `source_annotation` mit dem Abschluss von P1, damit 2026-10-27 in der UI erklärt ist (**offen**).
 
 `kline_1m` ist Referenz- und Anzeigedatum: die **Trade-Anzahl pro Minute kommt aus den Klines** (Stats-Zeile „Trades", auf jedem Zeitrahmen exakt als Summe).
 
@@ -385,55 +419,72 @@ Backup auf dem VPS: täglicher `pg_dump` nur der kleinen Tabellen (`data_day`, `
 
 ### 3.9 Kompression und Aufbewahrung
 
+Wie gebaut:
+
 | Tabelle | Chunk | columnstore nach | Retention |
 |---|---|---|---|
 | `fp_1m` | 1 Tag | 3 Tagen | keine |
-| `fp_1m_b10`, `fp_5m_b10`, `size_hist_1m` | 7 Tage | 3 Tagen | keine |
-| `fp_15m_b100`, `fp_1h_*`, `bar_1m`, `kline_1m`, `big_order` | 30 Tage | 3 Tagen | keine |
-| `fp_1d_*`, `bar_1h/1d`, `size_hist_1h` | 1 Jahr | 7 Tagen | keine |
+| `fp_1m_b10`, `fp_5m_b10` (später `size_hist_1m`) | 7 Tage | 3 Tagen | keine |
+| `fp_15m_b100`, `fp_1h_b10`, `fp_1h_b100`, `bar_1m`, `kline_1m` (später `big_order`) | 30 Tage | 3 Tagen | keine |
+| `fp_1d_b100`, `fp_1d_b1000`, `bar_1h`, `bar_1d` (später `size_hist_1h`) | 365 Tage | **nicht komprimiert** | keine |
 | Live-Spool (VPS) | – | zstd | 7 Tage nach `final_ok` |
 | Tagesdateien (VPS) | – | – | 14 Tage |
 
-Die Policies greifen nur im laufenden Betrieb. Backfill und Neuberechnung komprimieren explizit (§4.1); ein Re-Import eines alten Tages dekomprimiert den betroffenen Chunk, ersetzt und komprimiert neu.
+Die vier Jahres-Tabellen bleiben bewusst unkomprimiert: sie sind winzig (gemessen 1,8 MB roh gegenüber 0,5 MB komprimiert für 34 BTC-Tage), und komprimiert verlangte jeder Re-Import eines historischen Tages die Umwandlung eines ganzen Jahres-Chunks mit exklusiver Sperre über ein Jahr Lesezugriffe. Die Policies greifen nur im laufenden Betrieb; Backfill und Neuberechnung steuern die Kompression selbst (§4.1). Ein Re-Import eines komprimierten Tages wandelt die betroffenen Chunks in den Rowstore, ersetzt und wandelt zurück (§4.3).
 
-### 3.10 Größenschätzung (BTC + ETH, 2025-01-01 bis heute ≈ 692 Tage)
+### 3.10 Größen (gemessen, wo angegeben)
 
-Schätzungen auf Basis der gemessenen Zeilenzahlen und angenommener 6–10 B/Zeile komprimiert (nicht gemessen; wird in P1 gemessen und nachgetragen).
+Basis: ≈ 4,6–5 MB je BTC-Tag komprimiert über alle Tabellen (gemessen an 34 Tagen, §3.4); ETH nicht gemessen (Spanne unten aus der höheren Rohdatengröße abgeleitet).
 
-| Posten | Bestand heute | Zuwachs/Jahr |
+| Posten | Wert | Status |
 |---|---|---|
-| `fp_1m` (≈ 650 Mio. Zeilen) | 3,9–6,5 GB | 2,1–3,4 GB |
-| `fp_1m_b10` + `fp_5m_b10` | 0,6–1,0 GB | 0,3–0,5 GB |
-| übrige Rollups, `bar_*`, `kline_1m` | < 0,3 GB | < 0,15 GB |
-| `size_hist_1m` (Arrays komprimieren schwach) | 0,4–1 GB | 0,2–0,5 GB |
-| `big_order` (Anteil nach §3.7 offen) | 0,2–1 GB | 0,1–0,5 GB |
-| Indizes, unkomprimierte letzte Tage, WAL | ≈ 1–2 GB | |
-| **Postgres gesamt** | **≈ 6–12 GB** | **≈ 3–5 GB** |
-| Rohdaten aggTrades BTC (23–35 MB/Tag gemessen) – nur Mac | 16–24 GB | 8–13 GB |
-| Rohdaten aggTrades ETH (angenommen ≈ 0,75 × BTC) – nur Mac | 12–18 GB | 6–10 GB |
-| Klines 1m (klein) – nur Mac | < 0,1 GB | |
-| trades-Dumps (BTC ≈ 61 MB/Tag gemessen), nur Stichprobe ≈ 30 Tage/Jahr/Symbol | ≈ 3–4 GB | ≈ 3 GB |
+| Rohdaten aggTrades 2025-01-01…2026-11-23, ZIP | 29,2 GB (BTC 12,9, ETH 16,4) | gemessen (Fassung 2 schätzte 12–14 GB für die Monatsdateien – falsch) |
+| Rohdaten Klines 1m, gleicher Zeitraum | 87 MB | gemessen |
+| trades-Dump BTC | ≈ 61 MB/Tag | gemessen |
+| trades-Dumps für P7 (≈ 525 Tage je Symbol) | 30–50 GB | geschätzt |
+| DB v1: BTC ab 2026-06-10 (≈ 167 Tage) | ≈ 0,8 GB | abgeleitet |
+| DB, BTC über 692 Tage | ≈ 3,2–4,6 GB | hochgerechnet |
+| DB, BTC + ETH über 692 Tage | ≈ 4,6–9,3 GB | hochgerechnet, ETH ungemessen |
+| `size_hist_*`, `big_order` (P5) | 0,4–2 GB | geschätzt (Fassung 2) |
+| Zuwachs je Jahr, beide Symbole | ≈ 2,5–5 GB | abgeleitet |
 
-VPS-Platte: DB 6–12 GB + 14-Tage-Fenster < 1 GB + Spool + Transfer-Spitze ≈ 20 GB → ausreichend für mehrere Jahre.
+VPS-Platte: DB < 10 GB + 14-Tage-Fenster ≈ 1 GB + Spool + Transfer-Spitze → ausreichend für mehrere Jahre. Mac: Archiv ≈ 30 GB, mit P7 zusätzlich 30–50 GB trades-Dumps.
 
 ---
 
 ## 4. Ingestion und Korrektheit
 
-### 4.1 Historischer Import und Neuberechnung (Mac, Backfill-Modus)
+### 4.1 Historischer Import und Neuberechnung (Mac) – wie gebaut
 
-1. Freien Platz prüfen; < 15 GB → Abbruch.
-2. Columnstore-Policies pausieren (`alter_job(… scheduled => false)`).
-3. Tage **in Zeitreihenfolge chunkweise**: je Tag die aggTrades bereitstellen (Tagesdatei, oder für abgeschlossene Monate des Erstimports den Tagesanteil der einmal geprüften Monatsdatei, §3.1) und die Kline-Tagesdatei laden, SHA256 prüfen (Abweichung → erneut laden; nach 3 Versuchen Abbruch mit Fehler, nie stiller Erfolg), Streaming-Parse mit Manifest, Aggregation im Speicher (BTC ≈ 1,8 Mio. aggTrades/Tag, < 500 MB), Transaktion wie §4.3, Abgleich §4.6.
-4. Nach dem letzten Tag eines Chunks: `compress_chunk` für alle Tabellen dieses Zeitraums (bzw. columnstore-Konvertierung), bevor der nächste Chunk beginnt – keine Inserts in bereits komprimierte Chunks, kein unkomprimierter Rückstau.
-5. Am Ende Policies wieder aktivieren, Digests berechnen, Verifier starten.
+**Ablauf je Tag** (Tage in Zeitreihenfolge): aggTrades bereitstellen (Tagesdatei oder Tagesanteil der einmal geprüften Monatsdatei, §3.1) und **die Kline-Tagesdatei – ohne sie kein Import**; SHA256 gegen `.CHECKSUM`; streamendes ZIP-Lesen mit CRC32-Prüfung; exakter Ganzzahl-Parser; Aggregation aller Tabellen im Speicher; Abgleich §4.6; Schreiben in **einer** Transaktion (§4.3). Ein angeforderter Tag, dessen Dateien nicht kommen, ist ein **harter Fehler** (nie stiller Erfolg).
 
-Dauer wird gemessen und in P1 dokumentiert (Abnahmekriterium).
+**Randminuten:** Jeder Tag wird sofort geschrieben; seine Minute 1439 bleibt `edge_pending`, bis der Folgetag abgeglichen ist, und wird dann entschieden. Minute 0 wird mit dem Übertrag des Vortags entschieden. **Ausnahme per Definition:** Am ersten Tag der gespeicherten Historie gibt es keinen Vortag; seine Minute 0 bleibt dauerhaft `edge_pending`. Nach der gebauten Regel ist dieser eine Tag damit nie `immutable` und wird nicht dauerhaft gecacht – bewusst hingenommen (ein Tag); eine Sonderregel „Historienbeginn gilt als entschieden" ist eine offene Entwicklerentscheidung, keine Nutzerfrage.
+
+**Eingaben und Kaskade:** `data_day` speichert, womit ein Tag klassifiziert wurde (Übertrag s(−1) und dessen Herkunft, `last_agg_id` des Vortags). Wird Tag d neu importiert und ändern sich dadurch diese Eingaben für d+1, klassifiziert derselbe Lauf d+1 neu (Kaskade, endet beim ersten unveränderten Tag); sind die Quelldateien von d+1 nicht verfügbar, wird d+1 als `stale` markiert.
+
+**„Fertig" entscheiden die Daten:** Ein Tag gilt als erledigt, wenn Daten-Digest, Qualitäts-Digest und Eingaben (Quelldatei-Checksummen, Übertrag, Vortags-ID) zum gespeicherten Stand passen – nicht die Code-Version. Eine andere Quelldatei mit identischen Digests zählt als erledigt (Monats- statt Tagesdatei, Mac statt VPS). Semantische Regeländerungen erzwingen eine Neuberechnung ausdrücklich über `RULES_VERSION` (durch einen Test gegen versehentliche Änderung geschützt). Der Digest enthält `check_state` nicht (die Klassifikation hat einen eigenen Qualitäts-Digest).
+
+**Modi und Schalter** (Details im README):
+
+| Schalter | Wirkung |
+|---|---|
+| Standard / `--db` | Dry-Run (schreibt nichts) / Schreiben in die DB |
+| `--backfill` | für mehrtägige historische Läufe: pausiert die Columnstore-Jobs, komprimiert jeden fertigen Chunk selbst, aktiviert die Jobs am Ende; nach einem Absturz repariert der nächste Start die Jobs |
+| `--online` | mehrtägiger historischer Lauf ohne Backfill-Modus, wenn Lesersperren je Tag akzeptabel sind. **Ohne `--backfill` oder `--online` lehnt der Importer mehrtägige historische DB-Läufe ab** |
+| `--plan` | zeigt nur, was ein Lauf tun würde (nur lesend, kein Lock) |
+| `--force` | schreibt auch Tage, die nach den Daten bereits erledigt sind |
+| `--prefer auto\|daily\|monthly` | Wahl der aggTrades-Quelle |
+| `--direct-dml` | ersetzt komprimierte Tage per DML statt per Rowstore-Umwandlung (nur für Vergleiche; gemessen 7–25 s statt ≈ 2 s je Tag) |
+| `--resume`, `--no-neighbours`, `--sidecar` | fertige Tage überspringen / Nachbartage nicht lesen (Randminuten bleiben offen) / Manifest-Sidecar schreiben |
+
+Vor dem Start wird der freie Plattenplatz geprüft (< 15 GB → Abbruch; Regel aus Fassung 2, Umsetzung mit dem VPS-Betrieb zu prüfen).
+
+**Gemessen (Mac):** Dry-Run ≈ 1,2–2 Mio. aggTrade-Zeilen/s, gesamte Historie (2,27 Mrd. Zeilen, beide Symbole) in 31 min; DB-Modus ≈ 0,7–1,0 Mio. Zeilen/s, ≈ 3,3 s je Tag mit 3,5 Mio. Zeilen. Importer-RSS 440–560 MB (Dry-Run-Spitze vor einer Speicherkorrektur bis ≈ 1 GB an den größten Tagen, danach 510 MB im Monatsmodus).
 
 ### 4.2 Live-Pfad (Recorder, VPS)
 
 - Je Symbol eine WS-Verbindung `wss://fstream.binance.com/market/ws/<symbol>@aggTrade` (aggTrade liegt seit der Routing-Umstellung 2026 unter `/market`; vom Review gegen die offizielle Change Notice bestätigt). Geplanter Wechsel nach 23 h mit **Überlappung** (neue Verbindung zuerst, Deduplizierung per aggId).
-- **Lückenerkennung per aggId.** Gemessen sind aggIds innerhalb und über Tagesgrenzen strikt fortlaufend (0 Löcher, 0 Duplikate). Regel: erwartet `a = last_a + 1`; bei `a > last_a + 1` wird per REST `GET /fapi/v1/aggTrades?fromId=last_a+1&limit=1000` nachgeholt (Seiten über `fromId`, nie über `startTime`). Liefert REST als erste ID einen Wert > `last_a + 1`, ist bewiesen, dass die fehlenden IDs nicht existieren (wird protokolliert). `a ≤ last_a` → Duplikat, verwerfen.
+- **Lückenerkennung per aggId.** Gemessen sind aggIds innerhalb und über Tagesgrenzen strikt fortlaufend (0 Löcher, 0 Duplikate). Für den Live-Stream bleibt das die Lückenregel; für die Dumps reicht sie nachweislich nicht (am 2026-10-27 laufen die aggIds über ein echtes Loch hinweg fort, §4.5) – dort entdeckt der Kline-Abgleich Löcher. Regel: erwartet `a = last_a + 1`; bei `a > last_a + 1` wird per REST `GET /fapi/v1/aggTrades?fromId=last_a+1&limit=1000` nachgeholt (Seiten über `fromId`, nie über `startTime`). Liefert REST als erste ID einen Wert > `last_a + 1`, ist bewiesen, dass die fehlenden IDs nicht existieren (wird protokolliert). `a ≤ last_a` → Duplikat, verwerfen.
 - REST-Budget: Gewicht 20/Request (laut Vorrecherche), Limit 2 400/min/IP; Recorder hält ≤ 50 % (≤ 25 % im Parallelbetrieb mit PulseBot) ein und wertet `X-MBX-USED-WEIGHT-1M` aus. Nachholen ist ≈ 100× schneller als Echtzeit.
 - Lücken älter als 48 h (laut Vorrecherche Fehler −4166, nicht offiziell verifiziert) sind per REST nicht füllbar → Minuten bleiben `gap` (werden **nicht** geschrieben), bis die offizielle Tagesdatei den Tag ersetzt.
 - **Minutenabschluss:** Minute M ist abgeschlossen, wenn (a) ein Trade mit T ≥ M + 62 000 ms empfangen wurde oder die (per NTP synchronisierte) Uhr diese Zeit überschritten hat und ein REST-Abruf ab `last_a+1` nichts mit T < M + 60 000 liefert, und (b) keine offene Lücke mit IDs vor diesem Zeitpunkt existiert. Dann wird M **vollständig** in einer Transaktion geschrieben (Replace der Minute, inkl. laufender Rollup-Zeilen). Der formende Bar wird nie persistiert.
@@ -450,12 +501,18 @@ Dauer wird gemessen und in P1 dokumentiert (Abnahmekriterium).
 | `provisional` | Live-Daten, ggf. mit `gap`-Minuten | nur Recorder (minutenweise Replace) | → `importing` (Importer nimmt Advisory-Lock) |
 | `importing` | Ersatz läuft | nur Importer | → `final_ok`/`final_bad` (Commit) · → `provisional_import_failed` (Download/Checksum/Parse fehlgeschlagen; Rollback, Live-Daten bleiben) |
 | `provisional_import_failed` | Live-Daten, Ersatz steht aus | niemand (Recorder schreibt nicht mehr, Tag ist vorbei) | → `importing` (nächster Timer-Lauf) |
-| `final_ok` | offizielle Datei, 0 `mismatch`/`missing` | niemand | → `importing` (Neuberechnung) |
-| `final_bad` | offizielle Datei, ≥ 1 `mismatch`/`missing` | niemand | → `importing` (Neuberechnung); Ops-Alarm über Health |
+| `final_ok` | offizielle Datei, 0 `mismatch`/`missing` | Importer: nur Randminuten-Entscheid und Neuklassifikation | → `importing` (Neuberechnung) |
+| `final_bad` | offizielle Datei, ≥ 1 `mismatch`/`missing` | wie `final_ok` | → `importing` (Neuberechnung); Ops-Alarm über Health |
+
+Zusätzlich zum Zustand (gebaut): `stale` (Eingaben vom Vortag geändert, Neuklassifikation ausstehend), offene Randminuten (`edge_first_pending`, `edge_last_pending`) und `state_before_import` (bei Absturz während `importing` wird der vorige Zustand wiederhergestellt).
+
+**Unveränderlich ist nur, was `immutable` sagt:** `immutable` = `final_*` **und** keine offene Randminute **und** nicht `stale`. Nur solche Tage dürfen in dauerhaft gecachte Kacheln (`final = true`) eingehen. Das ersetzt die Annahme aus Fassung 2, ein `final_*`-Tag ändere sich nur über `importing`: Auch ohne neuen Import ändern Randminuten-Entscheid und Kaskade die Klassifikation (nicht die Daten) eines finalen Tages; jede solche Änderung erhöht `version`.
 
 Regeln:
-- **Ersatz nur nach erfolgreicher Checksumme und vollständigem Parse.** Erst dann beginnt die Transaktion: `DELETE` aller Zeilen des Tages in allen Tabellen → `COPY` → `data_day` (`version + 1`) → Commit. Ein `final_bad` aus einer korrekt geprüften Datei bleibt die Wahrheit (die Datei ist die Quelle; die Abweichung wird gezeigt und untersucht).
-- Der Recorder prüft vor jedem Minuten-Commit in derselben Transaktion `state = 'provisional'` (`SELECT … FOR SHARE`); die DB-Rolle `of_recorder` erzwingt das zusätzlich per Funktion.
+- **Ersatz nur nach erfolgreicher Checksumme und vollständigem Parse.** Erst dann beginnt die Transaktion: `DELETE` aller Zeilen des Tages in allen Tabellen → `COPY` → Digest-Gegenprobe in der Transaktion (`day_digest_all` = Importer-Digest) → `data_day` (`version + 1`) → Commit. Ein `final_bad` aus einer korrekt geprüften Datei bleibt die Wahrheit (die Datei ist die Quelle; die Abweichung wird gezeigt, annotiert und untersucht).
+- **Komprimierte Chunks:** Ersatz über `convert_to_rowstore` → Ersatz → `convert_to_columnstore` (gemessen ≈ 2 s je Tag; direkte DML auf komprimierten Chunks 7–25 s). Das hält für die Dauer der Transaktion eine **exklusive Sperre** auf den betroffenen Chunks; Leser (API) setzen daher `lock_timeout` und wiederholen (Regel für die API, **offen** bis zur API-Implementierung).
+- **Single Writer:** Advisory-Lock; der Importer prüft in **jeder** Transaktion erneut, dass er ihn noch hält.
+- Der Recorder prüft vor jedem Minuten-Commit in derselben Transaktion `state = 'provisional'` (`SELECT … FOR SHARE`); die DB-Rolle `of_recorder` erzwingt das zusätzlich per Funktion (P3).
 - Replace statt Merge: es gibt kein `UPDATE … SET vol = …` auf Level-Ebene.
 - Idempotenz: Re-Import erzeugt identischen Digest.
 - Timer 07:45 UTC (Datei erscheint beobachtet gegen 07:21 UTC), Wiederholung alle 30 min. Protokolliert wird, wie viele provisorische Minuten exakt mit der offiziellen Datei übereinstimmten (Recorder-Qualitätskennzahl, Ziel ≥ 99,9 %).
@@ -468,9 +525,9 @@ Regeln:
 
 **Seite:** `m = true` → Verkäufer ist Aggressor → `sell_q` („Bid"); `m = false` → `buy_q` („Ask").
 
-### 4.5 Ergebnis des Datenexperiments (ersetzt die Hypothese aus Fassung 1)
+### 4.5 Befunde zur Datenquelle
 
-5 Symbol-Tage (BTCUSDT 2026-11-20/21/22, ETHUSDT 2026-11-21/22), exakte Dezimalrechnung, aggTrades vs. trades-Dump vs. 1m-Klines:
+**(a) Erstes Experiment** (Fassung 2) – 5 Symbol-Tage (BTCUSDT 2026-11-20/21/22, ETHUSDT 2026-11-21/22), exakte Dezimalrechnung, aggTrades vs. trades-Dump vs. 1m-Klines:
 
 | Befund | Ergebnis |
 |---|---|
@@ -481,9 +538,31 @@ Regeln:
 | nach Verschieben der Straddler-Fills | Volumen und Taker-Buy 1 440/1 440 exakt; Rest nur Tagesrand (letzter aggTrade des Tages mit Fill nach Mitternacht, gespiegelt in Minute 0), mit Nachbartag auflösbar |
 | Trade-Anzahl aus `l − f + 1` | **nicht** exakt ableitbar: 64–742 „Loch-IDs" je Tag innerhalb von aggTrade-Bereichen (ohne Menge, in Klines nicht gezählt), 353–1 523 IDs je Tag zwischen aggTrades fehlend; in 35–76 Minuten/Tag übersteigt der ID-Span-Count jede Straddler-Erklärung (bis +402). Was diese IDs sind, ist unbekannt (Insurance-Fund/ADL ist eine Vermutung) |
 | aggId-Kontinuität | strikt fortlaufend innerhalb und über Tagesgrenzen, keine rückwärtslaufenden Zeiten |
-| trades-Dump-Qualität | BTCUSDT 2026-11-20 ist in den Stunden 19–23 UTC lückenhaft (16 885 fehlende Trade-IDs; 6 019 aggTrades ohne einen ihrer Fills), während Klines und aggTrades das Volumen enthalten. Der trades-Dump ist **nicht** unbedingt zuverlässig; aggTrades waren an allen Tagen vollständig |
+| trades-Dump-Qualität | BTCUSDT 2026-11-20 ist in den Stunden 19–23 UTC lückenhaft (16 885 fehlende Trade-IDs; 6 019 aggTrades ohne einen ihrer Fills), während Klines und aggTrades das Volumen enthalten. Der trades-Dump ist **nicht** unbedingt zuverlässig |
 
-Konsequenzen: (1) Produktregel §3.3; (2) Abgleich nur über Volumen und Taker-Buy mit der engen Hülle §4.6; (3) Trade-Anzahl nur als Referenz aus Klines, nicht als Prüfgröße; (4) Tiefenprüfung §4.7 beweist die Kline-Gleichheit dort, wo der trades-Dump nachweislich vollständig ist; (5) keine Klasse `source_excluded` – Volumen und Taker-Buy gehen vollständig auf, die Loch-IDs tragen keine Menge.
+**(b) Gesamt-Historien-Scan und Fill-Analyse** (nach Fassung 2): Abgleich aller 692 Tage × 2 Symbole (2025-01-01…2026-11-23) und Fill-Analyse an 13 Symbol-Tagen. Die Aussage „aggTrades waren an allen Tagen vollständig" aus (a) gilt **nicht** allgemein:
+
+| Befund | Ergebnis | Status |
+|---|---|---|
+| **Tail-Verlust bis 2026-06-09** | Die aggTrades-Dumps lassen „Tail-Fills" weg: Fills, die ans Ende eines aggTrades gehören (gleicher Preis und gleiche Seite, Trade-IDs direkt nach dessen letzter ID, Zeit in T…T+100 ms). Klines und trades-Dump enthalten sie. Tages- und Monatsdateien sind darin identisch | bewiesen an 13 Symbol-Tagen; zeitlich eingegrenzt durch den Gesamtscan |
+| Umfang | 352 von 692 Tagen je Symbol mit ≥ 1 `mismatch`-Minute; BTC 2 836 `mismatch` + 47 `missing` von 996 480 Minuten, ETH 2 504 + 48; fehlendes Volumen typischerweise 0,02–0,05 % je Tag, bis 0,25 % (2026-06-04), über die Historie ≈ 6 681 BTC. Ein Teil der Tails liegt **innerhalb** der Hülle und bleibt an bestandenen Tagen unentdeckt | gemessen |
+| Ende | letzter Fall BTC 2026-06-09 02:35:29.755, ETH 02:04:57.889 UTC; danach 0 Fälle in 5,5 Monaten. Keine Binance-Ankündigung bekannt | gemessen; Ursache offen |
+| Minutenregel und Hülle | in beiden Zeiträumen bestätigt (T = erster Fill, Spanne ≤ 100 ms, Straddler nur in die Folgeminute) | bewiesen an Stichproben |
+| Defekte Kline-Dumps | 2025-01-14 und 2025-01-29, beide Symbole; Tages- = Monats-Dump; REST-Klines weichen ab und sind gleich dem trades-Dump | bewiesen |
+| Lücke in der Kline-Quelle | 2025-03-10 08:21: Dump **und** REST lassen einen zusammenhängenden Block von 812 BTC-Trades weg | bewiesen; nicht korrigierbar, nur annotierbar |
+| Börsenausfall | 2025-08-29 06:18–06:37 UTC, echter Ausfall; im ETH-trades-Dump doppelte Trade-IDs | gemessen; bleibt annotiert |
+| **Echtes Loch in aggTrades** | 2026-10-27 00:02–00:30 UTC, beide Symbole: aggIds laufen fortlaufend weiter, Trade-IDs springen um 38 458 (BTC) bzw. 48 478 (ETH), 1 298,134 BTC fehlen; im trades-Dump vollständig | bewiesen |
+
+Konsequenzen:
+1. **Zwei Regime mit festem Schnitt** (§3.1): v1-Historie ab 2026-06-10; Regime A wird in der eigenen Reparaturphase P7 importiert (Nutzerentscheidung, zweistufig).
+2. **Reparaturregel R-A** für Regime A (§4.11); eine reine Kline-Toleranz für Regime A ist verworfen, weil sie auch echte Löcher verdecken würde.
+3. **Löcher wie 2026-10-27** sind reparierbar, indem aggTrades aus dem trades-Dump synthetisiert werden (§4.11, kleine Aufgabe in P7; Zeilen als synthetisch markiert).
+4. **aggId-Kontinuität erkennt solche Löcher nicht** – der Kline-Abgleich tut es. Trade-ID-Sprünge und Zeitlücken sind reine Berichtsfelder im Manifest.
+5. Der trades-Dump kann selbst lückenhaft sein → `reference_unusable` (§4.7).
+6. Klines sind nicht mehr ausschließlich Vision: wo der Dump von REST abweicht, wird REST genutzt, sobald es nachweislich gleich dem trades-Dump ist; Referenzdefekte werden annotiert (§3.1).
+7. Trade-Anzahl je Minute ist aus ID-Spannen nicht ableitbar (Loch-IDs) und kommt aus den Klines.
+8. Tageszustände brauchen für Regime A einen Begriff „Tails nicht geprüft/repariert" (`tail_status`, §3.8, geplant mit P7).
+9. Weiter gültig aus (a): Abgleich nur über Volumen und Taker-Buy mit der engen Hülle §4.6; keine Klasse `source_excluded` (die Loch-IDs tragen keine Menge).
 
 ### 4.6 Abgleich pro Minute gegen Klines
 
@@ -499,17 +578,19 @@ Für jede Minute m eines Tages (Mengen in Lots, ganzzahlig), getrennt für q = V
 | `shift` | nicht exact, aber Hülle `−cand(m−1) ≤ D(m) ≤ cand(m)` **und** Kompensation `0 ≤ s(m) ≤ cand(m)` (die Abweichung ist durch eine nichtnegative, von Kandidaten gedeckte Verschiebung erklärt und wird in der Nachbarminute ausgeglichen) |
 | `mismatch` | sonst; danach wird der Übertrag auf [0, cand(m)] begrenzt, damit ein Fehler nicht alle Folgeminuten falsch klassifiziert |
 | `missing` | Kline mit Volumen > 0 ohne eigene Zeile oder umgekehrt |
-| `edge_pending` | Minute 0 oder 1 439, solange der Nachbartag nicht abgeglichen ist |
+| `edge_pending` | Minute 0 oder 1 439, solange der Nachbartag nicht abgeglichen ist; Minute 0 des ersten gespeicherten Tages bleibt per Definition `edge_pending` (§4.1) |
+
+Der verwendete Übertrag s(−1) wird mit seiner Herkunft gespeichert: `chain` (im selben Lauf berechnet), `stored` (aus `data_day` des Vortags), `neighbour` (Vortag nur gelesen) oder `estimated` (kein Vortag verfügbar). Die Regel ist unverändert gegenüber Fassung 2 und in beiden Regimen an Fill-Daten bestätigt.
 
 Tagessumme: `Σ unser − Σ kline = s(1 439) − s(−1)`, mit beiden Überträgen innerhalb ihrer Kandidatengrenzen – das ist die „exakte Tagessumme bis auf Tagesrand-Straddler". OHLC wird als Bericht verglichen (Abweichungen nur durch Kandidatenpreise zulässig), nicht als Klasse.
 
 Grenzen der Prüfung: Sie ist eine notwendige Bedingung und locker (907–2 273 Kandidaten/Tag gegenüber 68–197 echten Straddlern). Ein Fehler, der Menge aus den letzten 100 ms einer Minute in die Folgeminute verschiebt, könnte maskiert werden – nicht aber ein Off-by-one, der einen aggTrade mit T = k·60 000 in die Vorminute legt (der erzeugt D(m−1) > 0 ohne passenden Übertrag, sobald kein Kandidat ihn zufällig deckt; zusätzlich deckt ihn Test T3 ab). Den vollständigen Beweis liefert die Tiefenprüfung.
 
-Folgen: `final_ok` bei 0 `mismatch`/`missing`, sonst `final_bad` + Ops-Alarm; bei Live-Daten löst `mismatch` beim Minutenabschluss keinen Alarm aus (Klines des Tages liegen erst am Folgetag vor), sondern erst die Finalisierung bewertet.
+Folgen: `final_ok` bei 0 `mismatch`/`missing`, sonst `final_bad` + Ops-Alarm (für Tage mit Annotation eines bekannten Quelldefekts kein erneuter Alarm); bei Live-Daten löst `mismatch` beim Minutenabschluss keinen Alarm aus (Klines des Tages liegen erst am Folgetag vor), sondern erst die Finalisierung bewertet.
 
 ### 4.7 Tiefenprüfung gegen den trades-Dump
 
-Stichprobe (deterministisch, Seed im Repo): die ersten 7 Tage der Historie je Symbol; 2 zufällige Tage je Monat und Symbol; jeder Tag mit `mismatch`; zusätzlich auf Anforderung (`verifier deep --day …`). Läuft auf dem Mac.
+Stichprobe (deterministisch, Seed im Repo): die ersten 7 Tage der gespeicherten Historie je Symbol (v1: ab 2026-06-10); 2 zufällige Tage je Monat und Symbol; jeder Tag mit `mismatch`; zusätzlich auf Anforderung. Läuft auf dem Mac. Status: die Fill-Analysen hinter §4.5 (b) sind diese Prüfung in Skriptform an 13 Symbol-Tagen; die automatisierte Stichprobe über die v1-Historie ist **offen** (P1).
 
 1. trades-Dump des Tages laden (+ CHECKSUM).
 2. **Vollständigkeit der Referenz prüfen:** für jeden aggTrade müssen die Einzeltrades mit ID in [f, l], die im Dump vorhanden sind, in Summe genau seine Menge ergeben, mit gleichem Preis und gleicher Seite (Loch-IDs ohne Menge sind zulässig); zusätzlich Σ Menge je Stunde = Σ Kline-Volumen je Stunde. Jede Stunde, in der das nicht gilt, ist **„Referenz unbrauchbar"**.
@@ -521,7 +602,7 @@ Ergebnis in `data_day.deep_check`: `passed`, `failed` (echter Fehler → Ops-Ala
 
 ### 4.8 Unabhängige Neuberechnung (Verifier) und Digests
 
-Der Verifier (Python, DuckDB) liest die ZIP-Dateien (`zipfile` → pyarrow-CSV → DuckDB) und berechnet unabhängig:
+Der Verifier (Python, DuckDB) liest die ZIP-Dateien (`zipfile` → pyarrow-CSV → DuckDB) und berechnet unabhängig – **gebaut im Datei- und DB-Modus**; gemessen 2–4,7 GB RSS je Tag, daher auf dem VPS nie parallel zu schweren Abfragen:
 - Minutensummen und Level-Summen je (Minute, px) – alle Tage nach Backfill;
 - **alle Rollup-Tabellen** und die `bar_1m`-Komposita (Max/Min-Delta, COT) – alle Tage nach Backfill, danach wöchentlich 20 zufällige Tage;
 - eine Stichprobe der API-Antworten: ≈ 50 Requests, Binärformat in Python dekodiert, gegen die eigene Rechnung;
@@ -529,11 +610,11 @@ Der Verifier (Python, DuckDB) liest die ZIP-Dateien (`zipfile` → pyarrow-CSV �
 
 Jede Abweichung ist ein Fehler (keine Toleranz – beide Seiten rechnen ganzzahlig auf denselben Rohdaten). Einschränkung: Verifier und Importer setzen dieselbe Spezifikation um, vermutlich vom selben Agenten geschrieben; Interpretationsfehler (Seite, Minutenregel) würden sich wiederholen. Diese Lücke schließen die externen Prüfungen: Kline-Abgleich (§4.6) und Tiefenprüfung gegen den trades-Dump (§4.7), die eine andere Binance-Quelle nutzt.
 
-**Digest:** je (Tabelle, Symbol, Tag) SHA256 über die nach Primärschlüssel sortierten Zeilen in kanonischer Textform (SQL-Funktion `day_digest`). Verwendet für Idempotenz (K8), Transferprüfung (§2.3) und den Mac/VPS-Gleichlauf.
+**Digest:** je (Tabelle, Symbol, Tag) SHA256 über die nach Primärschlüssel sortierten Zeilen in kanonischer Textform (SQL-Funktion `day_digest`, Tagesdigest `day_digest_all`; der Importer berechnet dieselbe Textform ohne DB und prüft sie in der Import-Transaktion). `bar_1m.check_state` ist **nicht** enthalten: die Klassifikation ändert sich beim Randminuten-Entscheid ohne Datenänderung; sie hat einen eigenen Qualitäts-Digest. `bar_1m.source` ist enthalten. Verwendet für Idempotenz (K8), „fertig"-Entscheid (§4.1), Transferprüfung (§2.3) und den Mac/VPS-Gleichlauf.
 
 ### 4.9 Qualitätsanzeige
 
-`GET /api/v1/quality?sym&from&to` liefert je Tag Zustand, Quelle, Zähler, Tiefenprüfung und Issue-Minuten. Die UI zeigt ein farbiges Band unter der Zeitachse (grün `final_ok`; gelb `provisional`, `provisional_import_failed`, `edge_pending`; rot `gap`, `final_bad`), Tooltip mit Zählern, Markierung betroffener Bars; `shift`-Minuten gelten als korrekt und werden nur im Tooltip gezählt. Statusbutton: Recorder-Zustand, Datenalter, Health.
+`GET /api/v1/quality?sym&from&to` liefert je Tag Zustand, Quelle, Zähler, Tiefenprüfung und Issue-Minuten. Die UI zeigt ein farbiges Band unter der Zeitachse (grün `final_ok`; gelb `provisional`, `provisional_import_failed`, `edge_pending`; rot `gap`, `final_bad`), Tooltip mit Zählern, Markierung betroffener Bars; `shift`-Minuten gelten als korrekt und werden nur im Tooltip gezählt. Annotierte Quelldefekte (§3.8) erscheinen mit ihrer Erklärung statt als unerklärter Fehler; Regime-A-Tage mit `tail_status = unverified` (ab P7) nie grün. Statusbutton: Recorder-Zustand, Datenalter, Health.
 
 ### 4.10 Teststrategie
 
@@ -545,14 +626,28 @@ Jede Abweichung ist ein Fehler (keine Toleranz – beide Seiten rechnen ganzzahl
 | T4 Rollup-Äquivalenz | Property | Σ(1m) = 5m = 15m = 1h = 1d; Max/Min-Delta- und COT-Komposition = Brute-Force über aggTrades |
 | T5 Klassifikator | Property | synthetische Tage mit eingebauten Straddlern → genau diese Minuten `shift`, Rest `exact`; eingebauter Off-by-one (T = k·60 000 → Vorminute) ohne deckenden Kandidaten → `mismatch`; Tagesrand-Fälle |
 | T6 Value Area | Property | enthält POC, zusammenhängend, ≥ va_pct, deterministisch bei Gleichstand |
-| T7 Golden Files | Integration | Mini-CSV (≈ 30 handgerechnete Trades inkl. Grenzfälle) im Repo; dazu die 5 Experiment-Tage (ZIPs per Skript geladen, per SHA256 gepinnt), erwartete Minutensummen und Klassifikation als CSV im Repo |
+| T7 Golden Files | Integration | Mini-CSV (≈ 30 handgerechnete Trades inkl. Grenzfälle) im Repo; dazu echte Tage unter `data/` (opt-in `test:golden`, nur lesend), erwartete Minutensummen und Klassifikation im Repo; aufzunehmen: ein Regime-A-Tag mit Tails (erwartet `mismatch`) und 2026-10-27 (erwartet `final_bad`) |
 | T8 Idempotenz | Integration | Tag zweimal importieren → identischer Digest |
 | T9 Live-Chaos | Integration | WS-Trennung mitten in der Minute, künstliche ID-Lücken, Recorder-Kill inkl. abgeschnittenem zstd-Frame, DB-Ausfall → lückenlos; Vergleich mit offizieller Datei am Folgetag |
 | T10 API | Integration | Endpunkte gegen naive Referenzrechnung; zusätzlich Verifier-Stichprobe (§4.8) |
 | T11 Render-Performance | Playwright | 25 000 sichtbare Zellen, Frame-Zeit und Long Tasks gegen §1.4 |
 | T12 Order-Merge (P5) | Property | Partition der aggTrades; Σ Menge/Notional erhalten |
 
-CI startet eine Timescale-Instanz im Container für T7–T10.
+CI startet eine Timescale-Instanz im Container für die DB-Tests. Prozessregel (neu): Nach jedem Umsetzungsschritt prüft ein separater Agent den Code unabhängig; Commit je Schritt, Push erst nach dem Review.
+
+### 4.11 Reparaturphase für Regime A und Löcher (P7)
+
+**Regel R-A (Tail-Zuordnung):** Ein Fill aus dem trades-Dump zählt genau dann als Tail des aggTrades X, wenn
+1. seine Trade-ID in **keinem** aggTrade-Bereich [f, l] liegt,
+2. sein Lauf direkt nach der letzten ID von X beginnt (dazwischen nur IDs, die im Dump fehlen),
+3. Preis und Seite gleich X sind und
+4. T(X) ≤ t ≤ T(X) + 100 ms.
+
+Er wird X zugeschlagen (Menge, Zähler); danach gilt die **unveränderte** Hüllregel §4.6. An den Stichprobentagen bringt R-A die schlechten Minuten auf 0 und erkennt eingebaute Fehler weiterhin (ein gelöschter aggTrade → 1 schlechte Minute; 10-Minuten-Loch → 10–15; das echte Loch 2026-10-27 bleibt bei 29) – bewiesen an Stichproben. Bedarf: trades-Dumps für ≈ 525 Tage je Symbol (geschätzt 30–50 GB, Mac). Verworfen: eine reine Kline-Toleranz für Regime A (würde echte Löcher verdecken).
+
+**Lochreparatur durch Synthese:** Für echte Löcher wie 2026-10-27 werden aggTrades aus dem trades-Dump gebildet (Gruppierung nach Preis, Seite, fortlaufenden Trade-IDs, ≤ 100 ms ab dem ersten Fill; T = erster Fill). Solche Zeilen und Tage tragen die Quelle „synthetisch" (Migration in P7) und bleiben in der UI als repariert erkennbar.
+
+**Zustände in Regime A:** `tail_status` = `unverified` (importiert, nicht repariert; nie als geprüft angezeigt) → `repaired` (R-A angewandt, Abgleich bestanden). Regime B: `n/a`. Für die Defekte aus §4.5 (Kline-Dumps, Kline-Quelle, Börsenausfall) gelten Annotationen; ein Tag, dessen einzige Abweichungen annotierte Referenzdefekte sind, wird als solcher angezeigt, nicht als Datenfehler.
 
 ---
 
@@ -582,12 +677,19 @@ GROUP BY 1, 2 ORDER BY 1, 2;
 
 ### 5.3 Kacheln
 
-Kachel = n Bars des Zeitrahmens, ausgerichtet an Vielfachen von n·tf seit Epoch. **n hängt von (Symbol, tf, R) ab**, damit die erwartete Zellzahl ≤ 30 000 bleibt: `n = clamp(2^floor(log2(30 000 / Zeilen_pro_Bar)), 32, 1024)`, mit `Zeilen_pro_Bar` = Median-Range der Bars dieses tf über die letzten 30 Tage / R, monatlich neu berechnet und als Konfigurationsversion Teil des Kachelschlüssels. Beispiel BTC 1m bei R = 1 Tick (≈ 450 Zeilen/Bar) → n = 64.
+Verbindlich ist [`TILE-FORMAT.md`](TILE-FORMAT.md) (Kachellänge, `/symbols`-Antwort mit `schema`, `tiles[tf][R] = n`, `tileConfigVersion`, Fehlercodes). Die Regel dort ersetzt die Median-Regel aus Fassung 2, weil diese gemessen Kacheln bis 107 000 Zellen ergab:
+
+- Kachel = n Bars, ausgerichtet an Vielfachen von n·tf seit Epoch; n je (Symbol, tf, R).
+- `n = clamp(2^floor(log2(30 000 / (1,5 · maxRows))), 32, 1024)`, `maxRows` = größte Zeilenzahl eines Bars dieses tf bei R über die **gesamte gespeicherte Historie**; eine Kombination (tf, R) wird nur angeboten, wenn `32 · 1,5 · maxRows ≤ 60 000`.
+- Neuberechnung nach jedem Import; ändert sich ein n, steigt `tileConfigVersion`. Die Version steht als `cfg` in der Kachel-URL, alle Caches sind damit getrennt. Veraltete `cfg` → 409; der Client lädt `/symbols` einmal je Welle neu und zeigt einen roten Hinweis nur bei echter Blockade.
+- **Bekannte Schwäche:** ein einzelner Ausreißer-Bar entfernt feine Zeilengrößen für alle Zeiträume. **Offener Entwurfspunkt** (Richtung in TILE-FORMAT.md): Kachellängen und angebotene R je Kalendermonat, Version je (tf, R).
+
+Querprüfung: Der Client prüft jede Footprint-Kachel auf finalen Daten gegen die Bars desselben Bereichs (gleiche Bar-Menge, gleiche buy+sell je Bar) und behandelt Abweichungen wie eine Konfigurationsabweichung (gebaut).
 
 ### 5.4 Versionen, Caching, Padding, Abbruch
 
 - **Datenversion:** `data_day.version`. Kachelversion = Hash der Versionen aller überdeckten (Symbol, Tag) + Konfigurationsversion. ETag = Kachelversion.
-- Kacheln, die nur `final_*`-Tage überdecken, sind unveränderlich (`Cache-Control: immutable`) und liegen im Server-LRU (≤ 200 MB, vorkomprimiert). Kacheln mit `provisional`-Tagen werden **nie** gecacht; der Client patcht sie per WS.
+- Kacheln, die nur `immutable`-Tage überdecken (§4.3), tragen `final = true`, sind unveränderlich (`Cache-Control: immutable`) und liegen im Server-LRU (≤ 200 MB, vorkomprimiert). Alle anderen werden **nie** dauerhaft gecacht (`no-cache`; der Client hält sie bis zur Live-Invalidierung höchstens 60 s).
 - Wechselt ein Tag nach `final_*`, pusht die API über den Live-WS ein Invalidierungsereignis (Symbol, Tag, neue Version); der Client lädt betroffene sichtbare Kacheln neu.
 - Client: Kachel-Cache, LRU nach Zellzahl (≤ 2 Mio.); sichtbare Kacheln + 1 Kachel Padding je Seite, Prefetch in Panrichtung; höchstens 4 parallele Requests.
 - Jeder Request hat einen `AbortController`; verlässt eine Kachel den Bedarf, wird abgebrochen; die API bricht die Query bei Client-Abbruch ab.
@@ -596,11 +698,10 @@ Kachel = n Bars des Zeitrahmens, ausgerichtet an Vielfachen von n·tf seit Epoch
 
 | Endpunkt | Parameter | Liefert |
 |---|---|---|
-| `GET /api/v1/symbols` | – | Symbole, Einheiten, Tickhistorie, Datenbeginn |
-| `GET /api/v1/bars` | sym, tf, from, to | OHLC + Stats-Felder je Bar (inkl. Kline-Trade-Anzahl), Qualitätsflag |
-| `GET /api/v1/footprint` | sym, tf, R, tile | Bars + Level (row, buy, sell, buy_a, sell_a) |
-| `GET /api/v1/profile` | sym, from, to, R | Level-Summen + POC/VAH/VAL/Delta-POC |
-| `GET /api/v1/profiles/daily` | sym, from, to, R, day_offset_h, va_pct | je Tag Level + POC/VAH/VAL |
+| `GET /api/v1/symbols` | – | Vertrag in TILE-FORMAT.md (`schema`, Einheiten, `dataFrom`/`dataTo`, `tiles`, `tileConfigVersion`) |
+| `GET /api/v1/bars` | sym, tf, from, to | Vertrag in TILE-FORMAT.md (ausgerichtete Abschnitte zu 1 000 Bars); Stats-Felder und Kline-Trade-Anzahl später als `x.`-Spalten |
+| `GET /api/v1/footprint` | sym, tf, R, tile, cfg | Vertrag in TILE-FORMAT.md |
+| Volume Profile (Range, je Tag) | – | Vertrag in `PROFILE-API.md` (entsteht mit P2) |
 | `GET /api/v1/tpo` | sym, day, block_min, R, ib_min | §6.5 |
 | `GET /api/v1/bigtrades` | sym, from, to, def, Parameter, tiers, side_mode | Orders ≥ Schwelle mit Stufe; Schwellen-Stufenreihe; `incomplete`-Intervalle |
 | `GET /api/v1/thresholds` | sym, from, to, def, … | nur Schwellen-Zeitreihe |
@@ -608,20 +709,30 @@ Kachel = n Bars des Zeitrahmens, ausgerichtet an Vielfachen von n·tf seit Epoch
 | `GET /api/v1/health` | – | §2.5; nur von localhost erreichbar (nginx leitet ihn nicht nach außen) |
 | `WS /api/v1/live` | subscribe {sym, tf, R, features} | formender Bar (Diffs), committed Bars aus DB, Big Trades, Invalidierungen |
 
-Zeitparameter in ms UTC, `[from, to)`. Die API hat **ausschließlich lesende Endpunkte**; Import, Neuberechnung, Transfer und jede Wartungsaktion laufen nur per CLI/systemd auf dem Server und sind über HTTP nicht erreichbar.
+Status: die lesende API für `symbols`/`bars`/`footprint` ist **in Arbeit**; bis dahin bedient eine Dev-Middleware Fixture-Kacheln in derselben URL-Form. Zeitparameter in ms UTC, `[from, to)`. Die API hat **ausschließlich lesende Endpunkte**; Import, Neuberechnung, Transfer und jede Wartungsaktion laufen nur per CLI/systemd auf dem Server und sind über HTTP nicht erreichbar.
 
 ### 5.6 Binärformat
 
-Länge-präfixierter JSON-Header (Formatversion, Symbol, tf, R, Spalten, Kachelversion, Qualitätsflags), danach spaltenweise Typed Arrays, Little Endian, 8-Byte-ausgerichtet:
-- Bars: `time` Int32 (s), `open/high/low/close` Int32 (px), Volumina Float64 (Lots; Ganzzahlen < 2⁵³ exakt), Zähler Int32, `levelOffset` Int32.
-- Level: `row` Int32, `buy`, `sell` Float64, `buyA`, `sellA` Int32.
-Kompression gzip (nginx) bzw. vorkomprimiert aus dem Server-Cache. ≈ 28 B/Zelle roh → 30 000 Zellen ≈ 840 kB roh; komprimierte Größe in P1 messen.
+Festgelegt in [`TILE-FORMAT.md`](TILE-FORMAT.md) (Format 1, gebaut mit Encoder/Decoder und Property-Tests): Magic + Headerlänge, JSON-Header mit Einheiten, spaltenweise Typed Arrays (Little Endian, 8-Byte-ausgerichtet), Level in CSR-Form mit Zeilenindex statt Preis, `x.`-Präfix als Erweiterungspunkt, Invarianten „Footprint-Summen = Bars". ≈ 28 B je Level + 44 B je Bar. Kompression gzip (nginx) bzw. vorkomprimiert aus dem Server-Cache; komprimierte Größe auf echten Daten noch zu messen.
 
 ### 5.7 Live-Updates
 
 - Eine WS-Verbindung je Tab; Abo nur für das angezeigte Symbol/tf/R (Wechsel ersetzt das Abo).
 - Formender Bar in der API: committed Minuten des laufenden tf-Bars aus der DB + formende Minute aus dem Feed; Level als Map `row → {b,s,ba,sa}` (O(1) pro Trade). Diff höchstens alle 250 ms.
 - Nach „Minute M committed" (§4.2) sendet die API M aus der DB.
+
+### 5.8 Messungen der Abfragen (Mac, warm, echte BTC-Daten, 34 Tage)
+
+| Abfrage | Quelle | Zeit |
+|---|---|---|
+| 1m-Kachel, 256 Bars | `fp_1m_b10` | 1,5 ms |
+| 5m-Kachel, 1 024 Bars | `fp_5m_b10` | 22 ms |
+| Profil über den Oktober | `fp_1h_b100` | 2,2 ms |
+| Profil über einen Tag | `fp_1m` | 5,8–23,6 ms |
+| Range-Profil über 2,5 Tage | `fp_1m` | 41 ms |
+| Planungszeit bei 34 Chunks | – | 0,6–3,7 ms |
+
+Folgerung: Abfragen brauchen **konstante Zeitgrenzen** (Literale bzw. Parameter, keine Ausdrücke wie `now()`), damit Timescale Chunks schon beim Planen ausschließt. Kalt-Werte und VPS-Werte stehen aus (M1).
 
 ---
 
@@ -631,21 +742,27 @@ Referenzen: **DC** = DeepCharts (öffentliche Doku, Formeln teils unbekannt), **
 
 ### 6.1 Footprint
 
-| Element | Definition | Default | Referenz | Stufe |
-|---|---|---|---|---|
-| Zeile | `floor(px / (R·tick_ref_units))`, R aus Leiter {1,2,5}·10^k Ticks, R ≥ aktueller Tick | auto | TV/DC | v1 |
-| Auto-R | R so, dass der Median-Range der letzten 200 abgeschlossenen Bars des tf ≈ 24 Zeilen hat; neu nur bei Symbol-/tf-Wechsel, LOD-Anpassung am Gestenende (§7.2) oder per Knopf, **nie beim Pannen** | 24 Zeilen | eigen (TV: 0,2 × ATR, unbestätigt) | v1 |
-| R manuell | Ticks pro Zeile aus der Leiter | – | TV/DC | v1 |
-| Gitter an Bar-Open verankert | – | aus | DC | später (nur aus `fp_1m`) |
-| Typ Bid×Ask | links sell, rechts buy | – | TV/DC | v1 |
-| Typ **Delta** | eine Zahl je Zeile b − s; Farbe nach Vorzeichen, Intensität nach Betrag | **Default** | TV/DC | v1 |
-| Typ Volume | b + s | – | TV/DC | v1 |
-| Typ Delta + Volume | Delta links, Volumen rechts | – | DC | v1 |
-| Modus Box / Profile | Zahl in gefärbter Zelle / horizontaler Balken je Zeile (Länge ∝ Wert / Max im Bar) | Box | DC/TV | v1 |
-| Zelleingabe | Volumen oder **Anzahl aggTrades** (nicht DCs Trade-Anzahl; Einzeltrade-Zahlen pro Level sind aus aggTrades nicht exakt ableitbar) | Volumen | DC | v1 |
-| Mehrere Spalten pro Bar (bis 4) | – | – | DC | später |
-| Ladder, dynamische Schriftgröße, Cluster-Umrisse | – | – | TV/DC | später |
-| Formender Bar | live | an | – | v1 |
+Spalte „Stand": **gebaut** (gegen Fixture-Daten) oder Phase, in der es kommt.
+
+| Element | Definition | Default | Referenz | Stufe | Stand |
+|---|---|---|---|---|---|
+| Zeile | `floor(px / (R·tick_ref_units))`, R aus Leiter {1,2,5}·10^k Ticks, R ≥ aktueller Tick, nur angebotene (tf, R) (§5.3) | auto | TV/DC | v1 | gebaut |
+| Auto-R | lesbarkeitsorientiert, nur am Gestenende/Resize/Laden; Regeln in §7.2. **Nie beim Pannen** | §7.2 | eigen (TV: 0,2 × ATR, unbestätigt) | v1 | gebaut |
+| R manuell | Ticks pro Zeile in Toolbar und URL; wird nie still überschrieben | – | TV/DC | v1 | gebaut |
+| Gitter an Bar-Open verankert | – | aus | DC | später (nur aus `fp_1m`) | – |
+| Typ Bid×Ask | links sell, rechts buy | – | TV/DC | v1 | gebaut |
+| Typ **Delta** | eine Zahl je Zeile b − s; Farbe nach Vorzeichen, Intensität nach Betrag | **Default** | TV/DC | v1 | gebaut |
+| Typ Volume | b + s | – | TV/DC | v1 | offen (P4) |
+| Typ Delta + Volume | Delta links, Volumen rechts | – | DC | v1 | offen (P4) |
+| Modus Box | Zahl in gefärbter Zelle | Box | DC/TV | v1 | gebaut |
+| Modus Profile im Footprint | horizontaler Balken je Zeile (Länge ∝ Wert / Max im Bar) | – | DC/TV | v1 | offen (P4) |
+| Zelleingabe | Volumen oder **Anzahl aggTrades** (nicht DCs Trade-Anzahl; Einzeltrade-Zahlen pro Level sind aus aggTrades nicht exakt ableitbar) | Volumen | DC | v1 | Volumen gebaut, aggTrade-Anzahl offen (P4; Daten liegen in der Kachel) |
+| Hover | exakte Lots, Preisintervall der Zeile, Bar-Zeit | an | – | v1 | gebaut |
+| Mehrere Spalten pro Bar (bis 4) | – | – | DC | später | – |
+| Ladder, dynamische Schriftgröße, Cluster-Umrisse | – | – | TV/DC | später | – |
+| Formender Bar | live | an | – | v1 | offen (P3) |
+
+Ebenfalls v1, aber noch nicht gebaut (alle P4): Imbalance und Stacked Imbalance, POC, Delta-POC, Value Area je Bar, High/Low Ratio, Farbmodi außer dem gebauten Verlauf.
 
 **Farbskalierung:** Intensität = min(1, |Wert| / Ref), Ref = 95. Perzentil der |Werte| im Bereich (Default sichtbare Bars; Option pro Bar), neu berechnet am Gestenende und beim Laden, nicht pro Frame. Farbmodi v1: aus, fest, Verlauf; [später] Mehrfarb-Bänder, „nur dominante Seite", Färbung nach Imbalance/Dominant-Delta.
 
@@ -689,7 +806,9 @@ Referenzen: **DC** = DeepCharts (öffentliche Doku, Formeln teils unbekannt), **
 
 Schattierung je Zeile: z = (x − μ)/σ über die sichtbaren Bars, Intensität min(1, |z|/3); optional feste Hervorhebungsschwelle je Zeile. [v1] LOD: Text ab bs ≥ 30 px, darunter nur Schattierung, unter 4 px ausgeblendet.
 
-### 6.3 Volume Profile
+### 6.3 Volume Profile (Phase P2, direkt nach der API)
+
+Prioritätsänderung des Nutzers: gemeint war ursprünglich „Volume Profile mit Delta", nicht nur der Delta-Footprint. Das Volume Profile (Custom Range + je Tag; Ansichten Total / Buy-Sell / Delta) kommt deshalb direkt nach der API und vor dem Stats-Grid. Der Endpunkt-Vertrag steht in `PROFILE-API.md` (entsteht gerade, wird hier nicht spezifiziert).
 
 | Element | Definition | Default | Stufe |
 |---|---|---|---|
@@ -697,7 +816,7 @@ Schattierung je Zeile: z = (x − μ)/σ über die sichtbaren Bars, Intensität 
 | Tagesprofile | je Tag, links am Tagesbeginn, Breite = Tagesbreite × 0,8 | an bei tf ≤ 1h | v1 |
 | Tagesgrenze | UTC 00:00; Offset in ganzen Stunden (entschieden); 1d-Rollups nur bei Offset 0, sonst 1h-Rollups | 0 | v1 |
 | Zeilen | eigenes R, **unabhängig vom Footprint-R** (POC/VA von Profil und Bars dürfen daher abweichen); auto ≈ 120 Zeilen (Range) bzw. ≈ 60 (Tag) | auto | v1 |
-| Darstellung | Total; Buy/Sell gestapelt; Delta | Total | v1 |
+| Darstellung | Total; Buy/Sell; Delta | Total | v1 (alle drei in P2) |
 | POC, VAH, VAL | §6.1, va_pct 70 % | an | v1 |
 | Linien verlängern | bis Chartende oder nächstes Profil | aus | v1 |
 | Naked POC, Wochen-/Monatsprofile | – | – | später |
@@ -756,15 +875,28 @@ Lizenz: Apache-2.0 mit Attributionspflicht → Hinweis im UI. `lightweight-order
 
 ### 7.2 Level-of-Detail-Regeln
 
-`bs` = Bar-Abstand (px), `rh` = Zeilenhöhe (px), `vc` = geschätzte sichtbare Zellen = Σ über sichtbare Bars der Zeilen innerhalb des sichtbaren Preisbereichs.
+Wie gebaut (`apps/web`, Regeln aus Nutzerrückmeldung „Zeilen viel zu fein"). `bs` = Bar-Abstand (px), `rh` = Zeilenhöhe (px), `vc` = geschätzte sichtbare Zellen.
 
 | Stufe | Bedingung | Darstellung | Daten |
 |---|---|---|---|
-| L3 Zahlen | bs ≥ 44 (eine Zahl/Spalte) bzw. ≥ 80 (Bid×Ask, Delta+Volume), rh ≥ 11, vc ≤ 25 000 | Text (10 px) in Zellen | Level |
-| L2 Zellen | bs ≥ 6, rh ≥ 2, vc ≤ 25 000 | gefärbte Zellen, POC-Rahmen | Level |
-| L1 Kerzen | sonst | Kerzen + Profile/Big Trades | nur `bars` |
+| L3 Zahlen | bs ≥ 44 (Delta) bzw. ≥ 80 (Bid×Ask), rh ≥ 11, vc ≤ 25 000 | Text in Zellen | Level |
+| L2 Zellen | bs ≥ 6, rh ≥ 2, vc ≤ 25 000 | gefärbte Zellen | Level |
+| L1 Kerzen | sonst | Kerzen | nur `bars` |
 
-Auto-R: fällt rh unter 2 px oder überschreitet vc 25 000, wird R am Gestenende (Debounce 150 ms) um eine Leiterstufe vergrößert (wiederholt, bis die Bedingungen gelten); steigt rh über 40 px, verkleinert. Bei manuellem R fällt die Ansicht auf L1 zurück, mit Hinweis „Zeilengröße zu fein für diesen Ausschnitt". Während einer Geste ändert sich R nie; Hysterese 10 % gegen Flackern.
+Wechsel in den bzw. aus dem Footprint-Modus mit 10 % Hysterese.
+
+**Zeilenklasse:** „Text", wenn bs ≥ 44 px (Delta) bzw. 80 px (Bid×Ask); verlassen wird sie erst unter 0,9 × Schwelle; sonst „Zellen".
+
+**Auto-R** (nur am Gestenende, bei Resize und beim Laden; nie während einer Geste):
+1. Das aktuelle R bleibt, solange rh im Halteband liegt (Text 11,5–44 px, Zellen 3–16 px) und vc ≤ 25 000.
+2. Sonst wird unter den angebotenen R mit rh ≥ Klassenminimum (Text 11,5 px, Zellen 4 px) dasjenige gewählt, dessen rh auf logarithmischer Skala dem Ziel am nächsten liegt (Text 14 px, Zellen 6 px).
+3. Danach wird R so lange vergrößert, bis vc ≤ 22 500.
+
+Manuelles R (Toolbar, URL) wird nie still überschrieben; passt es nicht, fällt die Ansicht auf eine gröbere Stufe zurück. Beim R-Wechsel zeichnet das bisherige R weiter, bis das neue geladen ist.
+
+**Standardansicht:** bs = Text-Schwelle × 1,05 (bei 1 600 px Breite ≈ 32 Delta-Kerzen bzw. 17 Bid×Ask-Kerzen mit Zahlen), Preis automatisch skaliert. Gemessen ergeben sich so ≈ 5–7 Zeilen je Kerze: bei ≈ 35 Kerzen ist die sichtbare Preisspanne ≈ 7× die Spanne einer Kerze; mit ≈ 20 Kerzen wären es ≈ 7, mit ≈ 12 Kerzen 9–10 Zeilen (Geometrie, abgeleitet). Ob standardmäßig weniger Kerzen gezeigt werden sollen, ist eine **offene Produktfrage an den Nutzer** (§10.3).
+
+**Gemessen** (Chromium, Dev-Build, Fixture-Daten, 25 ms simulierte Latenz): Frame-Arbeit p95 ≤ 2,7 ms, max ≤ 4,2 ms, 0 Long Tasks, ≤ 22 440 sichtbare Zellen, Renderer-Prozess ≈ 270 MB, erster Footprint ≈ 210–280 ms.
 
 ### 7.3 Zustand und Zeichnen (gegen die PulseBot-Probleme)
 
@@ -773,6 +905,7 @@ Auto-R: fällt rh unter 2 px oder überschreitet vc 25 000, wird R am Gestenende
 - `setData` nur bei Kachel-Ankunft bzw. tf-Wechsel; Live per `series.update()`. Obergrenzen: Footprint-Modus ≤ 5 000 Bars, Kerzen-Modus ≤ 20 000 Bars (setData mit 50 k Kerzen kann > 50 ms dauern); darüber erzwingt die UI einen größeren Zeitrahmen.
 - Alle Overlays zeichnen in den Renderern der Bibliothek; kein separates, bei jeder Crosshair-Bewegung neu gezeichnetes Overlay-Canvas. Tooltips als DOM, per `requestAnimationFrame` gebündelt.
 - Live-Diffs gepuffert, höchstens einmal pro Frame (max. 4/s).
+- Server-/Seiten-Abweichung (gebaut): `/symbols` trägt `schema`; die Kachel-URL trägt `cfg`; 409 → ein Neuladen von `/symbols` je Welle; roter Hinweis nur bei echter Blockade (Vertrag in TILE-FORMAT.md).
 - UI-Grundstruktur v1: Toolbar (Symbol, tf, Typ, R), Einstellungsdialog, Tooltips, Zustand in der URL (Symbol, tf, Ausschnitt, Profile).
 
 ### 7.4 TPO-Ansicht
@@ -787,22 +920,25 @@ Werkzeug „Profil": Ziehen im Chart markiert [t0, t1) (Snap auf Bar-Grenzen), n
 
 ## 8. Ausbauphasen
 
-Aufwand in Personentagen (PT), eine Person mit KI-Unterstützung. Reihenfolge (entschieden): **zuerst ein vertikaler Schnitt mit BTCUSDT**, der Datenkorrektheit und Performance – die beiden Top-Prioritäten – auf dem VPS beweist; danach der Rest. PulseBot läuft bis P2 weiter.
+Aufwand in Personentagen (PT), eine Person mit KI-Unterstützung. Reihenfolge (entschieden): **zuerst ein vertikaler Schnitt mit BTCUSDT**, der Datenkorrektheit und Performance auf dem VPS beweist; danach Volume Profile (Prioritätsänderung des Nutzers), Live-Betrieb und der Rest; die Reparatur der Historie vor 2026-06-10 ist eine eigene Phase. Prozess: unabhängiges Code-Review durch einen separaten Agenten nach jedem Umsetzungsschritt, Commit je Schritt, Push nach dem Review. PulseBot läuft bis P3 weiter.
 
-| Phase | Inhalt | Abnahmekriterien | PT |
-|---|---|---|---|
-| **P0 Grundgerüst** | Monorepo (`packages/core` Parser/Aggregation/Klassifikator, `apps/importer`, `apps/recorder`, `apps/api`, `apps/web`, `verifier/`), Docker-Postgres/Timescale (gepinnt), Migrationen, CI | `npm test` grün; Schema per Migration auf dem Mac reproduzierbar | 2–3 |
-| **P1 Vertikaler Schnitt BTCUSDT** | (a) Importer im Backfill-Modus: aggTrades + Klines ab 2025-01-01, Manifest, `fp_1m`, alle Rollups aus §3.6, `bar_1m/1h/1d`, `kline_1m`, Zustandsautomat, Digests; (b) Klassifikator §4.6, Tiefenprüfung §4.7 auf den Stichprobentagen, Verifier §4.8 (ohne Order-Teil); (c) Transfer auf den VPS §2.3; (d) API `bars`, `footprint`, `quality` binär mit Guards, Kachellänge, Versionen; (e) Frontend: Kerzen + Footprint-Custom-Series mit L1/L2/L3, Zellbudget, Kachel-LRU, Typen Delta und Bid×Ask im Box-Modus, Qualitätsband, minimale Toolbar; (f) Benchmark auf dem VPS | Manifest: alle Checksums ok, aggIds über alle Tage strikt fortlaufend; **100 % der Minuten `exact` oder `shift`, 0 `mismatch`, 0 `missing`**, Tagessummen exakt bis auf Tagesrand-Straddler; Tiefenprüfung `passed` auf allen Stichprobentagen mit brauchbarer Referenz (`reference_unusable` dokumentiert, nicht als Fehler); Verifier 0 Abweichungen inkl. Rollups und API-Stichprobe; Re-Import digest-gleich; **Gleichwertigkeit Monats-/Tagesdatei:** 3 Tage (einer davon ein Monatserster, einer ein Monatsletzter) einmal aus der Monatsdatei und einmal aus der zusätzlich geladenen Tagesdatei importiert ergeben identische Digests in allen Tabellen und identische Tages-Manifesteinträge (bis auf `origin*`); Transfer digest-gleich, VPS-Platte nie mit unkomprimierter Basistabelle; Backfill-Dauer auf dem Mac gemessen; Benchmarks kalt **und** warm innerhalb §1.4 für: 1m-Footprint R = 1 Tick, 15m-Footprint über 3 Monate pannen, 4h-Footprint über 1 Jahr, 1h-Kerzen über 1 Jahr; T11 grün | 15–20 |
-| **M1 – erstes sichtbares Ergebnis** | echter BTC-Footprint (Delta-Ansicht) auf dem VPS im Browser, geprüfte Daten, gemessene Budgets | nach **≈ 17–23 PT** | – |
-| **P2 ETH + Live-Betrieb** | ETH-Backfill + Teilübertragung; Recorder (WS, Lücken, REST, Spool, Wiederanlauf, committed-Events), tägliche Finalisierung auf dem VPS, Live-Forming-Bar in API/Frontend, Health, health-ping + healthchecks.io, DB-Rollen, Backup der kleinen Tabellen, Mac/VPS-Gleichlauf; PulseBot + mongod stoppen | 72-h-Lauf mit erzwungenen Disconnects, Kill, abgeschnittenem Frame und DB-Neustart: keine unentdeckte Lücke; provisorische Tage ≥ 99,9 % Minuten identisch mit der offiziellen Datei; E-Mail-Alarm ≤ 15 min nach Einfrieren des Recorders und nach Abschalten des VPS-Netzes; Tagesersatz läuft 7 Tage unbeaufsichtigt; Restore-Probe (neue DB aus Archiv bis `final_ok`) mit gemessener Dauer | 8–11 |
-| **P3 Volume Profile + UI-Grundstruktur** | `profile`, `profiles/daily`; Range-Werkzeug, Tagesprofile; Einstellungen, Symbolwechsel, Tooltips, URL-Zustand | Range-Profil 1 Jahr kalt/warm innerhalb §1.4; Profilsummen = Verifier | 6–8 |
-| **P4 Footprint komplett + Stats-Grid** | alle Typen und Modi, Imbalances, Stacked, POC/Delta-POC/VA, Ratios, Farbmodi, Stats-Grid mit LOD | Budgets bei 25 000 sichtbaren Zellen; Footprint-Summen = `bars`; Komposita = Verifier; Sichtvergleich mit TV an 3 Stichproben dokumentiert | 9–12 |
-| **P5 Big Trades** | Order-Merge (Importer + Recorder), `size_hist_*` (Durchlauf 1), Untergrenze, `big_order` (Durchlauf 2), Teilübertragung, `bigtrades`/`thresholds`, UI | Umschalten der Definition ≤ 300 ms ohne Rohdaten; Verifier bitgleich für Histogramme und `big_order`; gespeicherter Anteil gemessen und in §3.7 nachgetragen; `incomplete` am Datenbeginn getestet | 6–8 |
-| **P6 TPO** | `tpo`, TPO-Ansicht | Property-Tests (VA, IB, Single Prints); 30 Tage flüssig | 4–6 |
-| **Puffer** | Performance-Tuning nach Benchmarks, VPS-Härtung, Unvorhergesehenes (≈ 15 %) | – | 7–10 |
-| **Summe** | | | **≈ 57–78** |
+Stand 2026-11-24. Bereits verbrauchter Aufwand wird nur qualitativ angegeben.
 
-Die Schätzung liegt im Bereich des Reviews (55–75 PT). Fassung 1 (33–49 PT) enthielt weder Puffer noch UI-Grundstruktur noch Tiefenprüfung und Transfer.
+| Phase | Inhalt | Abnahmekriterien | Stand | PT |
+|---|---|---|---|---|
+| **P0 Grundgerüst** | Monorepo, Datenbank (lokal OrbStack, Image gepinnt), Migrationsrunner, CI | `npm test` grün; Schema per Migration reproduzierbar | **erledigt** | 2–3 (verbraucht) |
+| **P1 Vertikaler Schnitt BTCUSDT ab 2026-06-10** | (a) Importer mit Abgleich, Kaskade, Digests, Backfill-/Online-Modus; (b) Verifier Datei-/DB-Modus, Tiefenprüfungs-Stichprobe; (c) Schema 0001–0006; (d) Backfill BTC 2026-06-10…2026-11-23; (e) lesende API `symbols`/`bars`/`footprint` nach TILE-FORMAT.md; (f) Frontend: Footprint-Renderer Delta + Bid×Ask mit LOD, Zellbudget, Auto-R, Querprüfung; (g) Transfer auf den VPS; (h) Benchmark kalt/warm auf dem VPS; (i) `source_annotation` für 2026-10-27 | Manifest: Checksums ok, aggIds über alle Tage fortlaufend; **100 % der Minuten `exact` oder `shift`, 0 `mismatch`, 0 `missing`** außer dem annotierten Loch 2026-10-27 (bleibt `final_bad` bis P7); Tagessummen exakt bis auf Tagesrand-Straddler; Tiefenprüfung `passed` auf allen Stichprobentagen mit brauchbarer Referenz (`reference_unusable` dokumentiert, nicht als Fehler); Verifier 0 Abweichungen inkl. Rollups und API-Stichprobe; Re-Import digest-gleich; Monats- = Tagesdatei-Digest an 3 Tagen (Monatserster, Monatsletzter, ein weiterer); Transfer digest-gleich, VPS-Platte nie mit unkomprimierter Basistabelle; Benchmarks kalt **und** warm innerhalb §1.4 für 1m-Footprint feinstes angebotenes R, 15m-Footprint über 3 Monate pannen, 4h-Footprint über die ganze v1-Historie, 1h-Kerzen über die ganze v1-Historie; T11 grün | **teilweise**: erledigt (a), (b) ohne automatisierte Stichprobe, (c), (f) gegen Fixtures; in Arbeit (d), (e); offen (g), (h), (i), Stichprobe | 15–20 (großer Teil verbraucht) |
+| **M1 – erstes sichtbares Ergebnis** | echter BTC-Footprint (Delta-Ansicht) auf dem VPS im Browser, geprüfte Daten, gemessene Budgets | – | offen | – |
+| **P2 Volume Profile** | Range-Profil + Tagesprofile, Ansichten Total / Buy-Sell / Delta, POC/VAH/VAL; Vertrag `PROFILE-API.md`; Range-Werkzeug | Profilsummen = Verifier; Budgets §1.4 kalt/warm; Sichtvergleich an 3 Stichproben | offen (Vertrag entsteht) | 6–8 |
+| **P3 Live-Betrieb + ETH** | ETH-Backfill + Teilübertragung; Recorder, tägliche Finalisierung auf dem VPS, formender Bar, Health + healthchecks.io, DB-Rollen, Backup, Mac/VPS-Gleichlauf; PulseBot + mongod stoppen | wie Fassung 2: 72-h-Lauf ohne unentdeckte Lücke; provisorische Tage ≥ 99,9 % identisch mit der offiziellen Datei; E-Mail-Alarm ≤ 15 min; 7 Tage unbeaufsichtigt; Restore-Probe | offen | 8–11 |
+| **P4 Footprint komplett + Stats-Grid** | Typen Volume, Delta+Volume, aggTrade-Anzahl, Profile-Modus, Imbalances, Stacked, POC/Delta-POC/VA, Ratios, Farbmodi, Stats-Grid mit LOD | Budgets bei 25 000 sichtbaren Zellen; Komposita = Verifier; Sichtvergleich mit TV an 3 Stichproben | offen | 9–12 |
+| **P5 Big Trades** | wie Fassung 2 (§3.7, §6.4) | wie Fassung 2 | offen | 6–8 |
+| **P6 TPO** | `tpo`, TPO-Ansicht | Property-Tests (VA, IB, Single Prints); 30 Tage flüssig | offen | 4–6 |
+| **P7 Historien-Reparatur 2025-01-01…2026-06-09** | trades-Dumps ≈ 525 Tage/Symbol laden (30–50 GB, Mac); R-A in Importer und Verifier; `tail_status`, `kline_origin`, synthetische Zeilen (Migration); REST-Klines für die defekten Kline-Dumps; Annotationen; Lochreparatur 2026-10-27; Import beider Symbole; Teilübertragung | alle Regime-A-Tage `repaired` mit 0 `mismatch` außer annotierten Referenzdefekten; eingebaute Fehler werden weiterhin erkannt (Tests wie §4.11); 2026-10-27 nach Synthese `final_ok`; `data_from` = 2025-01-01 | offen | 6–10 |
+| **Puffer** | Performance-Tuning, VPS-Härtung, Review-Runden, Unvorhergesehenes (≈ 15 %) | – | – | 8–11 |
+| **Summe** | | | | **≈ 64–89** |
+
+Gegenüber Fassung 2 (57–78 PT) kommen P7 und der Review-Aufwand hinzu.
 
 ---
 
@@ -810,24 +946,28 @@ Die Schätzung liegt im Bereich des Reviews (55–75 PT). Fassung 1 (33–49 PT)
 
 | Risiko | Auswirkung | Gegenmaßnahme |
 |---|---|---|
-| Footprint-Kacheln aus komprimierten Chunks langsamer als geplant (6–10 B/Zeile und Abfragezeiten nicht gemessen) | Budgets verfehlt | Benchmark ist P1-Abnahme; Optionen: weitere Rollup-Stufe, kleinere Kacheln, mehr `shared_buffers` nach Stopp von PulseBot |
+| Footprint-Kacheln auf dem VPS langsamer als auf dem Mac (Mac-Werte gemessen, §5.8; VPS kalt offen) | Budgets verfehlt | Benchmark ist P1-Abnahme; Optionen: weitere Rollup-Stufe, kleinere Kacheln, mehr `shared_buffers` nach Stopp von PulseBot |
 | Mac/VPS-Abhängigkeit für Neuberechnungen | Regeländerung erfordert Mac + Transfer | Teilübertragung chunkweise (§2.3); Neu-Download von Binance als Rückfall |
 | Transfer komprimierter Chunks per `pg_dump` verhält sich anders als erwartet | Plattenspitze auf dem VPS | Vorab-Test an Test-DB; Rückfall: Teilübertragung chunkweise für alle Tage |
 | Binance ändert Routing/Formate/Dateiangebot | Live-Ausfall, fehlende Tagesdateien | Health + Totmann; Endpunkte konfigurierbar; Archiv auf dem Mac |
-| trades-Dumps häufiger lückenhaft | Tiefenprüfung oft `reference_unusable` | wird gezählt; Kline-Abgleich bleibt als Prüfung; zusätzliche Stichprobentage |
+| trades-Dumps häufiger lückenhaft | Tiefenprüfung oft `reference_unusable`; R-A in P7 für betroffene Tage nicht anwendbar | wird gezählt; Kline-Abgleich bleibt als Prüfung; zusätzliche Stichprobentage; nicht reparierbare Tage bleiben `unverified` |
+| Binance ändert das Dump-Verhalten erneut (wie zum Regimewechsel 2026-06-09) oder Dumps bekommen weitere Löcher | unbemerkt unvollständige Daten | Kline-Abgleich jedes Tages ist die Wache (nicht die aggId-Kontinuität); Trade-ID-Sprünge als Bericht |
+| Rowstore-Umwandlung sperrt Chunks exklusiv | API-Abfragen blockieren während eines Ersatzes | `lock_timeout` + Wiederholung in der API; Ersatz nachts; Jahres-Tabellen unkomprimiert |
+| Ausreißer-Bar entfernt feine Zeilengrößen (Kachelregel) | grobe Footprints in ruhigen Zeiträumen | offener Entwurfspunkt O2 |
+| Verifier-Speicherbedarf (2–4,7 GB je Tag) | VPS-Speicher knapp | Verifier auf dem VPS nur nachts und nie parallel zu schweren Abfragen; Hauptlauf auf dem Mac |
 | Order-Regel liefert andere Größen als DeepCharts | andere Schwellen | Empfindlichkeit dokumentiert (§3.7); Regel versioniert und neu berechenbar |
 | DC-Definitionen unvollständig | Abweichungen zu DeepCharts | eigene Definitionen explizit (§6) |
 | Plattenplatz VPS durch Spool/WAL/Transfer | Ausfall | Health-Prüfung ≥ 10 GB frei; Importer-Abbruch < 15 GB |
 
 ---
 
-## 10. Entscheidungen
+## 10. Entscheidungen und offene Fragen
 
 ### 10.1 Festgelegt
 
 | Thema | Entscheidung |
 |---|---|
-| Quelle der Wahrheit | aggTrades von Binance Vision (Betrieb: Tagesdateien; Erstimport: Monatsdateien, nach Tag zerlegt); Minute nach T (§3.3) |
+| Quelle der Wahrheit | aggTrades von Binance Vision (Betrieb: Tagesdateien; Erstimport: Monatsdateien, nach Tag zerlegt), mit Regime-Schnitt 2026-06-10 (§3.1); Minute nach T (§3.3) |
 | Validierung | Volumen + Taker-Buy gegen Klines mit enger Hülle; Trade-Anzahl nur Referenz; Tiefenprüfung auf Stichprobentagen |
 | Rohdaten/Berechnung | Archiv auf dem Mac (+ Backup), Historie auf dem Mac berechnet und übertragen, VPS mit 14-Tage-Fenster |
 | Reihenfolge | vertikaler Schnitt BTC zuerst (§8) |
@@ -835,12 +975,16 @@ Die Schätzung liegt im Bereich des Reviews (55–75 PT). Fassung 1 (33–49 PT)
 | Big Trades | Perzentile ≥ P99, Default `rolling7d` P99,9, Stufen 99,5/99,9/99,97; Order-Regel „gleiche ms + Seite + fortlaufende ID"; Untergrenze per Zwei-Durchlauf; ganzzahliges Notional; erst P5 |
 | Tagesgrenze | UTC 00:00, Offset in ganzen Stunden |
 | Delta-POC, DC-Elemente ohne Formel | max. \|Delta\|; Single Prints/Bar Ratio/Effort entfallen in v1 |
-| PulseBot | wird mit P2 gestoppt (inkl. mongod) |
+| PulseBot | wird mit P3 (Live-Betrieb) gestoppt (inkl. mongod) |
+| Historie | zweistufig: v1 ab 2026-06-10 (Regime B); Reparatur von 2025-01-01…2026-06-09 inkl. Loch 2026-10-27 als eigene Phase P7 |
+| Feature-Reihenfolge | Volume Profile mit Delta-Ansicht direkt nach der API (P2), vor Stats-Grid und restlichem Footprint |
+| Entwicklungsumgebung | lokale DB in OrbStack (Docker Desktop abgelehnt); Node 24.22.3 per nvm; Python 3.14 im Verifier-venv, 3.12 in CI |
+| Prozess | unabhängiges Code-Review durch einen separaten Agenten nach jedem Schritt; Commit je Schritt, Push nach dem Review |
 | Weitere Symbole | später; Kosten je Symbol ab 2025 ≈ 15–25 GB Rohdaten (Mac) + 2–5 GB DB |
 | Ops-Alarm | E-Mail an den Nutzer über healthchecks.io-Totmann; Fallback ntfy |
 | Zugriff | v1 öffentlich über HTTPS, **ohne Passwort** (§10.2) |
 
-Offene Fragen an den Nutzer gibt es in Fassung 2 keine mehr; offen sind nur Messgrößen, die in den Phasen nachgetragen werden (komprimierte Zeilengröße, Backfill-Dauer, Anteil `big_order`, Transferverhalten von `pg_dump`).
+Offene Messgrößen: Kalt- und VPS-Werte (M1), ETH-Größen, Anteil `big_order`, Transferverhalten von `pg_dump`, komprimierte Kachelgröße. Offene Fragen siehe §10.3.
 
 ### 10.2 Zugriff (entschieden)
 
@@ -855,6 +999,15 @@ Beibehalten werden Schutzmaßnahmen, die kein Passwort sind und fast nichts kost
 Marktdaten-Weitergabe: Binance Vision hat eigene Nutzungsbedingungen (PDF auf data.binance.vision), deren Text sich in dieser Sitzung nicht auslesen ließ; ein inoffizieller Beitrag im Binance-Entwicklerforum hält öffentliche Marktdaten für allgemein nutzbar. Verbindlich geprüft ist das nicht – kein Blocker für ein privates, öffentlich erreichbares Pilotprojekt, aber vor einer Weitergabe an Dritte oder kommerziellen Nutzung zu lesen.
 
 [später, falls gewünscht] Login: eine echte Login-Seite mit einem festen Passwort, das der Browser speichern kann; Passwort als argon2id- oder bcrypt-Hash in der Datenbank; Session-Cookie `HttpOnly`, `Secure`, `SameSite=Strict`; die API prüft das Cookie auch beim WS-Upgrade. Kein HTTP-Basic-Auth.
+
+### 10.3 Offene Fragen
+
+| # | Frage | an | Empfehlung |
+|---|---|---|---|
+| O1 | Standardansicht: weniger Kerzen zeigen? Heute ≈ 32 Delta-Kerzen bei 1 600 px mit ≈ 5–7 Zeilen je Kerze; ≈ 20 Kerzen ergäben ≈ 7, ≈ 12 Kerzen 9–10 Zeilen (§7.2) | Nutzer | an M1 mit echten Daten ausprobieren; Vorschlag: Ziel ≈ 20 Kerzen (bs ≈ 75–80 px im Delta-Typ) als Standard, Zoom bleibt frei |
+| O2 | Kachellänge je Kalendermonat statt über die ganze Historie (§5.3, TILE-FORMAT.md) | Entwickler | vor P3 entscheiden, spätestens wenn ein Ausreißer feine R entfernt; erst nach P7 dringend (längere Historie) |
+| O3 | Erster Tag der Historie: Minute 0 dauerhaft `edge_pending` und Tag nie `immutable` (§4.1) – Sonderregel oder hinnehmen? | Entwickler | hinnehmen bis P7; mit P7 verschiebt sich der Historienbeginn ohnehin |
+| O4 | Zeitpunkt von P7 (30–50 GB Download, 6–10 PT) | Nutzer | nach P4, sobald die ältere Historie für Profile/Vergleiche gebraucht wird |
 
 ---
 
@@ -895,3 +1048,28 @@ Marktdaten-Weitergabe: Binance Vision hat eigene Nutzungsbedingungen (PDF auf da
 - *W8 (Fehlerquote der Order-Regel gegen den trades-Dump messen):* teilweise – auch der trades-Dump enthält keine Order-ID, ein „Match-Ereignis" daraus wäre ebenfalls eine Heuristik. Stattdessen ist die Empfindlichkeit gegenüber der Alternativregel gemessen und dokumentiert; die Regel ist versioniert und neu berechenbar.
 - *W10 / E6 (Basic-Auth bzw. VPN, WS-Auth-Prüfung):* nicht übernommen – der Nutzer hat entschieden, v1 öffentlich ohne Passwort zu betreiben; Basic-Auth ist ausdrücklich ausgeschlossen. Die übrigen W10-Punkte (Port-Bindung, Rollen, Secrets) sind übernommen.
 - *W2:* beide vorgeschlagenen Stufen übernommen (nicht nur eine), weil 15m und 30m sonst unterschiedlich gut bedient würden.
+
+---
+
+## 12. Änderungen gegenüber Fassung 2
+
+| Bereich | Änderung | Grund |
+|---|---|---|
+| Datenquelle (§3.1, §4.5) | Aussage „aggTrades-Dumps vollständig" ersetzt: zwei Regime mit Schnitt 2026-06-10; Tail-Verlust bis 2026-06-09 belegt und beziffert; Kline-Dump-Defekte, Lücke in der Kline-Quelle, Börsenausfall, echtes aggTrades-Loch 2026-10-27 dokumentiert | Fill-Analyse an 13 Symbol-Tagen und Gesamtscan 692 Tage × 2 Symbole |
+| Historie (§1.5 K11, §3.2, §8) | v1-Historie ab 2026-06-10; Reparatur von Regime A als eigene Phase P7 | Nutzerentscheidung (zweistufig) |
+| Reparatur (§4.11) | neu: Regel R-A für Tails, Lochreparatur durch Synthese aus dem trades-Dump, `tail_status`, synthetische Zeilenquelle; Kline-Toleranz für Regime A verworfen | an Stichproben bewiesen; Toleranz würde echte Löcher verdecken |
+| Lückenerkennung (§1.5 K6, §3.1, §4.2) | aggId-Kontinuität erkennt Dump-Löcher nicht; Wache für die Historie ist der Kline-Abgleich; Trade-ID-Sprünge und Zeitlücken nur Berichtsfelder | 2026-10-27: aggIds fortlaufend über das Loch |
+| Klines (§3.1) | nicht mehr ausschließlich Vision: REST bei nachweislich defektem Dump (wenn gleich dem trades-Dump); Referenzdefekte annotiert; Importer verlangt je Tag eine Kline-Datei | defekte Kline-Dumps 2025-01-14/29; Lücke in der Kline-Quelle 2025-03-10 |
+| Annotationen (§3.8, §4.9) | geplante Tabelle `source_annotation` | Quelldefekte sichtbar erklären statt wegrechnen |
+| Rohdaten/Größen (§2.3, §3.4, §3.10) | Rohdaten 29,2 GB gemessen (Fassung 2: 12–14 GB, falsch); `fp_1m` 451–874 k Zeilen/BTC-Tag gemessen; Faktor 16,4 (7,3 B/Zeile); ≈ 4,6–5 MB je BTC-Tag; Hochrechnungen neu; trades-Dumps für P7 30–50 GB; Downloads höchstens 2 parallel | Messungen |
+| Kompression (§3.9) | Chunk-Intervalle wie gebaut; vier Jahres-Tabellen unkomprimiert | winzig; vermeidet jahresweite exklusive Sperre beim Re-Import |
+| Importmodell (§4.1, §4.3, §4.8) | Tag sofort schreiben, Minute 1439 beim Folgetag entscheiden; Eingaben in `data_day`, Kaskade bzw. `stale`; „fertig" nach Daten statt Code-Version, andere Quelldatei mit gleichen Digests = fertig; `RULES_VERSION`; `immutable` als einzige Basis für Dauer-Caches (ersetzt „final ändert sich nur über importing"); Ersatz über Rowstore-Umwandlung mit exklusiver Sperre → Leser mit `lock_timeout` + Wiederholung; `--backfill`/`--online` Pflicht für mehrtägige historische Läufe; `--plan`; Lock je Transaktion geprüft; fehlender Tag = harter Fehler; Digest ohne `check_state`, eigener Qualitäts-Digest | wie gebaut (Migrationen 0005/0006, Importer), Reviews N2–N6 |
+| Erster Historientag (§4.1, §4.6) | Minute 0 bleibt per Definition `edge_pending`; der Tag ist damit nie `immutable` (offene Entwicklerfrage O3) | Folge der gebauten Regel, ausdrücklich gemacht |
+| Messungen Import/Verifier (§4.1, §2.1) | Durchsatz, Laufzeit Gesamt-Dry-Run, RSS von Importer und Verifier | gemessen; Verifier-Speicher begrenzt seinen Einsatz auf dem VPS |
+| Kachellänge (§5.3) | Regel aus TILE-FORMAT.md (Maximum über die ganze Historie × 1,5, Angebot nur bis 60 000), `schema`/`cfg`/409, Querprüfung Kachel gegen Bars; Schwäche und offener Entwurfspunkt „je Kalendermonat" | Median-Regel ergab gemessen bis 107 000 Zellen |
+| API (§5.5, §5.6, §5.8) | Verträge in TILE-FORMAT.md bzw. `PROFILE-API.md` referenziert statt hier spezifiziert; Mac-Messungen der Abfragen; konstante Zeitgrenzen für Chunk-Ausschluss beim Planen | gebaut bzw. gemessen; Doppelspezifikation vermeiden |
+| Auto-R, LOD, Standardansicht (§6.1, §7.2) | lesbarkeitsorientierte Zeilenwahl mit Haltebändern, Zielhöhen und Zellbudget 22 500; Zeilenklassen mit Hysterese; manuelles R nie still überschrieben; altes R zeichnet bis das neue geladen ist; Standard-Bar-Abstand = Schwelle × 1,05; Messwerte des Renderings; Kerzenzahl der Standardansicht als offene Produktfrage | Nutzerrückmeldung „Zeilen viel zu fein"; Messung im Browser |
+| Footprint-Status (§6.1) | Spalte „Stand": gebaut sind Delta, Bid×Ask, Box, Volumen-Eingabe, Hover; v1 aber offen (P4): Volume, Delta+Volume, aggTrade-Anzahl, Profile-Modus, Imbalance, VA, POC/Delta-POC, Ratios | ehrlicher Stand |
+| Phasen (§8) | neue Reihenfolge: P1 Schnitt (teilweise erledigt) → M1 → P2 Volume Profile → P3 Live + ETH → P4 Footprint + Stats → P5 Big Trades → P6 TPO → P7 Reparatur; Stand je Phase; Aufwand ≈ 64–89 PT | Prioritätsänderung des Nutzers (Volume Profile mit Delta), zweistufige Historie, Review-Prozess |
+| Entscheidungen (§10) | OrbStack, Node/Python-Versionen, Prozessregel Review, Historie zweistufig, Feature-Reihenfolge; offene Fragen O1–O4 | Nutzerentscheidungen und gebauter Stand |
+
