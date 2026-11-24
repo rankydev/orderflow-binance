@@ -6,7 +6,7 @@
 // Performance-Tests: die 3 echten Tage werden 30× zeitlich verschoben wiederholt, Preise je Zyklus um
 // ein Vielfaches von 1 000 $ versetzt (Vielfaches jeder Zeilenbreite der Leiter → R-konsistent).
 // Kacheln dafür entstehen bei Bedarf aus den echten Kacheln (keine Riesendateien auf der Platte).
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Plugin } from 'vite';
@@ -83,7 +83,7 @@ export class FixtureStore {
     const tiles: Record<string, number> = {};
     // Stressbars überspannen höchstens 320 Ticks → max. Zeilen je Bar = ceil(320 / R) + 1
     for (const R of [1, 2, 5, 10, 20, 50, 100]) {
-      const n = tileBarsForMax(Math.ceil(320 / R) + 1);
+      const n = tileBarsForMax(Math.ceil(320 / R) + 1, 1);
       if (n !== null) tiles[String(R)] = n;
     }
     const stress: SymbolMeta = {
@@ -171,7 +171,15 @@ export class FixtureStore {
     if (!sym.synthetic) {
       const f = this.file(sym.name, 'footprint', tf, String(R), `${k}.bin`);
       if (f) return f;
-      return encodeTile({ meta, bars: emptyBars(), levels: emptyLevels() });
+      // Außerhalb der Daten: leere Kachel. Innerhalb: Datei fehlt → Fixtures und meta.json passen nicht
+      // zusammen (laut melden statt still leer liefern).
+      if (to <= sym.dataFrom || from >= sym.dataTo) {
+        return encodeTile({ meta, bars: emptyBars(), levels: emptyLevels() });
+      }
+      console.warn(
+        `[fixture-api] Kachel ${tf}/${R}/${k} fehlt – meta.json und Fixtures passen nicht zusammen`,
+      );
+      throw new HttpError(500, `Fixture-Kachel ${tf}/${R}/${k} fehlt (Fixtures neu erzeugen?)`);
     }
     const base = this.baseSeries(this.baseOf(sym), tf, R);
     const out = this.slice(sym, base, from, to, R * sym.tickRefUnits);
@@ -441,7 +449,12 @@ export function handleApi(
 ): { status: number; body: Uint8Array | string; type: string; etag?: string } {
   const path = url.pathname;
   if (path === '/api/v1/symbols') {
-    return { status: 200, body: JSON.stringify(store.meta), type: 'application/json' };
+    // schema: Version der /symbols-Form (der Client prüft sie, A)
+    return {
+      status: 200,
+      body: JSON.stringify({ schema: SYMBOLS_SCHEMA, ...store.meta }),
+      type: 'application/json',
+    };
   }
   if (path === '/api/v1/bars') {
     const body = store.bars(
@@ -453,6 +466,15 @@ export function handleApi(
     return { status: 200, body, type: 'application/octet-stream' };
   }
   if (path === '/api/v1/footprint') {
+    // cfg ≠ aktuelle Kachelkonfiguration → 409: der Client lädt /symbols neu statt alte n zu benutzen
+    const cfg = url.searchParams.get('cfg');
+    const sym = store.symbol(strParam(url, 'sym'));
+    if (cfg !== null && sym && Number(cfg) !== sym.tileConfigVersion) {
+      throw new HttpError(
+        409,
+        `tileConfigVersion ${cfg} veraltet (aktuell ${sym.tileConfigVersion})`,
+      );
+    }
     const body = store.footprint(
       strParam(url, 'sym'),
       strParam(url, 'tf'),
@@ -464,8 +486,11 @@ export function handleApi(
   throw new HttpError(404, `unbekannter Endpunkt ${path}`);
 }
 
+export const SYMBOLS_SCHEMA = 2;
+
 export function fixtureApi(opt: FixtureApiOptions): Plugin {
   let store: FixtureStore | null = null;
+  let metaMtime = 0;
   const middleware = (req: IncomingMessage, res: ServerResponse, next: () => void) => {
     if (!req.url?.startsWith('/api/v1/')) return next();
     const send = (status: number, body: Uint8Array | string, type: string) => {
@@ -477,14 +502,24 @@ export function fixtureApi(opt: FixtureApiOptions): Plugin {
     };
     const run = () => {
       try {
-        if (!store) {
-          if (!existsSync(join(opt.dir, 'meta.json'))) {
-            throw new HttpError(
-              503,
-              `Fixtures fehlen in ${opt.dir}: npm run fixtures -w @orderflow/web`,
+        const metaPath = join(opt.dir, 'meta.json');
+        if (!existsSync(metaPath)) {
+          throw new HttpError(
+            503,
+            `Fixtures fehlen in ${opt.dir}: npm run fixtures -w @orderflow/web`,
+          );
+        }
+        // A: nie veralten – meta.json bei jeder Anfrage per mtime prüfen und bei Änderung neu laden
+        const mtime = statSync(metaPath).mtimeMs;
+        if (!store || mtime !== metaMtime) {
+          const old = store;
+          store = new FixtureStore(opt.dir);
+          metaMtime = mtime;
+          if (old) {
+            console.warn(
+              `\n[fixture-api] meta.json geändert – neu geladen (tileConfigVersion ${store.meta.symbols[0]?.tileConfigVersion}). Seiten neu laden.\n`,
             );
           }
-          store = new FixtureStore(opt.dir);
         }
         const r = handleApi(store, new URL(req.url!, 'http://localhost'));
         send(r.status, r.body, r.type);

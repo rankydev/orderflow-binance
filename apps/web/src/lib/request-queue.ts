@@ -30,6 +30,7 @@ export type Scheduler = (fn: () => void, ms: number) => () => void;
 
 const RETRYABLE = new Set([408, 425, 429]);
 export const PARK_MS = 30_000;
+export const MAX_RETRY_AFTER_MS = 5 * 60_000;
 export const MAX_ATTEMPTS = 3;
 
 export function isTransient(status: number): boolean {
@@ -61,7 +62,7 @@ export class RequestQueue {
   lastError = '';
 
   private readonly onLoaded: (key: string, buf: ArrayBuffer) => void;
-  private readonly onRejected: (key: string, status: number) => void;
+  private readonly onRejected: (key: string, status: number, error?: unknown) => void;
   private readonly fetchFn: FetchFn;
   readonly maxParallel: number;
   private readonly now: () => number;
@@ -69,7 +70,7 @@ export class RequestQueue {
 
   constructor(
     onLoaded: (key: string, buf: ArrayBuffer) => void,
-    onRejected: (key: string, status: number) => void,
+    onRejected: (key: string, status: number, error?: unknown) => void,
     fetchFn: FetchFn = (u, i) => fetch(u, i),
     maxParallel = 4,
     now: () => number = () => performance.now(),
@@ -176,6 +177,7 @@ export class RequestQueue {
           if (ac.signal.aborted) return;
           this.failures.delete(w.key);
           this.stats.completed++;
+          if (this.lastError.startsWith(`${w.key}:`)) this.lastError = '';
           // Erst austragen, dann melden: der Verbraucher darf im Rückruf neuen Bedarf setzen.
           // Aus dem Bedarf nehmen: geladen ist geladen, bis der Verbraucher neu fragt (keine Schleife).
           release();
@@ -187,13 +189,15 @@ export class RequestQueue {
             this.lastError = `${w.key}: ${e instanceof Error ? e.message : String(e)}`;
             console.error('Kachel unbrauchbar', this.lastError);
             this.failures.set(w.key, { attempts: 1, retryAt: Infinity, final: true });
-            this.onRejected(w.key, 0);
+            this.onRejected(w.key, 0, e);
           }
         } else if (!isTransient(res.status)) {
           this.stats.failed++;
           this.failures.set(w.key, { attempts: 1, retryAt: Infinity, final: true });
           this.onRejected(w.key, res.status);
         } else {
+          // sichtbar machen (A): wiederholte Serverfehler dürfen nicht still bleiben
+          this.lastError = `${w.key}: HTTP ${res.status} – neuer Versuch folgt`;
           this.fail(w.key, retryAfterMs(res.headers.get('Retry-After')));
         }
       })
@@ -213,7 +217,8 @@ export class RequestQueue {
     f.attempts++;
     const backoff = f.attempts >= MAX_ATTEMPTS ? PARK_MS : 1000 * 2 ** f.attempts;
     if (f.attempts >= MAX_ATTEMPTS) f.attempts = 0; // nach der Pause wieder von vorn
-    f.retryAt = this.now() + Math.max(backoff, retryAfter ?? 0);
+    // N5: Retry-After begrenzen (setTimeout > 2^31 ms feuert sofort → enge Schleife)
+    f.retryAt = this.now() + Math.max(backoff, Math.min(retryAfter ?? 0, MAX_RETRY_AFTER_MS));
     this.failures.set(key, f);
   }
 }

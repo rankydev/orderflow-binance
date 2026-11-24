@@ -145,10 +145,10 @@ export function initialRowSize(
   rs: readonly number[],
   tickRefUnits: number,
   tickUnits: number,
-): number {
+): number | null {
   const n = Math.min(highs.length, lows.length);
   const allowed = rs.filter((r) => r * tickRefUnits >= tickUnits);
-  if (allowed.length === 0) throw new Error('keine zulässige Zeilengröße');
+  if (allowed.length === 0) return null; // N3: kein Wurf; Aufrufer zeigt „kein Footprint"
   if (n === 0) return allowed[0]!;
   const from = Math.max(0, n - 200);
   const ranges: number[] = [];

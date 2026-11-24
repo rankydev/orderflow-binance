@@ -9,7 +9,7 @@ export default defineConfig({
   plugins: [
     svelte(),
     fixtureApi({
-      dir: fileURLToPath(new URL('./fixtures', import.meta.url)),
+      dir: process.env.FIXTURE_DIR ?? fileURLToPath(new URL('./fixtures', import.meta.url)),
       latencyMs: Number(process.env.FIXTURE_LATENCY_MS ?? 0),
     }),
   ],

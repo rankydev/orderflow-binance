@@ -6,8 +6,10 @@ import {
   indexAtOrAfter,
   indexAtOrBefore,
   logicalIndexOfTime,
+  rangeAfterRebuild,
+  tfSwitchAnchorTime,
 } from '../src/lib/bar-store.ts';
-import { exactDecimal, pricePrecision } from '../src/lib/controller.ts';
+import { countItemsIn, exactDecimal, pricePrecision } from '../src/lib/controller.ts';
 import type { BarItem } from '../src/lib/types.ts';
 
 const items = (times: number[]) => times.map((t) => ({ time: t, t }) as unknown as BarItem);
@@ -52,6 +54,11 @@ describe('Index-Suche und Anker', () => {
     expect(indexAtOrBefore(xs, 700)).toBe(1);
     expect(indexAtOrBefore(xs, 660)).toBe(1);
     expect(indexAtOrBefore(xs, 599)).toBe(-1);
+  });
+  it('indexAtOrBefore bei echten Zeitstempeln (~1,8·10^9 s) exakt', () => {
+    const big = items([1_795_391_880, 1_795_391_940, 1_795_392_000]);
+    expect(indexAtOrBefore(big, 1_795_391_940)).toBe(1);
+    expect(indexAtOrBefore(big, 1_795_391_999)).toBe(1);
   });
   it('W8: Zeit im Bar → dieser Bar (10:20 im 1h-Bar 10:00, nicht 11:00)', () => {
     const h = items([36_000, 39_600, 43_200]); // 10:00, 11:00, 12:00
@@ -108,5 +115,54 @@ describe('Helfer', () => {
     expect(pricePrecision(25, 2)).toBe(2); // 0.25
     expect(pricePrecision(100, 2)).toBe(0); // 1
     expect(pricePrecision(5, 3)).toBe(3); // 0.005
+  });
+});
+
+describe('K1: Ausschnitt nach Fensterwechsel (rangeAfterRebuild)', () => {
+  // altes Fenster: 1 000 1m-Bars ab t0; die Geste hat die Ansicht 8 500…8 300 Bars links davon geschoben
+  const t0 = 10_000_000 * 60;
+  const old = items(Array.from({ length: 1000 }, (_, i) => t0 + i * 60));
+  const lr = { from: -8500, to: -8300 };
+  const target = t0 - 8400 * 60; // Zeit der Bildmitte
+  // neu geladener Abschnitt (1 000 Bars), der die Zielzeit enthält
+  const c0 = target - 300 * 60;
+  const fresh = items(Array.from({ length: 1000 }, (_, i) => c0 + i * 60));
+
+  it('liegt im neuen Fenster und ist auf den Bar der Zielzeit zentriert', () => {
+    const r = rangeAfterRebuild(old, lr, fresh, 60);
+    const mid = (r.from + r.to) / 2;
+    expect(mid).toBeGreaterThanOrEqual(0);
+    expect(mid).toBeLessThanOrEqual(fresh.length - 1);
+    expect(fresh[Math.round(mid)]!.time).toBe(target);
+    expect(r.to - r.from).toBe(200);
+  });
+
+  it('die frühere Logik (Anker = nächster Index im alten Fenster) hätte daneben gelegen', () => {
+    const i = Math.min(old.length - 1, Math.max(0, Math.round((lr.from + lr.to) / 2)));
+    const oldAnchor = old[i]!.time; // = t0, 8 400 Bars rechts vom Ziel
+    const idx = Math.min(fresh.length - 1, indexAtOrAfter(fresh, oldAnchor));
+    expect(fresh[idx]!.time).not.toBe(target);
+  });
+
+  it('Zielzeit außerhalb des neuen Fensters → Rand des Fensters, nie daneben', () => {
+    const r = rangeAfterRebuild(old, { from: -50_000, to: -49_800 }, fresh, 60);
+    expect((r.from + r.to) / 2).toBe(0);
+  });
+});
+
+describe('W8: Anker beim tf-Wechsel', () => {
+  it('auf feineren tf: Mitte des alten Bars; auf gröberen: unverändert', () => {
+    expect(tfSwitchAnchorTime(36_000 + 1200, 3600, 60)).toBe(36_000 + 1800); // 1h-Bar 10:00 → 10:30
+    expect(tfSwitchAnchorTime(37_200, 60, 3600)).toBe(37_200);
+  });
+});
+
+describe('A: Querprüfung Kachel ↔ Bars', () => {
+  it('countItemsIn zählt Items in [a, b)', () => {
+    const xs = items([60, 120, 180, 300]);
+    expect(countItemsIn(xs, 60, 181)).toBe(3);
+    expect(countItemsIn(xs, 61, 300)).toBe(2);
+    expect(countItemsIn(xs, 0, 60)).toBe(0);
+    expect(countItemsIn(xs, 400, 500)).toBe(0);
   });
 });

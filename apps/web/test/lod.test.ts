@@ -203,6 +203,10 @@ describe('chooseRowSize (automatische Zeilengröße am Gestenende)', () => {
 });
 
 describe('Start-R (vorläufig, vor der ersten Bewertung)', () => {
+  it('N3: ohne zulässige Zeilengröße null statt Ausnahme', () => {
+    expect(initialRowSize([1], [1], [], TICK, TICK)).toBeNull();
+    expect(initialRowSize([1], [1], [1, 2], TICK, 1000)).toBeNull();
+  });
   it('nie feiner als der aktuelle Tick', () => {
     expect(initialRowSize([100_010], [100_000], RS, TICK, 50)).toBe(5);
   });

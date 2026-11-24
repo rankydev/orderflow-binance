@@ -12,7 +12,8 @@
   let type = $state<FootprintType>(params.get('type') === 'bidask' ? 'bidask' : 'delta');
   // Zeilengröße: 'auto' oder Ticks (URL-Parameter r, z. B. r=50 = 5 USDT bei BTC)
   const rParam = params.get('r');
-  let rMode = $state<string>(rParam && /^\d+$/.test(rParam) ? rParam : 'auto');
+  // nur positive ganze Ticks; alles andere (z. B. r=0) = Auto
+  let rMode = $state<string>(rParam && /^[1-9]\d*$/.test(rParam) ? rParam : 'auto');
   let colorMode = $state<ColorMode>('gradient');
   let colorScope = $state<ColorScope>('visible');
   let symbols = $state.raw<string[]>([]);
@@ -47,7 +48,14 @@
       .catch((e: unknown) => (error = e instanceof Error ? e.message : String(e)));
     // Anzeige höchstens 4×/s aktualisieren (keine Kopplung an Frames).
     timer = setInterval(() => {
-      if (ctl) ro = ctl.readout();
+      if (!ctl) return;
+      ro = ctl.readout();
+      // Auswahl, URL und Controller konsistent halten: angezeigt wird das wirksame R
+      const eff = ro.rAuto ? 'auto' : String(ro.R);
+      if (ready && eff !== rMode && (ro.rAuto || rOptions.includes(ro.R))) {
+        rMode = eff;
+        syncUrl();
+      }
     }, 250);
   });
 
@@ -144,7 +152,12 @@
     </label>
   </header>
 
-  <div class="chart" bind:this={el}></div>
+  <div class="chart" bind:this={el}>
+    {#if (ro && ro.blocked) || error}
+      <!-- A: nicht zoombedingte Gründe ohne Footprint dauerhaft sichtbar -->
+      <div class="banner" role="alert">{error || ro?.blocked}</div>
+    {/if}
+  </div>
 
   <footer class="readout" data-testid="readout">
     {#if error}<span class="err">{error}</span>{/if}
@@ -234,6 +247,19 @@
       12px/1.5 ui-monospace,
       Menlo,
       monospace;
+  }
+  .banner {
+    position: absolute;
+    z-index: 5;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: 80%;
+    padding: 6px 12px;
+    background: #3b1d1d;
+    border: 1px solid #ef5350;
+    color: #ffd7d5;
+    font-weight: 600;
   }
   .legend {
     color: #8b949e;

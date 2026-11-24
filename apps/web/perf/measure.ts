@@ -158,6 +158,11 @@ async function main(): Promise<void> {
   const cx = box.x + box.width / 2 - 40;
   const cy = box.y + box.height / 2;
   const results: Record<string, Any> = {};
+  const failures: string[] = [];
+  const check = (what: string, ok: boolean) => {
+    if (!ok) failures.push(what);
+    console.log(ok ? 'OK  ' : 'FEHL', what);
+  };
   const marks = await page.evaluate(() =>
     Object.fromEntries(
       performance.getEntriesByType('mark').map((m) => [m.name, +m.startTime.toFixed(1)]),
@@ -523,6 +528,12 @@ async function main(): Promise<void> {
     }),
   };
   console.log('longSwipe', JSON.stringify(results.longSwipe));
+  // Review C: die Ansicht muss nach der Geste auf Daten stehen und sich wirklich bewegt haben
+  check('longSwipe: Ansicht auf Daten', results.longSwipe.after.onData === true);
+  check(
+    'longSwipe: Ansicht bewegt',
+    results.longSwipe.after.center < results.longSwipe.before.center,
+  );
 
   // W4: gedrosselte Verbindung (20 Mbit/s, 40 ms) – Start und Pannen
   await cdp.send('Network.enable');
@@ -620,6 +631,21 @@ async function main(): Promise<void> {
   };
   results.totalApiRequests = requests.length;
   results.errors = errors;
+  // über alle Szenarien (jede Seite hat eigene Zähler)
+  const maxVc = Math.max(
+    0,
+    ...Object.values(results).map((v: Any) =>
+      v && typeof v.maxVcWithCells === 'number' ? v.maxVcWithCells : 0,
+    ),
+  );
+  results.cellBudget.maxVcAllScenarios = maxVc;
+  check(`Zellbudget nie überschritten (max ${maxVc})`, maxVc <= 25_000);
+  check(
+    'keine Long Tasks',
+    Object.values(results).every((v: Any) => !v || v.longTasks === undefined || v.longTasks === 0),
+  );
+  check('keine Seitenfehler', errors.length === 0);
+  results.failures = failures;
   await writeFile(join(OUT, 'perf-results.json'), JSON.stringify(results, null, 2));
   console.log(
     'cellBudget',
@@ -633,6 +659,8 @@ async function main(): Promise<void> {
     errors.length,
   );
   await browser.close();
+  if (failures.length > 0) process.exitCode = 1;
 }
 
 await main();
+// (Exit-Code ≠ 0, wenn eine Prüfung fehlschlug; siehe perf-results.json → failures)

@@ -14,22 +14,29 @@ import {
   ColorType,
   createChart,
   CrosshairMode,
+  PriceScaleMode,
   type IChartApi,
   type ISeriesApi,
   type LogicalRange,
   type Time,
   type WhitespaceData,
 } from 'lightweight-charts';
-import { ApiClient } from './api.ts';
+import { ApiClient, SERVER_MISMATCH } from './api.ts';
+import { GestureTracker } from './gesture.ts';
 import {
   BarStore,
   CANDLE_WINDOW_BARS,
   FOOTPRINT_WINDOW_BARS,
+  indexAtOrBefore,
   logicalIndexOfTime,
+  rangeAfterRebuild,
+  tfSwitchAnchorTime,
+  timeAtLogical,
 } from './bar-store.ts';
 import { palette, quantileInPlace, COLOR_REF_PERCENTILE } from './color.ts';
-import { FootprintStore, type PreparedTile } from './footprint-store.ts';
+import { FootprintStore, TileMismatchError, type PreparedTile } from './footprint-store.ts';
 import {
+  nextFallback,
   DOWN_COLOR,
   FootprintSeriesView,
   RenderContext,
@@ -38,7 +45,6 @@ import {
 } from './footprint-series.ts';
 import {
   chooseRowSize,
-  GESTURE_DEBOUNCE_MS,
   initialRowSize,
   L2_MIN_BAR_SPACING,
   L3_MIN_BAR_SPACING,
@@ -61,9 +67,9 @@ import { tfSeconds } from '@orderflow/core/browser';
 export type Mode = 'footprint' | 'candle';
 
 /** Höchstzahl sichtbarer Footprint-Kacheln, die gleichzeitig angefordert werden (W1). */
-export const MAX_VISIBLE_TILES = 12;
-/** K3: Geste endet trotz gedrückter Taste, wenn sich so lange nichts bewegt hat. */
-export const POINTER_WATCHDOG_MS = 1000;
+// N6: an die tatsächliche Sichtbarkeit gekoppelt – bei n = 32 und bs ≥ 6 px deckt 24 bis ≈ 4 600 px
+// Breite; darüber sagt die Anzeige, dass Randkacheln fehlen (statt still Kerzen zu zeichnen).
+export const MAX_VISIBLE_TILES = 24;
 /** K1: Abstand der Abschnittsanforderungen während einer Geste. */
 export const CHUNK_REQUEST_THROTTLE_MS = 250;
 
@@ -100,6 +106,8 @@ export interface Readout {
   textsSkipped: number;
   /** Sichtbarer Fehler (z. B. unbrauchbare Kachel), sonst ''. */
   error: string;
+  /** Grund, warum kein Footprint gezeigt werden kann (nicht zoombedingt), sonst ''. */
+  blocked: string;
 }
 
 interface Anchor {
@@ -132,9 +140,18 @@ export class ChartController {
   private fpStore!: FootprintStore;
   private readonly barQueue: RequestQueue;
   private readonly fpQueue: RequestQueue;
-  private pointerDown = false;
-  private gestureActive = false;
-  private endTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly gesture = new GestureTracker({
+    onBegin: () => {
+      this.initialView = false;
+    },
+    onEnd: () => {
+      this.counters.gestureEnds++;
+      this.evaluate();
+    },
+    onResize: () => {
+      if (!this.destroyed) this.evaluate();
+    },
+  });
   private frameReq = 0;
   private lastCenter = Number.NaN;
   private panDir: -1 | 0 | 1 = 0;
@@ -154,7 +171,6 @@ export class ChartController {
     rChanges: 0,
     modeChanges: 0,
     colorRefs: 0,
-    watchdogReleases: 0,
     /** Längste Dekodier- + Vorbereitungszeit einer Kachel (ms, W4). */
     maxPrepareMs: 0,
   };
@@ -200,7 +216,7 @@ export class ChartController {
     );
     this.fpQueue = new RequestQueue(
       (key, buf) => this.onFpTile(key, buf),
-      (key) => this.onFpRejected(key),
+      (key, status, err) => this.onFpRejected(key, status, err),
     );
 
     this.chart.timeScale().subscribeVisibleLogicalRangeChange(this.onRangeChange);
@@ -223,37 +239,24 @@ export class ChartController {
       el.addEventListener(ev, f as EventListener, { passive: true });
       this.listeners.push(() => el.removeEventListener(ev, f as EventListener));
     };
-    on(container, 'pointerdown', () => {
-      this.pointerDown = true;
-      this.lastRangeChange = performance.now();
-      this.beginGesture();
-      this.armWatchdog();
-    });
-    on(window, 'pointerup', () => this.releasePointer());
-    on(window, 'pointercancel', () => this.releasePointer());
-    // K3: Loslassen außerhalb, Kontextmenü, Fokusverlust, verlorener Pointer-Capture beenden die Geste
-    on(window, 'blur', () => this.releasePointer());
-    on(container, 'contextmenu', () => this.releasePointer());
-    on(container, 'lostpointercapture', () => this.releasePointer());
+    // Gesten (N1/K3/W7): Regeln in gesture.ts
+    const g = this.gesture;
+    on(container, 'pointerdown', () => g.pointerDown());
+    on(container, 'pointermove', (e) => g.pointerMove(e.buttons));
+    on(window, 'pointerup', () => g.pointerUp());
+    on(window, 'pointercancel', () => g.pointerUp());
+    on(window, 'blur', () => g.pointerUp());
+    on(container, 'contextmenu', () => g.pointerUp());
+    on(container, 'lostpointercapture', () => g.pointerUp());
+    on(container, 'wheel', () => g.wheel());
     const onVis = () => {
-      if (document.visibilityState !== 'visible') this.releasePointer();
+      if (document.visibilityState !== 'visible') g.pointerUp();
     };
     document.addEventListener('visibilitychange', onVis);
     this.listeners.push(() => document.removeEventListener('visibilitychange', onVis));
-    // W7: Größenänderung (Fenster maximieren/verkleinern) wie ein Gestenende bewerten (entprellt)
-    const ro = new ResizeObserver(() => {
-      if (this.resizeTimer) clearTimeout(this.resizeTimer);
-      this.resizeTimer = setTimeout(() => {
-        this.resizeTimer = null;
-        if (!this.gestureActive && !this.destroyed) this.evaluate();
-      }, GESTURE_DEBOUNCE_MS);
-    });
+    const ro = new ResizeObserver(() => g.resize());
     ro.observe(container);
     this.listeners.push(() => ro.disconnect());
-    on(container, 'wheel', () => {
-      this.beginGesture();
-      this.armEnd();
-    });
   }
 
   /** Rückruf für die Hover-Anzeige (Text oder ''), gesetzt vom UI. */
@@ -270,7 +273,15 @@ export class ChartController {
     if (price === null) return '';
     const unit = Math.round(price * this.rc.priceScale);
     const time = new Date(p.t * 1000).toISOString().slice(0, 16).replace('T', ' ');
-    const hit = this.lookupBar(p.t);
+    // N8: wo Kerzen gezeichnet werden, Kerzenwerte zeigen (keine Footprint-Werte aus dem Cache)
+    const candles = this.mode === 'candle' || this.rc.stats.lod === 1;
+    const hit = candles ? null : this.lookupBar(p.t);
+    if (candles) {
+      const it = this.items[indexAtOrBefore(this.items, p.t)];
+      if (!it || it.time !== p.t) return `${time} UTC`;
+      const px2 = (u: number) => exactDecimal(u, this.sym.priceDecimals);
+      return `${time} UTC · O ${px2(it.o)} · H ${px2(it.h)} · L ${px2(it.l)} · C ${px2(it.c)}`;
+    }
     if (!hit) return `${time} UTC`;
     const [tile, bi, width] = hit;
     const row = Math.floor(unit / width);
@@ -313,9 +324,7 @@ export class ChartController {
     this.barQueue.cancelAll();
     this.fpQueue.cancelAll();
     for (const f of this.listeners) f();
-    if (this.endTimer) clearTimeout(this.endTimer);
-    if (this.watchdog) clearTimeout(this.watchdog);
-    if (this.resizeTimer) clearTimeout(this.resizeTimer);
+    this.gesture.dispose();
     if (this.frameReq) cancelAnimationFrame(this.frameReq);
     this.chart.remove();
   }
@@ -325,7 +334,13 @@ export class ChartController {
       this.rAuto = false;
       this.manualR = rowMode;
     }
-    const r = await this.api.symbols();
+    let r;
+    try {
+      r = await this.api.symbols();
+    } catch (e) {
+      this.blocked = e instanceof Error ? e.message : String(e);
+      throw e;
+    }
     this.symbols = r.symbols;
     const s = this.symbols.find((x) => x.name === sym) ?? this.symbols[0];
     if (!s) throw new Error('keine Symbole');
@@ -343,13 +358,22 @@ export class ChartController {
     if (!this.sym || tf === this.tf) return;
     const a = this.currentAnchor();
     // W8: beim Wechsel auf einen feineren tf die Mitte des alten Bars verankern, nicht seinen Beginn
-    if (a && tfSeconds(tf) < this.tfSec) a.centerSec += this.tfSec / 2;
+    if (a) a.centerSec = tfSwitchAnchorTime(a.centerSec, this.tfSec, tfSeconds(tf));
     this.setSeries(this.sym.name, tf, a);
   }
 
   setType(t: FootprintType): void {
     this.rc.type = t;
     this.colorRefDirty = true;
+    // Unberührte Startansicht: Bar-Abstand passend zum Typ (Bid×Ask braucht ≥ 80 px für Zahlen)
+    if (this.initialView && this.items.length > 0) {
+      const ts = this.chart.timeScale();
+      ts.applyOptions({ barSpacing: initialBarSpacing(t) });
+      ts.scrollToRealTime();
+      requestAnimationFrame(() => {
+        if (!this.destroyed) this.evaluate();
+      });
+    }
     this.evaluate();
   }
 
@@ -374,7 +398,14 @@ export class ChartController {
     } else {
       this.rAuto = false;
       this.manualR = r;
-      this.applyR(r);
+      const rs = this.availableR();
+      if (rs.includes(r)) this.applyR(r);
+      else if (rs.length > 0) {
+        // N7: nicht angebotenes R nicht still ignorieren – nächstes nehmen und sagen
+        const near = nearestR(rs, r);
+        this.applyR(near);
+        this.manualNote = `R ${r} für ${this.tf} nicht verfügbar → ${near}`;
+      }
     }
     this.evaluate();
   }
@@ -412,7 +443,7 @@ export class ChartController {
       barSpacing: this.chart.timeScale().options().barSpacing,
       rowHeight: fpMode ? st.rh : this.estRh,
       windowBars: this.items.length,
-      hint: this.hint,
+      hint: [this.hint, this.tileNote].filter(Boolean).join('; '),
       requests: this.fpQueue.stats.started + this.barQueue.stats.started,
       inFlight: this.fpQueue.stats.inFlight + this.barQueue.stats.inFlight,
       aborted: this.fpQueue.stats.aborted + this.barQueue.stats.aborted,
@@ -427,7 +458,8 @@ export class ChartController {
       rowsMax: fpMode ? Math.max(0, ...st.rowsPerBar) : 0,
       textsShortened: fpMode ? st.textsShortened : 0,
       textsSkipped: fpMode ? st.textsSkipped : 0,
-      error: this.fpQueue.lastError || this.barQueue.lastError,
+      error: this.blocked || this.windowError || this.fpQueue.lastError || this.barQueue.lastError,
+      blocked: this.blocked || this.noFootprint,
     };
   }
 
@@ -447,6 +479,7 @@ export class ChartController {
       textTable: this.fpStore?.text.size ?? 0,
       fpBytes: this.fpStore?.bytes ?? 0,
       gestureActive: this.gestureActive,
+      watchdogReleases: this.gesture.watchdogReleases,
     };
   }
 
@@ -510,12 +543,7 @@ export class ChartController {
 
   /** Zeit (s) an einer logischen Position; außerhalb des Fensters linear mit tf fortgesetzt. */
   private timeAtLogical(x: number): number {
-    const n = this.items.length;
-    if (n === 0) return this.anchor?.centerSec ?? 0;
-    const i = Math.round(x);
-    if (i < 0) return this.items[0]!.time + i * this.tfSec;
-    if (i >= n) return this.items[n - 1]!.time + (i - n + 1) * this.tfSec;
-    return this.items[i]!.time;
+    return timeAtLogical(this.items, x, this.tfSec, this.anchor?.centerSec ?? 0);
   }
 
   private visibleTimeRange(): [number, number] | null {
@@ -575,31 +603,25 @@ export class ChartController {
 
   private rebuildWindow(run: [number, number]): void {
     const ts = this.chart.timeScale();
-    let anchorTime: number;
-    let offset = 0;
-    let width: number;
     const lr = ts.getVisibleLogicalRange();
-    if (this.anchor || !lr || this.items.length === 0) {
-      const a = this.anchor ?? { centerSec: this.dataRangeSec()[1], logicalWidth: 200 };
-      anchorTime = a.centerSec;
-      width = a.logicalWidth;
-    } else {
-      // K1: Ankerzeit über timeAtLogical (setzt außerhalb des alten Fensters mit tf fort), nicht
-      // über den nächsten Index im alten Fenster – sonst geht die Zielzeit bei weiten Gesten verloren.
-      const mid = (lr.from + lr.to) / 2;
-      anchorTime = this.timeAtLogical(mid);
-      offset = mid >= 0 && mid <= this.items.length - 1 ? mid - Math.round(mid) : 0;
-      width = lr.to - lr.from;
-    }
+    const oldItems = this.items;
     const items = this.bars.items(run[0], run[1]);
+    // K1: neuer Ausschnitt aus der Zeit der Bildmitte (auch weit außerhalb des alten Fensters),
+    // begrenzt auf das neue Fenster (rangeAfterRebuild, getestet)
+    let range: { from: number; to: number };
+    if (this.anchor || !lr || oldItems.length === 0) {
+      const a = this.anchor ?? { centerSec: this.dataRangeSec()[1], logicalWidth: 200 };
+      const c = logicalIndexOfTime(items, a.centerSec, this.tfSec);
+      range = { from: c - a.logicalWidth / 2, to: c + a.logicalWidth / 2 };
+    } else {
+      range = rangeAfterRebuild(oldItems, lr, items, this.tfSec);
+    }
+    const idx = Math.round((range.from + range.to) / 2);
     this.items = items;
     this.win = run;
     this.candle.setData(items);
     this.fp.setData(this.mode === 'footprint' ? items : []);
     this.counters.setData++;
-    // Position der Ankerzeit im neuen Fenster (W8: letzter Bar ≤ t), auf das Fenster begrenzt
-    const idx = logicalIndexOfTime(items, anchorTime, this.tfSec);
-    const c = idx + offset;
     if (this.anchor?.initial) this.initialView = true;
     if (this.initialView) {
       // Startansicht (Nutzerentscheid, statt §1.4 „~200 Bars"): lesbarer Footprint mit Zahlen, d. h.
@@ -608,7 +630,7 @@ export class ChartController {
       ts.applyOptions({ barSpacing: initialBarSpacing(this.rc.type) });
       ts.scrollToRealTime();
     } else {
-      ts.setVisibleLogicalRange({ from: c - width / 2, to: c + width / 2 } as LogicalRange);
+      ts.setVisibleLogicalRange(range as LogicalRange);
     }
     const hadAnchor = this.anchor !== null;
     this.anchor = null;
@@ -619,8 +641,10 @@ export class ChartController {
     if (!this.rInit && items.length > 0) {
       this.rInit = true;
       const rs = this.availableR();
-      if (this.rAuto) {
-        this.applyR(this.initialR(idx)); // vorläufig; die erste Bewertung wählt nach Lesbarkeit
+      if (rs.length === 0) {
+        // N3: kein Wurf mehr – ohne angebotene Zeilengröße nur Kerzen, sichtbar begründet
+      } else if (this.rAuto) {
+        this.applyR(this.initialR(idx)!); // vorläufig; die erste Bewertung wählt nach Lesbarkeit
       } else if (rs.includes(this.manualR ?? -1)) {
         this.applyR(this.manualR!);
       } else {
@@ -643,15 +667,22 @@ export class ChartController {
   }
 
   private manualNote = '';
+  /** Nicht zoombedingter Grund, warum kein Footprint gezeigt wird ('' = keiner). */
+  private noFootprint = '';
+  private tileNote = '';
+  private evalRetries = 0;
+  /** A: dauerhafte Sperre (Server unverträglich) – sichtbar in der Anzeige. */
+  private blocked = '';
+  private symbolsRefetched = false;
+  /** N3: Fehler beim Fensterwechsel (sichtbar). */
+  private windowError = '';
   private destroyed = false;
-  private lastRangeChange = 0;
-  private watchdog: ReturnType<typeof setTimeout> | null = null;
-  private resizeTimer: ReturnType<typeof setTimeout> | null = null;
+
   private lastChunkRequest = 0;
   /** Vom Nutzer gewähltes R (Ticks) oder null bei Auto. */
   private manualR: number | null = null;
 
-  private initialR(atIndex = this.items.length - 1): number {
+  private initialR(atIndex = this.items.length - 1): number | null {
     const to = Math.max(0, Math.min(this.items.length - 1, atIndex));
     const from = Math.max(0, to - 199);
     const highs: number[] = [];
@@ -679,7 +710,14 @@ export class ChartController {
     // W6: bis die sichtbaren Kacheln der neuen Größe da sind, zeichnet der Renderer fehlende Bars mit
     // der bisherigen Größe (gleicher tf) statt als Kerzen.
     if (this.rc.series !== series && this.rc.series.startsWith(`${this.sym.name}|${this.tf}|`)) {
-      this.rc.prev = { series: this.rc.series, n: this.rc.n, width: this.rc.width };
+      // N2: die bisherige Größe nur dann als Rückfall nehmen, wenn sie sichtbar vollständig geladen
+      // ist; sonst die ältere (geladene) behalten
+      this.rc.prev = nextFallback(
+        this.rc.prev,
+        { series: this.rc.series, n: this.rc.n, width: this.rc.width },
+        this.visibleComplete(this.rc.series, this.rc.n),
+        series,
+      );
     } else if (this.rc.series !== series) {
       this.rc.prev = null;
     }
@@ -691,6 +729,18 @@ export class ChartController {
     this.colorRefDirty = true;
     this.scheduleFrame();
     this.redraw();
+  }
+
+  /** Sind alle sichtbaren Kacheln dieser Serie geladen? (ohne sichtbaren Bereich: ja) */
+  private visibleComplete(series: string, n: number): boolean {
+    const vis = this.items.length > 0 ? this.visibleTimeRange() : null;
+    if (!vis) return true;
+    const [df, dt] = this.dataRangeSec();
+    const span = n * this.tfSec;
+    const a = Math.floor(Math.max(vis[0], df) / span);
+    const b = Math.floor(Math.min(vis[1], dt - 1) / span);
+    for (let k = a; k <= b; k++) if (!this.fpStore.has(series, k)) return false;
+    return true;
   }
 
   private setMode(m: Mode): void {
@@ -713,52 +763,12 @@ export class ChartController {
   // Gesten beginnen nur mit Nutzereingaben (Zeiger, Rad, Tasten); Bereichsänderungen verlängern eine
   // laufende Geste (z. B. Touch-Kinetik), programmatische Änderungen (setData, Fensterwechsel) nicht.
   private readonly onRangeChange = (): void => {
-    this.lastRangeChange = performance.now();
-    if (this.gestureActive) this.armEnd();
+    this.gesture.rangeChange();
     this.scheduleFrame();
   };
 
-  /**
-   * K3-Sicherung: hängt `pointerDown` (kein pointerup kam an), endet die Geste spätestens, wenn sich
-   * der sichtbare Bereich POINTER_WATCHDOG_MS lang nicht geändert hat.
-   */
-  private armWatchdog(): void {
-    if (this.watchdog) clearTimeout(this.watchdog);
-    this.watchdog = setTimeout(() => {
-      this.watchdog = null;
-      if (!this.pointerDown) return;
-      if (performance.now() - this.lastRangeChange >= POINTER_WATCHDOG_MS) {
-        this.counters.watchdogReleases++;
-        this.releasePointer();
-      } else this.armWatchdog();
-    }, POINTER_WATCHDOG_MS);
-  }
-
-  private beginGesture(): void {
-    this.gestureActive = true;
-    this.initialView = false;
-    if (this.endTimer) {
-      clearTimeout(this.endTimer);
-      this.endTimer = null;
-    }
-  }
-
-  private releasePointer(): void {
-    if (!this.pointerDown) return;
-    this.pointerDown = false;
-    this.armEnd();
-  }
-
-  private armEnd(): void {
-    if (this.endTimer) clearTimeout(this.endTimer);
-    this.endTimer = null;
-    if (this.pointerDown) return;
-    this.endTimer = setTimeout(() => {
-      this.endTimer = null;
-      this.gestureActive = false;
-      this.counters.gestureEnds++;
-      this.evaluate();
-    }, GESTURE_DEBOUNCE_MS);
+  private get gestureActive(): boolean {
+    return this.gesture.active;
   }
 
   /** Sichtbare Geometrie aus der Bibliothek (nur am Gestenende/bei Bedarf, nicht je Frame). */
@@ -796,9 +806,33 @@ export class ChartController {
   /** Gestenende: Zeilengröße, Modus, Fenster, Farbreferenz (KONZEPT §7.2). */
   private evaluate(): void {
     if (!this.sym || this.items.length === 0) return;
+    const rs = this.availableR();
+    // Gründe, warum kein Footprint möglich ist (nicht zoombedingt) – sichtbar in der Anzeige (A)
+    const scaleMode = this.chart.priceScale('right').options().mode;
+    this.noFootprint =
+      rs.length === 0
+        ? `kein Footprint für ${this.tf} (keine Zeilengröße angeboten)`
+        : scaleMode !== PriceScaleMode.Normal
+          ? 'Preisskala nicht linear – nur Kerzen'
+          : this.blocked;
+    if (this.noFootprint) {
+      this.setMode('candle');
+      this.ensureWindow();
+      return;
+    }
     const g = this.measure();
+    if (!g) {
+      // Preisskala noch nicht vermessen (vor dem ersten Zeichnen): nicht still aufgeben, im
+      // nächsten Frame erneut (begrenzt); sichtbar als Grund
+      this.noFootprint = 'Ansicht wird vermessen …';
+      if (this.evalRetries++ < 60) {
+        requestAnimationFrame(() => {
+          if (!this.destroyed) this.evaluate();
+        });
+      } else this.noFootprint = 'Ansicht nicht vermessbar (Preisskala leer)';
+    }
     if (g) {
-      const rs = this.availableR();
+      this.evalRetries = 0;
       const bs = this.chart.timeScale().options().barSpacing;
       const cls = rowClassFor(bs, this.rc.type, this.rowClass);
       this.rowClass = cls;
@@ -896,6 +930,10 @@ export class ChartController {
     const capped = list.filter((w) =>
       w.priority === 0 ? ++vis0 <= MAX_VISIBLE_TILES : vis0 <= MAX_VISIBLE_TILES,
     );
+    this.tileNote =
+      vis0 > MAX_VISIBLE_TILES
+        ? `${vis0} Kacheln sichtbar, ${MAX_VISIBLE_TILES} geladen – Ränder als Kerzen`
+        : '';
     const series = this.rc.series;
     const wants: Want[] = [];
     const retain = new Set<string>();
@@ -950,16 +988,30 @@ export class ChartController {
       from: Number(c) * span,
       to: (Number(c) + 1) * span,
     });
-    if (!this.gestureActive) this.ensureWindow();
+    // N3: Fehler beim Fensterwechsel gehören nicht zur Antwort (sonst würde der gültige Abschnitt
+    // als Lücke überschrieben) – eigene, sichtbare Meldung
+    if (!this.gestureActive) this.safely('Fensterwechsel', () => this.ensureWindow());
+  }
+
+  /** Führt fn aus; ein Fehler wird sichtbar (Anzeige + Konsole), statt die Ursache zu verschleiern. */
+  private safely(what: string, fn: () => unknown): void {
+    try {
+      fn();
+      this.windowError = '';
+    } catch (e) {
+      this.windowError = `${what}: ${e instanceof Error ? e.message : String(e)}`;
+      console.error(this.windowError, e);
+    }
   }
 
   /** H3: ein endgültig fehlender Abschnitt wird als Lücke geführt, damit das Fenster darüber wachsen kann. */
   private onBarRejected(key: string): void {
     const [series, c] = key.split('#') as [string, string];
     if (series !== this.bars.series) return;
-    this.bars.markEmpty(Number(c));
+    // N3: einen bereits geladenen Abschnitt nie durch eine Lücke ersetzen
+    if (!this.bars.has(Number(c))) this.bars.markEmpty(Number(c));
     this.hint = `Bar-Abschnitt ${c} nicht ladbar – Lücke`;
-    if (!this.gestureActive) this.ensureWindow();
+    if (!this.gestureActive) this.safely('Fensterwechsel', () => this.ensureWindow());
   }
 
   private onFpTile(key: string, buf: ArrayBuffer): void {
@@ -979,6 +1031,28 @@ export class ChartController {
     });
     const ms = performance.now() - t0;
     if (ms > this.counters.maxPrepareMs) this.counters.maxPrepareMs = ms;
+    // A: Querprüfung gegen die Bars desselben Zeitraums (gleiche Quelle, gleiche Bars): im Überlapp von
+    // Kachel und Fenster muss die Kachel genau die Bars des Fensters haben. Sonst sind Server und Seite
+    // nicht auf demselben Stand (beobachtet: veralteter Server lieferte leere Kacheln).
+    const tile = this.fpStore.get(series, Number(key.slice(i + 1)));
+    if (tile && tile !== 'rejected' && tf === this.tf && this.items.length > 0) {
+      const a = Math.max(tile.fromSec, this.items[0]!.time);
+      const b = Math.min(
+        tile.fromSec + tile.n * this.tfSec,
+        this.items[this.items.length - 1]!.time + 1,
+      );
+      if (b > a) {
+        const expected = countItemsIn(this.items, a, b);
+        let got = 0;
+        for (let j = 0; j < tile.nBars; j++) if (tile.time[j]! >= a && tile.time[j]! < b) got++;
+        if (expected !== got) {
+          this.fpStore.markRejected(series, tile.k);
+          this.fpQueue.lastError = `Kachel ${key}: ${got} Bars, erwartet ${expected}`;
+          this.onServerMismatch();
+          return;
+        }
+      }
+    }
     this.fpStore.evict(this.wantedFp);
     if (series === this.rc.series) {
       this.colorRefDirty = true;
@@ -987,9 +1061,44 @@ export class ChartController {
     }
   }
 
-  private onFpRejected(key: string): void {
+  private onFpRejected(key: string, status: number, err?: unknown): void {
     const i = key.lastIndexOf('#');
     this.fpStore.markRejected(key.slice(0, i), Number(key.slice(i + 1)));
+    // A: Kachel passt nicht zur Anfrage (n/R/…) oder 409 (Kachelkonfiguration veraltet) → Server und
+    // Seite sind nicht auf demselben Stand
+    if (status === 409 || err instanceof TileMismatchError) this.onServerMismatch();
+  }
+
+  /**
+   * A: einmal /symbols neu laden. Hat sich die Kachelkonfiguration geändert, mit dem neuen Stand
+   * weiterarbeiten; sonst (oder beim zweiten Mal) dauerhaft und sichtbar melden.
+   */
+  private onServerMismatch(): void {
+    if (this.blocked) return;
+    if (this.symbolsRefetched) {
+      this.blocked = SERVER_MISMATCH;
+      this.fpQueue.cancelAll();
+      return;
+    }
+    this.symbolsRefetched = true;
+    const before = JSON.stringify(this.sym);
+    this.api
+      .symbols()
+      .then((r) => {
+        const s = r.symbols.find((x) => x.name === this.sym.name);
+        if (!s || JSON.stringify(s) === before) {
+          this.blocked = SERVER_MISMATCH;
+          this.fpQueue.cancelAll();
+          return;
+        }
+        this.symbols = r.symbols;
+        this.fpStore = new FootprintStore(s.qtyDecimals);
+        this.fpQueue.clearFailures();
+        this.setSeries(s.name, this.tf, this.currentAnchor());
+      })
+      .catch((e: unknown) => {
+        this.blocked = e instanceof Error ? e.message : SERVER_MISMATCH;
+      });
   }
 
   /** P95 der |Werte| über die sichtbaren Bars (KONZEPT §6.1), nicht je Frame. */
@@ -1095,4 +1204,9 @@ export function pricePrecision(tickRefUnits: number, priceDecimals: number): num
     d--;
   }
   return d;
+}
+
+/** Anzahl Items mit time in [a, b). */
+export function countItemsIn(items: readonly BarItem[], a: number, b: number): number {
+  return Math.max(0, indexAtOrBefore(items, b - 1) - indexAtOrBefore(items, a - 1));
 }

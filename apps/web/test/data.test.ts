@@ -19,7 +19,12 @@ import {
   prepareTile,
   TileMismatchError,
 } from '../src/lib/footprint-store.ts';
-import { PARK_MS, RequestQueue, retryAfterMs } from '../src/lib/request-queue.ts';
+import {
+  MAX_RETRY_AFTER_MS,
+  PARK_MS,
+  RequestQueue,
+  retryAfterMs,
+} from '../src/lib/request-queue.ts';
 import { chunkIndexAt, wantedTiles, windowChunks } from '../src/lib/tiles.ts';
 
 describe('wantedTiles (sichtbar + Padding + Prefetch, §5.4)', () => {
@@ -516,6 +521,19 @@ describe('RequestQueue (§5.4 + Review W2)', () => {
     q.setWanted(want(['d']), all(['d']));
     expect(pending).toHaveLength(1);
     q.clearFailures(); // per Knopf aufhebbar
+    expect(pending).toHaveLength(2);
+  });
+
+  it('N5: Retry-After wird auf 5 min begrenzt (kein setTimeout-Überlauf, keine enge Schleife)', async () => {
+    const { q, pending, advance } = setup();
+    q.setWanted(want(['r']), all(['r']));
+    pending[0]!.resolve(
+      new Response('', { status: 503, headers: { 'Retry-After': '99999999999' } }),
+    );
+    await tick();
+    advance(MAX_RETRY_AFTER_MS - 1);
+    expect(pending).toHaveLength(1);
+    advance(1);
     expect(pending).toHaveLength(2);
   });
 

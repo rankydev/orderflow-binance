@@ -132,7 +132,15 @@ export function indexAtOrAfter(items: readonly BarItem[], t: number): number {
 
 /** Index des letzten Items mit time ≤ t (−1, wenn keins); W8: der Bar, der t enthält. */
 export function indexAtOrBefore(items: readonly BarItem[], t: number): number {
-  return indexAtOrAfter(items, t + 1e-9) - 1;
+  // erster Index mit time > t, minus 1 (kein t + ε: bei ~10^9 s verschwindet ε im Gleitkomma)
+  let lo = 0;
+  let hi = items.length;
+  while (lo < hi) {
+    const m = (lo + hi) >>> 1;
+    if (items[m]!.time <= t) lo = m + 1;
+    else hi = m;
+  }
+  return lo - 1;
 }
 
 /**
@@ -145,4 +153,44 @@ export function logicalIndexOfTime(items: readonly BarItem[], t: number, tfSec: 
   if (n === 0) return 0;
   if (t < items[0]!.time) return Math.max(0, Math.floor((t - items[0]!.time) / tfSec));
   return Math.min(n - 1, Math.max(0, indexAtOrBefore(items, t)));
+}
+
+/** Zeit (s) an einer logischen Position; außerhalb der Items linear mit tf fortgesetzt. */
+export function timeAtLogical(
+  items: readonly BarItem[],
+  x: number,
+  tfSec: number,
+  fallback = 0,
+): number {
+  const n = items.length;
+  if (n === 0) return fallback;
+  const i = Math.round(x);
+  if (i < 0) return items[0]!.time + i * tfSec;
+  if (i >= n) return items[n - 1]!.time + (i - n + 1) * tfSec;
+  return items[i]!.time;
+}
+
+/**
+ * Sichtbarer Bereich nach einem Fensterwechsel (K1): Ankerzeit = Zeit der Bildmitte im alten Fenster
+ * (auch weit außerhalb, fortgesetzt), Position im neuen Fenster per logicalIndexOfTime (begrenzt), Breite
+ * und Nachkomma-Versatz der Mitte bleiben erhalten.
+ */
+export function rangeAfterRebuild(
+  oldItems: readonly BarItem[],
+  lr: { from: number; to: number },
+  newItems: readonly BarItem[],
+  tfSec: number,
+): { from: number; to: number } {
+  const mid = (lr.from + lr.to) / 2;
+  const width = lr.to - lr.from;
+  const t = timeAtLogical(oldItems, mid, tfSec);
+  const offset = mid >= 0 && mid <= oldItems.length - 1 ? mid - Math.round(mid) : 0;
+  const c = logicalIndexOfTime(newItems, t, tfSec) + offset;
+  return { from: c - width / 2, to: c + width / 2 };
+}
+
+/** W8: Ankerzeit beim tf-Wechsel – auf einen feineren tf die Mitte des alten Bars. */
+export function tfSwitchAnchorTime(centerSec: number, oldTfSec: number, newTfSec: number): number {
+  if (newTfSec >= oldTfSec) return centerSec;
+  return centerSec - (centerSec % oldTfSec) + oldTfSec / 2;
 }

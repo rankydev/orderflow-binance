@@ -4,7 +4,12 @@ import { describe, expect, it } from 'vitest';
 import { encodeTile, type TileData } from '@orderflow/core/browser';
 import { palette } from '../src/lib/color.ts';
 import { FootprintStore } from '../src/lib/footprint-store.ts';
-import { FootprintRenderer, RenderContext, type FpItem } from '../src/lib/footprint-series.ts';
+import {
+  FootprintRenderer,
+  nextFallback,
+  RenderContext,
+  type FpItem,
+} from '../src/lib/footprint-series.ts';
 
 class RecordingCtx {
   rects = 0;
@@ -233,5 +238,24 @@ describe('FootprintRenderer', () => {
     // Slot-Index außerhalb der Tabelle (undefined) darf nicht als gültiger Bar gelten
     const tile = rc.store!.tiles('X|1m|5')!.get(0) as { slot: Int32Array };
     expect(tile.slot[5000]).toBeUndefined();
+  });
+
+  it('N2: zweiter R-Wechsel vor dem Laden behält die geladene Größe als Rückfall', () => {
+    const A = { series: 'X|1m|5', n: 1024, width: W };
+    const B = { series: 'X|1m|10', n: 1024, width: 2 * W };
+    // A → B: A ist geladen → Rückfall A
+    let prev = nextFallback(null, A, true, B.series);
+    expect(prev).toEqual(A);
+    // B → C, B noch nicht geladen → A bleibt Rückfall
+    prev = nextFallback(prev, B, false, 'X|1m|20');
+    expect(prev).toEqual(A);
+    // zurück auf A → kein Rückfall nötig
+    expect(nextFallback(prev, B, false, A.series)).toBeNull();
+    // Renderer: Serie C leer, Rückfall A → Bars aus A gezeichnet
+    const { rc, draw } = setup(10, 7, 400, [0, 10]);
+    rc.prev = prev;
+    rc.series = 'X|1m|20';
+    draw();
+    expect(rc.stats.cellsDrawn).toBe(10 * N_ROWS);
   });
 });

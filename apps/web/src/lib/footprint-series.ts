@@ -93,9 +93,26 @@ export class RenderContext {
    * mit der alten gezeichnet statt als Kerzen; der Controller löscht `prev`, sobald alle sichtbaren
    * Kacheln der neuen Größe da sind.
    */
-  prev: { series: string; n: number; width: number } | null = null;
+  prev: Fallback | null = null;
   readonly stats = new FrameStats();
   onFirstFootprint: (() => void) | null = null;
+}
+
+export type Fallback = { series: string; n: number; width: number };
+
+/**
+ * Rückfall-Größe nach einem R-Wechsel (W6/N2): die bisherige Größe `current` nur übernehmen, wenn sie
+ * im sichtbaren Bereich vollständig geladen ist; sonst die ältere `prev` behalten (die noch zeichnet).
+ * Wechselt R auf die Rückfall-Größe selbst zurück, entfällt sie.
+ */
+export function nextFallback(
+  prev: Fallback | null,
+  current: Fallback,
+  currentComplete: boolean,
+  nextSeries: string,
+): Fallback | null {
+  const pick = currentComplete || !prev ? current : prev;
+  return pick.series === nextSeries ? null : pick;
 }
 
 /** Wachsender Rechteckpuffer je Farbe (x, y, w, h in Bitmap-px). */
