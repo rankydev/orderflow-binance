@@ -1,0 +1,14 @@
+{
+  "name": "@orderflow/recorder",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Daemon: WebSocket-aggTrades, Lückenerkennung, Spool (Phase P2)",
+  "scripts": {
+    "start": "node --env-file-if-exists=../../.env src/main.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2"
+  }
+}

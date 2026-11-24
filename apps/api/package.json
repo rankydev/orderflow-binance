@@ -1,0 +1,14 @@
+{
+  "name": "@orderflow/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Daemon: lesende HTTP/WS-API (Phase P1 bars/footprint/quality)",
+  "scripts": {
+    "start": "node --env-file-if-exists=../../.env src/main.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2"
+  }
+}
