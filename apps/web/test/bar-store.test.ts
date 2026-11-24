@@ -9,10 +9,16 @@ import {
   rangeAfterRebuild,
   tfSwitchAnchorTime,
 } from '../src/lib/bar-store.ts';
-import { countItemsIn, exactDecimal, pricePrecision } from '../src/lib/controller.ts';
+import {
+  compareTileWithBars,
+  countItemsIn,
+  exactDecimal,
+  pricePrecision,
+} from '../src/lib/controller.ts';
 import type { BarItem } from '../src/lib/types.ts';
 
-const items = (times: number[]) => times.map((t) => ({ time: t, t }) as unknown as BarItem);
+const items = (times: number[], v = 1) =>
+  times.map((t) => ({ time: t, t, v }) as unknown as BarItem);
 
 function chunk(sym: string, tf: string, from: number, to: number, times: number[]) {
   const n = times.length;
@@ -164,5 +170,30 @@ describe('A: Querprüfung Kachel ↔ Bars', () => {
     expect(countItemsIn(xs, 61, 300)).toBe(2);
     expect(countItemsIn(xs, 0, 60)).toBe(0);
     expect(countItemsIn(xs, 400, 500)).toBe(0);
+  });
+});
+
+describe('W-3/H-1: Querprüfung Kachel ↔ /bars', () => {
+  const xs = items([60, 120, 180, 300], 5);
+  it('gleiche Bars und Mengen → keine Abweichung', () => {
+    expect(compareTileWithBars(xs, [60, 120, 180], [5, 5, 5], 3, 0, 240)).toBe('');
+  });
+  it('fehlender Bar oder andere Menge wird gemeldet', () => {
+    expect(compareTileWithBars(xs, [60, 180], [5, 5], 2, 0, 240)).toMatch(/Bar 120 nur in \/bars/);
+    expect(compareTileWithBars(xs, [60, 120, 180], [5, 6, 5], 3, 0, 240)).toMatch(
+      /Bar 120: Menge 6/,
+    );
+    expect(compareTileWithBars(xs, [], [], 0, 0, 240)).toMatch(/Bar 60 nur in \/bars/);
+  });
+  it('BarStore: nur finale Abschnitte ohne Lücke gelten als prüfbar; drop lädt neu', () => {
+    const b = new BarStore('S|1m', 2);
+    const span = 60_000_000;
+    b.addEncoded(0, chunk('S', '1m', 0, span, [0, 60]));
+    b.markEmpty(1);
+    expect(b.allFinal(0, 0)).toBe(true);
+    expect(b.allFinal(0, 1)).toBe(false); // Lücke → keine Querprüfung (W-3a)
+    b.drop(0);
+    expect(b.has(0)).toBe(false);
+    expect(b.allFinal(0, 0)).toBe(false);
   });
 });

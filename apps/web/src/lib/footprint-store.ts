@@ -31,6 +31,8 @@ export interface PreparedTile {
   /** Farbreferenz je Bar (P95 von |Delta| bzw. von buy/sell) für den Bereich „je Bar". */
   refDelta: Float64Array;
   refVol: Float64Array;
+  /** buyQ + sellQ je Bar (Querprüfung gegen /bars, H-1). */
+  vol: Float64Array;
   /** Bytes der Typed Arrays (für die Speicheranzeige). */
   bytes: number;
   /** Alle überdeckten Tage final (unveränderlich); sonst läuft die Kachel nach NONFINAL_TTL_MS ab (W3). */
@@ -41,6 +43,8 @@ export interface PreparedTile {
 
 /** Nicht finale Kacheln (provisorische Tage) gelten nur so lange (W3; Live-Patches folgen in P2). */
 export const NONFINAL_TTL_MS = 60_000;
+/** Abgelehnte Kacheln werden nach dieser Zeit erneut angefragt (W-3). */
+export const REJECT_TTL_MS = 5 * 60_000;
 
 /** Erwartung aus der Anfrage; jede Abweichung im Header ist ein Fehler (Review K2). */
 export interface TileExpectation {
@@ -115,6 +119,8 @@ export function prepareTile(series: string, dec: DecodedTile, now = 0): Prepared
   const poc = new Int32Array(nb);
   const refDelta = new Float64Array(nb);
   const refVol = new Float64Array(nb);
+  const vol = new Float64Array(nb);
+  for (let i = 0; i < nb; i++) vol[i] = dec.bars.buyQ[i]! + dec.bars.sellQ[i]!;
   let scratch = new Float64Array(64);
   for (let i = 0; i < nb; i++) {
     slot[(dec.bars.time[i]! - fromSec) / tfSec] = i;
@@ -155,6 +161,7 @@ export function prepareTile(series: string, dec: DecodedTile, now = 0): Prepared
     slot,
     refDelta,
     refVol,
+    vol,
     bytes,
     final: h.final,
     dataVersion: h.dataVersion,
@@ -172,6 +179,7 @@ export class FootprintStore {
   private readonly lru = new Map<string, PreparedTile>();
   cells = 0;
   bytes = 0;
+  private readonly rejectedAt = new Map<string, number>();
 
   readonly maxCells: number;
 
@@ -200,7 +208,12 @@ export class FootprintStore {
   has(series: string, k: number): boolean {
     const t = this.bySeries.get(series)?.get(k);
     if (t === undefined) return false;
-    return t === 'rejected' || t.final || this.now() - t.loadedAt < NONFINAL_TTL_MS;
+    // W-3: Ablehnungen sind nicht endgültig – nach REJECT_TTL_MS wird erneut angefragt
+    if (t === 'rejected') {
+      const at = this.rejectedAt.get(FootprintStore.key(series, k)) ?? 0;
+      return this.now() - at < REJECT_TTL_MS;
+    }
+    return t.final || this.now() - t.loadedAt < NONFINAL_TTL_MS;
   }
 
   get(series: string, k: number): TileState | undefined {
@@ -244,6 +257,15 @@ export class FootprintStore {
       this.bySeries.set(series, m);
     }
     m.set(k, 'rejected');
+    this.rejectedAt.set(FootprintStore.key(series, k), this.now());
+  }
+
+  /** Kachel vergessen (wird beim nächsten Bedarf neu angefragt). */
+  forget(series: string, k: number): void {
+    const t = this.bySeries.get(series)?.get(k);
+    if (t && t !== 'rejected') this.remove(t);
+    else this.bySeries.get(series)?.delete(k);
+    this.rejectedAt.delete(FootprintStore.key(series, k));
   }
 
   private remove(t: PreparedTile): void {

@@ -15,6 +15,7 @@ import { formatQty, formatQtyShort, TextCache } from '../src/lib/format.ts';
 import {
   FootprintStore,
   NONFINAL_TTL_MS,
+  REJECT_TTL_MS,
   pocRow,
   prepareTile,
   TileMismatchError,
@@ -355,6 +356,18 @@ describe('Kachel-Cache', () => {
     for (const bad of [{ k: 8 }, { n: 64 }, { sym: 'Y' }, { tf: '5m' }, { R: 10 }]) {
       expect(() => store.addEncoded('X|1m|5', buf, { ...ok, ...bad })).toThrow(TileMismatchError);
     }
+  });
+  it('W-3: Ablehnungen sind nicht endgültig (nach 5 min erneut), forget entfernt', () => {
+    let now = 0;
+    const store = new FootprintStore(3, 1e9, () => now);
+    store.markRejected('S', 4);
+    expect(store.has('S', 4)).toBe(true);
+    now = REJECT_TTL_MS;
+    expect(store.has('S', 4)).toBe(false);
+    store.addEncoded('S', encodeTile(tile(1, 32, [[1]])).buffer as ArrayBuffer);
+    store.forget('S', 1);
+    expect(store.has('S', 1)).toBe(false);
+    expect(store.cells).toBe(0);
   });
   it('W3: nicht finale Kacheln laufen nach 60 s ab (werden neu angefragt), finale nie', () => {
     let now = 0;

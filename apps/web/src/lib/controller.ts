@@ -23,6 +23,7 @@ import {
 } from 'lightweight-charts';
 import { ApiClient, SERVER_MISMATCH } from './api.ts';
 import { GestureTracker } from './gesture.ts';
+import { MismatchRecovery } from './mismatch.ts';
 import {
   BarStore,
   CANDLE_WINDOW_BARS,
@@ -106,8 +107,10 @@ export interface Readout {
   textsSkipped: number;
   /** Sichtbarer Fehler (z. B. unbrauchbare Kachel), sonst ''. */
   error: string;
-  /** Grund, warum kein Footprint gezeigt werden kann (nicht zoombedingt), sonst ''. */
+  /** Echte Sperre (Server unverträglich) – Banner; sonst ''. */
   blocked: string;
+  /** Nicht zoombedingter, aber erwarteter/vorübergehender Grund ohne Footprint – normale Zeile. */
+  notice: string;
 }
 
 interface Anchor {
@@ -242,7 +245,10 @@ export class ChartController {
     // Gesten (N1/K3/W7): Regeln in gesture.ts
     const g = this.gesture;
     on(container, 'pointerdown', () => g.pointerDown());
-    on(container, 'pointermove', (e) => g.pointerMove(e.buttons));
+    // auch außerhalb des Charts weiterziehen (z. B. Preisachse bis in die Werkzeugleiste)
+    on(window, 'pointermove', (e) => {
+      if (g.active || g.held) g.pointerMove(e.buttons);
+    });
     on(window, 'pointerup', () => g.pointerUp());
     on(window, 'pointercancel', () => g.pointerUp());
     on(window, 'blur', () => g.pointerUp());
@@ -459,7 +465,8 @@ export class ChartController {
       textsShortened: fpMode ? st.textsShortened : 0,
       textsSkipped: fpMode ? st.textsSkipped : 0,
       error: this.blocked || this.windowError || this.fpQueue.lastError || this.barQueue.lastError,
-      blocked: this.blocked || this.noFootprint,
+      blocked: this.blocked,
+      notice: this.noFootprint && this.noFootprint !== this.blocked ? this.noFootprint : '',
     };
   }
 
@@ -644,7 +651,8 @@ export class ChartController {
       if (rs.length === 0) {
         // N3: kein Wurf mehr – ohne angebotene Zeilengröße nur Kerzen, sichtbar begründet
       } else if (this.rAuto) {
-        this.applyR(this.initialR(idx)!); // vorläufig; die erste Bewertung wählt nach Lesbarkeit
+        const r0 = this.initialR(idx); // vorläufig; die erste Bewertung wählt nach Lesbarkeit
+        if (r0 !== null) this.applyR(r0);
       } else if (rs.includes(this.manualR ?? -1)) {
         this.applyR(this.manualR!);
       } else {
@@ -673,7 +681,11 @@ export class ChartController {
   private evalRetries = 0;
   /** A: dauerhafte Sperre (Server unverträglich) – sichtbar in der Anzeige. */
   private blocked = '';
-  private symbolsRefetched = false;
+  private readonly recovery = new MismatchRecovery();
+  /** Kachelkonfiguration je laufender Anfrage (W-1) */
+  private readonly requestCfg = new Map<string, number>();
+  /** Querprüfungs-Abweichungen je Kachel (W-3) */
+  private readonly crossFails = new Map<string, number>();
   /** N3: Fehler beim Fensterwechsel (sichtbar). */
   private windowError = '';
   private destroyed = false;
@@ -948,6 +960,8 @@ export class ChartController {
       minK = Math.min(minK, w.k);
       maxK = Math.max(maxK, w.k);
       if (this.fpStore.has(series, w.k)) continue;
+      if (this.fpQueue.isFinal(key)) this.fpQueue.forgetFailure(key); // abgelaufene Ablehnung (W-3)
+      this.requestCfg.set(key, this.sym.tileConfigVersion);
       if (w.priority === 0) visibleMissing++;
       wants.push({
         key,
@@ -1018,6 +1032,8 @@ export class ChartController {
     const i = key.lastIndexOf('#');
     const series = key.slice(0, i);
     if (!series.startsWith(`${this.sym.name}|`)) return;
+    const reqCfg = this.takeRequestCfg(key);
+    if (reqCfg !== this.sym.tileConfigVersion) return; // W-1: Antwort der alten Konfiguration verwerfen
     const [sym, tf, R] = series.split('|') as [string, string, string];
     const n = this.sym.tiles[tf]?.[R];
     // K2: Header gegen die Anfrage prüfen; Abweichung wirft (→ endgültig, sichtbar, keine Schleife)
@@ -1031,26 +1047,35 @@ export class ChartController {
     });
     const ms = performance.now() - t0;
     if (ms > this.counters.maxPrepareMs) this.counters.maxPrepareMs = ms;
-    // A: Querprüfung gegen die Bars desselben Zeitraums (gleiche Quelle, gleiche Bars): im Überlapp von
-    // Kachel und Fenster muss die Kachel genau die Bars des Fensters haben. Sonst sind Server und Seite
-    // nicht auf demselben Stand (beobachtet: veralteter Server lieferte leere Kacheln).
+    // A/W-3/H-1: Querprüfung gegen die Bars desselben Zeitraums (gleiche Bars, gleiche Mengen). Nur auf
+    // finalen Daten ohne Lücken (sonst sind Unterschiede legitim). Erste Abweichung: Bar-Abschnitte und
+    // Kachel neu laden; erst eine wiederholte Abweichung gilt als Server/Seite-Abweichung.
     const tile = this.fpStore.get(series, Number(key.slice(i + 1)));
-    if (tile && tile !== 'rejected' && tf === this.tf && this.items.length > 0) {
+    if (tile && tile !== 'rejected' && tile.final && tf === this.tf && this.items.length > 0) {
       const a = Math.max(tile.fromSec, this.items[0]!.time);
       const b = Math.min(
         tile.fromSec + tile.n * this.tfSec,
         this.items[this.items.length - 1]!.time + 1,
       );
-      if (b > a) {
-        const expected = countItemsIn(this.items, a, b);
-        let got = 0;
-        for (let j = 0; j < tile.nBars; j++) if (tile.time[j]! >= a && tile.time[j]! < b) got++;
-        if (expected !== got) {
-          this.fpStore.markRejected(series, tile.k);
-          this.fpQueue.lastError = `Kachel ${key}: ${got} Bars, erwartet ${expected}`;
-          this.onServerMismatch();
+      const c0 = chunkIndexAt(a, this.tfSec);
+      const c1 = chunkIndexAt(b - 1, this.tfSec);
+      if (b > a && this.bars.allFinal(c0, c1)) {
+        const diff = compareTileWithBars(this.items, tile.time, tile.vol, tile.nBars, a, b);
+        if (diff) {
+          const n = (this.crossFails.get(key) ?? 0) + 1;
+          this.crossFails.set(key, n);
+          this.fpQueue.lastError = `Kachel ${key}: ${diff}`;
+          if (n === 1) {
+            for (let c = c0; c <= c1; c++) this.bars.drop(c);
+            this.fpStore.forget(series, tile.k);
+            this.safely('Neuladen', () => this.ensureWindow());
+          } else {
+            this.fpStore.markRejected(series, tile.k);
+            this.onServerMismatch(reqCfg);
+          }
           return;
         }
+        this.crossFails.delete(key);
       }
     }
     this.fpStore.evict(this.wantedFp);
@@ -1063,41 +1088,51 @@ export class ChartController {
 
   private onFpRejected(key: string, status: number, err?: unknown): void {
     const i = key.lastIndexOf('#');
+    const cfg = this.takeRequestCfg(key);
+    if (cfg !== this.sym.tileConfigVersion) return; // Antwort der alten Konfiguration (W-1)
     this.fpStore.markRejected(key.slice(0, i), Number(key.slice(i + 1)));
     // A: Kachel passt nicht zur Anfrage (n/R/…) oder 409 (Kachelkonfiguration veraltet) → Server und
     // Seite sind nicht auf demselben Stand
-    if (status === 409 || err instanceof TileMismatchError) this.onServerMismatch();
+    if (status === 409 || err instanceof TileMismatchError) this.onServerMismatch(cfg);
+  }
+
+  /** Kachelkonfiguration, mit der eine Anfrage gestellt wurde (W-1: späte Antworten erkennen). */
+  private takeRequestCfg(key: string): number {
+    const c = this.requestCfg.get(key);
+    this.requestCfg.delete(key);
+    return c ?? this.sym.tileConfigVersion;
   }
 
   /**
-   * A: einmal /symbols neu laden. Hat sich die Kachelkonfiguration geändert, mit dem neuen Stand
-   * weiterarbeiten; sonst (oder beim zweiten Mal) dauerhaft und sichtbar melden.
+   * A/W-1: Server und Seite nicht auf demselben Stand. Zustandsautomat (mismatch.ts): ein Neuladen von
+   * /symbols je Welle; weitere Abweichungen währenddessen und Antworten der alten Konfiguration werden
+   * ignoriert; gesperrt nur, wenn das Neuladen nichts geändert hat (nach RETRY_MS neuer Versuch).
    */
-  private onServerMismatch(): void {
-    if (this.blocked) return;
-    if (this.symbolsRefetched) {
-      this.blocked = SERVER_MISMATCH;
-      this.fpQueue.cancelAll();
-      return;
-    }
-    this.symbolsRefetched = true;
+  private onServerMismatch(responseCfg: number): void {
+    const act = this.recovery.onMismatch(responseCfg, this.sym.tileConfigVersion, Date.now());
+    if (act !== 'refetch') return;
     const before = JSON.stringify(this.sym);
     this.api
       .symbols()
       .then((r) => {
         const s = r.symbols.find((x) => x.name === this.sym.name);
-        if (!s || JSON.stringify(s) === before) {
+        const changed = !!s && JSON.stringify(s) !== before;
+        this.recovery.onRefetched(changed, Date.now());
+        if (!changed || !s) {
           this.blocked = SERVER_MISMATCH;
           this.fpQueue.cancelAll();
           return;
         }
+        this.blocked = '';
         this.symbols = r.symbols;
         this.fpStore = new FootprintStore(s.qtyDecimals);
+        this.crossFails.clear();
         this.fpQueue.clearFailures();
         this.setSeries(s.name, this.tf, this.currentAnchor());
       })
       .catch((e: unknown) => {
-        this.blocked = e instanceof Error ? e.message : SERVER_MISMATCH;
+        this.recovery.onRefetchFailed(Date.now());
+        this.blocked = `${SERVER_MISMATCH} (${e instanceof Error ? e.message : String(e)})`;
       });
   }
 
@@ -1209,4 +1244,33 @@ export function pricePrecision(tickRefUnits: number, priceDecimals: number): num
 /** Anzahl Items mit time in [a, b). */
 export function countItemsIn(items: readonly BarItem[], a: number, b: number): number {
   return Math.max(0, indexAtOrBefore(items, b - 1) - indexAtOrBefore(items, a - 1));
+}
+
+/**
+ * Vergleicht Bars einer Footprint-Kachel mit den Items aus /bars im Zeitraum [a, b): gleiche Zeiten und
+ * gleiche Mengen je Bar (H-1). Liefert eine Beschreibung der ersten Abweichung oder ''.
+ */
+export function compareTileWithBars(
+  items: readonly BarItem[],
+  time: ArrayLike<number>,
+  vol: ArrayLike<number>,
+  nBars: number,
+  a: number,
+  b: number,
+): string {
+  let i = indexAtOrBefore(items, a - 1) + 1;
+  let j = 0;
+  while (j < nBars && time[j]! < a) j++;
+  let n = 0;
+  for (;;) {
+    const ti = i < items.length && items[i]!.time < b ? items[i]!.time : Infinity;
+    const tj = j < nBars && time[j]! < b ? time[j]! : Infinity;
+    if (ti === Infinity && tj === Infinity) return '';
+    if (ti !== tj)
+      return `Bar ${Math.min(ti, tj)} nur in ${ti < tj ? '/bars' : 'Kachel'} (nach ${n} gleichen)`;
+    if (items[i]!.v !== vol[j]) return `Bar ${ti}: Menge ${vol[j]} ≠ ${items[i]!.v} aus /bars`;
+    i++;
+    j++;
+    n++;
+  }
 }

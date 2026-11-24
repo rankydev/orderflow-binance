@@ -139,6 +139,12 @@ Mit den Fixtures (Zuschlag 1,5): 0 Kacheln über 30 000, 0 abgelehnt; feinste an
 ändert sich die URL). Der Client prüft `sym`, `tf`, `R`, `tile.index`, `tile.n` gegen die Anfrage und verwirft
 Abweichungen endgültig (keine Wiederholung). Leere Kachel (0 Bars) ist eine gültige Antwort.
 
+**Vorbedingung (der Client prüft sie):** Die Bars einer Footprint-Kachel sind für denselben Zeitraum und dieselbe
+`dataVersion` genau die Bars von `/bars` – gleiche Zeiten (Bars ohne Trades fehlen in beiden) und gleiche
+`buyQ + sellQ` je Bar. Auf finalen Daten ohne Lücken lädt der Client bei einer Abweichung Abschnitt und Kachel
+einmal neu; wiederholt sich die Abweichung, lädt er `/symbols` neu und zeigt sonst „Server-Stand passt nicht zur
+Seite". Auf nicht finalen Daten oder über Lücken wird nicht geprüft.
+
 `GET /api/v1/bars?sym&tf&from&to` → Kachel `kind = "bars"`. Der Client fragt nur **ausgerichtete Abschnitte zu
 1 000 Bars** an: `from = c · 1000 · tfSec · 1000`, `to = from + 1000 · tfSec · 1000`; Header-`from`/`to` müssen genau
 der Anfrage entsprechen. Ein Abschnitt kann leer sein.
@@ -150,7 +156,8 @@ Fehler und Statuscodes:
 - `/bars` mit `to > dataTo` (letzter Abschnitt): normal beantworten; Header-`from`/`to` = **exakt die Anfrage**
   (der Abschnitt enthält nur Bars < dataTo). Dasselbe vor `dataFrom`.
 
-Weiter: `400`/`404`/`422` (+ JSON `{error}`) sind endgültig für diese URL; `408`/`425`/`429`/`5xx` werden mit Backoff
+Weiter: `400`/`404`/`422` (+ JSON `{error}`) sind endgültig für diese URL; `409` (veraltete `cfg`) führt zu einem
+einmaligen Neuladen von `/symbols` (Wiederholung frühestens nach 5 min); `408`/`425`/`429`/`5xx` werden mit Backoff
 wiederholt, `Retry-After` (Sekunden oder HTTP-Datum) wird beachtet. Kacheln mit `final = false` hält der Client
 höchstens 60 s, danach fragt er neu (bis die Live-Invalidierung aus §5.4 in P2 kommt). ETag/304 sind erlaubt, werden
 aber vom Client nicht vorausgesetzt.
@@ -173,3 +180,29 @@ nginx ist der Normalfall (§2.4).
 **Offen für die Live-Phase (P2, Review W3):** Bar-Abschnitte laufen im Client nie ab, `/symbols` und `dataTo` werden
 nur beim Start bzw. bei einer Konfigurationsabweichung neu geladen, ein formender Bar fehlt; nicht finale
 Footprint-Kacheln laufen nach 60 s ab. Invalidierung per Live-WS (§5.4) folgt mit dem Recorder.
+
+## Offener Entwurfspunkt für die API: Kachellänge je Zeitabschnitt (Review, nicht umgesetzt)
+
+**Problem der jetzigen Regel:** Mit der gesamten Historie als Referenz und 1,5 × Zuschlag entfernt ein einziger
+Ausreißer-Bar feine Zeilengrößen für **alle** Zeiträume. Gemessen an den Fixture-Tagen (max. Zeilen je 1m-Bar bei
+R = 5 Ticks: 1 110 / 1 755 / 1 017): 1,5 · 1 755 · 32 = 84 240 > 60 000, also wird R = 5 Ticks auf 1m nicht mehr
+angeboten. Ein einziger 1m-Bar mit 3 000 USD Spanne irgendwo in zwei Jahren machte ≈ 5 USDT zur feinsten 1m-Zeile.
+
+**Vorgeschlagene Richtung:**
+- n je **Zeitabschnitt** (z. B. Kalendermonat) bestimmen und in `/symbols` als Abschnittstabelle liefern:
+  `tiles[tf][R] = [{ from, n }, …]` (aufsteigend; ein Abschnitt gilt bis zum nächsten `from`). Kachelindex relativ
+  zum Abschnittsbeginn: Kachel k eines Abschnitts deckt `[from + k·n·tf, from + (k+1)·n·tf)`, letzte Kachel am
+  Abschnittsende abgeschnitten.
+- Angebotene (tf, R) **je Abschnitt** aus dessen Maximum × 1,5 ableiten; der Client wählt nur unter den im sichtbaren
+  Abschnitt angebotenen R (über eine Abschnittsgrenze hinweg: das gröbere der beiden).
+- `cfg` je (tf, R) statt je Symbol versionieren (z. B. `tiles[tf][R].cfg`), damit eine Neuberechnung nicht alle
+  Caches ungültig macht; abgeschlossene Monate sind unveränderlich (ihr n ändert sich nie mehr).
+
+**Abwägung:** + feine Zeilen bleiben in ruhigen Zeiträumen verfügbar, Ausreißer wirken nur in ihrem Monat, weniger
+Cache-Invalidierung; − `/symbols` wächst (Tabelle je tf/R/Monat, ≈ 4 tf · 12 R · 24 Monate ≈ 1 200 Einträge, als JSON
+≈ 30–50 kB, gzip ≈ 5 kB), Kachelgeometrie wird abschnittsabhängig, Kacheln an Monatsgrenzen sind kürzer.
+
+**Was sich im Client ändern würde:** `wantedTiles` rechnet Kachelindizes je Abschnitt (Abschnitt per binärer Suche
+über `from`), der Renderer schlägt die Kachel je Bar über (Abschnitt, k) nach; `availableR` hängt vom sichtbaren
+Bereich ab (Auswahl und Auto-R nur über die dort angebotenen R); die Footprint-URL trägt die `cfg` des (tf, R);
+die Querprüfung und der 409-Pfad bleiben gleich.

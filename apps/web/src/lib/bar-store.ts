@@ -30,6 +30,8 @@ export const MAX_CHUNKS = 80;
 
 export class BarStore {
   private readonly chunks = new Map<number, BarColumns>();
+  /** je Abschnitt: final (aus dem Header) bzw. Lücke (markEmpty) – für die Querprüfung (W-3) */
+  private readonly state = new Map<number, 'final' | 'provisional' | 'gap'>();
   readonly series: string;
   readonly priceDecimals: number;
 
@@ -58,11 +60,25 @@ export class BarStore {
     // Der Decoder garantiert streng aufsteigende Zeiten innerhalb [from, to) → setData-sicher.
     this.chunks.delete(c);
     this.chunks.set(c, dec.bars);
+    this.state.set(c, dec.header.final ? 'final' : 'provisional');
   }
 
   /** Endgültig fehlender Abschnitt als leere Lücke (das Fenster kann darüber wachsen). */
   markEmpty(c: number): void {
     this.chunks.set(c, EMPTY_BARS);
+    this.state.set(c, 'gap');
+  }
+
+  /** Abschnitt vergessen (wird beim nächsten Fensterbedarf neu angefragt). */
+  drop(c: number): void {
+    this.chunks.delete(c);
+    this.state.delete(c);
+  }
+
+  /** Alle Abschnitte c0…c1 geladen, final und keine Lücke? */
+  allFinal(c0: number, c1: number): boolean {
+    for (let c = c0; c <= c1; c++) if (this.state.get(c) !== 'final') return false;
+    return true;
   }
 
   get size(): number {
@@ -111,6 +127,7 @@ export class BarStore {
           h,
           l,
           c: cl,
+          v: b.buyQ[i]! + b.sellQ[i]!,
         });
       }
     }

@@ -329,35 +329,36 @@ function stressSeries(sym: SymbolMeta, from: number, to: number, width: number |
     bars.open[i] = lo[i]! + 100 * tick;
     bars.close[i] = hi[i]! - 100 * tick;
     if (levels) levels.levelOffset[i] = j;
+    // Werte je Tick (konsistent für jede Zeilengröße: Zeile = Summe ihrer Ticks), Querprüfung H-1
     let sb = 0;
     let ss = 0;
-    for (const r of rowsOf[i]!) {
-      const b = 1 + hash(t, r * 3);
-      const s = 1 + hash(t, r * 3 + 1);
+    let rowKey = Number.NaN;
+    for (let tk = Math.floor(lo[i]! / tick); tk <= Math.floor(hi[i]! / tick); tk++) {
+      const b = 1 + hash(t, tk * 3);
+      const s = 1 + hash(t, tk * 3 + 1);
       sb += b;
       ss += s;
-      if (levels) {
+      if (!levels) continue;
+      const r = Math.floor((tk * tick) / w);
+      if (r !== rowKey) {
+        rowKey = r;
         levels.row[j] = r;
-        levels.buy[j] = b;
-        levels.sell[j] = s;
-        levels.buyA[j] = 1;
-        levels.sellA[j] = 1;
+        levels.buy[j] = 0;
+        levels.sell[j] = 0;
+        levels.buyA[j] = 0;
+        levels.sellA[j] = 0;
         j++;
       }
+      levels.buy[j - 1]! += b;
+      levels.sell[j - 1]! += s;
+      levels.buyA[j - 1]! += 1;
+      levels.sellA[j - 1]! += 1;
     }
-    if (!width) {
-      // Bars ohne Level: Mengen trotzdem konsistent zu jeder Zeilengröße (Summe über Ticks)
-      sb = 0;
-      ss = 0;
-      for (let r = Math.floor(lo[i]! / tick); r <= Math.floor(hi[i]! / tick); r++) {
-        sb += 1 + hash(t, r * 3);
-        ss += 1 + hash(t, r * 3 + 1);
-      }
-    }
+    const ticks = Math.floor(hi[i]! / tick) - Math.floor(lo[i]! / tick) + 1;
     bars.buyQ[i] = sb;
     bars.sellQ[i] = ss;
-    bars.buyA[i] = rowsOf[i]!.length;
-    bars.sellA[i] = rowsOf[i]!.length;
+    bars.buyA[i] = ticks;
+    bars.sellA[i] = ticks;
   }
   if (levels) levels.levelOffset[nb] = j;
   return { bars, levels };

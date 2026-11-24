@@ -116,6 +116,11 @@ export class RequestQueue {
     this.setWanted([], new Set());
   }
 
+  /** Fehlerzustand eines Schlüssels vergessen (z. B. abgelaufene Ablehnung, W-3). */
+  forgetFailure(key: string): void {
+    this.failures.delete(key);
+  }
+
   /** Alle endgültigen/pausierten Fehler vergessen (z. B. per Knopf „neu laden"). */
   clearFailures(): void {
     this.failures.clear();

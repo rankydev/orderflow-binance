@@ -180,6 +180,8 @@
         Fenster {ro.windowBars} Bars · Kacheln {ro.fpTiles} ({ro.fpCells} Zellen) · Requests {ro.requests}
       </span>
       {#if ro.hint}<span class="hint">{ro.hint}</span>{/if}
+      <!-- W-2: erwartete/vorübergehende Gründe ohne Footprint als normale Zeile, nicht als Banner -->
+      {#if ro.notice}<span class="hint" data-k="notice">{ro.notice}</span>{/if}
       {#if ro.error}<span class="err">{ro.error}</span>{/if}
     {/if}
     <span class="legend">

@@ -46,5 +46,7 @@ export interface BarItem {
   o: number;
   h: number;
   l: number;
+  /** buyQ + sellQ in Lots (Querprüfung gegen Footprint-Kacheln). */
+  v: number;
   c: number;
 }

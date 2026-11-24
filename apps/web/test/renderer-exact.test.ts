@@ -115,6 +115,7 @@ function draw(type: 'delta' | 'bidask') {
     h: 50_149,
     l: 50_000,
     c: 50_149,
+    v: 11,
   };
   r.data = {
     bars: [{ x: 50, time: 0, originalData: it, barColor: '' }],
