@@ -40,6 +40,17 @@ export function chooseFpSource(
   return best;
 }
 
+/**
+ * Wert für eine Int32-Spalte; wirft statt still zu überlaufen (Int32Array schneidet ab 2^31 ab und
+ * der Encoder erkennt nur negative Ergebnisse – Review E).
+ */
+export function i32(v: number, what: string): number {
+  if (!Number.isInteger(v) || v < -2_147_483_648 || v > 2_147_483_647) {
+    throw new RangeError(`${what} = ${v} passt nicht in Int32`);
+  }
+  return v;
+}
+
 function barColumns(n: number): BarColumns {
   return {
     time: new Int32Array(n),
@@ -69,15 +80,15 @@ function fillBars(cols: BarColumns, bars: readonly Bar[], s: number, e: number):
   for (let i = s; i < e; i++) {
     const b = bars[i]!;
     const k = i - s;
-    cols.time[k] = b.ts / 1000;
-    cols.open[k] = b.open;
-    cols.high[k] = b.high;
-    cols.low[k] = b.low;
-    cols.close[k] = b.close;
+    cols.time[k] = i32(b.ts / 1000, 'time');
+    cols.open[k] = i32(b.open, 'open');
+    cols.high[k] = i32(b.high, 'high');
+    cols.low[k] = i32(b.low, 'low');
+    cols.close[k] = i32(b.close, 'close');
     cols.buyQ[k] = b.buyQ;
     cols.sellQ[k] = b.sellQ;
-    cols.buyA[k] = b.buyA;
-    cols.sellA[k] = b.sellA;
+    cols.buyA[k] = i32(b.buyA, 'buyA');
+    cols.sellA[k] = i32(b.sellA, 'sellA');
   }
 }
 
@@ -133,11 +144,11 @@ export function buildFootprintTile(
       const k = j - ls;
       const px = fp.px[j]!;
       if (px % width !== 0) throw new Error(`Zeile ${px} liegt nicht auf dem Raster ${width}`);
-      levels.row[k] = px / width;
+      levels.row[k] = i32(px / width, 'row');
       levels.buy[k] = fp.buyQ[j]!;
       levels.sell[k] = fp.sellQ[j]!;
-      levels.buyA[k] = fp.buyA[j]!;
-      levels.sellA[k] = fp.sellA[j]!;
+      levels.buyA[k] = i32(fp.buyA[j]!, 'buyA');
+      levels.sellA[k] = i32(fp.sellA[j]!, 'sellA');
       j++;
     }
   }

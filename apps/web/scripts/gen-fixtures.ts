@@ -139,7 +139,7 @@ async function main(): Promise<void> {
       const rows = medianRowsPerBar(high, low, width);
       const maxRows = maxRowsPerBar(high, low, width);
       const n = tileBarsForMax(maxRows);
-      if (n === null) continue; // nicht angeboten (32 · max > 60 000)
+      if (n === null) continue; // nicht angeboten (32 · 1,5 · max > 60 000)
       const src = chooseFpSource(tfMin, R, rowsPerDay);
       const rolled = rollupFp(fp[src], tfMin, width);
       const k0 = tileIndexAt(fromMs / 1000, n, tfSec);
@@ -200,7 +200,7 @@ async function main(): Promise<void> {
         dataTo: toMs,
         firstOpen: first.open,
         lastClose: last.close,
-        tileConfigVersion: 2,
+        tileConfigVersion: 3,
         tiles,
       },
     ],

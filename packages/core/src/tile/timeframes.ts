@@ -68,10 +68,17 @@ export function tileBoundsSec(k: number, n: number, tfSec: number): [number, num
  * selbst 32 Bars die harte Grenze überschreiten könnten (32 · max > 60 000): dann wird die Kombination
  * (tf, R) nicht angeboten (fehlt in /symbols.tiles) statt zur Laufzeit mit 422 abgelehnt.
  */
-export function tileBarsForMax(maxRowsPerBar: number): number | null {
-  if (maxRowsPerBar * TILE_MIN_BARS > TILE_MAX_CELLS) return null;
-  return tileBarsFor(maxRowsPerBar);
+export function tileBarsForMax(maxRowsPerBar: number, margin = TILE_ROWS_MARGIN): number | null {
+  const m = Math.ceil(maxRowsPerBar * margin);
+  if (m * TILE_MIN_BARS > TILE_MAX_CELLS) return null;
+  return tileBarsFor(m);
 }
+
+/**
+ * Sicherheitszuschlag auf das Maximum der Zeilen je Bar (Review E): ein späterer Tag darf um bis zu 50 %
+ * breitere Bars haben, ohne dass eine Kachel 30 000 (bzw. bei n = 32 60 000) Zellen überschreitet.
+ */
+export const TILE_ROWS_MARGIN = 1.5;
 
 /** Größte Zeilenzahl eines Bars: max(floor(high/w) − floor(low/w) + 1). */
 export function maxRowsPerBar(

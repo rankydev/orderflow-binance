@@ -19,6 +19,7 @@ import {
   tileColumnBytes,
   tileIndexAt,
   TileFormatError,
+  i32,
   type TileData,
 } from '../src/index.ts';
 import { DAY, tradesArb } from './gen.ts';
@@ -440,8 +441,12 @@ describe('Kachelgeometrie und Quellenwahl', () => {
   });
 
   it('Kachellänge aus dem Maximum: keine Kachel über 30 000 Zellen, nie über 60 000', () => {
-    expect(tileBarsForMax(1875)).toBe(32); // 32 · 1875 = 60 000
-    expect(tileBarsForMax(1876)).toBeNull(); // nicht angeboten
+    expect(tileBarsForMax(1875, 1)).toBe(32); // 32 · 1875 = 60 000
+    expect(tileBarsForMax(1876, 1)).toBeNull(); // nicht angeboten
+    expect(tileBarsForMax(1250)).toBe(32); // mit Zuschlag 1,5: 1875
+    expect(tileBarsForMax(1251)).toBeNull();
+    // Zuschlag: Bars bis 1,5 × Referenzmaximum bleiben unter den Grenzen
+    expect(tileBarsForMax(400)! * 400 * 1.5).toBeLessThanOrEqual(30_000);
     expect(maxRowsPerBar([105, 130, 99], [100, 100, 99], 10)).toBe(4);
     fc.assert(
       fc.property(
@@ -457,7 +462,7 @@ describe('Kachelgeometrie und Quellenwahl', () => {
         (raw, w, start) => {
           const high = raw.map(([l, d]) => l + d);
           const low = raw.map(([l]) => l);
-          const n = tileBarsForMax(maxRowsPerBar(high, low, w));
+          const n = tileBarsForMax(maxRowsPerBar(high, low, w), 1);
           if (n === null) {
             expect(maxRowsPerBar(high, low, w) * 32).toBeGreaterThan(60_000);
             return;
@@ -499,5 +504,13 @@ describe('Kachelgeometrie und Quellenwahl', () => {
     expect(chooseFpSource(15, 20, rows)).toBe('fp_5m_b10');
     expect(chooseFpSource(1, 5, rows)).toBe('fp_1m');
     expect(chooseFpSource(1, 20, rows)).toBe('fp_1m_b10');
+  });
+});
+
+describe('Int32-Spalten beim Aufbau (Review E)', () => {
+  it('Überlauf wirft statt still abzuschneiden', () => {
+    expect(i32(2_147_483_647, 'x')).toBe(2_147_483_647);
+    expect(() => i32(2_147_483_648, 'buyA')).toThrow(/buyA = 2147483648 passt nicht in Int32/);
+    expect(() => i32(1.5, 'row')).toThrow(RangeError);
   });
 });

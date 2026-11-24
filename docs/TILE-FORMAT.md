@@ -80,7 +80,7 @@ unbekannte Namen sind ein Fehler. Inkompatible Änderungen erhöhen `format`.
   `symbols`-Antwort interpretierbar ist (Verifier-Stichprobe §4.8).
 - Größe: 28 B je Level + 44 B je Bar + ≈ 0,5–1 kB Header, wie in §5.6 abgeschätzt.
 - Die Kachellänge `n` je (Symbol, tf, R) liefert `GET /api/v1/symbols` als `tiles[tf][R] = n` zusammen mit
-  `tileConfigVersion` (jetzt 2); die Fixture-API tut das bereits (der Client braucht n, um Kachelindizes zu
+  `tileConfigVersion` (Fixtures: 3); die Fixture-API tut das bereits (der Client braucht n, um Kachelindizes zu
   berechnen). **Nur angebotene Kombinationen** stehen in `tiles`; der Client fordert keine anderen an.
 
 ## Kachellänge (Abweichung von KONZEPT §5.3, Nutzerentscheid 2026-11-24)
@@ -89,17 +89,28 @@ unbekannte Namen sind ein Fehler. Inkompatible Änderungen erhöhen `format`.
 107 000 Zellen und 22 Kacheln über der harten Grenze. Neu (`tileBarsForMax` in `packages/core/src/tile/timeframes.ts`):
 
 ```
-maxRows = max über alle Bars des Referenzzeitraums von  floor(high/w) − floor(low/w) + 1,   w = R · tick_ref_units
-n       = clamp(2^floor(log2(30 000 / maxRows)), 32, 1024)
-angeboten nur, wenn 32 · maxRows ≤ 60 000   (sonst fehlt R für diesen tf in tiles[tf])
+w       = R · tick_ref_units
+maxRows = max über ALLE gespeicherten Bars des Symbols und tf von  floor(high/w) − floor(low/w) + 1
+m       = ceil(1,5 · maxRows)                 (Sicherheitszuschlag TILE_ROWS_MARGIN)
+n       = clamp(2^floor(log2(30 000 / m)), 32, 1024)
+angeboten nur, wenn 32 · m ≤ 60 000           (sonst fehlt R für diesen tf in tiles[tf])
 ```
 
-Damit gilt für jede Kachel: Zellen ≤ n · maxRows ≤ 30 000, bzw. ≤ 60 000 bei n = 32. Garantiert ist das für den
-Referenzzeitraum; die API prüft die harte Grenze trotzdem je Antwort (ein späterer Bar könnte breiter sein) und
-antwortet darüber mit `422` + JSON `{error}` (der Client markiert die Kachel als abgelehnt, zeichnet dort Kerzen
-und fragt sie nicht erneut an). Mit den Fixtures: 0 Kacheln über 30 000, 0 abgelehnt, größte Kachel 15 009 Zellen.
-Preis: kürzere Kacheln bei feinen R (z. B. 1m R = 5 Ticks: n = 32 statt 256) und damit mehr Anfragen, aber nur dort,
-wo feine Zeilen angefordert werden.
+- **Referenzzeitraum:** die gesamte gespeicherte Historie des Symbols (nicht die letzten N Tage). Grund: ein
+  Kurzzeitraum unterschätzt; gemessen max. Zeilen je 1m-Bar bei R = 5 an den drei Fixture-Tagen 1 110 / 1 755 /
+  1 017 – n aus Tag 1 allein hätte an Tag 2 bei R = 50 und n = 256 Kacheln mit 45 056 Zellen ergeben.
+- **Neuberechnung:** nach jedem Import eines Tages (billig: maxRows je (tf, R) als laufendes Maximum aus `bar_*`).
+  Ändert sich ein n, wird `tileConfigVersion` um 1 erhöht. Da `cfg` Teil der Kachel-URL ist, sind alle Caches
+  (Browser, nginx, Server-LRU) für die neue Konfiguration automatisch getrennt; alte Einträge laufen aus.
+- **Garantie:** Zellen je Kachel ≤ n · m ≤ 30 000 (bei n = 32: ≤ 60 000), solange kein neuer Bar mehr als 1,5 × das
+  Referenzmaximum an Zeilen hat; ein solcher Tag löst beim Import die Neuberechnung aus (neues n, neue Version).
+- **Falls eine Kachel trotzdem die harte Grenze überschreitet** (z. B. zwischen Import und Neuberechnung): Der
+  Server erhöht `tileConfigVersion` (neu berechnetes n) und antwortet auf die alte `cfg` mit **409** + JSON
+  `{error}`. Der Client lädt daraufhin **einmal** `/symbols` neu und fährt mit der neuen Konfiguration fort;
+  ändert sich dabei nichts, zeigt er dauerhaft „Server-Stand passt nicht zur Seite – Seite und Server neu laden".
+  Kein 422 für diesen Fall (422 zeigt der Client für den Rest der Sitzung als Kerzen).
+
+Mit den Fixtures (Zuschlag 1,5): 0 Kacheln über 30 000, 0 abgelehnt; feinste angebotene Zeilen 1m: R = 10 Ticks.
 
 ## Endpunkt-Verträge, die der Client voraussetzt (für die API; Review H2)
 
@@ -107,6 +118,7 @@ wo feine Zeilen angefordert werden.
 
 ```json
 {
+  "schema": 2,                      // Form dieser Antwort; der Client prüft sie
   "symbols": [
     {
       "name": "BTCUSDT",
@@ -116,8 +128,8 @@ wo feine Zeilen angefordert werden.
       "tickUnits": 10,             // aktueller Tick in price_unit (R · tickRefUnits ≥ tickUnits)
       "dataFrom": 1795132800000,   // [dataFrom, dataTo) in ms UTC; der Client fordert nichts außerhalb an
       "dataTo": 1795392000000,
-      "tileConfigVersion": 2,
-      "tiles": { "1m": { "5": 32, "10": 32, "20": 64 }, "5m": { … } }   // nur angebotene (tf, R) → n
+      "tileConfigVersion": 3,
+      "tiles": { "1m": { "10": 32, "20": 32, "50": 64 }, "5m": { … } }   // nur angebotene (tf, R) → n
     }
   ]
 }
@@ -131,7 +143,33 @@ Abweichungen endgültig (keine Wiederholung). Leere Kachel (0 Bars) ist eine gü
 1 000 Bars** an: `from = c · 1000 · tfSec · 1000`, `to = from + 1000 · tfSec · 1000`; Header-`from`/`to` müssen genau
 der Anfrage entsprechen. Ein Abschnitt kann leer sein.
 
-Fehler: `400`/`404`/`422` (+ JSON `{error}`) sind endgültig für diese URL; `408`/`425`/`429`/`5xx` werden mit Backoff
+Fehler und Statuscodes:
+- (tf, R) nicht angeboten → **422** `{error}` (endgültig; kommt bei korrektem Client nicht vor).
+- `cfg` ≠ aktuelle `tileConfigVersion` → **409** `{error}` (Server prüft `cfg`; Client lädt `/symbols` neu, s. o.).
+- unbekanntes Symbol/tf, ungültige Parameter → **400**/**404**.
+- `/bars` mit `to > dataTo` (letzter Abschnitt): normal beantworten; Header-`from`/`to` = **exakt die Anfrage**
+  (der Abschnitt enthält nur Bars < dataTo). Dasselbe vor `dataFrom`.
+
+Weiter: `400`/`404`/`422` (+ JSON `{error}`) sind endgültig für diese URL; `408`/`425`/`429`/`5xx` werden mit Backoff
 wiederholt, `Retry-After` (Sekunden oder HTTP-Datum) wird beachtet. Kacheln mit `final = false` hält der Client
 höchstens 60 s, danach fragt er neu (bis die Live-Invalidierung aus §5.4 in P2 kommt). ETag/304 sind erlaubt, werden
 aber vom Client nicht vorausgesetzt.
+
+**Cache-Header:** finale Kacheln (`final = true`) `Cache-Control: public, max-age=31536000, immutable` und
+`ETag: "<dataVersion>"`; nicht finale `Cache-Control: no-cache` (+ ETag, 304 erlaubt). `/symbols`: `no-cache`.
+
+**CORS:** Liegt die API auf einem anderen Ursprung als die Seite (`VITE_API_BASE`), muss sie für den Seiten-Ursprung
+`Access-Control-Allow-Origin` setzen (nur GET, keine Credentials, keine besonderen Header). Gleicher Ursprung über
+nginx ist der Normalfall (§2.4).
+
+**Hinweise für die API-Implementierung:**
+- `/symbols` trägt `"schema": 2`; der Client lehnt andere Werte mit sichtbarer Meldung ab. Inkompatible Änderungen
+  der Form erhöhen `schema`.
+- Notional-Summen überschreiten 2^53 (ETH-Tagesnotional ≈ 3,55·10^16): nie durch `Number()` leiten, in SQL/JS als
+  `bigint` behandeln (die Kacheln enthalten kein Notional; relevant für Stats/VWAP).
+- Int32-Spalten: `buildBarsTile`/`buildFootprintTile` prüfen jetzt jeden Wert auf den Int32-Bereich (`i32`) und
+  werfen statt still abzuschneiden.
+
+**Offen für die Live-Phase (P2, Review W3):** Bar-Abschnitte laufen im Client nie ab, `/symbols` und `dataTo` werden
+nur beim Start bzw. bei einer Konfigurationsabweichung neu geladen, ein formender Bar fehlt; nicht finale
+Footprint-Kacheln laufen nach 60 s ab. Invalidierung per Live-WS (§5.4) folgt mit dem Recorder.

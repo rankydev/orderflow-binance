@@ -88,7 +88,8 @@ npm run dev -w @orderflow/web        # http://127.0.0.1:5173/  (FIXTURE_LATENCY_
 Die Dev-Middleware (`apps/web/dev/fixture-api.ts`) bedient `/api/v1/symbols|bars|footprint` in der URL-Form der
 künftigen API; mit `VITE_API_BASE=<url>` spricht das Frontend stattdessen die echte API an. Symbole: `BTCUSDT`
 (echt), `BTCUSDT-SYN90` (90 Tage, 30× wiederholte echte Tage, nur Performance), `STRESS-FLAT` (Seitwärtsdaten
-für den Zellbudget-Test). Kachelformat: [`docs/TILE-FORMAT.md`](docs/TILE-FORMAT.md). Messung (T11) im Browser:
+für den Zellbudget-Test). Kachelformat: [`docs/TILE-FORMAT.md`](docs/TILE-FORMAT.md). Offen für die Live-Phase: Bar-Abschnitte und `/symbols` werden im Browser nicht aktualisiert (siehe
+TILE-FORMAT.md, „Offen für die Live-Phase"). Messung (T11) im Browser:
 `PLAYWRIGHT_CORE=<pfad zu playwright-core> node apps/web/perf/measure.ts` bei laufendem Dev-Server.
 
 ## Importer (P1)
