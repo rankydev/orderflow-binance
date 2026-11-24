@@ -18,8 +18,11 @@ import {
 
 export const VISION_BASE = 'https://data.binance.vision/data/';
 
+/** Ohne Fortschritt länger als dies → Abbruch (ein hängender Download blockiert sonst ewig). */
+const FETCH_TIMEOUT_MS = 15 * 60_000;
+
 async function fetchOk(url: string): Promise<Response> {
-  const r = await fetch(url);
+  const r = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   if (!r.ok || !r.body) throw new Error(`HTTP ${r.status} für ${url}`);
   return r;
 }
