@@ -249,6 +249,8 @@ export class Catalog extends EventEmitter {
     const A = tsLit(d0 * DAY_MS);
     const B = tsLit((d1 + 1) * DAY_MS);
     const widths = TILE_LADDER.map((R) => R * s.tickRefUnits);
+    if (!widths.every((w) => Number.isSafeInteger(w) && w > 0))
+      throw new Error('Zeilenbreite ungültig');
     const fresh = new Map<number, DayStats>();
     for (let d = d0; d <= d1; d++) {
       const info = s.days.get(d);
@@ -265,27 +267,29 @@ export class Catalog extends EventEmitter {
             WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B}`
         : `SELECT time_bucket('${tfSec} seconds'::interval, ts) AS t, max(high_px) AS h, min(low_px) AS l
              FROM ${table} WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 1`;
+      // eine Spalte je Leiterstufe (ein Durchlauf, kein Kreuzprodukt); Breiten sind geprüfte Ganzzahlen
+      const cols = widths.map((w) => `max(b.h / ${w} - b.l / ${w} + 1)::int`).join(', ');
       parts.push(
-        `SELECT '${tf}'::text, (extract(epoch from b.t)::int8 / 86400)::int AS d, w,
-                max(b.h / w - b.l / w + 1)::int
-           FROM (${src}) b CROSS JOIN unnest($2::int[]) AS w GROUP BY 2, 3`,
+        `SELECT '${tf}'::text, (extract(epoch from time_bucket('1 day'::interval, b.t))::int8 / 86400)::int, ${cols}
+           FROM (${src}) b GROUP BY time_bucket('1 day'::interval, b.t)`,
       );
     }
-    const mr = await tx.rows(parts.join('\nUNION ALL\n'), [s.symId, `{${widths.join(',')}}`]);
-    const wIndex = new Map(widths.map((w, i) => [w, i]));
+    const mr = await tx.rows(parts.join('\nUNION ALL\n'), [s.symId]);
     for (const r of mr) {
       const st = fresh.get(int(r[1]));
       if (!st) continue;
-      const tf = String(r[0]) as Timeframe;
-      let arr = st.maxRows.get(tf);
-      if (!arr) st.maxRows.set(tf, (arr = new Int32Array(widths.length)));
-      arr[wIndex.get(int(r[2]))!] = int(r[3]);
+      st.maxRows.set(
+        String(r[0]) as Timeframe,
+        Int32Array.from(widths, (_, i) => int(r[2 + i])),
+      );
     }
     const cnt: string[] = [];
     for (const t of [...FP_TABLE_NAMES, ...BAR_TABLES]) {
       cnt.push(
-        `SELECT '${t}'::text, (extract(epoch from time_bucket('1 day'::interval, ts))::int8 / 86400)::int, count(*)
-           FROM ${t} WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 2`,
+        // GROUP BY time_bucket direkt (vektorisiert); der Tagesindex entsteht außerhalb
+        `SELECT '${t}'::text, (extract(epoch from q.b)::int8 / 86400)::int, q.c FROM (
+           SELECT time_bucket('1 day'::interval, ts) AS b, count(*) AS c
+             FROM ${t} WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 1) q`,
       );
     }
     for (const r of await tx.rows(cnt.join('\nUNION ALL\n'), [s.symId])) {
