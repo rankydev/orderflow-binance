@@ -377,6 +377,40 @@ describe('Review N1–N6 (DB)', () => {
     expect(logs.some((l) => l.includes('Konvertierung nach 2026-09-19 fehlgeschlagen'))).toBe(true);
   });
 
+  it('N3: derselbe Tag aus einer anderen Quelldatei mit identischen Daten gilt als fertig', async () => {
+    const dir = archive({ dailyDays: ['2026-09-24'] });
+    const m = new Importer({
+      dataDir: dir,
+      spec: BTC,
+      firstDay: parseDay('2026-09-24'),
+      lastDay: parseDay('2026-09-24'),
+      prefer: 'monthly',
+      neighbours: true,
+      writer: await opened(new PostgresWriter(cfg, BTC)),
+      importerVersion: 'int-test',
+      sidecar: false,
+      log: () => {},
+    });
+    expect((await m.run())[0]!.decision).toBe('write');
+    await lastOpened?.close();
+    const d = new Importer({
+      dataDir: dir,
+      spec: BTC,
+      firstDay: parseDay('2026-09-24'),
+      lastDay: parseDay('2026-09-24'),
+      prefer: 'daily',
+      neighbours: true,
+      writer: await opened(new PostgresWriter(cfg, BTC)),
+      importerVersion: 'int-test',
+      sidecar: false,
+      log: () => {},
+    });
+    const [s] = await d.run();
+    await lastOpened?.close();
+    expect(s!.origin).toBe('daily');
+    expect(s!.decision).toBe('skip');
+  });
+
   it('N6: immutable erst ohne offene Randminute', async () => {
     await run(new PostgresWriter(cfg, BTC), '2026-09-22', '2026-09-22', false);
     const [a] = await sql`SELECT immutable FROM data_day WHERE day = '2026-09-22'`;

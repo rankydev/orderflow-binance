@@ -156,8 +156,6 @@ export function writeReasons(
   if (st.stale) r.push('stale');
   if (st.digest !== now.digest) r.push('Daten');
   if (st.qualityDigest !== now.quality) r.push('Klassifikation');
-  if (st.aggSha256 !== now.aggSha) r.push('aggTrades-Datei');
-  if (st.klineSha256 !== now.klineSha) r.push('Kline-Datei');
   const si = st.inputs;
   if (
     !si ||
@@ -166,6 +164,13 @@ export function writeReasons(
     si.prevLastAggId !== now.inputs.prevLastAggId
   ) {
     r.push('Vortagseingaben');
+  }
+  // Andere Quelldatei (z. B. Tages- statt Monatsdatei, oder ein auf den VPS übertragener Tag, der
+  // dort aus der Tagesdatei neu berechnet wird) mit identischen Daten- und Klassen-Digests ist kein
+  // Grund zum Schreiben: „fertig" hängt von den Daten ab, nicht von der Herkunft (Review N3).
+  if (r.length > 0) {
+    if (st.aggSha256 !== now.aggSha) r.push('aggTrades-Datei');
+    if (st.klineSha256 !== now.klineSha) r.push('Kline-Datei');
   }
   return r;
 }
