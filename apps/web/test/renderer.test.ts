@@ -30,6 +30,10 @@ class RecordingCtx {
   fillText() {
     this.texts++;
   }
+  // Monospace-Näherung: 6,5 CSS-px je Zeichen bei 10 px Schrift, Bitmap ×2
+  measureText(t: string) {
+    return { width: t.length * 13 };
+  }
 }
 
 const W = 50; // R=5 · tick 10
@@ -171,6 +175,17 @@ describe('FootprintRenderer', () => {
     const { rc, ctx } = setup(300, 50, 600, [0, 20]); // rh 15 px, bs 50
     expect(rc.stats.lod).toBe(3);
     expect(ctx.texts).toBe(20 * N_ROWS);
+    expect(rc.stats.textBars).toBe(20);
+    expect(rc.stats.textsSkipped).toBe(0);
+  });
+
+  it('L3 schmal: zu lange Zahlen werden gekürzt statt den ganzen Bar auszublenden', () => {
+    // bs 44 → Spalte ≈ 37,8 px − 2 px Rand ≈ 36 px → 5 Zeichen à 6,5 px passen, 6 nicht
+    const { rc, ctx } = setup(300, 44, 600, [0, 20]);
+    expect(rc.stats.lod).toBe(3);
+    expect(ctx.texts).toBe(20 * N_ROWS); // nichts ausgelassen
+    expect(rc.stats.textsShortened).toBeGreaterThan(0); // "-0.001" (6 Zeichen) → "-.001"
+    expect(rc.stats.textsSkipped).toBe(0);
   });
 
   it('Zellbudget: über 25 000 geschätzten Zellen werden keine Zellen gezeichnet (Kerzen statt dessen)', () => {
@@ -198,5 +213,25 @@ describe('FootprintRenderer', () => {
     expect(rc.stats.cellsDrawn).toBe(0);
     expect(ctx.rects).toBe(20); // Docht + Körper je Bar
     expect(ctx.fills).toBe(1); // alle Bars steigend: eine Füllung
+  });
+
+  it('W6: nach einem R-Wechsel zeichnet die alte Größe, bis die neue geladen ist', () => {
+    const { rc, draw } = setup(10, 7, 400, [0, 10]);
+    rc.prev = { series: 'X|1m|5', n: 1024, width: W };
+    rc.series = 'X|1m|10';
+    rc.width = 2 * W;
+    draw();
+    expect(rc.stats.cellsDrawn).toBe(10 * N_ROWS); // aus der alten Größe
+  });
+
+  it('K2: Kachellänge passt nicht zur Anfrage → Kerzen statt leerer Bars (kein Absturz)', () => {
+    const { rc, draw } = setup(10, 7, 400, [0, 10]);
+    rc.n = 7; // falsche Kachellänge: nur die ersten 7 Bars treffen die Kachel, der Rest fällt auf Kerzen
+    const ctx = draw();
+    expect(rc.stats.cellsDrawn).toBe(7 * N_ROWS);
+    expect(ctx.fills).toBeGreaterThan(0);
+    // Slot-Index außerhalb der Tabelle (undefined) darf nicht als gültiger Bar gelten
+    const tile = rc.store!.tiles('X|1m|5')!.get(0) as { slot: Int32Array };
+    expect(tile.slot[5000]).toBeUndefined();
   });
 });

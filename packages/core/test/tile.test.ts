@@ -9,10 +9,12 @@ import {
   chooseFpSource,
   decodeTile,
   encodeTile,
+  maxRowsPerBar,
   medianRowsPerBar,
   rollupBars,
   rollupFp,
   tileBarsFor,
+  tileBarsForMax,
   tileBoundsSec,
   tileColumnBytes,
   tileIndexAt,
@@ -396,6 +398,44 @@ describe('Kachelgeometrie und Quellenwahl', () => {
           const [a, b] = tileBoundsSec(k, n, tf);
           expect(t >= a && t < b).toBe(true);
           expect(b - a).toBe(n * tf);
+        },
+      ),
+    );
+  });
+
+  it('Kachellänge aus dem Maximum: keine Kachel über 30 000 Zellen, nie über 60 000', () => {
+    expect(tileBarsForMax(1875)).toBe(32); // 32 · 1875 = 60 000
+    expect(tileBarsForMax(1876)).toBeNull(); // nicht angeboten
+    expect(maxRowsPerBar([105, 130, 99], [100, 100, 99], 10)).toBe(4);
+    fc.assert(
+      fc.property(
+        fc.array(
+          fc.tuple(fc.integer({ min: 1, max: 10_000_000 }), fc.integer({ min: 0, max: 100_000 })),
+          {
+            minLength: 1,
+            maxLength: 3_000,
+          },
+        ),
+        fc.constantFrom(10, 20, 50, 100, 500, 1000, 10_000),
+        fc.integer({ min: 0, max: 5_000 }),
+        (raw, w, start) => {
+          const high = raw.map(([l, d]) => l + d);
+          const low = raw.map(([l]) => l);
+          const n = tileBarsForMax(maxRowsPerBar(high, low, w));
+          if (n === null) {
+            expect(maxRowsPerBar(high, low, w) * 32).toBeGreaterThan(60_000);
+            return;
+          }
+          // beliebige n aufeinanderfolgende Bars (eine Kachel) haben ≤ 30 000 Zellen bzw. ≤ 60 000 bei n = 32
+          let cells = 0;
+          for (
+            let i = start % raw.length;
+            i < Math.min(raw.length, (start % raw.length) + n);
+            i++
+          ) {
+            cells += Math.floor(high[i]! / w) - Math.floor(low[i]! / w) + 1;
+          }
+          expect(cells).toBeLessThanOrEqual(n === 32 ? 60_000 : 30_000);
         },
       ),
     );

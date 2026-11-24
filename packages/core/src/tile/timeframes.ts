@@ -61,6 +61,35 @@ export function tileBoundsSec(k: number, n: number, tfSec: number): [number, num
   return [k * span, (k + 1) * span];
 }
 
+/**
+ * Kachellänge mit Garantie (Abweichung von §5.3, Nutzerentscheid 2026-11-24): Grundlage ist das
+ * **Maximum** der Zeilen je Bar im Referenzzeitraum, nicht der Median. Da eine Kachel höchstens n Bars
+ * hat, gilt Zellen ≤ n · max ≤ 30 000 (bzw. ≤ 32 · max, wenn n auf 32 begrenzt ist). Liefert null, wenn
+ * selbst 32 Bars die harte Grenze überschreiten könnten (32 · max > 60 000): dann wird die Kombination
+ * (tf, R) nicht angeboten (fehlt in /symbols.tiles) statt zur Laufzeit mit 422 abgelehnt.
+ */
+export function tileBarsForMax(maxRowsPerBar: number): number | null {
+  if (maxRowsPerBar * TILE_MIN_BARS > TILE_MAX_CELLS) return null;
+  return tileBarsFor(maxRowsPerBar);
+}
+
+/** Größte Zeilenzahl eines Bars: max(floor(high/w) − floor(low/w) + 1). */
+export function maxRowsPerBar(
+  high: ArrayLike<number>,
+  low: ArrayLike<number>,
+  width: number,
+): number {
+  let m = 0;
+  const n = Math.min(high.length, low.length);
+  for (let i = 0; i < n; i++) {
+    const h = high[i]!;
+    const l = low[i]!;
+    const rows = (h - (h % width)) / width - (l - (l % width)) / width + 1;
+    if (rows > m) m = rows;
+  }
+  return m;
+}
+
 /** Median der Zeilenzahl je Bar: (floor(high/w) − floor(low/w) + 1) für Bars mit Preisen in price_unit. */
 export function medianRowsPerBar(
   high: ArrayLike<number>,

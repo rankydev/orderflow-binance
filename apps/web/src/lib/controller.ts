@@ -37,15 +37,20 @@ import {
   type FpItem,
 } from './footprint-series.ts';
 import {
-  adjustRowSize,
+  chooseRowSize,
   GESTURE_DEBOUNCE_MS,
   initialRowSize,
   L2_MIN_BAR_SPACING,
+  L3_MIN_BAR_SPACING,
+  L3_MIN_ROW_HEIGHT,
+  MANUAL_R_NO_TEXT,
   MANUAL_R_TOO_FINE,
+  rowClassFor,
   rowHeightPx,
   selectLod,
   visibleCells,
   wantsFootprintMode,
+  type RowClass,
   type ViewGeometry,
 } from './lod.ts';
 import { RequestQueue, type Want } from './request-queue.ts';
@@ -54,6 +59,9 @@ import type { BarItem, ColorMode, ColorScope, FootprintType, Lod, SymbolInfo } f
 import { tfSeconds } from '@orderflow/core/browser';
 
 export type Mode = 'footprint' | 'candle';
+
+/** Höchstzahl sichtbarer Footprint-Kacheln, die gleichzeitig angefordert werden (W1). */
+export const MAX_VISIBLE_TILES = 12;
 
 export interface Readout {
   sym: string;
@@ -75,6 +83,17 @@ export interface Readout {
   fpTiles: number;
   fpCells: number;
   barChunks: number;
+  /** Zeilenklasse der automatischen Wahl (text = Zahlen, cells = Blöcke). */
+  rowClass: string;
+  /** Zeilengröße in Preiseinheiten (z. B. "5 USDT"). */
+  rLabel: string;
+  /** Letzter Frame: Bars mit Zellen bzw. mit Zahlen, sichtbare Zeilen je Bar (Median/Max). */
+  barsWithCells: number;
+  textBars: number;
+  rowsMedian: number;
+  rowsMax: number;
+  textsShortened: number;
+  textsSkipped: number;
 }
 
 interface Anchor {
@@ -97,6 +116,8 @@ export class ChartController {
   private R = 1;
   private rAuto = true;
   private rInit = false;
+  /** Zeilenklasse der letzten automatischen Wahl (Hysterese text/cells). */
+  private rowClass: RowClass | null = null;
   private mode: Mode = 'candle';
   private items: BarItem[] = [];
   private win: [number, number] | null = null;
@@ -139,7 +160,7 @@ export class ChartController {
         timeVisible: true,
         secondsVisible: false,
         minBarSpacing: 0.1,
-        rightOffset: 4,
+        rightOffset: 2,
         enableConflation: true,
       },
       crosshair: { mode: CrosshairMode.Normal },
@@ -201,7 +222,11 @@ export class ChartController {
     this.chart.remove();
   }
 
-  async init(sym?: string, tf = '1m'): Promise<void> {
+  async init(sym?: string, tf = '1m', rowMode: 'auto' | number = 'auto'): Promise<void> {
+    if (rowMode !== 'auto') {
+      this.rAuto = false;
+      this.manualR = rowMode;
+    }
     const r = await this.api.symbols();
     this.symbols = r.symbols;
     const s = this.symbols.find((x) => x.name === sym) ?? this.symbols[0];
@@ -241,11 +266,13 @@ export class ChartController {
 
   /** 'auto' oder feste Zeilengröße in Ticks. */
   setRowMode(r: 'auto' | number): void {
+    this.manualNote = '';
     if (r === 'auto') {
       this.rAuto = true;
-      this.applyR(this.initialR());
+      this.manualR = null;
     } else {
       this.rAuto = false;
+      this.manualR = r;
       this.applyR(r);
     }
     this.evaluate();
@@ -291,6 +318,14 @@ export class ChartController {
       fpTiles: this.fpStore?.tileCount ?? 0,
       fpCells: this.fpStore?.cells ?? 0,
       barChunks: this.bars?.size ?? 0,
+      rowClass: this.rowClass ?? '',
+      rLabel: this.sym ? rowLabel(this.R, this.sym) : '',
+      barsWithCells: fpMode ? st.barsWithCells : 0,
+      textBars: fpMode ? st.textBars : 0,
+      rowsMedian: fpMode ? median(st.rowsPerBar) : 0,
+      rowsMax: fpMode ? Math.max(0, ...st.rowsPerBar) : 0,
+      textsShortened: fpMode ? st.textsShortened : 0,
+      textsSkipped: fpMode ? st.textsSkipped : 0,
     };
   }
 
@@ -346,7 +381,10 @@ export class ChartController {
     this.items = [];
     this.win = null;
     this.rInit = false;
-    this.rAuto = true; // Auto-R neu bei Symbol-/tf-Wechsel (§6.1)
+    this.rowClass = null;
+    this.manualNote = '';
+    // Preisskala wieder an die sichtbaren Bars anpassen (eine gestreckte Skala gilt nicht für den neuen tf).
+    this.chart.priceScale('right').applyOptions({ autoScale: true });
     this.lastCenter = Number.NaN;
     const dataToSec = s.dataTo / 1000;
     this.anchor = anchor ?? {
@@ -455,10 +493,10 @@ export class ChartController {
     const c = idx + offset;
     if (this.anchor?.initial) this.initialView = true;
     if (this.initialView) {
-      // Startansicht (§1.4: 1m-Footprint, ~200 Bars sichtbar): ≤ 200 Bars, Bar-Abstand ≥ 7 px, damit
-      // die erste Darstellung bereits Footprint-Zellen (L2, Schwelle 6 px + 10 % Hysterese) zeigt.
-      const paneW = this.chart.paneSize(0).width || 1200;
-      ts.applyOptions({ barSpacing: Math.max(7, paneW / 200) });
+      // Startansicht (Nutzerentscheid, statt §1.4 „~200 Bars"): lesbarer Footprint mit Zahlen, d. h.
+      // Bar-Abstand über der L3-Schwelle des Typs (+ ≈ 20 %), rechter Rand, Preisskala auf die
+      // sichtbaren Bars angepasst (autoScale).
+      ts.applyOptions({ barSpacing: initialBarSpacing(this.rc.type) });
       ts.scrollToRealTime();
     } else {
       ts.setVisibleLogicalRange({ from: c - width / 2, to: c + width / 2 } as LogicalRange);
@@ -471,11 +509,17 @@ export class ChartController {
     }
     if (!this.rInit && items.length > 0) {
       this.rInit = true;
-      if (this.rAuto || !this.availableR().includes(this.R)) {
-        this.rAuto = true;
-        this.applyR(this.initialR(idx));
+      const rs = this.availableR();
+      if (this.rAuto) {
+        this.applyR(this.initialR(idx)); // vorläufig; die erste Bewertung wählt nach Lesbarkeit
+      } else if (rs.includes(this.manualR ?? -1)) {
+        this.applyR(this.manualR!);
       } else {
-        this.applyR(this.R);
+        // manuelles R gibt es für diesen tf nicht: nächstes zulässiges, sichtbar im Hinweis
+        const want = this.manualR ?? this.R;
+        const near = nearestR(rs, want);
+        this.applyR(near);
+        this.manualNote = `R ${want} für ${this.tf} nicht verfügbar → ${near}`;
       }
     }
     // Erstes Fenster einer Serie: Detailstufe sofort bewerten (wie ein Gestenende).
@@ -483,6 +527,10 @@ export class ChartController {
     if (hadAnchor) requestAnimationFrame(() => requestAnimationFrame(() => this.evaluate()));
     this.scheduleFrame();
   }
+
+  private manualNote = '';
+  /** Vom Nutzer gewähltes R (Ticks) oder null bei Auto. */
+  private manualR: number | null = null;
 
   private initialR(atIndex = this.items.length - 1): number {
     const to = Math.max(0, Math.min(this.items.length - 1, atIndex));
@@ -507,9 +555,17 @@ export class ChartController {
   private applyR(r: number): void {
     const n = this.sym.tiles[this.tf]?.[String(r)];
     if (!n) return;
+    const series = `${this.sym.name}|${this.tf}|${r}`;
     if (r !== this.R) this.counters.rChanges++;
+    // W6: bis die sichtbaren Kacheln der neuen Größe da sind, zeichnet der Renderer fehlende Bars mit
+    // der bisherigen Größe (gleicher tf) statt als Kerzen.
+    if (this.rc.series !== series && this.rc.series.startsWith(`${this.sym.name}|${this.tf}|`)) {
+      this.rc.prev = { series: this.rc.series, n: this.rc.n, width: this.rc.width };
+    } else if (this.rc.series !== series) {
+      this.rc.prev = null;
+    }
     this.R = r;
-    this.rc.series = `${this.sym.name}|${this.tf}|${r}`;
+    this.rc.series = series;
     this.rc.n = n;
     this.rc.tfSec = this.tfSec;
     this.rc.width = r * this.sym.tickRefUnits;
@@ -607,18 +663,30 @@ export class ChartController {
     const g = this.measure();
     if (g) {
       const rs = this.availableR();
+      const bs = this.chart.timeScale().options().barSpacing;
+      const cls = rowClassFor(bs, this.rc.type, this.rowClass);
+      this.rowClass = cls;
       if (this.rAuto) {
-        const r = adjustRowSize(this.R, rs, g, this.sym.tickRefUnits);
+        const cur = rs.includes(this.R) ? this.R : null;
+        const r = chooseRowSize(cur, rs, g, this.sym.tickRefUnits, cls);
         if (r !== this.R) this.applyR(r);
       }
       const w = this.R * this.sym.tickRefUnits;
-      const bs = this.chart.timeScale().options().barSpacing;
       const rh = rowHeightPx(g, w);
       const vc = visibleCells(g, w);
       this.estVc = vc;
       this.estRh = rh;
       const lod = selectLod({ bs, rh, vc, type: this.rc.type });
-      this.hint = !this.rAuto && lod === 1 && bs >= L2_MIN_BAR_SPACING ? MANUAL_R_TOO_FINE : '';
+      // Manuelles R wird respektiert; ist es hier nicht darstellbar, sagt die Anzeige es.
+      this.hint = this.rAuto
+        ? ''
+        : lod === 1 && bs >= L2_MIN_BAR_SPACING
+          ? MANUAL_R_TOO_FINE
+          : bs >= L3_MIN_BAR_SPACING[this.rc.type] && rh < L3_MIN_ROW_HEIGHT
+            ? MANUAL_R_NO_TEXT
+            : '';
+      if (this.manualNote)
+        this.hint = this.hint ? `${this.manualNote}; ${this.hint}` : this.manualNote;
       const fp = wantsFootprintMode(this.mode === 'footprint', { bs, rh, vc });
       this.setMode(fp ? 'footprint' : 'candle');
     }
@@ -668,19 +736,28 @@ export class ChartController {
       dataToSec: dt,
       panDir: this.panDir,
     });
+    // W1: solange der Renderer in einer laufenden Geste nur Kerzen zeichnet, keine Kacheln anfordern
+    // (der Bedarf wird am Gestenende neu bestimmt); höchstens MAX_VISIBLE_TILES sichtbare Kacheln.
+    if (this.gestureActive && this.rc.stats.lod < 2) return;
+    let vis0 = 0;
+    const capped = list.filter((w) =>
+      w.priority === 0 ? ++vis0 <= MAX_VISIBLE_TILES : vis0 <= MAX_VISIBLE_TILES,
+    );
     const series = this.rc.series;
     const wants: Want[] = [];
     const retain = new Set<string>();
     const pinned = new Set<string>();
     let minK = Infinity;
     let maxK = -Infinity;
-    for (const w of list) {
+    let visibleMissing = 0;
+    for (const w of capped) {
       const key = FootprintStore.key(series, w.k);
       pinned.add(key);
       retain.add(key);
       minK = Math.min(minK, w.k);
       maxK = Math.max(maxK, w.k);
       if (this.fpStore.has(series, w.k)) continue;
+      if (w.priority === 0) visibleMissing++;
       wants.push({
         key,
         url: this.api.footprintUrl(this.sym.name, this.tf, this.R, w.k),
@@ -691,6 +768,19 @@ export class ChartController {
     if (minK <= maxK) {
       retain.add(FootprintStore.key(series, minK - 1));
       retain.add(FootprintStore.key(series, maxK + 1));
+    }
+    const prev = this.rc.prev;
+    if (prev) {
+      if (visibleMissing === 0) {
+        this.rc.prev = null; // neue Größe vollständig sichtbar → alte nicht mehr zeichnen
+        this.colorRefDirty = true;
+        this.redraw();
+      } else {
+        // sichtbare Kacheln der alten Größe nicht verdrängen, solange sie gezeichnet werden
+        const a = Math.floor(vis[0] / (prev.n * this.tfSec));
+        const b = Math.floor(vis[1] / (prev.n * this.tfSec));
+        for (let k = a; k <= b; k++) pinned.add(FootprintStore.key(prev.series, k));
+      }
     }
     this.wantedFp = pinned;
     this.fpQueue.setWanted(wants, retain);
@@ -728,7 +818,6 @@ export class ChartController {
     if (!lr || !tiles) return;
     const from = Math.max(0, Math.floor(lr.from));
     const to = Math.min(this.items.length - 1, Math.ceil(lr.to));
-    const span = this.rc.n * this.tfSec;
     const bid = this.rc.type === 'bidask';
     let m = 0;
     const push = (v: number) => {
@@ -739,13 +828,25 @@ export class ChartController {
       }
       this.scratch[m++] = v;
     };
+    const prev = this.rc.prev;
+    const prevTiles = prev ? this.fpStore.tiles(prev.series) : undefined;
+    const lookup = (t: number): [PreparedTile, number] | null => {
+      for (const [m, n] of [
+        [tiles, this.rc.n],
+        [prevTiles, prev?.n ?? 1],
+      ] as const) {
+        const st = m?.get(Math.floor(t / (n * this.tfSec)));
+        if (!st || st === 'rejected') continue;
+        const bi = st.slot[(t - st.fromSec) / this.tfSec];
+        if (bi !== undefined && bi >= 0) return [st, bi];
+      }
+      return null;
+    };
     for (let i = from; i <= to; i++) {
       const t = this.items[i]!.time;
-      const st = tiles.get(Math.floor(t / span));
-      if (!st || st === 'rejected') continue;
-      const tile: PreparedTile = st;
-      const bi = tile.slot[(t - tile.fromSec) / this.tfSec]!;
-      if (bi < 0) continue;
+      const hit = lookup(t);
+      if (!hit) continue;
+      const [tile, bi] = hit;
       for (let j = tile.levelOffset[bi]!; j < tile.levelOffset[bi + 1]!; j++) {
         if (bid) {
           push(tile.buy[j]!);
@@ -764,4 +865,33 @@ export class ChartController {
   private redraw(): void {
     this.fp.applyOptions({});
   }
+}
+
+/** Start-Bar-Abstand: L3-Schwelle des Typs + 5 % (Delta 46 px, Bid×Ask 84 px). */
+export function initialBarSpacing(type: FootprintType): number {
+  return Math.round(L3_MIN_BAR_SPACING[type] * 1.05);
+}
+
+/** Nächstes R (logarithmisch) aus einer aufsteigenden Liste. */
+export function nearestR(rs: readonly number[], r: number): number {
+  let best = rs[0] ?? r;
+  for (const x of rs) if (Math.abs(Math.log(x / r)) < Math.abs(Math.log(best / r))) best = x;
+  return best;
+}
+
+/** Zeilengröße R (Ticks) in Preiseinheiten, z. B. BTC R=50 → "5 USDT". */
+export function rowLabel(
+  R: number,
+  sym: Pick<SymbolInfo, 'tickRefUnits' | 'priceDecimals' | 'name'>,
+): string {
+  const v = (R * sym.tickRefUnits) / 10 ** sym.priceDecimals;
+  const quote = sym.name.includes('USDT') ? 'USDT' : '';
+  return `${Number(v.toPrecision(6))} ${quote}`.trim();
+}
+
+function median(a: readonly number[]): number {
+  if (a.length === 0) return 0;
+  const s = [...a].sort((x, y) => x - y);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m]! : (s[m - 1]! + s[m]!) / 2;
 }

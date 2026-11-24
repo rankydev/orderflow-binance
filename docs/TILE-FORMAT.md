@@ -80,6 +80,23 @@ unbekannte Namen sind ein Fehler. Inkompatible Änderungen erhöhen `format`.
   `symbols`-Antwort interpretierbar ist (Verifier-Stichprobe §4.8).
 - Größe: 28 B je Level + 44 B je Bar + ≈ 0,5–1 kB Header, wie in §5.6 abgeschätzt.
 - Die Kachellänge `n` je (Symbol, tf, R) liefert `GET /api/v1/symbols` als `tiles[tf][R] = n` zusammen mit
-  `tileConfigVersion`; die Fixture-API tut das bereits (der Client braucht n, um Kachelindizes zu berechnen).
-- Kachel über der harten Grenze (60 000 Zellen): `422` mit JSON `{error}` (Client markiert die Kachel als
-  abgelehnt, zeichnet dort Kerzen und fragt sie nicht erneut an).
+  `tileConfigVersion` (jetzt 2); die Fixture-API tut das bereits (der Client braucht n, um Kachelindizes zu
+  berechnen). **Nur angebotene Kombinationen** stehen in `tiles`; der Client fordert keine anderen an.
+
+## Kachellänge (Abweichung von KONZEPT §5.3, Nutzerentscheid 2026-11-24)
+
+§5.3 leitet n aus dem **Median** der Zeilen je Bar ab. Gemessen (BTCUSDT 2026-11-20…22) ergab das Kacheln bis
+107 000 Zellen und 22 Kacheln über der harten Grenze. Neu (`tileBarsForMax` in `packages/core/src/tile/timeframes.ts`):
+
+```
+maxRows = max über alle Bars des Referenzzeitraums von  floor(high/w) − floor(low/w) + 1,   w = R · tick_ref_units
+n       = clamp(2^floor(log2(30 000 / maxRows)), 32, 1024)
+angeboten nur, wenn 32 · maxRows ≤ 60 000   (sonst fehlt R für diesen tf in tiles[tf])
+```
+
+Damit gilt für jede Kachel: Zellen ≤ n · maxRows ≤ 30 000, bzw. ≤ 60 000 bei n = 32. Garantiert ist das für den
+Referenzzeitraum; die API prüft die harte Grenze trotzdem je Antwort (ein späterer Bar könnte breiter sein) und
+antwortet darüber mit `422` + JSON `{error}` (der Client markiert die Kachel als abgelehnt, zeichnet dort Kerzen
+und fragt sie nicht erneut an). Mit den Fixtures: 0 Kacheln über 30 000, 0 abgelehnt, größte Kachel 15 009 Zellen.
+Preis: kürzere Kacheln bei feinen R (z. B. 1m R = 5 Ticks: n = 32 statt 256) und damit mehr Anfragen, aber nur dort,
+wo feine Zeilen angefordert werden.

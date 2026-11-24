@@ -14,6 +14,8 @@ import {
   decodeTile,
   encodeTile,
   tfSeconds,
+  tileBarsForMax,
+  TILE_MAX_CELLS,
   type BarColumns,
   type DecodedTile,
   type LevelColumns,
@@ -32,7 +34,6 @@ export interface SymbolMeta {
   lastClose: number;
   tileConfigVersion: number;
   tiles: Record<string, Record<string, number>>;
-  rejected: Record<string, Record<string, number[]>>;
   synthetic?: { baseSymbol: string; cycles: number; driftUnits: number };
   stress?: boolean;
 }
@@ -75,23 +76,21 @@ export class FixtureStore {
         ...s,
         name: s.name + SYNTH_SUFFIX,
         dataFrom: s.dataTo - span * SYNTH_CYCLES,
-        rejected: {},
         synthetic: { baseSymbol: s.name, cycles: SYNTH_CYCLES, driftUnits: drift },
       };
     });
     const b = m.symbols[0]!;
     const tiles: Record<string, number> = {};
-    for (const R of [1, 2, 5, 10, 20, 50, 100])
-      tiles[String(R)] = Math.max(
-        32,
-        Math.min(1024, 2 ** Math.floor(Math.log2(30_000 / Math.ceil(300 / R + 1)))),
-      );
+    // Stressbars überspannen höchstens 320 Ticks → max. Zeilen je Bar = ceil(320 / R) + 1
+    for (const R of [1, 2, 5, 10, 20, 50, 100]) {
+      const n = tileBarsForMax(Math.ceil(320 / R) + 1);
+      if (n !== null) tiles[String(R)] = n;
+    }
     const stress: SymbolMeta = {
       ...b,
       name: STRESS_SYMBOL,
       dataFrom: b.dataTo - STRESS_DAYS * 86_400_000,
       tiles: { '1m': tiles },
-      rejected: {},
       stress: true,
     };
     this.meta = { symbols: [...m.symbols, ...synth, stress] };
@@ -156,9 +155,6 @@ export class FixtureStore {
     const tfSec = tfSeconds(tf);
     const n = sym.tiles[tf]?.[String(R)];
     if (!n) throw new HttpError(422, `R=${R} für ${tf} nicht verfügbar (Zellgrenze)`);
-    if (sym.rejected[tf]?.[String(R)]?.includes(k)) {
-      throw new HttpError(422, `Kachel überschreitet 60 000 Zellen; gröberes R wählen`);
-    }
     const span = n * tfSec * 1000;
     const from = k * span;
     const to = from + span;
@@ -170,7 +166,7 @@ export class FixtureStore {
     };
     if (sym.stress) {
       const s = stressSeries(sym, from, to, R * sym.tickRefUnits);
-      return encodeTile({ meta, bars: s.bars, levels: s.levels! });
+      return guarded({ meta, bars: s.bars, levels: s.levels! });
     }
     if (!sym.synthetic) {
       const f = this.file(sym.name, 'footprint', tf, String(R), `${k}.bin`);
@@ -180,7 +176,7 @@ export class FixtureStore {
     const base = this.baseSeries(this.baseOf(sym), tf, R);
     const out = this.slice(sym, base, from, to, R * sym.tickRefUnits);
     const tile: TileData = { meta, bars: out.bars, levels: out.levels! };
-    return encodeTile(tile);
+    return guarded(tile);
   }
 
   private mustSymbol(name: string): SymbolMeta {
@@ -357,6 +353,14 @@ function stressSeries(sym: SymbolMeta, from: number, to: number, width: number |
   }
   if (levels) levels.levelOffset[nb] = j;
   return { bars, levels };
+}
+
+/** Harte Zellgrenze wie die API (§1.4); mit der Kachellänge aus tileBarsForMax nie erreicht. */
+function guarded(tile: TileData): Uint8Array {
+  const cells = tile.levels?.row.length ?? 0;
+  if (cells > TILE_MAX_CELLS)
+    throw new HttpError(422, `Kachel mit ${cells} Zellen über ${TILE_MAX_CELLS}`);
+  return encodeTile(tile);
 }
 
 function lowerBound(a: Int32Array, v: number): number {

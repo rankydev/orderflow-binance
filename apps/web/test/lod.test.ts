@@ -3,8 +3,10 @@ import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import { ladder } from '@orderflow/core/browser';
 import {
-  adjustRowSize,
+  chooseRowSize,
   initialRowSize,
+  ROW_TARGET,
+  rowClassFor,
   rowHeightPx,
   selectLod,
   VISIBLE_CELL_BUDGET,
@@ -110,93 +112,115 @@ describe('visibleCells (vc)', () => {
   });
 });
 
-describe('Zeilengröße (Auto-R)', () => {
-  it('Start-R: Median-Range der letzten 200 Bars ≈ 24 Zeilen, nächste Leiterstufe', () => {
-    // Range 4 800 price_unit = 480 Ticks → 20 Ticks je Zeile
-    const highs = Array.from({ length: 300 }, (_, i) => 100_000 + 4_800 + (i % 3));
-    const lows = Array.from({ length: 300 }, () => 100_000);
-    expect(initialRowSize(highs, lows, RS, TICK, TICK)).toBe(20);
-    // ältere Bars (vor den letzten 200) zählen nicht
-    const h2 = [...Array.from({ length: 100 }, () => 1e9), ...highs.slice(0, 200)];
-    const l2 = [...Array.from({ length: 100 }, () => 0), ...lows.slice(0, 200)];
-    expect(initialRowSize(h2, l2, RS, TICK, TICK)).toBe(20);
-    // nie feiner als der aktuelle Tick
+describe('Zeilenklasse (Lesbarkeit zuerst)', () => {
+  it('Zahlen ab der L3-Schwelle des Typs, Hysterese 10 % beim Verlassen', () => {
+    expect(rowClassFor(44, 'delta', null)).toBe('text');
+    expect(rowClassFor(43.9, 'delta', null)).toBe('cells');
+    expect(rowClassFor(40, 'delta', 'text')).toBe('text'); // ≥ 39,6
+    expect(rowClassFor(39.5, 'delta', 'text')).toBe('cells');
+    expect(rowClassFor(42, 'delta', 'cells')).toBe('cells');
+    expect(rowClassFor(79, 'bidask', null)).toBe('cells');
+    expect(rowClassFor(80, 'bidask', null)).toBe('text');
+  });
+});
+
+describe('chooseRowSize (automatische Zeilengröße am Gestenende)', () => {
+  // 30 Bars über 4 000 price_unit Range; ppu frei wählbar
+  const view = (ppu: number, n = 30, range = 4_000): ViewGeometry => ({
+    highs: Array.from({ length: n }, () => 500_000 + range),
+    lows: Array.from({ length: n }, () => 500_000),
+    from: 0,
+    to: n - 1,
+    unitBottom: 500_000,
+    unitTop: 500_000 + 700 / ppu,
+    pxPerUnit: ppu,
+  });
+  const rh = (g: ViewGeometry, r: number) => g.pxPerUnit * r * TICK;
+
+  it('Zahlen: rh(R) ≥ 11,5 px und am nächsten an 14 px (logarithmisch)', () => {
+    // ppu 0,16 px/unit: R=10 → 16 px exakt
+    expect(chooseRowSize(null, RS, view(0.16), TICK, 'text')).toBe(10);
+    // ppu 0,1: R=10 → 10 px (zu klein), R=20 → 20 px
+    expect(chooseRowSize(null, RS, view(0.1), TICK, 'text')).toBe(20);
+    fc.assert(
+      fc.property(fc.double({ min: 0.0005, max: 5, noNaN: true }), (ppu) => {
+        const g = view(ppu, 10, 400);
+        const r = chooseRowSize(null, RS, g, TICK, 'text');
+        // (ist schon R = 1 Tick höher als 44 px, gibt es nichts Feineres – dann R = 1)
+        if (
+          rh(g, RS[RS.length - 1]!) >= ROW_TARGET.text.min &&
+          rh(g, 1) <= ROW_TARGET.text.keepMax
+        ) {
+          expect(rh(g, r)).toBeGreaterThanOrEqual(ROW_TARGET.text.min);
+          // gewähltes rh liegt im Behalten-Band → keine Rückwechsel ohne Änderung der Skala
+          expect(rh(g, r)).toBeLessThanOrEqual(ROW_TARGET.text.keepMax);
+          expect(chooseRowSize(r, RS, g, TICK, 'text')).toBe(r);
+        }
+      }),
+    );
+  });
+
+  it('Zellen: rh ≥ 4 px, Ziel 6 px', () => {
+    expect(chooseRowSize(null, RS, view(0.06), TICK, 'cells')).toBe(10); // 6 px
+    const r = chooseRowSize(null, RS, view(0.013), TICK, 'cells');
+    expect(rh(view(0.013), r)).toBeGreaterThanOrEqual(4);
+  });
+
+  it('Hysterese: R bleibt im Band, folgt beim Strecken (feiner) und Stauchen (gröber)', () => {
+    const g = view(0.16);
+    expect(chooseRowSize(10, RS, view(0.25), TICK, 'text')).toBe(10); // 25 px: im Band, bleibt
+    expect(chooseRowSize(10, RS, view(0.12), TICK, 'text')).toBe(10); // 12 px: bleibt
+    expect(chooseRowSize(10, RS, view(0.1), TICK, 'text')).toBe(20); // 10 px < 11,5: gröber
+    // 50 px > 44: feiner; R=2 hätte 10 px (< 11,5), also R=5 mit 25 px
+    expect(chooseRowSize(10, RS, view(0.5), TICK, 'text')).toBe(5);
+    // Wechsel text → cells: 16 px liegt noch im Zellen-Band [3, 16] → bleibt
+    expect(chooseRowSize(10, RS, g, TICK, 'cells')).toBe(10);
+    // 20 px ist für Zellen zu hoch → feiner, Ziel 6 px (R=5 → 6,25 px)
+    expect(chooseRowSize(10, RS, view(0.2) /* 20 px */, TICK, 'cells')).toBe(2);
+  });
+
+  it('Zellbudget: R wird vergrößert, bis vc ≤ 22 500', () => {
+    // 600 Bars, je 400 Zeilen bei R=1 im sichtbaren Bereich; rh-Ziel würde R=1 wählen
+    const g: ViewGeometry = {
+      highs: Array.from({ length: 600 }, () => 504_000),
+      lows: Array.from({ length: 600 }, () => 500_000),
+      from: 0,
+      to: 599,
+      unitBottom: 500_000,
+      unitTop: 504_000,
+      pxPerUnit: 0.6,
+    };
+    const r = chooseRowSize(null, RS, g, TICK, 'cells');
+    expect(visibleCells(g, r * TICK)).toBeLessThanOrEqual(VISIBLE_CELL_BUDGET * 0.9);
+    const prev = RS[RS.indexOf(r) - 1]!;
+    expect(visibleCells(g, prev * TICK)).toBeGreaterThan(VISIBLE_CELL_BUDGET * 0.9);
+  });
+
+  it('nur verfügbare R (Liste), sonst das größte', () => {
+    expect(chooseRowSize(null, [50, 100], view(0.01), TICK, 'text')).toBe(100);
+    expect(chooseRowSize(7, [5, 10], view(0.16), TICK, 'text')).toBe(10);
+  });
+});
+
+describe('Start-R (vorläufig, vor der ersten Bewertung)', () => {
+  it('nie feiner als der aktuelle Tick', () => {
     expect(initialRowSize([100_010], [100_000], RS, TICK, 50)).toBe(5);
   });
+});
 
-  const flat = (n: number, range: number, heightPx: number, viewRange: number): ViewGeometry =>
-    geom(
-      Array.from({ length: n }, () => [500_000 + range, 500_000] as [number, number]),
-      500_000,
-      500_000 + viewRange,
-      heightPx,
-    );
+void rowHeightPx;
+void wantsFootprintMode;
 
-  it('vergrößert R, solange rh < 2 px oder vc > 25 000', () => {
-    // 300 Bars, je 4 000 price_unit Range, sichtbar 4 000 auf 800 px → R=1: rh 2 px, vc 300·401 > 25 000
-    const g = flat(300, 4_000, 800, 4_000);
-    const r = adjustRowSize(1, RS, g, TICK);
-    const w = r * TICK;
-    expect(visibleCells(g, w)).toBeLessThanOrEqual(VISIBLE_CELL_BUDGET);
-    expect(rowHeightPx(g, w)).toBeGreaterThanOrEqual(2);
-    // und es ist die kleinste solche Stufe
-    const prev = RS[RS.indexOf(r) - 1]!;
-    expect(
-      visibleCells(g, prev * TICK) > VISIBLE_CELL_BUDGET || rowHeightPx(g, prev * TICK) < 2,
-    ).toBe(true);
-  });
-
-  it('verkleinert R erst über 44 px (40 + 10 %) und nur, wenn die feinere Stufe passt', () => {
-    const g = flat(20, 1_000, 800, 1_000); // 0,8 px je price_unit
-    // R=50: rh = 400 px → schrittweise kleiner bis R=5 (40 px); R=2 hätte 16 px, wird aber nicht
-    // gewählt, weil 40 px ≤ 44 px schon im Band liegt.
-    expect(adjustRowSize(50, RS, g, TICK)).toBe(5);
-    expect(adjustRowSize(5, RS, g, TICK)).toBe(5);
-    // 45 px (knapp über 44) → eine Stufe kleiner
-    const g2 = { ...g, pxPerUnit: 0.9 }; // R=5: 45 px
-    expect(adjustRowSize(5, RS, g2, TICK)).toBe(2);
-  });
-
-  it('bleibt stehen innerhalb des Bands [2, 44] px (keine Änderung ohne Grund)', () => {
-    fc.assert(
-      fc.property(
-        fc.constantFrom(...RS),
-        fc.double({ min: 0.001, max: 5, noNaN: true }),
-        (r, ppu) => {
-          const rh = ppu * r * TICK;
-          const g: ViewGeometry = {
-            highs: [1_000],
-            lows: [1_000],
-            from: 0,
-            to: 0,
-            unitBottom: 0,
-            unitTop: 2_000,
-            pxPerUnit: ppu,
-          };
-          if (rh >= 2 && rh <= 44) expect(adjustRowSize(r, RS, g, TICK)).toBe(r);
-        },
-      ),
-    );
-  });
-
-  it('Ergebnis liegt immer in der Liste und erfüllt das Budget, wenn möglich', () => {
-    fc.assert(
-      fc.property(
-        fc.constantFrom(...RS),
-        fc.integer({ min: 1, max: 600 }),
-        fc.integer({ min: 10, max: 50_000 }),
-        fc.integer({ min: 100, max: 50_000 }),
-        (r0, n, range, view) => {
-          const g = flat(n, range, 700, view);
-          const r = adjustRowSize(r0, RS, g, TICK);
-          expect(RS).toContain(r);
-          const w = r * TICK;
-          if (r !== RS[RS.length - 1]) {
-            expect(visibleCells(g, w)).toBeLessThanOrEqual(VISIBLE_CELL_BUDGET);
-            expect(rowHeightPx(g, w)).toBeGreaterThanOrEqual(2);
-          }
-        },
-      ),
-    );
+describe('Manuelles R und Startansicht', () => {
+  it('Beschriftung in Preiseinheiten, nächstes verfügbares R, Start-Bar-Abstand über der L3-Schwelle', async () => {
+    const { rowLabel, nearestR, initialBarSpacing } = await import('../src/lib/controller.ts');
+    const btc = { name: 'BTCUSDT', tickRefUnits: 10, priceDecimals: 2 };
+    expect(rowLabel(1, btc)).toBe('0.1 USDT');
+    expect(rowLabel(50, btc)).toBe('5 USDT');
+    expect(rowLabel(1000, btc)).toBe('100 USDT');
+    expect(nearestR([5, 10, 20, 50], 2)).toBe(5);
+    expect(nearestR([5, 10, 20, 50], 30)).toBe(20); // ln: 30/20 < 50/30
+    expect(initialBarSpacing('delta')).toBeGreaterThanOrEqual(44);
+    expect(initialBarSpacing('bidask')).toBeGreaterThanOrEqual(80);
   });
 });

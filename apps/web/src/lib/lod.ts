@@ -7,7 +7,6 @@ export const L3_MIN_BAR_SPACING: Record<FootprintType, number> = { delta: 44, bi
 export const L3_MIN_ROW_HEIGHT = 11;
 export const L2_MIN_BAR_SPACING = 6;
 export const L2_MIN_ROW_HEIGHT = 2;
-export const ROW_HEIGHT_MAX = 40;
 export const HYSTERESIS = 0.1;
 export const AUTO_R_TARGET_ROWS = 24;
 export const GESTURE_DEBOUNCE_MS = 150;
@@ -74,51 +73,65 @@ export function rowHeightPx(g: Pick<ViewGeometry, 'pxPerUnit'>, width: number): 
   return g.pxPerUnit * width;
 }
 
-/** Nächste/vorige Stufe in einer aufsteigend sortierten Liste zulässiger R (Leiter ∩ verfügbar). */
-function stepIndex(rs: readonly number[], r: number): number {
-  let i = rs.indexOf(r);
-  if (i < 0) {
-    i = 0;
-    while (i < rs.length - 1 && rs[i]! < r) i++;
-  }
-  return i;
+/**
+ * Zeilenklasse (Abweichung von §6.1/§7.2, Nutzerentscheid 2026-11-24, „Lesbarkeit zuerst"):
+ * reichen die Bars für Zahlen (bs ≥ L3-Schwelle des Typs), werden die Zeilen so grob gewählt, dass eine
+ * Zahl hineinpasst ("text"); sonst so, dass Zellen als Blöcke erkennbar sind ("cells").
+ * Hysterese: einmal "text", bleibt es bis bs < 0,9 · Schwelle.
+ */
+export type RowClass = 'text' | 'cells';
+
+export const ROW_TARGET: Record<
+  RowClass,
+  { min: number; target: number; keepMin: number; keepMax: number }
+> = {
+  // Zahlen: Ziel 14 px, mindestens 11,5 px (über der L3-Grenze 11 px); behalten in [11,5, 44] px
+  text: { min: 11.5, target: 14, keepMin: 11.5, keepMax: 44 },
+  // Zellen: Ziel 6 px, mindestens 4 px; behalten in [3, 16] px
+  cells: { min: 4, target: 6, keepMin: 3, keepMax: 16 },
+};
+
+export function rowClassFor(bs: number, type: FootprintType, prev: RowClass | null): RowClass {
+  const th = L3_MIN_BAR_SPACING[type];
+  return bs >= (prev === 'text' ? th * (1 - HYSTERESIS) : th) ? 'text' : 'cells';
 }
 
 /**
- * Auto-R am Gestenende (§7.2): fällt rh unter 2 px oder überschreitet vc 25 000, eine Leiterstufe
- * größer (wiederholt); steigt rh über 40 px, kleiner – mit 10 % Hysterese, und nur wenn die kleinere
- * Stufe die Bedingungen weiterhin (mit Reserve) erfüllt. Liefert R aus `rs` (aufsteigend).
+ * Automatische Zeilengröße am Gestenende (ersetzt §7.2 „Auto-R"):
+ *  1. Behalten, wenn rh(R_akt) ∈ [keepMin, keepMax] der Klasse und vc(R_akt) ≤ 25 000.
+ *  2. Sonst: unter allen R mit rh(R) ≥ min das R mit minimalem |ln(rh(R) / target)|
+ *     (gibt es keins, das größte R).
+ *  3. Danach so lange eine Stufe größer, bis vc ≤ 0,9 · 25 000.
+ * rh(R) = Pixel je price_unit · R · tick_ref_units (aus der aktuellen Preisskala).
+ * Weil die gewählten rh in [min, target · 2,5 · …] ⊂ [keepMin, keepMax] liegen, springt R nicht zurück.
  */
-export function adjustRowSize(
-  current: number,
+export function chooseRowSize(
+  current: number | null,
   rs: readonly number[],
   g: ViewGeometry,
   tickRefUnits: number,
+  cls: RowClass,
 ): number {
-  if (rs.length === 0) return current;
-  let i = stepIndex(rs, current);
-  const m = (k: number) => {
-    const w = rs[k]! * tickRefUnits;
-    return { rh: rowHeightPx(g, w), vc: visibleCells(g, w) };
-  };
-  let x = m(i);
-  let grew = false;
-  while ((x.rh < L2_MIN_ROW_HEIGHT || x.vc > VISIBLE_CELL_BUDGET) && i < rs.length - 1) {
-    i++;
-    x = m(i);
-    grew = true;
+  if (rs.length === 0) return current ?? 1;
+  const t = ROW_TARGET[cls];
+  const rh = (r: number) => rowHeightPx(g, r * tickRefUnits);
+  const vc = (r: number) => visibleCells(g, r * tickRefUnits);
+  if (current !== null && rs.includes(current)) {
+    const h = rh(current);
+    if (h >= t.keepMin && h <= t.keepMax && vc(current) <= VISIBLE_CELL_BUDGET) return current;
   }
-  if (grew) return rs[i]!;
-  while (x.rh > ROW_HEIGHT_MAX * (1 + HYSTERESIS) && i > 0) {
-    const y = m(i - 1);
-    if (
-      y.rh < L2_MIN_ROW_HEIGHT * (1 + HYSTERESIS) ||
-      y.vc > VISIBLE_CELL_BUDGET * (1 - HYSTERESIS)
-    )
-      break;
-    i--;
-    x = y;
+  let i = rs.length - 1;
+  let best = Infinity;
+  for (let k = 0; k < rs.length; k++) {
+    const h = rh(rs[k]!);
+    if (h < t.min) continue;
+    const d = Math.abs(Math.log(h / t.target));
+    if (d < best) {
+      best = d;
+      i = k;
+    }
   }
+  while (i < rs.length - 1 && vc(rs[i]!) > VISIBLE_CELL_BUDGET * (1 - HYSTERESIS)) i++;
   return rs[i]!;
 }
 
@@ -156,5 +169,6 @@ export function initialRowSize(
   return best;
 }
 
-/** Hinweis bei manuellem R, wenn die Bedingungen für L2 nicht erfüllt sind (§7.2). */
-export const MANUAL_R_TOO_FINE = 'Zeilengröße zu fein für diesen Ausschnitt';
+/** Hinweise bei manuellem R (§7.2: Rückfall statt stillem Ignorieren). */
+export const MANUAL_R_TOO_FINE = 'Zeilengröße zu fein für diesen Ausschnitt – Kerzen';
+export const MANUAL_R_NO_TEXT = 'Zeilen zu niedrig für Zahlen – nur Zellen';

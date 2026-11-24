@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { APP_TITLE, CHARTS_ATTRIBUTION, CHARTS_URL } from './app-info.ts';
-  import { ChartController, type Readout } from './lib/controller.ts';
-  import type { ColorMode, ColorScope, FootprintType } from './lib/types.ts';
+  import { ChartController, rowLabel, type Readout } from './lib/controller.ts';
+  import type { ColorMode, ColorScope, FootprintType, SymbolInfo } from './lib/types.ts';
 
   // Nur UI-Einstellungen sind reaktiv (KONZEPT §7.3); Chartdaten liegen im Controller.
   const params = new URLSearchParams(location.search);
@@ -10,11 +10,14 @@
   let sym = $state(params.get('sym') ?? 'BTCUSDT');
   let tf = $state(TIMEFRAMES.includes(params.get('tf') ?? '') ? params.get('tf')! : '1m');
   let type = $state<FootprintType>(params.get('type') === 'bidask' ? 'bidask' : 'delta');
-  let rMode = $state<string>('auto');
+  // Zeilengröße: 'auto' oder Ticks (URL-Parameter r, z. B. r=50 = 5 USDT bei BTC)
+  const rParam = params.get('r');
+  let rMode = $state<string>(rParam && /^\d+$/.test(rParam) ? rParam : 'auto');
   let colorMode = $state<ColorMode>('gradient');
   let colorScope = $state<ColorScope>('visible');
   let symbols = $state.raw<string[]>([]);
   let rOptions = $state.raw<number[]>([]);
+  let symInfo = $state.raw<SymbolInfo | null>(null);
   let ro = $state.raw<Readout | null>(null);
   let error = $state('');
 
@@ -29,10 +32,11 @@
     }
     ctl.setType(type);
     ctl
-      .init(sym, tf)
+      .init(sym, tf, rMode === 'auto' ? 'auto' : Number(rMode))
       .then(() => {
         symbols = ctl!.symbols.map((s) => s.name);
         sym = ctl!.readout().sym;
+        symInfo = ctl!.symbols.find((s) => s.name === sym) ?? null;
         rOptions = ctl!.availableR(tf);
       })
       .catch((e: unknown) => (error = e instanceof Error ? e.message : String(e)));
@@ -48,20 +52,21 @@
   });
 
   function syncUrl(): void {
-    const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}${params.has('debug') ? '&debug' : ''}`;
+    const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${params.has('debug') ? '&debug' : ''}`;
     history.replaceState(null, '', q);
   }
 
   function chooseTf(v: string): void {
     tf = v;
-    rMode = 'auto';
-    ctl?.setTimeframe(v);
+    ctl?.setTimeframe(v); // manuelles R bleibt, falls für v verfügbar (sonst nächstes, mit Hinweis)
     rOptions = ctl?.availableR(v) ?? [];
     syncUrl();
   }
   function chooseSym(v: string): void {
     sym = v;
     ctl?.setSymbol(v);
+    symInfo = ctl?.symbols.find((s) => s.name === v) ?? null;
+    rOptions = ctl?.availableR(tf) ?? [];
     syncUrl();
   }
   function chooseType(v: FootprintType): void {
@@ -72,7 +77,9 @@
   function chooseR(v: string): void {
     rMode = v;
     ctl?.setRowMode(v === 'auto' ? 'auto' : Number(v));
+    syncUrl();
   }
+  const label = (r: number) => (symInfo ? rowLabel(r, symInfo) : `${r} Ticks`);
 </script>
 
 <main>
@@ -97,8 +104,8 @@
         value={rMode}
         onchange={(e) => chooseR(e.currentTarget.value)}
       >
-        <option value="auto">auto{ro && ro.rAuto ? ` (${ro.R})` : ''}</option>
-        {#each rOptions as r (r)}<option value={String(r)}>{r} Ticks</option>{/each}
+        <option value="auto">Auto{ro && ro.rAuto ? ` (${ro.rLabel})` : ''}</option>
+        {#each rOptions as r (r)}<option value={String(r)}>{label(r)}</option>{/each}
       </select>
     </label>
     <label>
@@ -134,8 +141,16 @@
     {#if error}<span class="err">{error}</span>{/if}
     {#if ro}
       <span>tf <b data-k="tf">{ro.tf}</b></span>
-      <span>R <b data-k="R">{ro.R}</b>{ro.rAuto ? ' auto' : ''}</span>
+      <span>
+        Zeile <b data-k="R">{ro.rLabel}</b> ({ro.R} Ticks, {ro.rAuto
+          ? `auto${ro.rowClass ? ' ' + ro.rowClass : ''}`
+          : 'manuell'})
+      </span>
       <span>LOD <b data-k="lod">L{ro.lod}</b> ({ro.mode})</span>
+      <span>
+        Bars mit Zahlen <b data-k="textBars">{ro.textBars}</b> · Zeilen/Bar {ro.rowsMedian} (max
+        {ro.rowsMax})
+      </span>
       <span>Zellen sichtbar <b data-k="vc">{ro.visibleCells}</b> / gezeichnet {ro.cellsDrawn}</span>
       <span>Frame <b data-k="frame">{ro.lastFrameMs.toFixed(2)} ms</b></span>
       <span>bs {ro.barSpacing.toFixed(1)} px · rh {ro.rowHeight.toFixed(1)} px</span>

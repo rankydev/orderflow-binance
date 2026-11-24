@@ -221,52 +221,63 @@ async function main(): Promise<void> {
   });
   results.pan_1m.requestsPerPass = passReq;
 
-  // 2) Zoom: hinein bis L3, heraus bis L1, wieder hinein (alle drei Stufen).
+  // 2) Zoom nur horizontal (Mausrad): von der Startansicht (L3) heraus bis L1 und wieder hinein
+  //    bis L3 – ohne die Preisachse anzufassen. Danach Preisachse strecken/stauchen: R folgt.
   const lodsSeen = new Set<number>();
   const lodTrace: Any[] = [];
+  const row = (r: Any, label: string) => ({
+    label,
+    lod: r.lod,
+    R: r.R,
+    rLabel: r.rLabel,
+    cls: r.rowClass,
+    bs: +r.barSpacing.toFixed(1),
+    rh: +r.rowHeight.toFixed(1),
+    vc: r.visibleCells,
+    cells: r.cellsDrawn,
+    textBars: r.textBars,
+    rowsMedian: r.rowsMedian,
+    rowsMax: r.rowsMax,
+    shortened: r.textsShortened,
+    skipped: r.textsSkipped,
+    hint: r.hint,
+  });
   const trace = async (label: string) => {
     const r = await readout();
     lodsSeen.add(r.lod);
-    lodTrace.push({
-      label,
-      lod: r.lod,
-      R: r.R,
-      bs: +r.barSpacing.toFixed(1),
-      rh: +r.rowHeight.toFixed(1),
-      vc: r.visibleCells,
-      cells: r.cellsDrawn,
-    });
+    lodTrace.push(row(r, label));
     cellsSamples.push(r.cellsDrawn);
   };
   await scenario('zoom_1m', async () => {
-    for (let i = 0; i < 6; i++) {
-      await wheel(-240, 4);
-      await idle(250);
-      await trace(`in${i}`);
-    }
-    // Zeilen vertikal strecken (Preisachse ziehen) → Auto-R wird feiner/gröber, L3 mit Zahlen
-    for (let k = 0; k < 6; k++) {
-      await stretch(40);
-      await idle(300);
-      await trace(`stretch${k}`);
-      if ((await readout()).lod === 3) break;
-    }
-    for (let i = 0; i < 12; i++) {
-      await wheel(240, 4);
+    await trace('start');
+    for (let i = 0; i < 14; i++) {
+      await wheel(240, 2);
       await idle(250);
       await trace(`out${i}`);
     }
-    for (let i = 0; i < 8; i++) {
-      await wheel(-240, 4);
+    for (let i = 0; i < 14; i++) {
+      await wheel(-240, 2);
       await idle(250);
-      await trace(`in2_${i}`);
+      await trace(`in${i}`);
+      if ((await readout()).lod === 3 && i > 3) break;
+    }
+    for (let k = 0; k < 3; k++) {
+      await stretch(80);
+      await idle(300);
+      await trace(`stretch${k}`);
+    }
+    for (let k = 0; k < 5; k++) {
+      await stretch(-80);
+      await idle(300);
+      await trace(`compress${k}`);
     }
   });
   results.zoom_1m.lodsSeen = [...lodsSeen].sort();
   results.zoom_1m.trace = lodTrace;
 
   // 3) Maus über dem Chart bewegen (Fadenkreuz), 5 s.
-  await page.evaluate(() => (window as Any).__of.chart.timeScale().resetTimeScale());
+  await page.goto(`${URL0}?sym=BTCUSDT&tf=1m&type=delta`);
+  await page.waitForFunction(() => performance.getEntriesByName('of:first-footprint').length > 0);
   await idle();
   await scenario('mousemove', async () => {
     const t0 = Date.now();
@@ -280,29 +291,68 @@ async function main(): Promise<void> {
     }
   });
 
-  // Screenshots (echte Daten): L2-Zellen
-  await page.goto(`${URL0}?sym=BTCUSDT&tf=1m&type=delta`);
+  // 4) Je Zeitrahmen (echte Tage): Startansicht, dann nur horizontal heraus bis L1/L2 und wieder
+  //    hinein bis L3. Screenshots: Startansichten, 5m/15m nach horizontalem Zoom, Zellen-Stufe.
+  results.shots = {};
+  const perTf: Any[] = [];
+  for (const tf of ['1m', '5m', '15m', '1h']) {
+    await page.goto(`${URL0}?sym=BTCUSDT&tf=${tf}&type=delta`);
+    await page.waitForFunction(() => performance.getEntriesByName('of:first-footprint').length > 0);
+    await idle();
+    const def = row(await readout(), `${tf} start`);
+    perTf.push(def);
+    if (tf === '1m') await page.screenshot({ path: join(SHOTS, 'default-delta-1m.png') });
+    let minLod = 3;
+    let cellsShot = false;
+    for (let i = 0; i < 10; i++) {
+      await wheel(240, 2);
+      await idle(250);
+      const r = await readout();
+      minLod = Math.min(minLod, r.lod);
+      if (tf === '1m' && !cellsShot && r.lod === 2 && r.rowClass === 'cells' && r.barSpacing < 25) {
+        await page.screenshot({ path: join(SHOTS, 'cells-level-1m.png') });
+        results.shots.cells = row(r, 'cells');
+        perTf.push(row(r, `${tf} zellen`));
+        cellsShot = true;
+      }
+      if (r.lod === 1) break;
+    }
+    perTf.push({ ...row(await readout(), `${tf} herausgezoomt`), minLod });
+    let reached: Any = null;
+    for (let i = 0; i < 20; i++) {
+      await wheel(-240, 2);
+      await idle(250);
+      const r = await readout();
+      if (r.lod === 3) {
+        reached = row(r, `${tf} horizontal hinein → L3`);
+        break;
+      }
+    }
+    perTf.push(reached ?? row(await readout(), `${tf}: L3 nicht erreicht`));
+    if (tf === '5m' || tf === '15m')
+      await page.screenshot({ path: join(SHOTS, `delta-${tf}-horizontal-zoom.png`) });
+  }
+  results.perTimeframe = perTf;
+  await page.goto(`${URL0}?sym=BTCUSDT&tf=1m&type=bidask`);
   await page.waitForFunction(() => performance.getEntriesByName('of:first-footprint').length > 0);
   await idle();
-  await page.screenshot({ path: join(SHOTS, 'l2-delta-cells-1m.png') });
-  results.shots = { l2: await readout() };
-  // L3 Delta: hineinzoomen und Zeilen strecken
-  const toL3 = async () => {
-    for (let k = 0; k < 20; k++) {
-      const r = await readout();
-      if (r.lod === 3) return r;
-      if (r.barSpacing < 95) await wheel(-240, 2);
-      else await stretch(r.rowHeight < 6 ? 60 : 30);
-      await idle(300);
-    }
-    return readout();
-  };
-  results.shots.l3delta = await toL3();
-  await page.screenshot({ path: join(SHOTS, 'l3-delta-numbers-1m.png') });
-  await page.getByRole('button', { name: 'Bid×Ask' }).click();
-  await idle();
-  results.shots.l3bidask = await toL3();
-  await page.screenshot({ path: join(SHOTS, 'l3-bidask-numbers-1m.png') });
+  results.shots.bidask = row(await readout(), 'bidask start');
+  await page.screenshot({ path: join(SHOTS, 'default-bidask-1m.png') });
+  // Manuelles R: 2 USDT (r=20) per URL, dann weit herauszoomen → Rückfall sichtbar im Hinweis
+  await page.goto(`${URL0}?sym=BTCUSDT&tf=1m&type=delta&r=20`);
+  await page.waitForFunction(() => performance.getEntriesByName('of:first-candles').length > 0);
+  await idle(800);
+  results.shots.manual = row(await readout(), 'manuell R=20');
+  await page.screenshot({ path: join(SHOTS, 'manual-r-2usdt-1m.png') });
+  await page.getByLabel('Zeilengröße').selectOption('50');
+  await idle(500);
+  results.shots.manualSelect = row(await readout(), 'manuell R=50 per Auswahl');
+  results.shots.manualUrl = await page.evaluate(() => location.search);
+  for (let i = 0; i < 6; i++) {
+    await wheel(240, 2);
+    await idle(250);
+  }
+  results.shots.manualZoomedOut = row(await readout(), 'manuell R=50 herausgezoomt');
 
   // T11: Zellbudget unter Last – manuelles R, fester Preisbereich so gewählt, dass knapp ≤ 25 000
   // Zellen sichtbar sind; dann pannen (vc schwankt; über dem Budget muss der Renderer auf Kerzen fallen).

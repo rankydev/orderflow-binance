@@ -19,14 +19,14 @@ import {
   formatDay,
   getSymbol,
   ladder,
+  maxRowsPerBar,
   medianRowsPerBar,
   parseDay,
   rollupBars,
   rollupFp,
   tfSeconds,
-  tileBarsFor,
+  tileBarsForMax,
   tileIndexAt,
-  TILE_MIN_BARS,
   TILE_MAX_CELLS,
   type Bar,
   type FpTable,
@@ -116,9 +116,9 @@ async function main(): Promise<void> {
     dataVersion,
     final: true,
   };
+  // n je (tf, R) aus dem Maximum der Zeilen je Bar (tileBarsForMax): keine Kachel über der harten
+  // Grenze; Kombinationen, bei denen selbst 32 Bars sie reißen könnten, werden nicht angeboten.
   const tiles: Record<string, Record<string, number>> = {};
-  // Kacheln über der harten Grenze (60 000 Zellen, §1.4): die API lehnt sie mit 422 ab; hier ebenso.
-  const rejected: Record<string, Record<string, number[]>> = {};
   const stats: Record<string, unknown>[] = [];
   let files = 0;
   let bytes = 0;
@@ -132,14 +132,14 @@ async function main(): Promise<void> {
     files++;
     bytes += barsEnc.length;
     tiles[tf] = {};
-    rejected[tf] = {};
     const high = bars.map((b) => b.high);
     const low = bars.map((b) => b.low);
     for (const R of ladder(MAX_R)) {
       const width = R * spec.tickRefUnits;
       const rows = medianRowsPerBar(high, low, width);
-      if (rows * TILE_MIN_BARS > TILE_MAX_CELLS) continue; // API würde mit 422 ablehnen
-      const n = tileBarsFor(rows);
+      const maxRows = maxRowsPerBar(high, low, width);
+      const n = tileBarsForMax(maxRows);
+      if (n === null) continue; // nicht angeboten (32 · max > 60 000)
       const src = chooseFpSource(tfMin, R, rowsPerDay);
       const rolled = rollupFp(fp[src], tfMin, width);
       const k0 = tileIndexAt(fromMs / 1000, n, tfSec);
@@ -147,7 +147,6 @@ async function main(): Promise<void> {
       let maxCells = 0;
       let maxSrcRows = 0;
       let over30k = 0;
-      const rej: number[] = [];
       const dir = join(symDir, 'footprint', tf, String(R));
       await mkdir(dir, { recursive: true });
       for (let k = k0; k <= k1; k++) {
@@ -161,17 +160,14 @@ async function main(): Promise<void> {
         // Geschätzte Quellzeilen der Kachel (Guard §5.1, nur Bericht): Zeilen/Tag × Kachelspanne
         maxSrcRows = Math.max(maxSrcRows, (rowsPerDay[src] * n * tfSec) / 86_400);
         if (cells > 30_000) over30k++;
-        if (cells > TILE_MAX_CELLS) {
-          rej.push(k);
-          continue;
-        }
+        if (cells > TILE_MAX_CELLS)
+          throw new Error(`Kachel ${tf}/${R}/${k} mit ${cells} Zellen – Kachellänge falsch`);
         const enc = encodeTile(tile);
         await writeFile(join(dir, `${k}.bin`), enc);
         files++;
         bytes += enc.length;
       }
       tiles[tf][String(R)] = n;
-      if (rej.length > 0) rejected[tf][String(R)] = rej;
       stats.push({
         tf,
         R,
@@ -181,7 +177,7 @@ async function main(): Promise<void> {
         tiles: k1 - k0 + 1,
         maxCells,
         over30k,
-        rejected: rej.length,
+        maxRowsPerBar: maxRows,
         maxSrcRows: Math.round(maxSrcRows),
       });
       if (rows <= 1) break; // gröbere Zeilen bringen nichts mehr
@@ -204,9 +200,8 @@ async function main(): Promise<void> {
         dataTo: toMs,
         firstOpen: first.open,
         lastClose: last.close,
-        tileConfigVersion: 1,
+        tileConfigVersion: 2,
         tiles,
-        rejected,
       },
     ],
     stats,

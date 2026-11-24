@@ -11,7 +11,7 @@ import {
   palette,
   quantileInPlace,
 } from '../src/lib/color.ts';
-import { formatQty, TextTable } from '../src/lib/format.ts';
+import { formatQty, formatQtyShort, TextTable } from '../src/lib/format.ts';
 import { FootprintStore, pocRow, prepareTile } from '../src/lib/footprint-store.ts';
 import { RequestQueue } from '../src/lib/request-queue.ts';
 import { chunkIndexAt, wantedTiles, windowChunks } from '../src/lib/tiles.ts';
@@ -157,11 +157,29 @@ describe('Zelltext', () => {
       }),
     );
   });
+  it('Kurzform für schmale Zellen: ≤ 4 Zeichen ohne Vorzeichen', () => {
+    expect(formatQtyShort(1, 3)).toBe('.001');
+    expect(formatQtyShort(250, 3)).toBe('.25');
+    expect(formatQtyShort(-1234, 3)).toBe('-1.2');
+    expect(formatQtyShort(12_345, 3)).toBe('12');
+    expect(formatQtyShort(123_456, 3)).toBe('123');
+    expect(formatQtyShort(1_234_567, 3)).toBe('1.2k');
+    expect(formatQtyShort(45_678_000, 3)).toBe('46k');
+    expect(formatQtyShort(2_500_000_000, 3)).toBe('2.5M');
+    fc.assert(
+      fc.property(fc.integer({ min: 1, max: 1e12 }), (v) => {
+        expect(formatQtyShort(v, 3).length).toBeLessThanOrEqual(4);
+        expect(formatQtyShort(v, 3).length).toBeLessThanOrEqual(formatQty(v, 3).length);
+      }),
+    );
+  });
+
   it('Texttabelle formatiert jeden Wert genau einmal', () => {
     const t = new TextTable(3);
     const a = t.id(1500);
     expect(t.id(1500)).toBe(a);
     expect(t.strings[a]).toBe('1.500');
+    expect(t.short[a]).toBe('1.5');
     expect(t.size).toBe(1);
   });
 });
