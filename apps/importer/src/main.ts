@@ -3,7 +3,7 @@
 // Befehle:
 //   import   --symbol S (--day D | --from D --to D | --month YYYY-MM) [--dry-run | --db]
 //            [--prefer auto|daily|monthly] [--no-neighbours] [--out datei.jsonl] [--resume]
-//            [--sidecar | --sidecar-dir DIR] [--data-dir DIR] [--quiet]
+//            [--sidecar | --sidecar-dir DIR] [--data-dir DIR] [--quiet] [--backfill]
 //   download --symbol S --kind aggTrades|klines (--day D | --from D --to D)
 // Standard ist --dry-run (schreibt nichts); --db schreibt in die Datenbank aus OF_DB_* (.env).
 import {
@@ -14,7 +14,9 @@ import {
   RULES_VERSION,
   formatDay,
 } from '@orderflow/core';
-import { appendFileSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { appendFileSync, readdirSync, readFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import { parseArgs } from 'node:util';
 import { downloadFile } from './download.ts';
 import type { FileRef } from './files.ts';
@@ -28,7 +30,34 @@ const PKG_VERSION = (
     version: string;
   }
 ).version;
-export const IMPORTER_VERSION = `importer@${PKG_VERSION}+rules${RULES_VERSION}`;
+
+/**
+ * Hash der Quelltexte, die Daten oder Klassifikation bestimmen (packages/core ohne tile/,
+ * apps/importer/src). Teil der Importer-Version und damit des Resume-Schlüssels: jede Code- oder
+ * Regeländerung erzwingt eine Neuberechnung statt stillem Überspringen alter Tage (Review W4).
+ */
+export function sourceHash(): string {
+  const roots = [
+    new URL('../../../packages/core/src/', import.meta.url).pathname,
+    new URL('./', import.meta.url).pathname,
+  ];
+  const files: string[] = [];
+  const walk = (dir: string) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) {
+        if (e.name !== 'tile') walk(p);
+      } else if (e.name.endsWith('.ts')) files.push(p);
+    }
+  };
+  for (const r of roots) walk(r);
+  const h = createHash('sha256');
+  for (const f of files.sort())
+    h.update(relative(roots[0]!, f)).update('\0').update(readFileSync(f));
+  return h.digest('hex').slice(0, 12);
+}
+
+export const IMPORTER_VERSION = `importer@${PKG_VERSION}+rules${RULES_VERSION}+src${sourceHash()}`;
 
 export const USAGE = `Verwendung:
   importer import --symbol BTCUSDT (--day YYYY-MM-DD | --from YYYY-MM-DD --to YYYY-MM-DD | --month YYYY-MM)
@@ -50,6 +79,7 @@ export interface ImportArgs {
   sidecar: false | { dir?: string };
   dataDir: string;
   quiet: boolean;
+  backfill: boolean;
 }
 
 function dayRange(v: Record<string, string | boolean | undefined>): [number, number] {
@@ -95,11 +125,13 @@ export function parseImportArgs(
       'sidecar-dir': { type: 'string' },
       'data-dir': { type: 'string' },
       quiet: { type: 'boolean' },
+      backfill: { type: 'boolean' },
     },
     strict: true,
   });
   if (!v.symbol) throw new UsageError('--symbol fehlt');
   getSymbol(v.symbol);
+  if (v.backfill && !v.db) throw new UsageError('--backfill nur mit --db');
   if (v['dry-run'] && v.db) throw new UsageError('--dry-run und --db schließen sich aus');
   const prefer = (v.prefer ?? 'auto') as Prefer;
   if (!['auto', 'daily', 'monthly'].includes(prefer))
@@ -123,6 +155,7 @@ export function parseImportArgs(
     sidecar,
     dataDir: v['data-dir'] ?? env.OF_DATA_DIR ?? 'data',
     quiet: !!v.quiet,
+    backfill: !!v.backfill,
   };
   if (v.out) a.out = v.out;
   return a;
@@ -133,7 +166,10 @@ async function runImport(argv: string[]): Promise<number> {
   const spec = getSymbol(a.symbol);
   const writer: DayWriter =
     a.mode === 'db'
-      ? new PostgresWriter(parseConfig(process.env).db, spec)
+      ? new PostgresWriter(parseConfig(process.env).db, spec, {
+          backfill: a.backfill,
+          log: (s) => console.log(s),
+        })
       : new DryRunWriter(a.resume ? a.out : undefined);
   const log = (s: string) => {
     if (!a.quiet) console.log(s);
@@ -155,13 +191,14 @@ async function runImport(argv: string[]): Promise<number> {
       log: (s) => {
         log(s);
       },
+      // Ergebnis je Tag sofort anhängen (ein Abbruch verliert keine fertigen Tage)
+      onSummary: (s) => {
+        if (a.out && !s.skipped) appendFileSync(a.out, JSON.stringify(s) + '\n');
+      },
     });
     summaries = await imp.run();
   } finally {
     await writer.close();
-  }
-  if (a.out) {
-    for (const s of summaries) if (!s.skipped) appendFileSync(a.out, JSON.stringify(s) + '\n');
   }
   const wall = (performance.now() - t0) / 1000;
   const rows = summaries.reduce((x, s) => x + s.rows, 0);

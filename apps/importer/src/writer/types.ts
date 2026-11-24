@@ -1,5 +1,10 @@
 // Schnittstelle des Tages-Schreibers (KONZEPT §4.3). Zwei Implementierungen: Postgres (eine
 // Transaktion je Tag, COPY, Single Writer) und Dry-Run (schreibt nichts, sammelt Zähler/Digests).
+//
+// Ablauf je Tag d: writeDay(d) sofort nach dem Abgleich von d (Minute 1439 noch edge_pending, ihre
+// eigene Klasse steht aber schon in data_minute_issue bzw. ist exact); sobald d+1 abgeglichen ist,
+// resolveEdge(d, 1439). Minute 0 eines Tages, dessen Vortag beim Schreiben unbekannt war, wird per
+// resolveEdge(d, 0, Klasse) mit dem dann bekannten Übertrag entschieden.
 import type { DayData, DayManifest, FileManifest, ReconcileResult } from '@orderflow/core';
 
 export interface DayWrite {
@@ -22,25 +27,52 @@ export interface WriteOutcome {
   version: number | null;
 }
 
-/** Nachträgliche Auflösung einer Randminute eines bereits geschriebenen Nachbartags. */
+export interface MinuteFacts {
+  dQ: number;
+  dB: number;
+  sQ: number;
+  sB: number;
+  candQ: number;
+  candB: number;
+}
+
+/** Entscheidung einer Randminute (0 oder 1439) eines geschriebenen Tages. */
 export interface EdgeUpdate {
   symbol: string;
   symId: number;
   day: number;
-  /** 0 oder 1439 */
   minute: number;
-  recon: ReconcileResult;
-  /** Kandidaten je Minute des Nachbartags (für data_minute_issue). */
-  cand: { candQ: Float64Array; candB: Float64Array };
+  /**
+   * Klasse der Minute (1 exact, 2 shift, 3 mismatch, 5 missing) mit Fakten. Fehlt sie (nur für
+   * Minute 1439), gilt die beim Schreiben gespeicherte eigene Klasse.
+   */
+  decided?: { cls: number; facts: MinuteFacts };
+}
+
+/** Gespeicherter Endzustand eines finalen Tages: Übertrag in den Folgetag und letzte aggId. */
+export interface StoredChain {
+  carry: { q: number; b: number };
+  cand: { q: number; b: number };
+  lastAggId: number | null;
+}
+
+export interface ResumeKey {
+  symbol: string;
+  day: number;
+  aggSha256: string;
+  klineSha256: string;
+  importerVersion: string;
 }
 
 export interface DayWriter {
   readonly kind: 'postgres' | 'dry-run';
   open(): Promise<void>;
-  /** Resume: Tag ist bereits final mit derselben aggTrades-Quelle (SHA256) und Importer-Version. */
-  isDone(symbol: string, day: number, aggSha256: string, importerVersion: string): Promise<boolean>;
+  /** Resume: Tag ist final mit denselben Quelldateien (SHA256) und derselben Importer-/Code-Version. */
+  isDone(k: ResumeKey): Promise<boolean>;
+  /** Übertrag eines bereits finalen Tages (null, wenn unbekannt). */
+  storedChain(symbol: string, day: number): Promise<StoredChain | null>;
   writeDay(w: DayWrite): Promise<WriteOutcome>;
-  /** true, wenn ein gespeicherter Tag tatsächlich aktualisiert wurde. */
+  /** true, wenn ein gespeicherter Tag tatsächlich aktualisiert wurde (Minute war offen). */
   resolveEdge(e: EdgeUpdate): Promise<boolean>;
   close(): Promise<void>;
 }
@@ -52,4 +84,19 @@ export function stateOf(
   return recon.counts.mismatch + recon.counts.missing === 0 && extraBad.length === 0
     ? 'final_ok'
     : 'final_bad';
+}
+
+export function factsOf(
+  r: ReconcileResult,
+  cand: { candQ: Float64Array; candB: Float64Array },
+  m: number,
+): MinuteFacts {
+  return {
+    dQ: r.dQ[m]!,
+    dB: r.dB[m]!,
+    sQ: r.sQ[m]!,
+    sB: r.sB[m]!,
+    candQ: cand.candQ[m]!,
+    candB: cand.candB[m]!,
+  };
 }

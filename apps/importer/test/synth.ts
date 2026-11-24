@@ -138,11 +138,24 @@ function klineCsv(rows: Row[], day: number): string {
   return lines.join('\n') + '\n';
 }
 
-export function archive(
-  opts: { dailyDays?: string[]; monthly?: boolean; holeOnDay?: number } = {},
-) {
+export interface ArchiveOptions {
+  dailyDays?: string[];
+  monthly?: boolean;
+  holeOnDay?: number;
+  /** Tag, der in der Monatsdatei fehlt. */
+  dropFromMonthly?: string;
+  /** Tagesdatei nur mit Kopfzeile. */
+  emptyDaily?: string;
+  /** aggTrades dieser Minute fehlen (Klines behalten ihr Volumen) → missing. */
+  dropAggMinute?: { day: string; minute: number };
+}
+
+export function archive(opts: ArchiveOptions = {}) {
   const dir = tmpDir('arch-');
-  const { rows, first, last } = synthMonth('2026-09', opts.holeOnDay);
+  const { rows: all, first, last } = synthMonth('2026-09', opts.holeOnDay);
+  const drop = opts.dropAggMinute;
+  const dropStart = drop ? parseDay(drop.day) * DAY_MS + drop.minute * MINUTE_MS : -1;
+  const rows = all.filter((r) => !(r.T >= dropStart && r.T < dropStart + MINUTE_MS));
   const byDay = new Map<number, Row[]>();
   for (const r of rows) {
     const d = Math.floor(r.T / DAY_MS);
@@ -152,7 +165,7 @@ export function archive(
     putVisionFile(
       dir,
       `futures/um/daily/klines/BTCUSDT/1m/BTCUSDT-1m-${formatDay(d)}.zip`,
-      klineCsv(rows, d),
+      klineCsv(all, d),
     );
   }
   for (const ds of opts.dailyDays ?? []) {
@@ -163,11 +176,20 @@ export function archive(
       [HEAD, ...byDay.get(d)!.map(csvRow)].join('\n') + '\n',
     );
   }
+  if (opts.emptyDaily) {
+    putVisionFile(
+      dir,
+      `futures/um/daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-${opts.emptyDaily}.zip`,
+      HEAD + '\n',
+    );
+  }
   if (opts.monthly !== false) {
+    const skip = opts.dropFromMonthly ? parseDay(opts.dropFromMonthly) : -1;
     putVisionFile(
       dir,
       'futures/um/monthly/aggTrades/BTCUSDT/BTCUSDT-aggTrades-2026-09.zip',
-      [HEAD, ...rows.map(csvRow)].join('\n') + '\n',
+      [HEAD, ...rows.filter((r) => Math.floor(r.T / DAY_MS) !== skip).map(csvRow)].join('\n') +
+        '\n',
     );
   }
   return dir;

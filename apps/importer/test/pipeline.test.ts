@@ -149,6 +149,54 @@ describe('Import-Ablauf (synthetisch)', () => {
   });
 });
 
+describe('Review-Regressionen (Dry-Run)', () => {
+  it('K1: fehlender letzter angeforderter Tag in der Monatsdatei → Fehler statt stiller Erfolg', async () => {
+    const dir = archive({ dropFromMonthly: '2026-09-15' });
+    await expect(run(dir, '2026-09-10', '2026-09-15', 'monthly')).rejects.toThrow(
+      /2026-09-15 fehlt in der Datei/,
+    );
+    await expect(run(dir, '2026-09-15', '2026-09-15', 'monthly')).rejects.toThrow(/fehlt/);
+    // Tag mitten im Bereich
+    await expect(run(dir, '2026-09-14', '2026-09-16', 'monthly')).rejects.toThrow(/fehlt/);
+  });
+
+  it('K1: Tagesdatei nur mit Kopfzeile → Fehler', async () => {
+    const dir = archive({ emptyDaily: '2026-09-14' });
+    await expect(run(dir, '2026-09-14', '2026-09-14', 'daily')).rejects.toThrow(
+      /2026-09-14 fehlt in der Datei/,
+    );
+  });
+
+  it('K1: fehlender Nachbartag in der Monatsdatei → Randminute bleibt offen (kein falscher Nachbar)', async () => {
+    const dir = archive({ dropFromMonthly: '2026-09-16' });
+    const { summaries, logs } = await run(dir, '2026-09-15', '2026-09-15', 'monthly');
+    expect(summaries[0]!.edges[1]!.cls).toBe('edge_pending');
+    expect(logs.some((l) => l.includes('2026-09-16 nicht verfügbar'))).toBe(true);
+  });
+
+  it('W1: Randminute 1439 ohne eigene Trades, aber mit Kline-Volumen → missing (final_bad)', async () => {
+    const dir = archive({ dropAggMinute: { day: '2026-09-10', minute: 1439 } });
+    const { summaries } = await run(dir, '2026-09-10', '2026-09-10', 'monthly');
+    const s = summaries[0]!;
+    expect(s.edges[1]!.cls).toBe('missing');
+    expect(s.state).toBe('final_bad');
+  });
+
+  it('W6: Teilläufe mit gespeichertem Vortag (Resume-Datei) = ein Lauf (Qualitäts-Digest)', async () => {
+    const dir = archive();
+    const one = await run(dir, '2026-09-03', '2026-09-06', 'monthly');
+    const out = join(tmpDir('split-'), 'r.jsonl');
+    const a = await run(dir, '2026-09-03', '2026-09-04', 'monthly');
+    writeFileSync(out, a.summaries.map((s) => JSON.stringify(s)).join('\n') + '\n');
+    const b = await run(dir, '2026-09-05', '2026-09-06', 'monthly', {
+      writer: new DryRunWriter(out),
+    });
+    expect(b.logs.some((l) => l.includes('aus dem Speicher'))).toBe(true);
+    const q = (x: DaySummary[]) => x.map((s) => [s.day, s.qualityDigest, s.digest, s.counts]);
+    expect(q([...a.summaries, ...b.summaries])).toEqual(q(one.summaries));
+  });
+});
+
 describe('CLI-Argumente', () => {
   it('Bereich, Modus und Standardwerte', () => {
     const a = parseImportArgs(['--symbol', 'BTCUSDT', '--month', '2026-02'], {});

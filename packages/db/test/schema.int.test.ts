@@ -122,14 +122,19 @@ describe('Migrationen', () => {
 
   it('Columnstore: ein Chunk lässt sich komprimieren und wieder entpacken', async () => {
     await sql`INSERT INTO fp_1m VALUES (1, '2026-10-01 00:00:00+00', 6900000, 5, 3, 2, 1)`;
-    const chunks = await sql`SELECT show_chunks('fp_1m') AS c`;
+    // nur der Chunk dieses Tages (leere Chunks früherer Tests bleiben nach DELETE bestehen)
+    const chunks = await sql`
+      SELECT show_chunks('fp_1m', newer_than => '2026-10-01'::timestamptz,
+                                  older_than => '2026-10-02'::timestamptz) AS c`;
     expect(chunks).toHaveLength(1);
     const c = chunks[0]!.c as string;
-    await sql`SELECT compress_chunk(${c}::regclass)`;
+    // aktuelle API (seit 2.18): convert_to_columnstore / convert_to_rowstore statt compress_/decompress_chunk
+    await sql.unsafe(`CALL convert_to_columnstore('${c}'::regclass)`);
     const [cs] = await sql`
-      SELECT is_compressed FROM timescaledb_information.chunks WHERE hypertable_name = 'fp_1m'`;
+      SELECT is_compressed FROM timescaledb_information.chunks
+       WHERE hypertable_name = 'fp_1m' AND format('%I.%I', chunk_schema, chunk_name)::regclass = ${c}::regclass`;
     expect(cs?.is_compressed).toBe(true);
-    await sql`SELECT decompress_chunk(${c}::regclass)`;
+    await sql.unsafe(`CALL convert_to_rowstore('${c}'::regclass)`);
     await sql`DELETE FROM fp_1m`;
   });
 

@@ -77,7 +77,13 @@ CREATE TABLE data_day (
   min_mismatch     integer,
   min_missing      integer,
   min_gap          integer,
-  edge_pending     boolean,
+  edge_pending     boolean,                      -- = edge_first_pending OR edge_last_pending
+  edge_first_pending boolean,                    -- Minute 0 wartet auf den Abgleich des Vortags
+  edge_last_pending  boolean,                    -- Minute 1439 wartet auf den Abgleich des Folgetags
+  carry_q          bigint,                       -- Übertrag s(1439) in den Folgetag (Lots, §4.6)
+  carry_b          bigint,
+  cand_last_q      bigint,                       -- cand(1439): untere Hüllgrenze für Minute 0 des Folgetags
+  cand_last_b      bigint,
   deep_check       text     CHECK (deep_check IN ('passed', 'failed', 'reference_unusable')),
   digest           text,
   importer_version text,

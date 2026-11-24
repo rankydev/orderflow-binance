@@ -7,7 +7,7 @@
 // 2. Regression je Minute gegen test/golden/*.csv (erzeugt mit UPDATE_GOLDEN=1).
 // 3. Gleichwertigkeit Monats-/Tagesdatei (§3.1, §8): Monatserster, Monatsmitte, Monatsletzter.
 // 4. Bekannte Datenlücke BTCUSDT 2026-10-27 00:02–00:30 UTC (in Tages- und Monatsdatei identisch).
-import { getSymbol, parseDay, type DayData, type ReconcileResult } from '@orderflow/core';
+import { getSymbol, parseDay, type ReconcileInput, type ReconcileResult } from '@orderflow/core';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -20,6 +20,8 @@ import {
   type Prefer,
 } from '../src/pipeline.ts';
 import { DryRunWriter } from '../src/writer/dryrun.ts';
+
+type DayInfo = { symbol: string; dayStr: string; reconcileInput: ReconcileInput };
 
 const DATA = new URL('../../../data', import.meta.url).pathname;
 const GOLDEN = new URL('./golden/', import.meta.url).pathname;
@@ -34,7 +36,7 @@ function available(symbol: string, days: string[], prefer: Prefer = 'auto'): boo
 }
 
 async function run(symbol: string, from: string, to: string, prefer: Prefer) {
-  const per: { data: DayData; recon: ReconcileResult }[] = [];
+  const per: { data: DayInfo; recon: ReconcileResult }[] = [];
   const imp = new Importer({
     dataDir: DATA,
     spec: getSymbol(symbol),
@@ -52,7 +54,7 @@ async function run(symbol: string, from: string, to: string, prefer: Prefer) {
   return { summaries, per };
 }
 
-function minuteCsv(data: DayData, r: ReconcileResult): string {
+function minuteCsv(data: DayInfo, r: ReconcileResult): string {
   const inp = data.reconcileInput;
   const cls = ['', 'exact', 'shift', 'mismatch', 'edge_pending', 'missing'];
   const lines = ['minute,our_q,our_b,kline_q,kline_b,cand_q,cand_b,d_q,d_b,s_q,s_b,class'];
@@ -102,9 +104,9 @@ function checkReference(s: DaySummary): void {
   expect(s.state, key).toBe('final_ok');
 }
 
-function checkGolden(per: { data: DayData; recon: ReconcileResult }[]): void {
+function checkGolden(per: { data: DayInfo; recon: ReconcileResult }[]): void {
   for (const { data, recon } of per) {
-    const file = join(GOLDEN, `${data.spec.name}-${data.dayStr}.csv`);
+    const file = join(GOLDEN, `${data.symbol}-${data.dayStr}.csv`);
     const csv = minuteCsv(data, recon);
     if (UPDATE || !existsSync(file)) {
       mkdirSync(GOLDEN, { recursive: true });

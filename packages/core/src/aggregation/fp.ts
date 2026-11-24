@@ -60,16 +60,17 @@ export class FpBuilder {
     this.sellA[i] = sellA;
   }
 
+  /** Ansichten (subarray) statt Kopien: vermeidet kurzzeitig doppelten Speicher (Review W5). */
   build(): FpTable {
     const n = this.n;
     return {
       n,
-      ts: this.ts.slice(0, n),
-      px: this.px.slice(0, n),
-      buyQ: this.buyQ.slice(0, n),
-      sellQ: this.sellQ.slice(0, n),
-      buyA: this.buyA.slice(0, n),
-      sellA: this.sellA.slice(0, n),
+      ts: this.ts.subarray(0, n),
+      px: this.px.subarray(0, n),
+      buyQ: this.buyQ.subarray(0, n),
+      sellQ: this.sellQ.subarray(0, n),
+      buyA: this.buyA.subarray(0, n),
+      sellA: this.sellA.subarray(0, n),
     };
   }
 }

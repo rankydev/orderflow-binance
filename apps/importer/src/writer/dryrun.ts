@@ -7,8 +7,24 @@ import {
   type DayWrite,
   type DayWriter,
   type EdgeUpdate,
+  type ResumeKey,
+  type StoredChain,
   type WriteOutcome,
 } from './types.ts';
+
+interface ResumeLine {
+  symbol: string;
+  day: string;
+  aggSha256?: string;
+  klineSha256?: string;
+  importerVersion?: string;
+  carryOut?: { q: number; b: number };
+  lastAggId?: number | null;
+  edges?: { candQ: number; candB: number }[];
+}
+
+const keyOf = (symbol: string, day: string, agg = '', kl = '', ver = '') =>
+  `${symbol}|${day}|${agg}|${kl}|${ver}`;
 
 export interface DryRunRecord {
   symbol: string;
@@ -26,18 +42,23 @@ export class DryRunWriter implements DayWriter {
   readonly edges: { symbol: string; day: string; minute: number; cls: number }[] = [];
   private readonly done = new Set<string>();
 
+  private readonly chains = new Map<string, StoredChain>();
+
   /** `resumeFrom`: JSONL mit DaySummary-Zeilen früherer Läufe (Felder symbol, day, …). */
   constructor(resumeFrom?: string) {
     if (resumeFrom && existsSync(resumeFrom)) {
       for (const line of readFileSync(resumeFrom, 'utf8').split('\n')) {
         if (!line.trim()) continue;
-        const r = JSON.parse(line) as {
-          symbol: string;
-          day: string;
-          aggSha256?: string;
-          importerVersion?: string;
-        };
-        this.done.add(`${r.symbol}|${r.day}|${r.aggSha256 ?? ''}|${r.importerVersion ?? ''}`);
+        const r = JSON.parse(line) as ResumeLine;
+        this.done.add(keyOf(r.symbol, r.day, r.aggSha256, r.klineSha256, r.importerVersion));
+        const last = r.edges?.[1];
+        if (r.carryOut && last) {
+          this.chains.set(`${r.symbol}|${r.day}`, {
+            carry: r.carryOut,
+            cand: { q: last.candQ, b: last.candB },
+            lastAggId: r.lastAggId ?? null,
+          });
+        }
       }
     }
   }
@@ -45,13 +66,14 @@ export class DryRunWriter implements DayWriter {
   async open(): Promise<void> {}
   async close(): Promise<void> {}
 
-  async isDone(
-    symbol: string,
-    day: number,
-    aggSha256: string,
-    importerVersion: string,
-  ): Promise<boolean> {
-    return this.done.has(`${symbol}|${formatDay(day)}|${aggSha256}|${importerVersion}`);
+  async isDone(k: ResumeKey): Promise<boolean> {
+    return this.done.has(
+      keyOf(k.symbol, formatDay(k.day), k.aggSha256, k.klineSha256, k.importerVersion),
+    );
+  }
+
+  async storedChain(symbol: string, day: number): Promise<StoredChain | null> {
+    return this.chains.get(`${symbol}|${formatDay(day)}`) ?? null;
   }
 
   async writeDay(w: DayWrite): Promise<WriteOutcome> {
@@ -79,7 +101,7 @@ export class DryRunWriter implements DayWriter {
       symbol: e.symbol,
       day: formatDay(e.day),
       minute: e.minute,
-      cls: e.recon.ownCls[e.minute]!,
+      cls: e.decided?.cls ?? 0,
     });
     return false;
   }
