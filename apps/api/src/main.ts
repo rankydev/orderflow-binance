@@ -1,12 +1,100 @@
-// Platzhalter-Einstiegspunkt (api, geplant für Phase P1). Noch keine Logik.
-export const APP_NAME = 'api';
-export const PLANNED_PHASE = 'P1';
+// Einstiegspunkt der API (Daemon, KONZEPT §2.1): nur lesend, bindet standardmäßig an 127.0.0.1.
+//   node --env-file-if-exists=.env apps/api/src/main.ts      (bzw. npm start -w @orderflow/api)
+// Beenden mit SIGINT/SIGTERM: keine neuen Verbindungen, laufende Anfragen fertig, Pools schließen.
+import { ConfigError } from '@orderflow/core';
+import { buildApp } from './app.ts';
+import { ResponseCache } from './cache.ts';
+import { Catalog } from './catalog.ts';
+import { parseApiConfig, type ApiConfig } from './config.ts';
+import { createPool } from './db.ts';
+import { Limiter } from './limiter.ts';
 
-export function main(): number {
-  console.error(`${APP_NAME}: noch nicht implementiert (geplant in Phase ${PLANNED_PHASE})`);
-  return 2;
+export interface RunningApi {
+  url: string;
+  close: () => Promise<void>;
+}
+
+/** Startet die API (auch für Tests und den Benchmark); wartet, bis der Katalog geladen ist. */
+export async function startApi(
+  cfg: ApiConfig,
+  opt: { logger?: false | { level: string } } = {},
+): Promise<RunningApi> {
+  const sql = createPool(cfg);
+  // eigener Ein-Verbindungs-Pool für den Katalog: Anfragen-Bursts blockieren ihn nicht und umgekehrt
+  const catSql = createPool({ ...cfg, dbPool: 1 }, 'orderflow-api-catalog');
+  const cache = new ResponseCache(cfg.cacheBytes);
+  const limiter = new Limiter(cfg.dbPool, cfg.maxQueue, cfg.queueTimeoutMs);
+  let app: ReturnType<typeof buildApp> | null = null;
+  const catalog = new Catalog(catSql, {
+    pollMs: cfg.pollMs,
+    lockRetries: cfg.lockRetries,
+    maxSourceRows: cfg.maxSourceRows,
+    log: (level, msg, obj) => app?.log[level](obj ?? {}, msg),
+  });
+  app = buildApp({ cfg, sql, catalog, cache, limiter }, opt);
+  catalog.on('dayChanged', (ev) => app?.log.debug(ev, 'dayChanged'));
+  await catalog.start();
+  if (!catalog.ready) app.log.warn({ err: catalog.lastError }, 'Katalog beim Start nicht geladen');
+  else
+    app.log.info(
+      {
+        symbols: catalog.symbols().map((s) => ({
+          name: s.name,
+          days: s.days.size,
+          dataFrom: new Date(s.dataFrom).toISOString(),
+          dataTo: new Date(s.dataTo).toISOString(),
+          tileConfigVersion: s.tileConfigVersion,
+        })),
+      },
+      'Katalog geladen',
+    );
+  const url = await app.listen({ host: cfg.host, port: cfg.port });
+  let closing: Promise<void> | null = null;
+  return {
+    url,
+    close: () =>
+      (closing ??= (async () => {
+        await app.close();
+        await catalog.stop();
+        await Promise.all([sql.end({ timeout: 5 }), catSql.end({ timeout: 5 })]);
+      })()),
+  };
+}
+
+async function main(): Promise<number> {
+  let cfg: ApiConfig;
+  try {
+    cfg = parseApiConfig(process.env);
+  } catch (e) {
+    console.error(e instanceof ConfigError ? e.message : e);
+    return 1;
+  }
+  const api = await startApi(cfg);
+  const stop = (sig: string) => {
+    console.error(JSON.stringify({ level: 30, msg: `${sig}: beende` }));
+    const force = setTimeout(() => process.exit(1), 15_000);
+    force.unref();
+    api.close().then(
+      () => process.exit(0),
+      (e: unknown) => {
+        console.error(e);
+        process.exit(1);
+      },
+    );
+  };
+  process.once('SIGINT', () => stop('SIGINT'));
+  process.once('SIGTERM', () => stop('SIGTERM'));
+  return 0;
 }
 
 if (import.meta.main) {
-  process.exitCode = main();
+  main().then(
+    (code) => {
+      if (code !== 0) process.exitCode = code;
+    },
+    (e: unknown) => {
+      console.error(e instanceof Error ? e.message : e);
+      process.exitCode = 1;
+    },
+  );
 }

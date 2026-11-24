@@ -1,0 +1,37 @@
+// Datenversion und Unveränderlichkeit einer Antwort (KONZEPT §5.4, TILE-FORMAT.md): Hash über die
+// Versionen aller überdeckten (Symbol, UTC-Tag) + Antwortparameter (+ tileConfigVersion bei Kacheln).
+// `final` nur, wenn jeder überdeckte Tag existiert und data_day.immutable ist (final_*, keine offene
+// Randminute, nicht veraltet). Ein Tag ohne data_day-Zeile (Lücke, Zukunft, vor Datenbeginn) ist nie
+// final: dort können noch Daten entstehen (Backfill, Live).
+import { createHash } from 'node:crypto';
+
+export interface DayVersion {
+  day: number;
+  version: number;
+  immutable: boolean;
+}
+
+/** Version des Antwortaufbaus (Inhalt bei gleichem Datenstand); erhöhen trennt alle ETags. */
+export const RESPONSE_BUILD_VERSION = 1;
+
+export function versionOf(
+  parts: (string | number)[],
+  d0: number,
+  d1: number,
+  get: (day: number) => DayVersion | null | undefined,
+): { dataVersion: string; final: boolean } {
+  const h = createHash('sha256');
+  h.update(`b${RESPONSE_BUILD_VERSION}|${parts.join('|')}|${d0}..${d1}|`);
+  let final = true;
+  for (let d = d0; d <= d1; d++) {
+    const v = get(d);
+    if (!v) {
+      final = false;
+      h.update('-,');
+    } else {
+      if (!v.immutable) final = false;
+      h.update(`${v.version}${v.immutable ? 'i' : 'm'},`);
+    }
+  }
+  return { dataVersion: h.digest('base64url').slice(0, 27), final };
+}
