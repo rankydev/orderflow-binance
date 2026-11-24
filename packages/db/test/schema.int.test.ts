@@ -4,7 +4,10 @@
 import { parseConfig, type DbConfig } from '@orderflow/core';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { connect, type Sql } from '../src/connection.ts';
-import { dropAndCreateDatabase, migrateDown, migrateUp } from '../src/migrate.ts';
+import { dropAndCreateDatabase, migrateDown, migrateUp, MIGRATIONS_DIR } from '../src/migrate.ts';
+import { loadMigrations } from '../src/migrations.ts';
+
+const ALL_MIGRATIONS = loadMigrations(MIGRATIONS_DIR).length;
 
 const base = parseConfig(process.env).db;
 const cfg: DbConfig = { ...base, database: `${base.database}_test` };
@@ -150,11 +153,11 @@ describe('Migrationen', () => {
 
   it('Rollback aller Migrationen und erneutes Anwenden funktionieren', async () => {
     const rolled = await migrateDown(sql, 'all');
-    expect(rolled).toHaveLength(8);
+    expect(rolled).toHaveLength(ALL_MIGRATIONS);
     const left = await sql`
       SELECT table_name FROM information_schema.tables
        WHERE table_schema = 'public' AND table_name <> 'schema_migrations'`;
     expect(left).toHaveLength(0);
-    expect(await migrateUp(sql)).toHaveLength(8);
+    expect(await migrateUp(sql)).toHaveLength(ALL_MIGRATIONS);
   });
 });
