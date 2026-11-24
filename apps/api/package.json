@@ -3,10 +3,18 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Daemon: lesende HTTP/WS-API (Phase P1 bars/footprint/quality)",
+  "description": "Daemon: lesende HTTP-API (Phase P1 symbols/bars/footprint/profile/quality)",
   "scripts": {
     "start": "node --env-file-if-exists=../../.env src/main.ts",
+    "role:password": "node --env-file-if-exists=../../.env src/cli/api-role-password.ts",
+    "bench": "node --env-file-if-exists=../../.env bench/bench.ts",
     "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@orderflow/core": "0.0.0",
+    "@orderflow/db": "0.0.0",
+    "fastify": "5.12.8",
+    "postgres": "4.1.1"
   },
   "devDependencies": {
     "@types/node": "24.19.2"
