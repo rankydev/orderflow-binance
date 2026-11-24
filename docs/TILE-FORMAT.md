@@ -139,6 +139,12 @@ Mit den Fixtures (Zuschlag 1,5): 0 Kacheln über 30 000, 0 abgelehnt; feinste an
 ändert sich die URL). Der Client prüft `sym`, `tf`, `R`, `tile.index`, `tile.n` gegen die Anfrage und verwirft
 Abweichungen endgültig (keine Wiederholung). Leere Kachel (0 Bars) ist eine gültige Antwort.
 
+**Minuten ohne eigene Trades:** `/bars` und `/footprint` enthalten nur Bars aus eigenen aggTrades (`bar_*` bzw.
+`fp_*`), **nie** aus Klines abgeleitete Bars. Minuten ohne aggTrades – auch echte Lücken eines `final_bad`-Tages wie
+2026-10-27 00:02–00:30 UTC – fehlen in **beiden** Antworten (keine Füll-Bars mit Menge 0, keine Kline-Bars). Die
+Zeitachse des Clients ist indexbasiert, solche Minuten erscheinen dort zusammengeschoben; die Kennzeichnung ist
+Aufgabe des Qualitätsbands (`/api/v1/quality`, später).
+
 **Vorbedingung (der Client prüft sie):** Die Bars einer Footprint-Kachel sind für denselben Zeitraum und dieselbe
 `dataVersion` genau die Bars von `/bars` – gleiche Zeiten (Bars ohne Trades fehlen in beiden) und gleiche
 `buyQ + sellQ` je Bar. Auf finalen Daten ohne Lücken lädt der Client bei einer Abweichung Abschnitt und Kachel

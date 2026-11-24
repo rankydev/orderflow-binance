@@ -6,9 +6,14 @@
 
   // Nur UI-Einstellungen sind reaktiv (KONZEPT §7.3); Chartdaten liegen im Controller.
   const params = new URLSearchParams(location.search);
-  const TIMEFRAMES = ['1m', '5m', '15m', '1h'];
   let sym = $state(params.get('sym') ?? 'BTCUSDT');
-  let tf = $state(TIMEFRAMES.includes(params.get('tf') ?? '') ? params.get('tf')! : '1m');
+  // Zeitrahmen kommen aus /symbols (nur angebotene); bis dahin der aus der URL
+  let tf = $state(params.get('tf') ?? '1m');
+  let timeframes = $state.raw<string[]>([]);
+  let dataTo = $state(0);
+  const atParam = Number(params.get('at'));
+  // Diagnosezeile: in der Entwicklung offen, sonst eingeklappt (für Fehlerberichte aufklappbar)
+  let diagOpen = $state(import.meta.env.DEV || params.has('debug'));
   let type = $state<FootprintType>(params.get('type') === 'bidask' ? 'bidask' : 'delta');
   // Zeilengröße: 'auto' oder Ticks (URL-Parameter r, z. B. r=50 = 5 USDT bei BTC)
   const rParam = params.get('r');
@@ -28,6 +33,7 @@
   let ready = $state(false);
   let ctl: ChartController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   onMount(() => {
     ctl = new ChartController(el);
@@ -36,16 +42,31 @@
     }
     ctl.setType(type);
     ctl.onHover = (t) => (hover = t);
-    ctl
-      .init(sym, tf, rMode === 'auto' ? 'auto' : Number(rMode))
-      .then(() => {
-        symbols = ctl!.symbols.map((s) => s.name);
-        sym = ctl!.readout().sym;
-        symInfo = ctl!.symbols.find((s) => s.name === sym) ?? null;
-        rOptions = ctl!.availableR(tf);
-        ready = true;
-      })
-      .catch((e: unknown) => (error = e instanceof Error ? e.message : String(e)));
+    ctl.onSymbols = () => refreshLists();
+    // Start; ist die API (noch) nicht erreichbar, sichtbar melden und alle 10 s erneut versuchen
+    const start = (): void => {
+      if (!ctl) return;
+      ctl
+        .init(
+          sym,
+          tf,
+          rMode === 'auto' ? 'auto' : Number(rMode),
+          Number.isFinite(atParam) && atParam > 0 ? atParam : undefined,
+        )
+        .then(() => {
+          error = '';
+          sym = ctl!.readout().sym;
+          tf = ctl!.readout().tf;
+          refreshLists();
+          ready = true;
+          syncUrl();
+        })
+        .catch((e: unknown) => {
+          error = `${e instanceof Error ? e.message : String(e)} – neuer Versuch in 10 s`;
+          retryTimer = setTimeout(start, 10_000);
+        });
+    };
+    start();
     // Anzeige höchstens 4×/s aktualisieren (keine Kopplung an Frames).
     timer = setInterval(() => {
       if (!ctl) return;
@@ -61,13 +82,29 @@
 
   onDestroy(() => {
     if (timer) clearInterval(timer);
+    if (retryTimer) clearTimeout(retryTimer);
     ctl?.destroy();
   });
+
+  /** Symbol-/Zeitrahmen-/R-Listen und Datenstand aus dem Controller (nach Start und Aktualisierung). */
+  function refreshLists(): void {
+    if (!ctl) return;
+    symbols = ctl.symbols.map((s) => s.name);
+    symInfo = ctl.symbols.find((s) => s.name === sym) ?? null;
+    timeframes = ctl.timeframes();
+    rOptions = ctl.availableR(tf);
+    dataTo = ctl.dataTo();
+  }
 
   function syncUrl(): void {
     const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${params.has('debug') ? '&debug' : ''}`;
     history.replaceState(null, '', q);
+    document.title = `${sym} ${tf} · ${APP_TITLE}`;
   }
+
+  /** „Daten bis": letzte volle Minute vor dataTo (exklusiv), UTC. */
+  const fmtUtc = (ms: number) =>
+    ms > 0 ? new Date(ms - 60_000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '';
 
   function chooseTf(v: string): void {
     if (!ready) return; // H3: vor init() keine Umschaltung
@@ -80,8 +117,8 @@
     if (!ready) return;
     sym = v;
     ctl?.setSymbol(v);
-    symInfo = ctl?.symbols.find((s) => s.name === v) ?? null;
-    rOptions = ctl?.availableR(tf) ?? [];
+    if (ctl) tf = ctl.readout().tf;
+    refreshLists();
     syncUrl();
   }
   function chooseType(v: FootprintType): void {
@@ -101,11 +138,15 @@
 <main>
   <header class="toolbar">
     <strong>{APP_TITLE}</strong>
-    <select aria-label="Symbol" value={sym} onchange={(e) => chooseSym(e.currentTarget.value)}>
-      {#each symbols as s (s)}<option value={s}>{s}</option>{/each}
-    </select>
+    {#if symbols.length > 1}
+      <select aria-label="Symbol" value={sym} onchange={(e) => chooseSym(e.currentTarget.value)}>
+        {#each symbols as s (s)}<option value={s}>{s}</option>{/each}
+      </select>
+    {:else}
+      <span class="sym">{sym}</span>
+    {/if}
     <div class="group" role="group" aria-label="Zeitrahmen">
-      {#each TIMEFRAMES as t (t)}
+      {#each timeframes as t (t)}
         <button class:active={tf === t} onclick={() => chooseTf(t)}>{t}</button>
       {/each}
     </div>
@@ -150,6 +191,9 @@
         <option value="bar">je Bar</option>
       </select>
     </label>
+    {#if dataTo}<span class="datato" title="Ende der Daten (UTC)">
+        Daten bis {fmtUtc(dataTo)}
+      </span>{/if}
   </header>
 
   <div class="chart" bind:this={el}>
@@ -161,7 +205,18 @@
 
   <footer class="readout" data-testid="readout">
     {#if error}<span class="err">{error}</span>{/if}
-    {#if ro}
+    <button class="diag-toggle" aria-expanded={diagOpen} onclick={() => (diagOpen = !diagOpen)}>
+      {diagOpen ? '▾' : '▸'} Diagnose
+    </button>
+    {#if ro && !diagOpen}
+      <span class="compact">
+        {ro.tf} · Zeile {ro.rLabel}{ro.rAuto ? ' (auto)' : ''} · L{ro.lod}
+        {#if ro.hint}<span class="hint">· {ro.hint}</span>{/if}
+        {#if ro.notice}<span class="hint">· {ro.notice}</span>{/if}
+        {#if ro.error}<span class="err">· {ro.error}</span>{/if}
+      </span>
+    {/if}
+    {#if ro && diagOpen}
       <span>tf <b data-k="tf">{ro.tf}</b></span>
       <span>
         Zeile <b data-k="R">{ro.rLabel}</b> ({ro.R} Ticks, {ro.rAuto
@@ -262,6 +317,17 @@
     border: 1px solid #ef5350;
     color: #ffd7d5;
     font-weight: 600;
+  }
+  .sym {
+    font-weight: 600;
+  }
+  .datato {
+    margin-left: auto;
+    color: #8b949e;
+  }
+  .diag-toggle {
+    padding: 0 6px;
+    font: inherit;
   }
   .legend {
     color: #8b949e;

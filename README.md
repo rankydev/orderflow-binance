@@ -85,6 +85,20 @@ npm run fixtures -w @orderflow/web   # Kacheln aus data/raw (BTCUSDT 2026-11-20�
 npm run dev -w @orderflow/web        # http://127.0.0.1:5173/  (FIXTURE_LATENCY_MS=25 simuliert Netzlatenz)
 ```
 
+Produktion (statisches Bundle, spricht `/api/v1` am **eigenen Ursprung** an, z. B. nginx: `/` → `apps/web/dist`,
+`/api/` → API auf 127.0.0.1:8780):
+
+```bash
+npm run build -w @orderflow/web                          # → apps/web/dist (≈ 273 kB JS, ≈ 93 kB gzip)
+API_PROXY=http://127.0.0.1:8780 npx -w @orderflow/web vite preview   # Build lokal gegen die echte API prüfen
+API_PROXY=http://127.0.0.1:8780 npm run dev -w @orderflow/web        # Entwicklung gegen die echte API statt Fixtures
+```
+
+`VITE_API_BASE=https://…` (beim Build) nur, wenn die API auf einem anderen Ursprung liegt (dann CORS an der API).
+Die Seite übernimmt Symbole, Zeitrahmen und Datenstand („Daten bis …") aus `/api/v1/symbols` und lädt die Liste alle
+5 min neu. URL-Zustand: `?sym=&tf=&type=&r=&at=<Unix-Sekunden>` (at = Ansicht um diese Zeit). Die Diagnosezeile ist in
+Produktion eingeklappt („▸ Diagnose"), `&debug` öffnet sie und stellt `window.__of` bereit.
+
 Die Dev-Middleware (`apps/web/dev/fixture-api.ts`) bedient `/api/v1/symbols|bars|footprint` in der URL-Form der
 künftigen API; mit `VITE_API_BASE=<url>` spricht das Frontend stattdessen die echte API an. Symbole: `BTCUSDT`
 (echt), `BTCUSDT-SYN90` (90 Tage, 30× wiederholte echte Tage, nur Performance), `STRESS-FLAT` (Seitwärtsdaten

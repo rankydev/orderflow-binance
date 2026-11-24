@@ -17,7 +17,6 @@ import {
   PriceScaleMode,
   type IChartApi,
   type ISeriesApi,
-  type LogicalRange,
   type Time,
   type WhitespaceData,
 } from 'lightweight-charts';
@@ -64,7 +63,7 @@ import {
 import { RequestQueue, type Want } from './request-queue.ts';
 import { BAR_CHUNK_BARS, chunkIndexAt, chunkSpanSec, wantedTiles, windowChunks } from './tiles.ts';
 import type { BarItem, ColorMode, ColorScope, FootprintType, Lod, SymbolInfo } from './types.ts';
-import { tfSeconds } from '@orderflow/core/browser';
+import { isTimeframe, tfSeconds } from '@orderflow/core/browser';
 
 export type Mode = 'footprint' | 'candle';
 
@@ -119,6 +118,8 @@ interface Anchor {
   logicalWidth: number;
   /** Startansicht: rechter Datenrand, ≤ 200 Bars bei Bar-Abstand ≥ 7 px. */
   initial?: boolean;
+  /** Startansicht um eine Zeit (URL-Parameter at): Start-Bar-Abstand, Bildmitte = centerSec. */
+  at?: boolean;
 }
 
 export class ChartController {
@@ -333,26 +334,140 @@ export class ChartController {
     for (const f of this.listeners) f();
     this.gesture.dispose();
     this.cancelRetry?.();
+    this.cancelSymbolsRefresh?.();
     if (this.frameReq) cancelAnimationFrame(this.frameReq);
     this.chart.remove();
   }
 
-  async init(sym?: string, tf = '1m', rowMode: 'auto' | number = 'auto'): Promise<void> {
+  /**
+   * Start: /symbols laden, Symbol/tf wählen (tf nur aus dem Angebot des Servers), optional Ansicht um
+   * `atSec` (URL-Parameter at) statt am rechten Datenrand. Danach /symbols alle SYMBOLS_REFRESH_MS
+   * neu laden (neue Symbole, dataTo, geänderte Kachelkonfiguration).
+   */
+  async init(
+    sym?: string,
+    tf = '1m',
+    rowMode: 'auto' | number = 'auto',
+    atSec?: number,
+  ): Promise<void> {
     if (rowMode !== 'auto') {
       this.rAuto = false;
       this.manualR = rowMode;
     }
     let r;
     try {
-      r = await this.api.symbols();
+      r = await this.api.symbols(AbortSignal.timeout(REFETCH_TIMEOUT_MS * 3));
     } catch (e) {
       this.blocked = e instanceof Error ? e.message : String(e);
       throw e;
     }
+    this.blocked = ''; // erneuter Start nach einem Fehler (App wiederholt init)
+    if (this.destroyed) return;
     this.symbols = r.symbols;
     const s = this.symbols.find((x) => x.name === sym) ?? this.symbols[0];
     if (!s) throw new Error('keine Symbole');
-    this.setSeries(s.name, tf, null);
+    const tfs = offeredTimeframes(s);
+    const tf0 = tfs.includes(tf) ? tf : (tfs.find((x) => x === '1m') ?? tfs[0] ?? '1m');
+    let anchor: Anchor | null = null;
+    if (atSec !== undefined && atSec * 1000 >= s.dataFrom && atSec * 1000 < s.dataTo) {
+      const paneW = this.chart.paneSize(0).width || 1200;
+      anchor = {
+        centerSec: atSec,
+        logicalWidth: paneW / startBarSpacing(this.rc.type, paneW),
+        at: true,
+      };
+    }
+    this.setSeries(s.name, tf0, anchor);
+    this.scheduleSymbolsRefresh();
+  }
+
+  /**
+   * Zuletzt gesetzter Bereich bis zum nächsten Frame: die Bibliothek übernimmt setVisibleLogicalRange
+   * erst beim Zeichnen; mehrere Fensterwechsel im selben Frame lasen sonst einen veralteten Bereich.
+   */
+  private pendingRange: { from: number; to: number } | null = null;
+
+  private logicalRange(): { from: number; to: number } | null {
+    return this.pendingRange ?? this.chart.timeScale().getVisibleLogicalRange();
+  }
+
+  /**
+   * Mitte des Ausschnitts auf die Mitte von r legen, Bar-Abstand exakt behalten (scrollToPosition =
+   * Abstand des letzten Bars zum rechten Rand). setVisibleLogicalRange verkleinerte den Bar-Abstand
+   * bei jedem Fensterwechsel leicht (gemessen 46 → 42,9 px).
+   */
+  private setRange(r: { from: number; to: number }, spacing?: number): void {
+    const ts = this.chart.timeScale();
+    const bs = spacing ?? this.pendingSpacing ?? ts.options().barSpacing;
+    if (spacing !== undefined) ts.applyOptions({ barSpacing: spacing });
+    const w = ts.width() || this.chart.paneSize(0).width || 1200;
+    const W = w / bs;
+    const c = (r.from + r.to) / 2;
+    ts.scrollToPosition(c + W / 2 - (this.items.length - 1), false);
+    if (!this.pendingRange) {
+      requestAnimationFrame(() => {
+        this.pendingRange = null;
+        this.pendingSpacing = null;
+      });
+    }
+    this.pendingRange = { from: c - W / 2, to: c + W / 2 };
+    if (spacing !== undefined) this.pendingSpacing = spacing;
+  }
+
+  private pendingSpacing: number | null = null;
+
+  /** Bildmitte auf die Zeit t legen, sobald die Pane eine Breite hat (höchstens 60 Frames warten). */
+  private centerAt(t: number, tries: number, spacing: number): void {
+    const w = this.chart.timeScale().width();
+    if (!w && tries < 60) {
+      requestAnimationFrame(() => {
+        if (!this.destroyed) this.centerAt(t, tries + 1, spacing);
+      });
+      return;
+    }
+    // Bar-Abstand explizit (options() liefert direkt nach applyOptions noch den alten Wert)
+    const width = (w || 1200) / spacing;
+    const c = logicalIndexOfTime(this.items, t, this.tfSec);
+    this.setRange({ from: c - width / 2, to: c + width / 2 }, spacing);
+    if (this.anchor?.at) this.anchor = null;
+  }
+
+  /** Rückruf, wenn sich die Symbolliste oder ihre Daten (dataTo) geändert haben. */
+  onSymbols: (() => void) | null = null;
+  private cancelSymbolsRefresh: (() => void) | null = null;
+
+  private scheduleSymbolsRefresh(): void {
+    this.cancelSymbolsRefresh?.();
+    const id = setTimeout(() => {
+      this.cancelSymbolsRefresh = null;
+      if (this.destroyed) return;
+      this.api
+        .symbols(AbortSignal.timeout(REFETCH_TIMEOUT_MS))
+        .then((r) => {
+          if (this.destroyed) return;
+          const s = r.symbols.find((x) => x.name === this.sym.name);
+          if (s && tileConfigChanged(this.sym, s)) this.applyNewSymbols(r.symbols);
+          else {
+            // gleiche Kachelkonfiguration: nur Liste und Datenbereich übernehmen
+            this.symbols = r.symbols;
+            if (s) this.sym = s;
+          }
+          this.onSymbols?.();
+        })
+        .catch(() => {})
+        .finally(() => this.scheduleSymbolsRefresh());
+    }, SYMBOLS_REFRESH_MS);
+    this.cancelSymbolsRefresh = () => clearTimeout(id);
+  }
+
+  /** Zeitrahmen, die der Server für das aktuelle Symbol anbietet (aufsteigend). */
+  timeframes(): string[] {
+    return this.sym ? offeredTimeframes(this.sym) : [];
+  }
+
+  /** Ende der Daten (ms, exklusiv) des aktuellen Symbols. */
+  dataTo(): number {
+    return this.sym?.dataTo ?? 0;
   }
 
   // ---------------------------------------------------------------- Einstellungen (vom UI)
@@ -376,7 +491,7 @@ export class ChartController {
     // Unberührte Startansicht: Bar-Abstand passend zum Typ (Bid×Ask braucht ≥ 80 px für Zahlen)
     if (this.initialView && this.items.length > 0) {
       const ts = this.chart.timeScale();
-      ts.applyOptions({ barSpacing: initialBarSpacing(t) });
+      ts.applyOptions({ barSpacing: startBarSpacing(t, this.chart.paneSize(0).width || 1200) });
       ts.scrollToRealTime();
       requestAnimationFrame(() => {
         if (!this.destroyed) this.evaluate();
@@ -544,7 +659,7 @@ export class ChartController {
   private currentAnchor(): Anchor | null {
     // W8: ohne Daten (Fenster noch leer) den noch ausstehenden Anker behalten statt zum Datenende zu springen
     if (this.items.length === 0) return this.anchor ? { ...this.anchor, initial: false } : null;
-    const lr = this.chart.timeScale().getVisibleLogicalRange();
+    const lr = this.logicalRange();
     if (!lr) return null;
     const mid = (lr.from + lr.to) / 2;
     return { centerSec: this.timeAtLogical(mid), logicalWidth: lr.to - lr.from };
@@ -556,7 +671,7 @@ export class ChartController {
   }
 
   private visibleTimeRange(): [number, number] | null {
-    const lr = this.chart.timeScale().getVisibleLogicalRange();
+    const lr = this.logicalRange();
     if (!lr) return null;
     return [this.timeAtLogical(lr.from), this.timeAtLogical(lr.to)];
   }
@@ -612,7 +727,7 @@ export class ChartController {
 
   private rebuildWindow(run: [number, number]): void {
     const ts = this.chart.timeScale();
-    const lr = ts.getVisibleLogicalRange();
+    const lr = this.logicalRange();
     const oldItems = this.items;
     const items = this.bars.items(run[0], run[1]);
     // K1: neuer Ausschnitt aus der Zeit der Bildmitte (auch weit außerhalb des alten Fensters),
@@ -632,17 +747,27 @@ export class ChartController {
     this.fp.setData(this.mode === 'footprint' ? items : []);
     this.counters.setData++;
     if (this.anchor?.initial) this.initialView = true;
-    if (this.initialView) {
+    if (this.anchor?.at) {
+      // Start um eine Zeit: Bar-Abstand setzen und die Mitte erst platzieren, wenn das Chart eine
+      // Breite hat (vor dem ersten Layout ist die Pane 0 px breit und der Bereich ginge verloren)
+      const spacing = startBarSpacing(this.rc.type, this.chart.paneSize(0).width || 1200);
+      ts.applyOptions({ barSpacing: spacing });
+      this.centerAt(this.anchor.centerSec, 0, spacing);
+    } else if (this.initialView) {
       // Startansicht (Nutzerentscheid, statt §1.4 „~200 Bars"): lesbarer Footprint mit Zahlen, d. h.
-      // Bar-Abstand über der L3-Schwelle des Typs (+ ≈ 20 %), rechter Rand, Preisskala auf die
-      // sichtbaren Bars angepasst (autoScale).
-      ts.applyOptions({ barSpacing: initialBarSpacing(this.rc.type) });
+      // Bar-Abstand über der L3-Schwelle des Typs, rechter Rand, Preisskala auf die sichtbaren Bars
+      // angepasst (autoScale). Siehe START_CANDLES.
+      ts.applyOptions({
+        barSpacing: startBarSpacing(this.rc.type, this.chart.paneSize(0).width || 1200),
+      });
       ts.scrollToRealTime();
     } else {
-      ts.setVisibleLogicalRange(range as LogicalRange);
+      this.setRange(range);
     }
     const hadAnchor = this.anchor !== null;
-    this.anchor = null;
+    // at-Anker bleibt bestehen, bis centerAt ihn angewendet hat (sonst zentriert ein weiterer
+    // Fensterwechsel auf die Standardansicht der Bibliothek)
+    if (!this.anchor?.at) this.anchor = null;
     if (!this.firstCandles && items.length > 0) {
       this.firstCandles = true;
       requestAnimationFrame(() => performance.mark('of:first-candles'));
@@ -768,9 +893,9 @@ export class ChartController {
     // Zu großes Fenster für den Footprint-Modus: aus den (geladenen) Abschnitten neu zuschneiden.
     if (this.win && this.win[1] - this.win[0] + 1 > this.capChunks() && this.ensureWindow(true))
       return;
-    const lr = this.chart.timeScale().getVisibleLogicalRange();
+    const lr = this.logicalRange();
     this.fp.setData(m === 'footprint' ? this.items : []);
-    if (lr) this.chart.timeScale().setVisibleLogicalRange(lr);
+    if (lr) this.setRange(lr);
     this.colorRefDirty = true;
     this.scheduleFrame();
   }
@@ -790,7 +915,7 @@ export class ChartController {
 
   /** Sichtbare Geometrie aus der Bibliothek (nur am Gestenende/bei Bedarf, nicht je Frame). */
   private measure(): ViewGeometry | null {
-    const lr = this.chart.timeScale().getVisibleLogicalRange();
+    const lr = this.logicalRange();
     const n = this.items.length;
     if (!lr || n === 0) return null;
     const from = Math.max(0, Math.ceil(lr.from));
@@ -875,7 +1000,7 @@ export class ChartController {
       if (this.manualNote)
         this.hint = this.hint ? `${this.manualNote}; ${this.hint}` : this.manualNote;
       // K1/§7.3: mehr sichtbare Bars als das Kerzen-Fenster fasst → Hinweis statt leerer Fläche
-      const lr = this.chart.timeScale().getVisibleLogicalRange();
+      const lr = this.logicalRange();
       if (lr && lr.to - lr.from > CANDLE_WINDOW_BARS)
         this.hint = `Mehr als ${CANDLE_WINDOW_BARS} Bars sichtbar – größeren Zeitrahmen wählen`;
       const fp = wantsFootprintMode(this.mode === 'footprint', { bs, rh, vc });
@@ -1196,7 +1321,7 @@ export class ChartController {
   /** P95 der |Werte| über die sichtbaren Bars (KONZEPT §6.1), nicht je Frame. */
   private scratch = new Float64Array(1 << 15);
   private recomputeColorRef(): void {
-    const lr = this.chart.timeScale().getVisibleLogicalRange();
+    const lr = this.logicalRange();
     const tiles = this.fpStore.tiles(this.rc.series);
     if (!lr || !tiles) return;
     const from = Math.max(0, Math.floor(lr.from));
@@ -1254,6 +1379,32 @@ export class ChartController {
 export function initialBarSpacing(type: FootprintType): number {
   return Math.round(L3_MIN_BAR_SPACING[type] * 1.05);
 }
+
+/**
+ * Anzahl Delta-Kerzen in der Startansicht. null = so viele, wie bei 46 px Bar-Abstand passen (heute
+ * ≈ 32 auf 1600 px, Median ≈ 5–7 Zeilen je Kerze). Eine Zahl (z. B. 20) ergibt weniger, breitere Kerzen
+ * mit mehr Zeilen (≈ 7 Zeilen auf 15m/1h). Bid×Ask skaliert entsprechend (Verhältnis der L3-Schwellen).
+ * Umschalten = diese eine Zeile ändern.
+ */
+export const START_CANDLES: number | null = null;
+
+/** Bar-Abstand der Startansicht (nie unter der Zahlenschwelle des Typs). */
+export function startBarSpacing(type: FootprintType, paneWidth: number): number {
+  const min = initialBarSpacing(type);
+  if (START_CANDLES === null) return min;
+  const scale = L3_MIN_BAR_SPACING[type] / L3_MIN_BAR_SPACING.delta;
+  return Math.max(min, (paneWidth / START_CANDLES) * scale);
+}
+
+/** Zeitrahmen mit Footprint-Angebot des Symbols, aufsteigend nach Dauer (nur bekannte Kürzel). */
+export function offeredTimeframes(s: Pick<SymbolInfo, 'tiles'>): string[] {
+  return Object.keys(s.tiles)
+    .filter((tf) => isTimeframe(tf) && Object.keys(s.tiles[tf] ?? {}).length > 0)
+    .sort((a, b) => tfSeconds(a) - tfSeconds(b));
+}
+
+/** Abstand der /symbols-Aktualisierung (neue Symbole, dataTo; Konfigurationswechsel). */
+export const SYMBOLS_REFRESH_MS = 5 * 60_000;
 
 /** Nächstes R (logarithmisch) aus einer aufsteigenden Liste. */
 export function nearestR(rs: readonly number[], r: number): number {

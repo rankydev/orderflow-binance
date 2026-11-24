@@ -228,3 +228,24 @@ describe('Manuelles R und Startansicht', () => {
     expect(initialBarSpacing('bidask')).toBeGreaterThanOrEqual(80);
   });
 });
+
+describe('Produktion: Zeitrahmen aus /symbols, Startansicht', () => {
+  it('nur angebotene, bekannte Zeitrahmen, nach Dauer sortiert', async () => {
+    const { offeredTimeframes } = await import('../src/lib/controller.ts');
+    const tiles = {
+      '1h': { '50': 32 },
+      '1m': { '50': 32 },
+      '1w': { '50': 32 },
+      '5m': {},
+      '15m': { '10': 64 },
+    };
+    expect(offeredTimeframes({ tiles })).toEqual(['1m', '15m', '1h']);
+  });
+  it('START_CANDLES = null: Start-Bar-Abstand = Zahlenschwelle + 5 % (heutiges Verhalten)', async () => {
+    const { START_CANDLES, startBarSpacing, initialBarSpacing } =
+      await import('../src/lib/controller.ts');
+    expect(START_CANDLES).toBeNull();
+    expect(startBarSpacing('delta', 1500)).toBe(initialBarSpacing('delta'));
+    expect(startBarSpacing('bidask', 1500)).toBe(initialBarSpacing('bidask'));
+  });
+});
