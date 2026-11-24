@@ -1,0 +1,50 @@
+// Gemeinsame Typen des Frontends. Chartdaten selbst liegen in Typed Arrays außerhalb der Svelte-
+// Reaktivität (KONZEPT §7.3); hier nur Formen und UI-Einstellungen.
+
+import type { UTCTimestamp } from 'lightweight-charts';
+
+/** P1-Typen (KONZEPT §6.1): Delta (Default) und Bid×Ask. Volume, Delta+Volume folgen in P4. */
+export type FootprintType = 'delta' | 'bidask';
+/** Farbmodi v1 (KONZEPT §6.1): aus, fest, Verlauf. */
+export type ColorMode = 'off' | 'fixed' | 'gradient';
+/** Bereich der Farbreferenz (KONZEPT §6.1): sichtbare Bars (Default) oder je Bar. */
+export type ColorScope = 'visible' | 'bar';
+/** Level of Detail (KONZEPT §7.2): 3 Zahlen, 2 Zellen, 1 Kerzen. */
+export type Lod = 1 | 2 | 3;
+
+/** Antwort von GET /api/v1/symbols (Form der Fixture-API; die echte API liefert dieselben Felder). */
+export interface SymbolInfo {
+  name: string;
+  priceDecimals: number;
+  qtyDecimals: number;
+  tickRefUnits: number;
+  /** Aktueller Tick in price_unit (R ≥ Tick, KONZEPT §3.2). */
+  tickUnits: number;
+  /** Datenbereich [dataFrom, dataTo) in ms. */
+  dataFrom: number;
+  dataTo: number;
+  tileConfigVersion: number;
+  /** Kachellänge n je tf und R (Ticks); fehlende R sind für diesen tf nicht zulässig (Zellgrenze). */
+  tiles: Record<string, Record<string, number>>;
+}
+
+export interface SymbolsResponse {
+  symbols: SymbolInfo[];
+}
+
+/** Datenitem beider Serien (Kerzen + Footprint); Preise als Gleitkomma für die Bibliothek, Ganzzahlen für Zeilen. */
+export interface BarItem {
+  /** Bar-Beginn in Sekunden (UTC). */
+  time: UTCTimestamp;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  /** Bar-Beginn in Sekunden; Kopie von time, weil die Bibliothek `time` aus originalData entfernt. */
+  t: number;
+  /** Ganzzahlige Preise in price_unit. */
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+}

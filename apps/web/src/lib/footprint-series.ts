@@ -1,0 +1,398 @@
+// Footprint als Custom Series für lightweight-charts 5.x (KONZEPT §7.1, §7.2). Der Renderer zeichnet
+// nur sichtbare Bars und nur Zeilen im sichtbaren Preisbereich, entscheidet die Detailstufe je Frame
+// (billig: Bar-Abstand, Zeilenhöhe, geschätzte Zellen) und erzwingt das Zellbudget: über 25 000
+// geschätzten sichtbaren Zellen werden keine Zellen gezeichnet, sondern Kerzen. Zellen werden je
+// Farbstufe gebündelt (ein fillStyle je Stufe), Texte sind vorformatiert (Index in die Texttabelle).
+import {
+  customSeriesDefaultOptions,
+  type CustomData,
+  type CustomSeriesOptions,
+  type CustomSeriesPricePlotValues,
+  type CustomSeriesWhitespaceData,
+  type ICustomSeriesPaneRenderer,
+  type ICustomSeriesPaneView,
+  type PaneRendererCustomData,
+  type PriceToCoordinateConverter,
+  type Time,
+} from 'lightweight-charts';
+import { colorIndex, NEUTRAL_INDEX } from './color.ts';
+import type { FootprintStore, PreparedTile } from './footprint-store.ts';
+import {
+  L2_MIN_BAR_SPACING,
+  L2_MIN_ROW_HEIGHT,
+  selectLod,
+  VISIBLE_CELL_BUDGET,
+  visibleCells,
+} from './lod.ts';
+import type { BarItem, ColorMode, ColorScope, FootprintType, Lod } from './types.ts';
+
+export type FpItem = BarItem & CustomData<Time>;
+
+type Target = Parameters<ICustomSeriesPaneRenderer['draw']>[0];
+type Scope = Parameters<Parameters<Target['useBitmapCoordinateSpace']>[0]>[0];
+
+export const UP_COLOR = '#26a69a';
+export const DOWN_COLOR = '#ef5350';
+const POC_COLOR = '#f2c94c';
+const TEXT_COLOR = '#eef1f5';
+const DRAW_RING = 4096;
+
+/** Laufende Messwerte je Frame (für Anzeige und Playwright-Messung; nicht reaktiv). */
+export class FrameStats {
+  lod: Lod = 1;
+  vc = 0;
+  rh = 0;
+  bs = 0;
+  cellsDrawn = 0;
+  lastDrawMs = 0;
+  frames = 0;
+  /** Größtes vc in einem Frame, der Zellen gezeichnet hat (muss ≤ 25 000 bleiben). */
+  maxVcWithCells = 0;
+  maxCellsDrawn = 0;
+  readonly drawMs = new Float64Array(DRAW_RING);
+  /** Frames je Stufe (Index 1–3). */
+  readonly lodFrames = [0, 0, 0, 0];
+  /** Frames, die nur wegen vc > 25 000 Kerzen statt Zellen zeichneten (Budget greift). */
+  budgetFallbacks = 0;
+  firstFootprintAt = 0;
+
+  record(ms: number): void {
+    this.lastDrawMs = ms;
+    this.drawMs[this.frames % DRAW_RING] = ms;
+    this.frames++;
+  }
+}
+
+/** Vom Controller gesetzter Zeichenzustand (keine Reaktivität, kein Kopieren je Frame). */
+export class RenderContext {
+  store: FootprintStore | null = null;
+  /** sym|tf|R der aktuellen Kacheln. */
+  series = '';
+  n = 1;
+  tfSec = 60;
+  /** Zeilenbreite in price_unit (R · tick_ref_units). */
+  width = 1;
+  /** 10^priceDecimals. */
+  priceScale = 100;
+  type: FootprintType = 'delta';
+  colorMode: ColorMode = 'gradient';
+  colorScope: ColorScope = 'visible';
+  /** Farbreferenz (P95) über die sichtbaren Bars, am Gestenende/Laden berechnet. */
+  colorRef = 1;
+  palette: string[] = [];
+  readonly stats = new FrameStats();
+  onFirstFootprint: (() => void) | null = null;
+}
+
+/** Wachsender Rechteckpuffer je Farbe (x, y, w, h in Bitmap-px). */
+class RectBatch {
+  private data: Float64Array[] = [];
+  private count: Int32Array;
+  readonly colors: number;
+  constructor(colors: number) {
+    this.colors = colors;
+    this.count = new Int32Array(colors);
+    for (let i = 0; i < colors; i++) this.data.push(new Float64Array(256));
+  }
+  reset(): void {
+    this.count.fill(0);
+  }
+  push(c: number, x: number, y: number, w: number, h: number): void {
+    let a = this.data[c]!;
+    const n = this.count[c]!;
+    if (n * 4 + 4 > a.length) {
+      const b = new Float64Array(a.length * 2);
+      b.set(a);
+      this.data[c] = a = b;
+    }
+    a[n * 4] = x;
+    a[n * 4 + 1] = y;
+    a[n * 4 + 2] = w;
+    a[n * 4 + 3] = h;
+    this.count[c] = n + 1;
+  }
+  fill(ctx: CanvasRenderingContext2D, styles: readonly string[]): void {
+    for (let c = 0; c < this.colors; c++) {
+      const n = this.count[c]!;
+      if (n === 0) continue;
+      const a = this.data[c]!;
+      ctx.fillStyle = styles[c]!;
+      ctx.beginPath();
+      for (let i = 0; i < n; i++) ctx.rect(a[i * 4]!, a[i * 4 + 1]!, a[i * 4 + 2]!, a[i * 4 + 3]!);
+      ctx.fill();
+    }
+  }
+  stroke(ctx: CanvasRenderingContext2D, c: number): void {
+    const n = this.count[c]!;
+    if (n === 0) return;
+    const a = this.data[c]!;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) ctx.rect(a[i * 4]!, a[i * 4 + 1]!, a[i * 4 + 2]!, a[i * 4 + 3]!);
+    ctx.stroke();
+  }
+}
+
+class TextBatch {
+  x = new Float64Array(1024);
+  y = new Float64Array(1024);
+  s = new Int32Array(1024);
+  n = 0;
+  push(x: number, y: number, s: number): void {
+    if (this.n === this.x.length) {
+      const g = <T extends Float64Array | Int32Array>(a: T, mk: (n: number) => T) => {
+        const b = mk(a.length * 2);
+        b.set(a);
+        return b;
+      };
+      this.x = g(this.x, (n) => new Float64Array(n));
+      this.y = g(this.y, (n) => new Float64Array(n));
+      this.s = g(this.s, (n) => new Int32Array(n));
+    }
+    this.x[this.n] = x;
+    this.y[this.n] = y;
+    this.s[this.n] = s;
+    this.n++;
+  }
+}
+
+export class FootprintRenderer implements ICustomSeriesPaneRenderer {
+  data: PaneRendererCustomData<Time, FpItem> | null = null;
+  private readonly cells = new RectBatch(NEUTRAL_INDEX + 1);
+  /** 0 = up, 1 = down, 2 = POC. */
+  private readonly misc = new RectBatch(3);
+  private readonly texts = new TextBatch();
+  private readonly fallback: number[] = [];
+  private readonly highs: number[] = [];
+  private readonly lows: number[] = [];
+
+  readonly rc: RenderContext;
+  constructor(rc: RenderContext) {
+    this.rc = rc;
+  }
+
+  draw(target: Target, priceToCoordinate: PriceToCoordinateConverter): void {
+    const t0 = performance.now();
+    target.useBitmapCoordinateSpace((scope) => this.drawImpl(scope, priceToCoordinate));
+    this.rc.stats.record(performance.now() - t0);
+  }
+
+  private drawImpl(scope: Scope, conv: PriceToCoordinateConverter): void {
+    const d = this.data;
+    const rc = this.rc;
+    const st = rc.stats;
+    if (!d || !d.visibleRange || d.bars.length === 0) return;
+    const from = Math.max(0, d.visibleRange.from);
+    const to = Math.min(d.bars.length, d.visibleRange.to);
+    if (to <= from) return;
+    // Affine Abbildung price_unit → y (CSS-px), aus zwei Stützstellen je Frame (lineare Preisskala).
+    const ref = d.bars[from]!.originalData.h;
+    const yA = conv(ref / rc.priceScale);
+    const yB = conv((ref + 1000) / rc.priceScale);
+    if (yA === null || yB === null || yA === yB) return;
+    const A = (yB - yA) / 1000;
+    const B = yA - A * ref;
+    const H = scope.mediaSize.height;
+    const unitTop = (0 - B) / A;
+    const unitBottom = (H - B) / A;
+    const bs = d.barSpacing;
+    const width = rc.width;
+    const rh = -A * width;
+    this.highs.length = 0;
+    this.lows.length = 0;
+    for (let i = from; i < to; i++) {
+      const it = d.bars[i]!.originalData;
+      this.highs.push(it.h);
+      this.lows.push(it.l);
+    }
+    const vc = visibleCells(
+      {
+        highs: this.highs,
+        lows: this.lows,
+        from: 0,
+        to: this.highs.length - 1,
+        unitBottom,
+        unitTop,
+        pxPerUnit: -A,
+      },
+      width,
+    );
+    const lod = rc.store ? selectLod({ bs, rh, vc, type: rc.type }) : 1;
+    st.lod = lod;
+    st.lodFrames[lod]!++;
+    if (
+      lod === 1 &&
+      vc > VISIBLE_CELL_BUDGET &&
+      bs >= L2_MIN_BAR_SPACING &&
+      rh >= L2_MIN_ROW_HEIGHT
+    )
+      st.budgetFallbacks++;
+    st.vc = vc;
+    st.rh = rh;
+    st.bs = bs;
+    const ctx = scope.context;
+    const hpr = scope.horizontalPixelRatio;
+    const vpr = scope.verticalPixelRatio;
+    const yU = (u: number) => (A * u + B) * vpr;
+    this.fallback.length = 0;
+    if (lod === 1) {
+      for (let i = from; i < to; i++) this.fallback.push(i);
+      st.cellsDrawn = 0;
+      this.drawCandles(ctx, d, hpr, yU);
+      return;
+    }
+    const store = rc.store!;
+    const tiles = store.tiles(rc.series);
+    const span = rc.n * rc.tfSec;
+    const rowMin = Math.floor(unitBottom / width);
+    const rowMax = Math.floor(unitTop / width);
+    const rhB = rh * vpr;
+    const gap = rhB >= 5 ? Math.max(1, Math.floor(vpr)) : 0;
+    const colW = bs * (rc.type === 'bidask' ? 0.92 : 0.86) * hpr;
+    const bid = rc.type === 'bidask';
+    const mode = rc.colorMode;
+    const perBar = rc.colorScope === 'bar';
+    this.cells.reset();
+    this.misc.reset();
+    this.texts.n = 0;
+    let cells = 0;
+    let curK = Number.NaN;
+    let tile: PreparedTile | undefined;
+    for (let i = from; i < to; i++) {
+      const bar = d.bars[i]!;
+      const t = bar.originalData.t;
+      const k = Math.floor(t / span);
+      if (k !== curK) {
+        curK = k;
+        const s = tiles?.get(k);
+        tile = s && s !== 'rejected' ? s : undefined;
+        if (tile) store.touch(tile);
+      }
+      const bi = tile ? tile.slot[(t - tile.fromSec) / rc.tfSec]! : -1;
+      if (!tile || bi < 0) {
+        this.fallback.push(i);
+        continue;
+      }
+      const xc = bar.x * hpr;
+      const x0 = Math.round(xc - colW / 2);
+      const x1 = Math.max(x0 + 1, Math.round(xc + colW / 2));
+      const xm = Math.round(xc);
+      const s = tile.levelOffset[bi]!;
+      const e = tile.levelOffset[bi + 1]!;
+      const cref = perBar ? (bid ? tile.refVol[bi]! : tile.refDelta[bi]!) : rc.colorRef;
+      const row = tile.row;
+      const buy = tile.buy;
+      const sell = tile.sell;
+      const pr = tile.poc[bi]!;
+      for (let j = s; j < e; j++) {
+        const r = row[j]!;
+        if (r < rowMin || r > rowMax) continue;
+        const yt = Math.round(yU((r + 1) * width));
+        const yb = Math.round(yU(r * width));
+        const h = Math.max(1, yb - yt - gap);
+        const b = buy[j]!;
+        const sl = sell[j]!;
+        if (bid) {
+          this.cells.push(colorIndex(sl, cref, true, mode), x0, yt, Math.max(1, xm - x0 - 1), h);
+          this.cells.push(colorIndex(b, cref, false, mode), xm, yt, Math.max(1, x1 - xm), h);
+        } else {
+          this.cells.push(colorIndex(b - sl, cref, false, mode), x0, yt, x1 - x0, h);
+        }
+        if (r === pr) this.misc.push(2, x0 + 0.5, yt + 0.5, x1 - x0 - 1, h - 1);
+        cells++;
+        if (lod === 3) {
+          const ym = yt + h / 2;
+          if (bid) {
+            this.texts.push((x0 + xm) / 2, ym, tile.txtSell[j]!);
+            this.texts.push((xm + x1) / 2, ym, tile.txtBuy[j]!);
+          } else {
+            this.texts.push(xc, ym, tile.txtDelta[j]!);
+          }
+        }
+      }
+    }
+    this.cells.fill(ctx, rc.palette);
+    ctx.lineWidth = Math.max(1, Math.floor(vpr));
+    ctx.strokeStyle = POC_COLOR;
+    this.misc.stroke(ctx, 2);
+    if (this.texts.n > 0) {
+      ctx.font = `${Math.round(10 * vpr)}px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = TEXT_COLOR;
+      const strs = store.text.strings;
+      const tb = this.texts;
+      for (let q = 0; q < tb.n; q++) ctx.fillText(strs[tb.s[q]!]!, tb.x[q]!, tb.y[q]!);
+    }
+    st.cellsDrawn = cells;
+    if (cells > 0) {
+      if (vc > st.maxVcWithCells) st.maxVcWithCells = vc;
+      if (cells > st.maxCellsDrawn) st.maxCellsDrawn = cells;
+      if (st.firstFootprintAt === 0) {
+        st.firstFootprintAt = performance.now();
+        rc.onFirstFootprint?.();
+      }
+    }
+    if (this.fallback.length > 0) this.drawCandles(ctx, d, hpr, yU);
+  }
+
+  /** Kerzen für die Bars in `fallback` (L1 oder Bars ohne geladene Kachel), zwei Füllungen insgesamt. */
+  private drawCandles(
+    ctx: CanvasRenderingContext2D,
+    d: PaneRendererCustomData<Time, FpItem>,
+    hpr: number,
+    yU: (u: number) => number,
+  ): void {
+    const m = this.misc;
+    m.reset();
+    const bodyW = Math.max(1, Math.floor(d.barSpacing * 0.7 * hpr));
+    const wickW = Math.max(1, Math.floor(hpr));
+    for (const i of this.fallback) {
+      const bar = d.bars[i]!;
+      const it = bar.originalData;
+      const c = it.c >= it.o ? 0 : 1;
+      const xc = Math.round(bar.x * hpr);
+      const yh = Math.round(yU(it.h));
+      const yl = Math.round(yU(it.l));
+      const yo = Math.round(yU(it.o));
+      const yc = Math.round(yU(it.c));
+      m.push(c, xc - Math.floor(wickW / 2), yh, wickW, Math.max(1, yl - yh));
+      if (bodyW > wickW)
+        m.push(
+          c,
+          xc - Math.floor(bodyW / 2),
+          Math.min(yo, yc),
+          bodyW,
+          Math.max(1, Math.abs(yo - yc)),
+        );
+    }
+    m.fill(ctx, [UP_COLOR, DOWN_COLOR, POC_COLOR]);
+  }
+}
+
+export class FootprintSeriesView implements ICustomSeriesPaneView<
+  Time,
+  FpItem,
+  CustomSeriesOptions
+> {
+  private readonly r: FootprintRenderer;
+  constructor(rc: RenderContext) {
+    this.r = new FootprintRenderer(rc);
+  }
+  renderer(): FootprintRenderer {
+    return this.r;
+  }
+  update(data: PaneRendererCustomData<Time, FpItem>): void {
+    this.r.data = data;
+  }
+  priceValueBuilder(item: FpItem): CustomSeriesPricePlotValues {
+    return [item.low, item.high, item.close];
+  }
+  isWhitespace(
+    item: FpItem | CustomSeriesWhitespaceData<Time>,
+  ): item is CustomSeriesWhitespaceData<Time> {
+    return (item as Partial<FpItem>).close === undefined;
+  }
+  defaultOptions(): CustomSeriesOptions {
+    return { ...customSeriesDefaultOptions, lastValueVisible: false, priceLineVisible: false };
+  }
+}

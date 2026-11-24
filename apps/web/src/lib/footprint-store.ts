@@ -1,0 +1,233 @@
+// Kachel-Cache der Footprint-Daten (KONZEPT §5.4, §7.3): dekodierte Typed Arrays plus einmal beim Laden
+// berechnete Ableitungen (POC je Bar, Slot-Tabelle Zeit → Bar, Text-Indizes, Farbreferenz je Bar).
+// Nicht reaktiv; LRU nach Zellzahl (≤ 2 Mio. Zellen), sichtbare Kacheln werden nie verdrängt.
+import { decodeTile, type DecodedTile } from '@orderflow/core/browser';
+import { COLOR_REF_PERCENTILE, quantileInPlace } from './color.ts';
+import { TextTable } from './format.ts';
+
+export const CACHE_MAX_CELLS = 2_000_000;
+
+export interface PreparedTile {
+  /** sym|tf|R */
+  series: string;
+  k: number;
+  n: number;
+  tfSec: number;
+  fromSec: number;
+  nBars: number;
+  cells: number;
+  time: Int32Array;
+  high: Int32Array;
+  low: Int32Array;
+  levelOffset: Int32Array;
+  row: Int32Array;
+  buy: Float64Array;
+  sell: Float64Array;
+  /** Zeilenindex des POC je Bar. */
+  poc: Int32Array;
+  /** slot[(t − fromSec)/tfSec] = Bar-Index oder −1. */
+  slot: Int32Array;
+  /** Text-Indizes (TextTable) je Level. */
+  txtDelta: Int32Array;
+  txtBuy: Int32Array;
+  txtSell: Int32Array;
+  /** Farbreferenz je Bar (P95 von |Delta| bzw. von buy/sell) für den Bereich „je Bar". */
+  refDelta: Float64Array;
+  refVol: Float64Array;
+  /** Bytes der Typed Arrays (für die Speicheranzeige). */
+  bytes: number;
+}
+
+/**
+ * POC (KONZEPT §6.1): Zeile mit maximalem Volumen; Gleichstand → näher an der Mitte des Bar-Ranges,
+ * dann die tiefere. Mitte in Zeilen = (Zeile(low) + Zeile(high)) / 2.
+ */
+export function pocRow(
+  row: ArrayLike<number>,
+  buy: ArrayLike<number>,
+  sell: ArrayLike<number>,
+  s: number,
+  e: number,
+  rowLow: number,
+  rowHigh: number,
+): number {
+  const mid2 = rowLow + rowHigh; // doppelte Mitte, ganzzahlig
+  let best = -1;
+  let bestV = -1;
+  let bestD = Infinity;
+  for (let j = s; j < e; j++) {
+    const v = buy[j]! + sell[j]!;
+    const r = row[j]!;
+    const d = Math.abs(2 * r - mid2);
+    if (v > bestV || (v === bestV && (d < bestD || (d === bestD && r < best)))) {
+      best = r;
+      bestV = v;
+      bestD = d;
+    }
+  }
+  return best;
+}
+
+export function prepareTile(series: string, dec: DecodedTile, text: TextTable): PreparedTile {
+  const h = dec.header;
+  if (h.kind !== 'footprint' || !h.tile || h.R === null) throw new Error('keine Footprint-Kachel');
+  const lv = dec.levels!;
+  const n = h.tile.n;
+  const tfSec = h.tfSec;
+  const fromSec = h.from / 1000;
+  const width = h.R * h.tickRefUnits;
+  const nb = h.nBars;
+  const nl = h.nLevels;
+  const slot = new Int32Array(n).fill(-1);
+  const poc = new Int32Array(nb);
+  const refDelta = new Float64Array(nb);
+  const refVol = new Float64Array(nb);
+  const txtDelta = new Int32Array(nl);
+  const txtBuy = new Int32Array(nl);
+  const txtSell = new Int32Array(nl);
+  let scratch = new Float64Array(64);
+  for (let i = 0; i < nb; i++) {
+    slot[(dec.bars.time[i]! - fromSec) / tfSec] = i;
+    const s = lv.levelOffset[i]!;
+    const e = lv.levelOffset[i + 1]!;
+    const lo = dec.bars.low[i]!;
+    const hi = dec.bars.high[i]!;
+    poc[i] = pocRow(lv.row, lv.buy, lv.sell, s, e, Math.floor(lo / width), Math.floor(hi / width));
+    const m = e - s;
+    if (scratch.length < 2 * m) scratch = new Float64Array(2 * m);
+    for (let j = s; j < e; j++) {
+      const b = lv.buy[j]!;
+      const sl = lv.sell[j]!;
+      txtDelta[j] = text.id(b - sl);
+      txtBuy[j] = text.id(b);
+      txtSell[j] = text.id(sl);
+      scratch[j - s] = Math.abs(b - sl);
+    }
+    refDelta[i] = quantileInPlace(scratch, m, COLOR_REF_PERCENTILE);
+    for (let j = s; j < e; j++) {
+      scratch[2 * (j - s)] = lv.buy[j]!;
+      scratch[2 * (j - s) + 1] = lv.sell[j]!;
+    }
+    refVol[i] = quantileInPlace(scratch, 2 * m, COLOR_REF_PERCENTILE);
+  }
+  const bytes = dec.levels!.row.buffer.byteLength + (n + nb * 3) * 4 + nl * 12 + nb * 16;
+  return {
+    series,
+    k: h.tile.index,
+    n,
+    tfSec,
+    fromSec,
+    nBars: nb,
+    cells: nl,
+    time: dec.bars.time,
+    high: dec.bars.high,
+    low: dec.bars.low,
+    levelOffset: lv.levelOffset,
+    row: lv.row,
+    buy: lv.buy,
+    sell: lv.sell,
+    poc,
+    slot,
+    txtDelta,
+    txtBuy,
+    txtSell,
+    refDelta,
+    refVol,
+    bytes,
+  };
+}
+
+export type TileState = PreparedTile | 'rejected';
+
+export class FootprintStore {
+  /** Gemeinsame Texttabelle (Werte → vorformatierter Text). */
+  readonly text: TextTable;
+  private readonly bySeries = new Map<string, Map<number, TileState>>();
+  /** LRU-Reihenfolge: älteste zuerst. */
+  private readonly lru = new Map<string, PreparedTile>();
+  cells = 0;
+  bytes = 0;
+
+  readonly maxCells: number;
+
+  constructor(qtyDecimals: number, maxCells = CACHE_MAX_CELLS) {
+    this.text = new TextTable(qtyDecimals);
+    this.maxCells = maxCells;
+  }
+
+  static key(series: string, k: number): string {
+    return `${series}#${k}`;
+  }
+
+  tiles(series: string): Map<number, TileState> | undefined {
+    return this.bySeries.get(series);
+  }
+
+  has(series: string, k: number): boolean {
+    return this.bySeries.get(series)?.has(k) ?? false;
+  }
+
+  get(series: string, k: number): TileState | undefined {
+    return this.bySeries.get(series)?.get(k);
+  }
+
+  /** Markiert Zugriff (LRU). */
+  touch(t: PreparedTile): void {
+    const key = FootprintStore.key(t.series, t.k);
+    this.lru.delete(key);
+    this.lru.set(key, t);
+  }
+
+  addEncoded(series: string, buf: ArrayBuffer): PreparedTile {
+    const t = prepareTile(series, decodeTile(buf), this.text);
+    this.add(t);
+    return t;
+  }
+
+  add(t: PreparedTile): void {
+    let m = this.bySeries.get(t.series);
+    if (!m) {
+      m = new Map();
+      this.bySeries.set(t.series, m);
+    }
+    const old = m.get(t.k);
+    if (old && old !== 'rejected') this.remove(old);
+    m.set(t.k, t);
+    this.lru.set(FootprintStore.key(t.series, t.k), t);
+    this.cells += t.cells;
+    this.bytes += t.bytes;
+  }
+
+  markRejected(series: string, k: number): void {
+    let m = this.bySeries.get(series);
+    if (!m) {
+      m = new Map();
+      this.bySeries.set(series, m);
+    }
+    m.set(k, 'rejected');
+  }
+
+  private remove(t: PreparedTile): void {
+    this.lru.delete(FootprintStore.key(t.series, t.k));
+    this.bySeries.get(t.series)?.delete(t.k);
+    this.cells -= t.cells;
+    this.bytes -= t.bytes;
+  }
+
+  /** Verdrängt die ältesten Kacheln bis ≤ maxCells; `pinned` (Schlüssel) bleiben. Liefert die Anzahl. */
+  evict(pinned: Set<string>): number {
+    let n = 0;
+    if (this.cells <= this.maxCells) return 0;
+    for (const [key, t] of this.lru) {
+      if (this.cells <= this.maxCells) break;
+      if (pinned.has(key)) continue;
+      this.remove(t);
+      n++;
+    }
+    return n;
+  }
+
+  get tileCount(): number {
+    return this.lru.size;
+  }
+}
