@@ -12,8 +12,10 @@ import {
   formatDay,
   monthDays,
   monthOfDay,
+  ownQualityDigest,
   qualityDigest,
   reconcileDay,
+  RULES_VERSION,
   type DayData,
   type DayManifest,
   type DayStats,
@@ -34,7 +36,15 @@ import {
   type VerifiedFile,
 } from './files.ts';
 import { readAggTrades, readKlineDay, type AggDayChunk } from './readers.ts';
-import { factsOf, stateOf, type DayWriter, type WriteOutcome } from './writer/types.ts';
+import {
+  factsOf,
+  stateOf,
+  type CarryOrigin,
+  type DayInputs,
+  type DayWriter,
+  type StoredDay,
+  type WriteOutcome,
+} from './writer/types.ts';
 
 function emptyInput(): ReconcileInput {
   const z = () => new Float64Array(1440);
@@ -72,6 +82,8 @@ export interface ImportOptions {
   ) => void;
   /** Optional: je abgeschlossenem Tag (z. B. sofort an eine Ergebnisdatei anhängen). */
   onSummary?: (s: DaySummary) => void;
+  /** Tage des Bereichs immer neu schreiben (auch wenn identisch gespeichert). */
+  force?: boolean;
 }
 
 export interface MinuteDetail {
@@ -117,6 +129,12 @@ export interface DaySummary {
   digest: string;
   digests: DayData['digests'];
   qualityDigest: string;
+  /** Digest der eigenen Klassen (data_day.quality_digest). */
+  ownQualityDigest: string;
+  inputs: DayInputs;
+  /** write = neu/geändert geschrieben; skip = unverändert; keep = gespeicherte (bessere) Klassifikation behalten. */
+  decision: 'write' | 'skip' | 'keep';
+  reasons: string[];
   manifest: ReturnType<typeof comparableDayManifest>;
   state: 'final_ok' | 'final_bad';
   extraBad: string[];
@@ -126,6 +144,31 @@ export interface DaySummary {
 }
 
 const CLS = ['', 'exact', 'shift', 'mismatch', 'edge_pending', 'missing'];
+
+/** Gründe, einen Tag (neu) zu schreiben; leer = gespeicherter Tag ist identisch. */
+export function writeReasons(
+  st: StoredDay | null,
+  now: { digest: string; quality: string; aggSha: string; klineSha: string; inputs: DayInputs },
+): string[] {
+  if (!st) return ['neu'];
+  if (st.state !== 'final_ok' && st.state !== 'final_bad') return [`Zustand ${st.state}`];
+  const r: string[] = [];
+  if (st.stale) r.push('stale');
+  if (st.digest !== now.digest) r.push('Daten');
+  if (st.qualityDigest !== now.quality) r.push('Klassifikation');
+  if (st.aggSha256 !== now.aggSha) r.push('aggTrades-Datei');
+  if (st.klineSha256 !== now.klineSha) r.push('Kline-Datei');
+  const si = st.inputs;
+  if (
+    !si ||
+    si.carryIn.q !== now.inputs.carryIn.q ||
+    si.carryIn.b !== now.inputs.carryIn.b ||
+    si.prevLastAggId !== now.inputs.prevLastAggId
+  ) {
+    r.push('Vortagseingaben');
+  }
+  return r;
+}
 
 function minuteDetail(r: ReconcileResult, inp: DayData['reconcileInput'], m: number): MinuteDetail {
   return {
@@ -260,7 +303,17 @@ interface Chain {
   day: number;
   prevIn: NeighbourIn;
   lastAggId: number | null;
+  /** Herkunft des Übertrags, den der Folgetag verwendet. */
+  origin: CarryOrigin;
 }
+
+/** Stärke einer Übertrags-Herkunft: ein schwächerer Lauf überschreibt keine bessere Klassifikation. */
+const ORIGIN_RANK: Record<CarryOrigin, number> = {
+  estimated: 0,
+  neighbour: 1,
+  stored: 2,
+  chain: 2,
+};
 
 /** Tag mit noch offener Minute 1439 (nur die kleinen Abgleich-Eingaben werden gehalten). */
 interface OpenDay {
@@ -272,6 +325,22 @@ interface OpenDay {
   extraBad: string[];
   /** Nur für Nachbartage ohne gespeicherten Zustand: eigene Klasse/Fakten aus der Nachbaranalyse. */
   neighbourRecon?: ReconcileResult;
+}
+
+/** Warum ein gespeicherter Tag mit anderen Vortagseingaben klassifiziert wurde (null = gleich). */
+export function inputsDiffer(
+  st: StoredDay,
+  ch: Chain | { prevIn: NeighbourIn; lastAggId: number | null },
+): string | null {
+  if (!st.inputs) return 'Vortagseingaben unbekannt';
+  const c = st.inputs.carryIn;
+  if (c.q !== ch.prevIn.carry.q || c.b !== ch.prevIn.carry.b) {
+    return `Übertrag des Vortags ${c.q}/${c.b} → ${ch.prevIn.carry.q}/${ch.prevIn.carry.b}`;
+  }
+  if (st.inputs.prevLastAggId !== ch.lastAggId) {
+    return `letzte aggId des Vortags ${st.inputs.prevLastAggId} → ${ch.lastAggId}`;
+  }
+  return null;
 }
 
 export class Importer {
@@ -339,36 +408,25 @@ export class Importer {
     }
   }
 
-  async run(): Promise<DaySummary[]> {
-    const { spec, dataDir, firstDay, lastDay, prefer, writer, log } = this.o;
-    // Quellen bestimmen und zu Läufen zusammenfassen (eine Monatsdatei = ein Lauf).
-    const runs: { src: Source; days: number[] }[] = [];
-    for (let d = firstDay; d <= lastDay; d++) {
-      const src = resolveAggSource(dataDir, spec.name, d, prefer);
-      if (!src) {
-        throw new Error(
-          `Keine aggTrades-Quelle für ${spec.name} ${formatDay(d)} (prefer=${prefer}); Datei + .CHECKSUM nötig`,
-        );
-      }
-      const last = runs[runs.length - 1];
-      if (last && last.src.path === src.path) last.days.push(d);
-      else runs.push({ src, days: [d] });
-    }
+  private chain: Chain | null = null;
+  private open: OpenDay | null = null;
 
-    let chain: Chain | null = null;
-    let open: OpenDay | null = null;
+  async run(): Promise<DaySummary[]> {
+    const { spec, firstDay, writer, log } = this.o;
+    let lastDay = this.o.lastDay;
 
     // Vortag des Bereichs: gespeicherter Zustand (DB/Resume) hat Vorrang vor der Neuberechnung,
     // damit ein Lauf und mehrere Teilläufe identisch klassifizieren (die Kette des gespeicherten
     // Tages ist maßgeblich, nicht ein aus dem Tag geschätzter Übertrag).
-    const stored = await writer.storedChain(spec.name, firstDay - 1);
+    const stored = (await writer.storedDay(spec.name, firstDay - 1))?.chain ?? null;
     if (stored) {
-      chain = {
+      this.chain = {
         day: firstDay - 1,
         prevIn: { carry: stored.carry, cand: stored.cand },
         lastAggId: stored.lastAggId,
+        origin: 'stored',
       };
-      open = {
+      this.open = {
         day: firstDay - 1,
         inp: emptyInput(),
         prevIn: undefined,
@@ -381,12 +439,13 @@ export class Importer {
     } else if (this.o.neighbours) {
       const n = await this.analyseNeighbour(firstDay - 1);
       if (n) {
-        chain = {
+        this.chain = {
           day: firstDay - 1,
           prevIn: { carry: n.recon.carryOut, cand: n.recon.candLast },
           lastAggId: n.stats.lastAggId,
+          origin: 'neighbour',
         };
-        open = {
+        this.open = {
           day: firstDay - 1,
           inp: n.inp,
           prevIn: undefined,
@@ -402,6 +461,88 @@ export class Importer {
           `Nachbartag ${formatDay(firstDay - 1)} nicht verfügbar: Minute 0 von ${formatDay(firstDay)} bleibt edge_pending`,
         );
       }
+    }
+
+    await this.processRange(firstDay, lastDay);
+
+    // Kaskade (Review N2): ein gespeicherter Folgetag, der mit einem anderen Übertrag bzw. einer
+    // anderen letzten aggId des Vortags klassifiziert wurde, wird in diesem Lauf mitgerechnet; ohne
+    // Quelldateien wird er als veraltet (stale) markiert. Weiter als bis zur ersten unveränderten
+    // Folgeminute ohne Kandidat reicht die Wirkung praktisch nie, daher endet die Kaskade dort.
+    for (;;) {
+      const next = lastDay + 1;
+      const st = await writer.storedDay(spec.name, next);
+      const ch = this.chain!;
+      if (!st || !(st.state === 'final_ok' || st.state === 'final_bad')) break;
+      const why = inputsDiffer(st, ch);
+      if (!why) break;
+      if (!this.sourcesAvailable(next)) {
+        await writer.markStale(next, why);
+        log(
+          `Folgetag ${formatDay(next)} veraltet (${why}), Quelldateien fehlen: als stale markiert`,
+        );
+        break;
+      }
+      log(`Kaskade: Folgetag ${formatDay(next)} wird neu klassifiziert (${why})`);
+      lastDay = next;
+      await this.processRange(next, next);
+    }
+
+    if (
+      this.summaries.length !== lastDay - firstDay + 1 ||
+      !this.chain ||
+      this.chain.day !== lastDay
+    ) {
+      throw new Error(
+        `Interner Fehler: ${this.summaries.length} von ${lastDay - firstDay + 1} Tagen verarbeitet`,
+      );
+    }
+
+    // Folgetag des Bereichs: nur lesen, Minute 0 mit unserem Übertrag abgleichen.
+    let nextOk = false;
+    const lastChain = this.chain;
+    if (this.o.neighbours) {
+      const n = await this.analyseNeighbour(lastDay + 1, lastChain.prevIn);
+      if (n) {
+        nextOk = true;
+        log(
+          `Nachbartag ${formatDay(lastDay + 1)} gelesen: Minute 0 ${CLS[n.recon.ownCls[0]!]} (D_q=${n.recon.dQ[0]}, s_q=${n.recon.sQ[0]})`,
+        );
+        if (this.open) await this.settle(this.open, true);
+        this.open = null;
+        await this.resolve(lastDay + 1, 0, n.recon, n.inp);
+      } else {
+        log(
+          `Nachbartag ${formatDay(lastDay + 1)} nicht verfügbar: Minute 1439 von ${formatDay(lastDay)} bleibt edge_pending`,
+        );
+      }
+    }
+    if (!nextOk && this.open) await this.settle(this.open, false);
+    return this.summaries;
+  }
+
+  private sourcesAvailable(day: number): boolean {
+    const { spec, dataDir, prefer } = this.o;
+    return (
+      resolveAggSource(dataDir, spec.name, day, prefer) !== null &&
+      isPresent(absPath(dataDir, klineRef(spec.name, day)))
+    );
+  }
+
+  private async processRange(firstDay: number, lastDay: number): Promise<void> {
+    const { spec, dataDir, prefer } = this.o;
+    // Quellen bestimmen und zu Läufen zusammenfassen (eine Monatsdatei = ein Lauf).
+    const runs: { src: Source; days: number[] }[] = [];
+    for (let d = firstDay; d <= lastDay; d++) {
+      const src = resolveAggSource(dataDir, spec.name, d, prefer);
+      if (!src) {
+        throw new Error(
+          `Keine aggTrades-Quelle für ${spec.name} ${formatDay(d)} (prefer=${prefer}); Datei + .CHECKSUM nötig`,
+        );
+      }
+      const last = runs[runs.length - 1];
+      if (last && last.src.path === src.path) last.days.push(d);
+      else runs.push({ src, days: [d] });
     }
 
     for (const run of runs) {
@@ -448,7 +589,8 @@ export class Importer {
             readMs,
             buildMs: performance.now() - t0,
           };
-          const linked: Chain | null = chain && chain.day === c.day - 1 ? chain : null;
+          const linked: Chain | null =
+            this.chain && this.chain.day === c.day - 1 ? this.chain : null;
           const continuesPrev =
             linked && linked.lastAggId !== null && c.stats.firstAggId !== null
               ? c.stats.firstAggId === linked.lastAggId + 1
@@ -456,21 +598,27 @@ export class Importer {
           const prevIn = linked ? linked.prevIn : undefined;
           // Abgleich des Tages; Minute 1439 bleibt offen, bis d+1 abgeglichen ist.
           const recon = reconcileDay(data.reconcileInput, { prev: prevIn, nextReconciled: false });
-          const w = await this.write(p, recon, continuesPrev);
-          // Resume: übersprungener Tag mit beim Schreiben unbekanntem Vortag → Minute 0 jetzt entscheiden
+          const inputs: DayInputs = {
+            carryIn: recon.carryIn,
+            carryInOrigin: linked ? linked.origin : 'estimated',
+            prevLastAggId: linked ? linked.lastAggId : null,
+          };
+          const w = await this.write(p, recon, continuesPrev, inputs);
+          // Übersprungener Tag mit beim Schreiben unbekanntem Vortag → Minute 0 jetzt entscheiden
           if (w.summary.skipped && prevIn) await this.resolve(c.day, 0, recon, data.reconcileInput);
-          if (open && open.day === c.day - 1) await this.settle(open, true);
-          open = {
+          if (this.open && this.open.day === c.day - 1) await this.settle(this.open, true);
+          this.open = {
             day: c.day,
             inp: data.reconcileInput,
             prevIn,
             summary: w.summary,
             extraBad: w.extraBad,
           };
-          chain = {
+          this.chain = {
             day: c.day,
             prevIn: { carry: recon.carryOut, cand: recon.candLast },
             lastAggId: c.stats.lastAggId,
+            origin: 'chain',
           };
           tPrev = performance.now();
         },
@@ -492,33 +640,6 @@ export class Importer {
         await this.writeSidecar(run.src, v, summary);
       }
     }
-    if (this.summaries.length !== lastDay - firstDay + 1 || !chain || chain.day !== lastDay) {
-      throw new Error(
-        `Interner Fehler: ${this.summaries.length} von ${lastDay - firstDay + 1} Tagen verarbeitet`,
-      );
-    }
-
-    // Folgetag des Bereichs: nur lesen, Minute 0 mit unserem Übertrag abgleichen.
-    let nextOk = false;
-    const lastChain = chain as Chain;
-    if (this.o.neighbours) {
-      const n = await this.analyseNeighbour(lastDay + 1, lastChain.prevIn);
-      if (n) {
-        nextOk = true;
-        log(
-          `Nachbartag ${formatDay(lastDay + 1)} gelesen: Minute 0 ${CLS[n.recon.ownCls[0]!]} (D_q=${n.recon.dQ[0]}, s_q=${n.recon.sQ[0]})`,
-        );
-        if (open) await this.settle(open, true);
-        open = null;
-        await this.resolve(lastDay + 1, 0, n.recon, n.inp);
-      } else {
-        log(
-          `Nachbartag ${formatDay(lastDay + 1)} nicht verfügbar: Minute 1439 von ${formatDay(lastDay)} bleibt edge_pending`,
-        );
-      }
-    }
-    if (!nextOk && open) await this.settle(open, false);
-    return this.summaries;
   }
 
   /** Minute eines gespeicherten Tages mit bekannter Klasse entscheiden. */
@@ -579,6 +700,7 @@ export class Importer {
     p: Prepared,
     recon: ReconcileResult,
     continuesPrev: boolean | null,
+    inputs: DayInputs,
   ): Promise<{ summary: DaySummary; extraBad: string[] }> {
     const { spec, writer, importerVersion } = this.o;
     const aggManifest = aggDayManifest(
@@ -629,17 +751,36 @@ export class Importer {
     );
     const t0 = performance.now();
     let outcome: WriteOutcome;
-    let skipped = false;
-    const key = {
-      symbol: spec.name,
-      day: p.day,
-      aggSha256: p.aggV.sha256,
-      klineSha256: p.klineV.sha256,
-      importerVersion,
-    };
-    if (await writer.isDone(key)) {
-      skipped = true;
+    // „Fertig" hängt von Daten ab, nicht vom Codetext (Review N3): der Tag ist bereits berechnet;
+    // gleichen Daten-Digest, Klassen-Digest, Quelldateien und Vortagseingaben den gespeicherten,
+    // wird nichts geschrieben (nur die Herkunft aktualisiert).
+    const own = ownQualityDigest(recon);
+    const st = await writer.storedDay(spec.name, p.day);
+    const reasons = writeReasons(st, {
+      digest: p.data.digest,
+      quality: own,
+      aggSha: p.aggV.sha256,
+      klineSha: p.klineV.sha256,
+      inputs,
+    });
+    if (this.o.force && reasons.length === 0) reasons.push('--force');
+    let decision: DaySummary['decision'] = reasons.length === 0 ? 'skip' : 'write';
+    // Ein Lauf mit schwächerem Übertrag (geschätzt) überschreibt keine mit bekanntem Übertrag
+    // berechnete Klassifikation derselben Daten.
+    if (
+      decision === 'write' &&
+      st?.inputs &&
+      ORIGIN_RANK[inputs.carryInOrigin] < ORIGIN_RANK[st.inputs.carryInOrigin] &&
+      reasons.every((r) => r === 'Klassifikation' || r === 'Vortagseingaben')
+    ) {
+      decision = 'keep';
+    }
+    const skipped = decision !== 'write';
+    if (skipped) {
       outcome = { dbDigest: null, state: stateOf(recon, extraBad), version: null };
+      if (decision === 'skip' && st && st.importerVersion !== importerVersion) {
+        await writer.touchDay(p.day, importerVersion, RULES_VERSION);
+      }
     } else {
       outcome = await writer.writeDay({
         data: p.data,
@@ -649,7 +790,10 @@ export class Importer {
         aggFile,
         klineFile,
         importerVersion,
+        rulesVersion: RULES_VERSION,
         extraBad,
+        inputs,
+        qualityDigest: own,
       });
     }
     const writeMs = performance.now() - t0;
@@ -687,6 +831,10 @@ export class Importer {
       digest: p.data.digest,
       digests: p.data.digests,
       qualityDigest: qualityDigest(recon),
+      ownQualityDigest: own,
+      inputs,
+      decision,
+      reasons,
       manifest: comparableDayManifest(aggManifest),
       state: outcome.state,
       extraBad,
@@ -746,7 +894,7 @@ export function formatSummary(s: DaySummary): string {
     `  Σvol ours=${t.ourQ} kline=${t.klQ} diff=${t.ourQ - t.klQ} | Σtaker ours=${t.ourB} kline=${t.klB} diff=${t.ourB - t.klB} | s(-1)=${s.carryIn.q}/${s.carryIn.b}${s.carryInKnown ? '' : ' (geschätzt)'} s(1439)=${s.carryOut.q}/${s.carryOut.b} identity=${t.identityQ && t.identityB} bounds=${t.carryBoundsOk}`,
     `  edge m0: ${e0.cls} (own ${e0.ownCls}, D=${e0.dQ}/${e0.dB}, s=${e0.sQ}/${e0.sB}) m1439: ${e1.cls} (own ${e1.ownCls}, D=${e1.dQ}/${e1.dB}, s=${e1.sQ}/${e1.sB}, cand=${e1.candQ}/${e1.candB})`,
     `  ohlc diff o/h/l/c=${s.ohlc.open}/${s.ohlc.high}/${s.ohlc.low}/${s.ohlc.close} of ${s.ohlc.compared} | fp_1m=${fmtInt(s.fpRows.fp_1m ?? 0)} bars=${s.bars} tick=${s.minStepUnits}`,
-    `  state=${s.state}${s.extraBad.length ? ` (${s.extraBad.join('; ')})` : ''}${s.skipped ? ' SKIPPED(resume)' : ''} digest=${s.digest}${s.dbDigest ? ` db=${s.dbDigest === s.digest ? 'match' : s.dbDigest}` : ''}`,
+    `  state=${s.state}${s.extraBad.length ? ` (${s.extraBad.join('; ')})` : ''}${s.decision === 'write' ? ` WRITTEN(${s.reasons.join(', ')})` : s.decision === 'skip' ? ' UNCHANGED' : ` KEPT(${s.reasons.join(', ')})`} digest=${s.digest}${s.dbDigest ? ` db=${s.dbDigest === s.digest ? 'match' : s.dbDigest}` : ''}`,
     `  time read=${s.timing.readMs}ms build=${s.timing.buildMs}ms write=${s.timing.writeMs}ms → ${fmtInt(s.timing.rowsPerSec)} rows/s`,
   ].join('\n');
 }

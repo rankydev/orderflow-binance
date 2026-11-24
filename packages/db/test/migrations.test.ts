@@ -9,7 +9,7 @@ const real = loadMigrations(MIGRATIONS_DIR);
 
 describe('Migrationsdateien im Repo', () => {
   it('sind lückenlos nummeriert und haben je eine up- und down-Datei', () => {
-    expect(real.map((m) => m.version)).toEqual(['0001', '0002', '0003', '0004', '0005']);
+    expect(real.map((m) => m.version)).toEqual(['0001', '0002', '0003', '0004', '0005', '0006']);
     for (const m of real) {
       expect(m.upSql.trim().length).toBeGreaterThan(0);
       expect(m.downSql.trim().length).toBeGreaterThan(0);

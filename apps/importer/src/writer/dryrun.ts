@@ -4,27 +4,28 @@ import { formatDay } from '@orderflow/core';
 import { existsSync, readFileSync } from 'node:fs';
 import {
   stateOf,
+  type DayInputs,
   type DayWrite,
   type DayWriter,
   type EdgeUpdate,
-  type ResumeKey,
-  type StoredChain,
+  type StoredDay,
   type WriteOutcome,
 } from './types.ts';
 
 interface ResumeLine {
   symbol: string;
   day: string;
+  state?: string;
+  digest?: string;
+  ownQualityDigest?: string;
   aggSha256?: string;
   klineSha256?: string;
   importerVersion?: string;
+  inputs?: DayInputs;
   carryOut?: { q: number; b: number };
   lastAggId?: number | null;
   edges?: { candQ: number; candB: number }[];
 }
-
-const keyOf = (symbol: string, day: string, agg = '', kl = '', ver = '') =>
-  `${symbol}|${day}|${agg}|${kl}|${ver}`;
 
 export interface DryRunRecord {
   symbol: string;
@@ -40,25 +41,35 @@ export class DryRunWriter implements DayWriter {
   readonly kind = 'dry-run' as const;
   readonly records: DryRunRecord[] = [];
   readonly edges: { symbol: string; day: string; minute: number; cls: number }[] = [];
-  private readonly done = new Set<string>();
+  readonly touched: string[] = [];
+  readonly stale: { day: string; reason: string }[] = [];
+  private readonly stored = new Map<string, StoredDay>();
 
-  private readonly chains = new Map<string, StoredChain>();
-
-  /** `resumeFrom`: JSONL mit DaySummary-Zeilen früherer Läufe (Felder symbol, day, …). */
+  /** `resumeFrom`: JSONL mit DaySummary-Zeilen früherer Läufe; die letzte Zeile je Tag gilt. */
   constructor(resumeFrom?: string) {
     if (resumeFrom && existsSync(resumeFrom)) {
       for (const line of readFileSync(resumeFrom, 'utf8').split('\n')) {
         if (!line.trim()) continue;
         const r = JSON.parse(line) as ResumeLine;
-        this.done.add(keyOf(r.symbol, r.day, r.aggSha256, r.klineSha256, r.importerVersion));
         const last = r.edges?.[1];
-        if (r.carryOut && last) {
-          this.chains.set(`${r.symbol}|${r.day}`, {
-            carry: r.carryOut,
-            cand: { q: last.candQ, b: last.candB },
-            lastAggId: r.lastAggId ?? null,
-          });
-        }
+        this.stored.set(`${r.symbol}|${r.day}`, {
+          state: r.state ?? 'unknown',
+          stale: false,
+          digest: r.digest ?? null,
+          qualityDigest: r.ownQualityDigest ?? null,
+          aggSha256: r.aggSha256 ?? null,
+          klineSha256: r.klineSha256 ?? null,
+          importerVersion: r.importerVersion ?? null,
+          inputs: r.inputs ?? null,
+          chain:
+            r.carryOut && last
+              ? {
+                  carry: r.carryOut,
+                  cand: { q: last.candQ, b: last.candB },
+                  lastAggId: r.lastAggId ?? null,
+                }
+              : null,
+        });
       }
     }
   }
@@ -66,14 +77,16 @@ export class DryRunWriter implements DayWriter {
   async open(): Promise<void> {}
   async close(): Promise<void> {}
 
-  async isDone(k: ResumeKey): Promise<boolean> {
-    return this.done.has(
-      keyOf(k.symbol, formatDay(k.day), k.aggSha256, k.klineSha256, k.importerVersion),
-    );
+  async storedDay(symbol: string, day: number): Promise<StoredDay | null> {
+    return this.stored.get(`${symbol}|${formatDay(day)}`) ?? null;
   }
 
-  async storedChain(symbol: string, day: number): Promise<StoredChain | null> {
-    return this.chains.get(`${symbol}|${formatDay(day)}`) ?? null;
+  async touchDay(day: number): Promise<void> {
+    this.touched.push(formatDay(day));
+  }
+
+  async markStale(day: number, reason: string): Promise<void> {
+    this.stale.push({ day: formatDay(day), reason });
   }
 
   async writeDay(w: DayWrite): Promise<WriteOutcome> {

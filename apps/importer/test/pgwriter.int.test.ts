@@ -17,6 +17,8 @@ import {
   type DbConfig,
 } from '@orderflow/core';
 import { connect, dropAndCreateDatabase, migrateUp, type Sql } from '@orderflow/db';
+import { spawn } from 'node:child_process';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Importer } from '../src/pipeline.ts';
 import { DryRunWriter } from '../src/writer/dryrun.ts';
@@ -45,7 +47,7 @@ async function run(
       spec: BTC,
       firstDay: parseDay(from),
       lastDay: parseDay(to),
-      prefer: 'monthly',
+      prefer: 'auto',
       neighbours,
       writer,
       importerVersion: 'int-test',
@@ -55,6 +57,13 @@ async function run(
   } finally {
     if (!alreadyOpen) await writer.close();
   }
+}
+
+let lastOpened: PostgresWriter | null = null;
+async function opened(w: PostgresWriter): Promise<PostgresWriter> {
+  await w.open();
+  lastOpened = w;
+  return w;
 }
 
 beforeAll(async () => {
@@ -99,14 +108,36 @@ describe('PostgresWriter', () => {
     expect(raw.map((r) => `${r.kind}/${r.origin}`)).toEqual(['aggTrades/monthly', 'klines/daily']);
   });
 
-  it('Re-Import: version + 1, identischer Digest (K8); Resume überspringt', async () => {
-    const before = await sql`SELECT digest FROM data_day WHERE day = '2026-09-10'`;
+  it('Re-Import identischer Daten: nichts geschrieben, nur Herkunft; --force schreibt (K8, N3)', async () => {
+    const [before] = await sql`SELECT version, digest FROM data_day WHERE day = '2026-09-10'`;
     await sql`UPDATE data_day SET importer_version = 'alt' WHERE day = '2026-09-10'`;
-    await run(new PostgresWriter(cfg, BTC), '2026-09-10', '2026-09-10');
-    const [dd] = await sql`SELECT version, digest FROM data_day WHERE day = '2026-09-10'`;
-    expect(dd).toMatchObject({ version: 4, digest: before[0]!.digest }); // +1 Ersatz, +1 Randminute
-    const [again] = await run(new PostgresWriter(cfg, BTC), '2026-09-10', '2026-09-10');
-    expect(again!.skipped).toBe(true);
+    const [same] = await run(new PostgresWriter(cfg, BTC), '2026-09-10', '2026-09-10');
+    expect(same!.decision).toBe('skip');
+    const [dd] =
+      await sql`SELECT version, digest, importer_version FROM data_day WHERE day = '2026-09-10'`;
+    expect(dd).toMatchObject({
+      version: before!.version,
+      digest: before!.digest,
+      importer_version: 'int-test',
+    });
+    const forced = await new Importer({
+      dataDir,
+      spec: BTC,
+      firstDay: parseDay('2026-09-10'),
+      lastDay: parseDay('2026-09-10'),
+      prefer: 'monthly',
+      neighbours: true,
+      writer: await opened(new PostgresWriter(cfg, BTC)),
+      importerVersion: 'int-test',
+      sidecar: false,
+      log: () => {},
+      force: true,
+    }).run();
+    expect(forced[0]!.decision).toBe('write');
+    const [d2] = await sql`SELECT version, digest FROM data_day WHERE day = '2026-09-10'`;
+    expect(d2!.digest).toBe(before!.digest);
+    expect(d2!.version).toBeGreaterThan(before!.version as number);
+    await lastOpened?.close();
   });
 
   it('Randminute eines früher importierten Tages wird beim Import des Nachbartags aufgelöst', async () => {
@@ -218,5 +249,140 @@ describe('Review-Regressionen (DB)', () => {
                                  notional::text AS n FROM bar_1d WHERE ts = ${new Date(t)}`;
     expect(b!.n).toBe('35500000000000001');
     expect(b!.d).toBe(barDigest(1, [bar]));
+  });
+});
+
+describe('Review N1–N6 (DB)', () => {
+  const jobsPaused = async () =>
+    Number(
+      (
+        await sql`SELECT count(*) FILTER (WHERE NOT scheduled)::int AS n FROM timescaledb_information.jobs
+                   WHERE proc_name = 'policy_compression' AND hypertable_schema = 'public'`
+      )[0]!.n,
+    );
+
+  it('N1: Backfill pausiert Jobs, konvertiert fertige Chunks und aktiviert die Jobs beim Schließen', async () => {
+    const w = new PostgresWriter(cfg, BTC, { backfill: true });
+    await run(w, '2026-09-26', '2026-09-27', false);
+    expect(await jobsPaused()).toBe(0);
+    const [c] = await sql`
+      SELECT bool_and(is_compressed) AS all FROM timescaledb_information.chunks
+       WHERE hypertable_name = 'fp_1m' AND range_start >= '2026-09-26' AND range_end <= '2026-09-28'`;
+    expect(c!.all).toBe(true);
+  });
+
+  it('N1: nach kill -9 eines Backfills repariert der nächste open() die pausierten Jobs', async () => {
+    const child = spawn(
+      process.execPath,
+      [
+        'apps/importer/src/main.ts',
+        'import',
+        '--symbol',
+        'BTCUSDT',
+        '--month',
+        '2026-09',
+        '--prefer',
+        'monthly',
+        '--db',
+        '--backfill',
+        '--force',
+        '--quiet',
+        '--data-dir',
+        dataDir,
+      ],
+      { env: { ...process.env, OF_DB_NAME: cfg.database }, stdio: 'ignore' },
+    );
+    try {
+      for (let i = 0; i < 300 && (await jobsPaused()) === 0; i++) await sleep(100);
+      expect(await jobsPaused()).toBeGreaterThan(0);
+    } finally {
+      child.kill('SIGKILL');
+      await new Promise((r) => child.once('exit', r));
+    }
+    await sleep(300); // Sitzung des getöteten Prozesses endet
+    expect(await jobsPaused()).toBeGreaterThan(0);
+    const logs: string[] = [];
+    const w = new PostgresWriter(cfg, BTC, { log: (l) => logs.push(l) });
+    await w.open();
+    await w.close();
+    expect(await jobsPaused()).toBe(0);
+    expect(logs.some((l) => l.includes('pausierte Columnstore-Jobs'))).toBe(true);
+  });
+
+  it('N2: geänderter Vortag → Folgetag wird kaskadiert neu klassifiziert; ohne Quellen stale', async () => {
+    const bad = archive({ dropAggMinute: { day: '2026-09-14', minute: 1439 } });
+    await run(new PostgresWriter(cfg, BTC), '2026-09-14', '2026-09-15', false, bad);
+    const [b15] = await sql`SELECT state FROM data_day WHERE day = '2026-09-15'`;
+    expect(b15!.state).toBe('final_bad'); // Minute 0: Übertrag fehlt
+    const good = archive();
+    const res = await run(new PostgresWriter(cfg, BTC), '2026-09-14', '2026-09-14', false, good);
+    expect(res.map((x) => [x.day, x.decision])).toEqual([
+      ['2026-09-14', 'write'],
+      ['2026-09-15', 'write'],
+    ]);
+    const [g15] =
+      await sql`SELECT state, stale, carry_in_q, immutable FROM data_day WHERE day = '2026-09-15'`;
+    expect(g15).toMatchObject({ state: 'final_ok', stale: false, carry_in_q: '9' });
+    // ohne Quelldateien für den Folgetag: stale statt stiller Inkonsistenz
+    const only14 = archive({ dailyDays: ['2026-09-14'], monthly: false });
+    await run(new PostgresWriter(cfg, BTC), '2026-09-14', '2026-09-14', false, bad);
+    const r = await run(new PostgresWriter(cfg, BTC), '2026-09-14', '2026-09-14', false, only14);
+    expect(r).toHaveLength(1);
+    const [s15] = await sql`SELECT stale, immutable FROM data_day WHERE day = '2026-09-15'`;
+    expect(s15).toMatchObject({ stale: true, immutable: false });
+  });
+
+  it('N4: Fehler in Transaktion B stellt den Zustand vor einem früheren Abbruch wieder her', async () => {
+    await run(new PostgresWriter(cfg, BTC), '2026-09-18', '2026-09-18');
+    const [before] = await sql`SELECT state, digest FROM data_day WHERE day = '2026-09-18'`;
+    // früherer Abbruch nach Transaktion A
+    await sql`UPDATE data_day SET state = 'importing', state_before_import = 'final_ok' WHERE day = '2026-09-18'`;
+    const w = new PostgresWriter(cfg, BTC);
+    (w as unknown as { upsertRawDay: () => Promise<void> }).upsertRawDay = async () => {
+      throw new Error('boom');
+    };
+    await w.open();
+    await expect(
+      new Importer({
+        dataDir,
+        spec: BTC,
+        firstDay: parseDay('2026-09-18'),
+        lastDay: parseDay('2026-09-18'),
+        prefer: 'monthly',
+        neighbours: false,
+        writer: w,
+        importerVersion: 'int-test',
+        sidecar: false,
+        log: () => {},
+      }).run(),
+    ).rejects.toThrow(/boom/);
+    await w.close();
+    const [after] = await sql`SELECT state, digest FROM data_day WHERE day = '2026-09-18'`;
+    expect(after).toMatchObject({ state: before!.state, digest: before!.digest });
+  });
+
+  it('N4: Konvertierungsfehler nach dem Commit setzt den neuen Zustand nicht zurück', async () => {
+    const logs: string[] = [];
+    const w = new PostgresWriter(cfg, BTC, { backfill: true, log: (l) => logs.push(l) });
+    let calls = 0;
+    const orig = w.convertFinishedChunks.bind(w);
+    w.convertFinishedChunks = async (u: number) => {
+      if (++calls === 1) throw new Error('lock timeout (simuliert)');
+      return orig(u);
+    };
+    const [s] = await run(w, '2026-09-19', '2026-09-19', false);
+    expect(s!.decision).toBe('write');
+    const [d] = await sql`SELECT state FROM data_day WHERE day = '2026-09-19'`;
+    expect(d!.state).toBe('final_ok');
+    expect(logs.some((l) => l.includes('Konvertierung nach 2026-09-19 fehlgeschlagen'))).toBe(true);
+  });
+
+  it('N6: immutable erst ohne offene Randminute', async () => {
+    await run(new PostgresWriter(cfg, BTC), '2026-09-22', '2026-09-22', false);
+    const [a] = await sql`SELECT immutable FROM data_day WHERE day = '2026-09-22'`;
+    expect(a!.immutable).toBe(false);
+    await run(new PostgresWriter(cfg, BTC), '2026-09-21', '2026-09-23');
+    const [b] = await sql`SELECT immutable FROM data_day WHERE day = '2026-09-22'`;
+    expect(b!.immutable).toBe(true);
   });
 });

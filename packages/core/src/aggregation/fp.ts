@@ -60,9 +60,23 @@ export class FpBuilder {
     this.sellA[i] = sellA;
   }
 
-  /** Ansichten (subarray) statt Kopien: vermeidet kurzzeitig doppelten Speicher (Review W5). */
+  /**
+   * Ansichten (subarray) statt Kopien, solange der Puffer höchstens 1,5× überdimensioniert ist;
+   * sonst eine passgenaue Kopie, damit der übergroße Puffer freigegeben werden kann (Review W5/H5).
+   */
   build(): FpTable {
     const n = this.n;
+    if (this.cap > n * 1.5 + 16) {
+      return {
+        n,
+        ts: this.ts.slice(0, n),
+        px: this.px.slice(0, n),
+        buyQ: this.buyQ.slice(0, n),
+        sellQ: this.sellQ.slice(0, n),
+        buyA: this.buyA.slice(0, n),
+        sellA: this.sellA.slice(0, n),
+      };
+    }
     return {
       n,
       ts: this.ts.subarray(0, n),

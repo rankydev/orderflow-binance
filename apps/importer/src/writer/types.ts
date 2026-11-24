@@ -16,8 +16,22 @@ export interface DayWrite {
   aggFile: FileManifest;
   klineFile: FileManifest;
   importerVersion: string;
+  rulesVersion: string;
   /** final_bad-Gründe zusätzlich zu mismatch/missing (aggId-Löcher, fehlende Kontinuität). */
   extraBad: string[];
+  /** Eingaben aus dem Vortag, mit denen klassifiziert wurde (für Kaskade/„fertig", Review N2). */
+  inputs: DayInputs;
+  /** ownQualityDigest des Abgleichs. */
+  qualityDigest: string;
+}
+
+export type CarryOrigin = 'chain' | 'stored' | 'neighbour' | 'estimated';
+
+export interface DayInputs {
+  carryIn: { q: number; b: number };
+  carryInOrigin: CarryOrigin;
+  /** last_agg_id des Vortags (null = unbekannt). */
+  prevLastAggId: number | null;
 }
 
 export interface WriteOutcome {
@@ -56,21 +70,29 @@ export interface StoredChain {
   lastAggId: number | null;
 }
 
-export interface ResumeKey {
-  symbol: string;
-  day: number;
-  aggSha256: string;
-  klineSha256: string;
-  importerVersion: string;
+/** Was über einen gespeicherten Tag bekannt ist (Grundlage der Entscheidung „fertig"). */
+export interface StoredDay {
+  state: string;
+  stale: boolean;
+  digest: string | null;
+  qualityDigest: string | null;
+  aggSha256: string | null;
+  klineSha256: string | null;
+  importerVersion: string | null;
+  inputs: DayInputs | null;
+  /** null, wenn der Tag nicht final ist oder kein Übertrag gespeichert wurde. */
+  chain: StoredChain | null;
 }
 
 export interface DayWriter {
   readonly kind: 'postgres' | 'dry-run';
   open(): Promise<void>;
-  /** Resume: Tag ist final mit denselben Quelldateien (SHA256) und derselben Importer-/Code-Version. */
-  isDone(k: ResumeKey): Promise<boolean>;
-  /** Übertrag eines bereits finalen Tages (null, wenn unbekannt). */
-  storedChain(symbol: string, day: number): Promise<StoredChain | null>;
+  /** Gespeicherter Zustand eines Tages (null = unbekannt). */
+  storedDay(symbol: string, day: number): Promise<StoredDay | null>;
+  /** Tag ist unverändert (gleiche Daten, Klassen, Quellen, Eingaben): nur Herkunft aktualisieren. */
+  touchDay(day: number, importerVersion: string, rulesVersion: string): Promise<void>;
+  /** Vortag hat sich geändert, Neuklassifikation nicht möglich (Quelldateien fehlen). */
+  markStale(day: number, reason: string): Promise<void>;
   writeDay(w: DayWrite): Promise<WriteOutcome>;
   /** true, wenn ein gespeicherter Tag tatsächlich aktualisiert wurde (Minute war offen). */
   resolveEdge(e: EdgeUpdate): Promise<boolean>;

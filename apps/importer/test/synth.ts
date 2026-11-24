@@ -25,6 +25,7 @@ interface Row {
 function synthMonth(
   month: string,
   holeOnDay?: number,
+  straddleAllDay?: number,
 ): { rows: Row[]; first: number; last: number } {
   const [first, last] = monthDays(month);
   const rows: Row[] = [];
@@ -46,7 +47,7 @@ function synthMonth(
         fills: [[t0 + 30_000, q]],
       });
       tid++;
-      if (m === 100 || m === 1439 || (m === 0 && d % 5 === 0)) {
+      if (m === 100 || m === 1439 || (m === 0 && d % 5 === 0) || d === straddleAllDay) {
         // Mehrfach-Fill nahe der Grenze: 4 Lots in m, 9 Lots in m+1 (über Mitternacht bei m = 1439)
         const T = t0 + 59_950;
         rows.push({
@@ -148,11 +149,21 @@ export interface ArchiveOptions {
   emptyDaily?: string;
   /** aggTrades dieser Minute fehlen (Klines behalten ihr Volumen) → missing. */
   dropAggMinute?: { day: string; minute: number };
+  /** Straddler in jeder Minute dieses Tages: keine kandidatenfreie Minute, s(−1) nicht schätzbar. */
+  straddleAllDay?: string;
 }
 
 export function archive(opts: ArchiveOptions = {}) {
   const dir = tmpDir('arch-');
-  const { rows: all, first, last } = synthMonth('2026-09', opts.holeOnDay);
+  const {
+    rows: all,
+    first,
+    last,
+  } = synthMonth(
+    '2026-09',
+    opts.holeOnDay,
+    opts.straddleAllDay ? parseDay(opts.straddleAllDay) : undefined,
+  );
   const drop = opts.dropAggMinute;
   const dropStart = drop ? parseDay(drop.day) * DAY_MS + drop.minute * MINUTE_MS : -1;
   const rows = all.filter((r) => !(r.T >= dropStart && r.T < dropStart + MINUTE_MS));

@@ -147,6 +147,19 @@ export function qualityDigest(r: ReconcileResult): string {
   return h.hex();
 }
 
+/**
+ * Digest der eigenen Klassen (ownCls: ohne Randvorbehalt) mit D und s je Minute. Hängt nur von den
+ * Daten des Tages und dem verwendeten Übertrag s(−1) ab, nicht davon, ob der Folgetag schon
+ * abgeglichen ist – daher als data_day.quality_digest gespeichert und Teil von „fertig" (Review N3).
+ */
+export function ownQualityDigest(r: ReconcileResult): string {
+  const h = new LineHasher();
+  for (let m = 0; m < r.ownCls.length; m++) {
+    h.line(`${m},${r.ownCls[m]},${r.dQ[m]},${r.dB[m]},${r.sQ[m]},${r.sB[m]}`);
+  }
+  return h.hex();
+}
+
 export function sha256Hex(s: string): string {
   return createHash('sha256').update(s, 'utf8').digest('hex');
 }

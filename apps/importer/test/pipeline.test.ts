@@ -3,7 +3,7 @@
 // mitten am Tag und über jede Tagesgrenze. Prüft Klassifikation, Tagesrand-Übertrag über Tages- und
 // Monatsgrenzen, Monats-/Tagesdatei-Gleichwertigkeit (Digest, Klassifikation, Manifest),
 // Sidecar-Manifest, Resume, Checksum-Abbruch und aggId-Löcher.
-import { formatDay, getSymbol, parseDay } from '@orderflow/core';
+import { formatDay, getSymbol, parseDay, RULES_VERSION } from '@orderflow/core';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -14,6 +14,11 @@ import { tmpDir } from './helpers.ts';
 import { archive } from './synth.ts';
 
 const BTC = getSymbol('BTCUSDT');
+const PIN = {
+  rules: '1',
+  digest: '687ee0dda5c5d2e888d035ff1f3d23b456611148a759666d37e34000709c4f99',
+  quality: 'a03ae98654604477021d244e48b5eac09c6f567e9851914af18ba28acdef9bcf',
+};
 async function run(
   dataDir: string,
   from: string,
@@ -197,6 +202,36 @@ describe('Review-Regressionen (Dry-Run)', () => {
   });
 });
 
+describe('Review N2/N3 (Dry-Run)', () => {
+  it('W6 trennscharf: Tag ohne kandidatenfreie Minute – geschätzter ≠ gespeicherter Übertrag; Teilläufe = ein Lauf', async () => {
+    const dir = archive({ straddleAllDay: '2026-09-04' });
+    const one = await run(dir, '2026-09-03', '2026-09-06', 'monthly');
+    expect(one.summaries.every((s) => s.counts.mismatch === 0)).toBe(true);
+    const out = join(tmpDir('split2-'), 'r.jsonl');
+    const a = await run(dir, '2026-09-03', '2026-09-04', 'monthly');
+    writeFileSync(out, a.summaries.map((s) => JSON.stringify(s)).join('\n') + '\n');
+    const b = await run(dir, '2026-09-05', '2026-09-06', 'monthly', {
+      writer: new DryRunWriter(out),
+    });
+    const q = (x: DaySummary[]) => x.map((s) => [s.day, s.qualityDigest, s.counts]);
+    expect(q([...a.summaries, ...b.summaries])).toEqual(q(one.summaries));
+    // Gegenprobe: ohne gespeicherten Vortag wird 09-04 neu geschätzt (s(−1) = 0 statt 9) – das
+    // ergibt einen anderen Übertrag und eine falsche Minute 0 am 09-05.
+    const fresh = await run(dir, '2026-09-05', '2026-09-06', 'monthly');
+    expect(fresh.summaries[0]!.qualityDigest).not.toBe(one.summaries[2]!.qualityDigest);
+    expect(fresh.summaries[0]!.counts.mismatch).toBeGreaterThan(0);
+  });
+
+  it('Pin: Daten- und Klassen-Digest eines festen synthetischen Tages (RULES_VERSION erhöhen bei Änderung)', async () => {
+    // Schlägt dieser Test fehl, hat sich die Berechnung (Parser, Aggregation, Abgleich, Digest,
+    // Leser, Pipeline) semantisch geändert: RULES_VERSION in packages/core/src/constants.ts erhöhen
+    // und die Pins hier neu setzen – gespeicherte Tage werden dann anhand ihrer Digests neu geschrieben.
+    const dir = archive();
+    const [s] = (await run(dir, '2026-09-10', '2026-09-10', 'monthly')).summaries;
+    expect({ rules: RULES_VERSION, digest: s!.digest, quality: s!.ownQualityDigest }).toEqual(PIN);
+  });
+});
+
 describe('CLI-Argumente', () => {
   it('Bereich, Modus und Standardwerte', () => {
     const a = parseImportArgs(['--symbol', 'BTCUSDT', '--month', '2026-02'], {});
@@ -208,6 +243,18 @@ describe('CLI-Argumente', () => {
       a.neighbours,
       a.dataDir,
     ]).toEqual(['2026-02-01', '2026-02-28', 'dry-run', 'auto', true, 'data']);
+    expect(() =>
+      parseImportArgs(
+        ['--symbol', 'BTCUSDT', '--from', '2025-01-01', '--to', '2025-01-02', '--db'],
+        {},
+      ),
+    ).toThrow(/--backfill/);
+    expect(
+      parseImportArgs(
+        ['--symbol', 'BTCUSDT', '--from', '2025-01-01', '--to', '2025-01-02', '--db', '--backfill'],
+        {},
+      ).backfill,
+    ).toBe(true);
     const b = parseImportArgs(
       [
         '--symbol',
@@ -220,6 +267,7 @@ describe('CLI-Argumente', () => {
         '--prefer',
         'daily',
         '--no-neighbours',
+        '--online',
       ],
       { OF_DATA_DIR: '/x' },
     );

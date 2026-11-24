@@ -175,3 +175,18 @@ describe('Kline-Leser', () => {
     ]);
   });
 });
+
+describe('Download-Inaktivitäts-Timeout (H3)', () => {
+  it('bricht nur ohne Fortschritt ab, nicht nach einer Gesamtfrist', async () => {
+    const { idleAbort } = await import('../src/download.ts');
+    const a = idleAbort(80);
+    for (let i = 0; i < 4; i++) {
+      await new Promise((r) => setTimeout(r, 40));
+      a.touch(); // Fortschritt: insgesamt 160 ms > 80 ms, aber nie 80 ms ohne Daten
+    }
+    expect(a.signal.aborted).toBe(false);
+    await new Promise((r) => setTimeout(r, 120));
+    expect(a.signal.aborted).toBe(true);
+    a.done();
+  });
+});

@@ -18,11 +18,27 @@ import {
 
 export const VISION_BASE = 'https://data.binance.vision/data/';
 
-/** Ohne Fortschritt länger als dies → Abbruch (ein hängender Download blockiert sonst ewig). */
-const FETCH_TIMEOUT_MS = 15 * 60_000;
+/** Ohne empfangene Bytes länger als dies → Abbruch (Inaktivität, keine Gesamtfrist; Review H3). */
+export const IDLE_TIMEOUT_MS = 120_000;
 
-async function fetchOk(url: string): Promise<Response> {
-  const r = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+/** AbortController, der abbricht, wenn `touch()` länger als `ms` nicht aufgerufen wurde. */
+export function idleAbort(ms: number): {
+  signal: AbortSignal;
+  touch: () => void;
+  done: () => void;
+} {
+  const ac = new AbortController();
+  let t: NodeJS.Timeout | undefined;
+  const touch = () => {
+    if (t) clearTimeout(t);
+    t = setTimeout(() => ac.abort(new Error(`keine Daten seit ${ms / 1000} s`)), ms);
+  };
+  touch();
+  return { signal: ac.signal, touch, done: () => t && clearTimeout(t) };
+}
+
+async function fetchOk(url: string, signal?: AbortSignal): Promise<Response> {
+  const r = await fetch(url, signal ? { signal } : {});
   if (!r.ok || !r.body) throw new Error(`HTTP ${r.status} für ${url}`);
   return r;
 }
@@ -44,14 +60,26 @@ export async function downloadFile(
   for (let attempt = 1; attempt <= 3; attempt++) {
     const part = `${path}.part`;
     try {
-      const cs = await (await fetchOk(`${url}.CHECKSUM`)).text();
-      const want = parseChecksumFile(cs, name);
-      const r = await fetchOk(url);
-      const h = createHash('sha256');
-      const body = Readable.fromWeb(r.body as never);
-      body.on('data', (c: Buffer) => h.update(c));
-      await pipeline(body, createWriteStream(part));
-      const got = h.digest('hex');
+      const idle = idleAbort(IDLE_TIMEOUT_MS);
+      let got = '';
+      let cs = '';
+      let want = '';
+      try {
+        cs = await (await fetchOk(`${url}.CHECKSUM`, idle.signal)).text();
+        idle.touch();
+        want = parseChecksumFile(cs, name);
+        const r = await fetchOk(url, idle.signal);
+        const h = createHash('sha256');
+        const body = Readable.fromWeb(r.body as never);
+        body.on('data', (c: Buffer) => {
+          idle.touch();
+          h.update(c);
+        });
+        await pipeline(body, createWriteStream(part));
+        got = h.digest('hex');
+      } finally {
+        idle.done();
+      }
       if (got !== want)
         throw new Error(`SHA256-Abweichung beim Download ${name}: ${got} ≠ ${want}`);
       await writeFile(`${part}.CHECKSUM`, cs);

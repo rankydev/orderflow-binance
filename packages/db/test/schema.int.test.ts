@@ -31,7 +31,8 @@ const P1_TABLES = [
   'kline_1m',
 ];
 // KONZEPT §3.9: Chunk-Intervall und Columnstore-Frist je Hypertable
-const HYPERTABLES: Record<string, { chunkDays: number; afterDays: number }> = {
+// afterDays null = kein Columnstore (Jahres-Chunk-Tabellen, Migration 0006 / Review N5)
+const HYPERTABLES: Record<string, { chunkDays: number; afterDays: number | null }> = {
   fp_1m: { chunkDays: 1, afterDays: 3 },
   fp_1m_b10: { chunkDays: 7, afterDays: 3 },
   fp_5m_b10: { chunkDays: 7, afterDays: 3 },
@@ -40,10 +41,10 @@ const HYPERTABLES: Record<string, { chunkDays: number; afterDays: number }> = {
   fp_1h_b100: { chunkDays: 30, afterDays: 3 },
   bar_1m: { chunkDays: 30, afterDays: 3 },
   kline_1m: { chunkDays: 30, afterDays: 3 },
-  fp_1d_b100: { chunkDays: 365, afterDays: 7 },
-  fp_1d_b1000: { chunkDays: 365, afterDays: 7 },
-  bar_1h: { chunkDays: 365, afterDays: 7 },
-  bar_1d: { chunkDays: 365, afterDays: 7 },
+  fp_1d_b100: { chunkDays: 365, afterDays: null },
+  fp_1d_b1000: { chunkDays: 365, afterDays: null },
+  bar_1h: { chunkDays: 365, afterDays: null },
+  bar_1d: { chunkDays: 365, afterDays: null },
 };
 
 let sql: Sql;
@@ -89,15 +90,24 @@ describe('Migrationen', () => {
     // Spaltennamen der Info-Sicht variieren je Version; daher als JSON prüfen.
     const settings = await sql`
       SELECT to_jsonb(s) AS j FROM timescaledb_information.hypertable_columnstore_settings s`;
+    const hts = await sql`
+      SELECT hypertable_name AS t, compression_enabled AS enabled FROM timescaledb_information.hypertables`;
     expect(dims.map((d) => d.t as string).sort()).toEqual(Object.keys(HYPERTABLES).sort());
     for (const [t, want] of Object.entries(HYPERTABLES)) {
       expect(Number(dims.find((d) => d.t === t)?.days), `${t} chunk`).toBe(want.chunkDays);
       const p = policies.find((x) => x.t === t);
+      const s = settings.find((x) => String(x.j.hypertable).endsWith(t));
+      const ht = hts.find((x) => x.t === t);
+      if (want.afterDays === null) {
+        expect(p, `${t} ohne policy`).toBeUndefined();
+        expect(ht?.enabled, `${t} ohne columnstore`).toBe(false);
+        continue;
+      }
+      expect(ht?.enabled, `${t} columnstore`).toBe(true);
       expect(p, `${t} policy`).toBeDefined();
       expect(String(p?.after), `${t} after`).toMatch(
         new RegExp(`^(${want.afterDays} days|${want.afterDays * 24}:)`),
       );
-      const s = settings.find((x) => String(x.j.hypertable).endsWith(t));
       expect(s, `${t} columnstore settings`).toBeDefined();
       expect(JSON.stringify(s?.j), `${t} segmentby`).toContain('sym_id');
     }
@@ -140,11 +150,11 @@ describe('Migrationen', () => {
 
   it('Rollback aller Migrationen und erneutes Anwenden funktionieren', async () => {
     const rolled = await migrateDown(sql, 'all');
-    expect(rolled).toHaveLength(5);
+    expect(rolled).toHaveLength(6);
     const left = await sql`
       SELECT table_name FROM information_schema.tables
        WHERE table_schema = 'public' AND table_name <> 'schema_migrations'`;
     expect(left).toHaveLength(0);
-    expect(await migrateUp(sql)).toHaveLength(5);
+    expect(await migrateUp(sql)).toHaveLength(6);
   });
 });

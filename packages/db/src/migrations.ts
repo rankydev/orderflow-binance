@@ -65,7 +65,8 @@ export function assertConsistent(migrations: Migration[], applied: AppliedMigrat
     if (m.checksum !== a.checksum) {
       throw new Error(
         `Migration ${a.version}_${a.name} wurde nach dem Anwenden geändert (Checksum-Abweichung). ` +
-          'Angewendete Migrationen nie bearbeiten, sondern eine neue anlegen.',
+          'Angewendete Migrationen nie bearbeiten, sondern eine neue anlegen. ' +
+          'Lokale Entwicklungsdatenbank mit älterem Stand: npm run db:reset (löscht sie).',
       );
     }
   });

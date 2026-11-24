@@ -3,7 +3,7 @@
 // Befehle:
 //   import   --symbol S (--day D | --from D --to D | --month YYYY-MM) [--dry-run | --db]
 //            [--prefer auto|daily|monthly] [--no-neighbours] [--out datei.jsonl] [--resume]
-//            [--sidecar | --sidecar-dir DIR] [--data-dir DIR] [--quiet] [--backfill] [--force]
+//            [--sidecar | --sidecar-dir DIR] [--data-dir DIR] [--quiet] [--backfill | --online] [--force] [--plan]
 //   download --symbol S --kind aggTrades|klines (--day D | --from D --to D)
 // Standard ist --dry-run (schreibt nichts); --db schreibt in die Datenbank aus OF_DB_* (.env).
 import {
@@ -14,14 +14,13 @@ import {
   RULES_VERSION,
   formatDay,
 } from '@orderflow/core';
-import { createHash } from 'node:crypto';
-import { appendFileSync, readdirSync, readFileSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { appendFileSync, readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { downloadFile } from './download.ts';
 import type { FileRef } from './files.ts';
 import { Importer, type DaySummary, type Prefer } from './pipeline.ts';
 import { DryRunWriter } from './writer/dryrun.ts';
+import { PlanWriter } from './writer/plan.ts';
 import { PostgresWriter } from './writer/postgres.ts';
 import type { DayWriter } from './writer/types.ts';
 
@@ -32,32 +31,11 @@ const PKG_VERSION = (
 ).version;
 
 /**
- * Hash der Quelltexte, die Daten oder Klassifikation bestimmen (packages/core ohne tile/,
- * apps/importer/src). Teil der Importer-Version und damit des Resume-Schlüssels: jede Code- oder
- * Regeländerung erzwingt eine Neuberechnung statt stillem Überspringen alter Tage (Review W4).
+ * Version der Importer-Software (Herkunft in data_day.importer_version). „Fertig" hängt nicht davon
+ * ab, sondern von Daten-/Klassen-Digest, Quelldateien und Vortagseingaben (Review N3);
+ * semantische Regeländerungen erzwingt RULES_VERSION (geschützt durch einen Pin-Test).
  */
-export function sourceHash(): string {
-  const roots = [
-    new URL('../../../packages/core/src/', import.meta.url).pathname,
-    new URL('./', import.meta.url).pathname,
-  ];
-  const files: string[] = [];
-  const walk = (dir: string) => {
-    for (const e of readdirSync(dir, { withFileTypes: true })) {
-      const p = join(dir, e.name);
-      if (e.isDirectory()) {
-        if (e.name !== 'tile') walk(p);
-      } else if (e.name.endsWith('.ts')) files.push(p);
-    }
-  };
-  for (const r of roots) walk(r);
-  const h = createHash('sha256');
-  for (const f of files.sort())
-    h.update(relative(roots[0]!, f)).update('\0').update(readFileSync(f));
-  return h.digest('hex').slice(0, 12);
-}
-
-export const IMPORTER_VERSION = `importer@${PKG_VERSION}+rules${RULES_VERSION}+src${sourceHash()}`;
+export const IMPORTER_VERSION = `importer@${PKG_VERSION}+rules${RULES_VERSION}`;
 
 export const USAGE = `Verwendung:
   importer import --symbol BTCUSDT (--day YYYY-MM-DD | --from YYYY-MM-DD --to YYYY-MM-DD | --month YYYY-MM)
@@ -84,6 +62,10 @@ export interface ImportArgs {
   force: boolean;
   /** Messoption: Ersatz per DML direkt auf Columnstore-Chunks statt Rowstore-Umweg. */
   directDml: boolean;
+  /** Nur anzeigen, was geschrieben/übersprungen/kaskadiert würde (liest die DB, schreibt nichts). */
+  plan: boolean;
+  /** Mehrtägigen historischen DB-Import ohne --backfill ausdrücklich erlauben. */
+  online: boolean;
 }
 
 function dayRange(v: Record<string, string | boolean | undefined>): [number, number] {
@@ -132,12 +114,15 @@ export function parseImportArgs(
       backfill: { type: 'boolean' },
       force: { type: 'boolean' },
       'direct-dml': { type: 'boolean' },
+      plan: { type: 'boolean' },
+      online: { type: 'boolean' },
     },
     strict: true,
   });
   if (!v.symbol) throw new UsageError('--symbol fehlt');
   getSymbol(v.symbol);
   if (v.backfill && !v.db) throw new UsageError('--backfill nur mit --db');
+  if (v.plan && !v.db) throw new UsageError('--plan liest die Datenbank: nur mit --db');
   if (v['dry-run'] && v.db) throw new UsageError('--dry-run und --db schließen sich aus');
   const prefer = (v.prefer ?? 'auto') as Prefer;
   if (!['auto', 'daily', 'monthly'].includes(prefer))
@@ -164,23 +149,43 @@ export function parseImportArgs(
     backfill: !!v.backfill,
     force: !!v.force,
     directDml: !!v['direct-dml'],
+    plan: !!v.plan,
+    online: !!v.online,
   };
   if (v.out) a.out = v.out;
+  // Review N5: mehrtägige Importe historischer Tage im laufenden Betrieb (ohne --backfill) wandeln
+  // je Tag komprimierte Chunks in den Rowstore und sperren dabei Leser; das ist nur bewusst erlaubt.
+  const historical = lastDay < Math.floor(Date.now() / 86_400_000) - 3;
+  if (mode === 'db' && !a.plan && !a.backfill && !a.online && lastDay > firstDay && historical) {
+    throw new UsageError(
+      'mehrtägiger historischer Import: --backfill verwenden (oder --online, wenn Leser-Sperren je Tag akzeptabel sind)',
+    );
+  }
   return a;
 }
 
 async function runImport(argv: string[]): Promise<number> {
   const a = parseImportArgs(argv, process.env);
   const spec = getSymbol(a.symbol);
-  const writer: DayWriter =
+  const base: DayWriter =
     a.mode === 'db'
       ? new PostgresWriter(parseConfig(process.env).db, spec, {
-          backfill: a.backfill,
+          backfill: a.backfill && !a.plan,
           directDml: a.directDml,
+          readOnly: a.plan,
           log: (s) => console.log(s),
         })
       : new DryRunWriter(a.resume ? a.out : undefined);
-  if (a.force) writer.isDone = async () => false;
+  const plan = a.plan ? new PlanWriter(base) : null;
+  const writer: DayWriter = plan ?? base;
+  // Ctrl-C / SIGTERM: Schreiber geordnet schließen (Backfill-Jobs wieder aktivieren, Lock lösen).
+  // kill -9/OOM erreicht das nicht; dann repariert der nächste open() die Jobs (Review N1).
+  const onSignal = (sig: NodeJS.Signals) => {
+    console.error(`${sig}: schließe den Schreiber …`);
+    writer.close().finally(() => process.exit(130));
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
   const log = (s: string) => {
     if (!a.quiet) console.log(s);
   };
@@ -197,18 +202,29 @@ async function runImport(argv: string[]): Promise<number> {
       neighbours: a.neighbours,
       writer,
       importerVersion: IMPORTER_VERSION,
-      sidecar: a.sidecar,
+      sidecar: a.plan ? false : a.sidecar,
+      force: a.force,
       log: (s) => {
         log(s);
       },
       // Ergebnis je Tag sofort anhängen (ein Abbruch verliert keine fertigen Tage)
       onSummary: (s) => {
-        if (a.out && !s.skipped) appendFileSync(a.out, JSON.stringify(s) + '\n');
+        if (a.out && !a.plan && !s.skipped) appendFileSync(a.out, JSON.stringify(s) + '\n');
       },
     });
     summaries = await imp.run();
   } finally {
     await writer.close();
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+  }
+  if (plan) {
+    for (const s of summaries) {
+      console.log(
+        `PLAN ${s.symbol} ${s.day}: ${s.decision}${s.reasons.length ? ` (${s.reasons.join(', ')})` : ''}`,
+      );
+    }
+    for (const x of plan.actions) console.log(`PLAN   ${x}`);
   }
   const wall = (performance.now() - t0) / 1000;
   const rows = summaries.reduce((x, s) => x + s.rows, 0);

@@ -42,8 +42,8 @@ import {
   type DayWriter,
   type EdgeUpdate,
   type MinuteFacts,
-  type ResumeKey,
-  type StoredChain,
+  type CarryOrigin,
+  type StoredDay,
   type WriteOutcome,
 } from './types.ts';
 
@@ -181,6 +181,8 @@ export interface PostgresWriterOptions {
    * DELETE/COPY direkt auf dem Columnstore); true = direktes DML auf dem Columnstore (Messoption).
    */
   directDml?: boolean;
+  /** Nur lesen (--plan): kein Lock, keine Job-Reparatur, keine Schreibzugriffe. */
+  readOnly?: boolean;
   log?: (s: string) => void;
 }
 
@@ -231,6 +233,7 @@ export class PostgresWriter implements DayWriter {
 
   async open(): Promise<void> {
     this.sql = connect(this.cfg);
+    if (this.opt.readOnly) return; // --plan: nur lesen, kein Lock, keine Änderungen
     const [l] = await this.db`SELECT pg_try_advisory_lock(${IMPORTER_LOCK_KEY}) AS ok`;
     if (!l?.ok) {
       await this.sql.end();
@@ -259,28 +262,49 @@ export class PostgresWriter implements DayWriter {
         `Tabelle symbol (sym_id ${s.symId}) passt nicht zu den Einheiten im Code: ${JSON.stringify(row)}`,
       );
     }
+    // N1: pausierte Columnstore-Jobs der Projekttabellen stammen von einem abgebrochenen Backfill
+    // (kill -9, OOM): niemand sonst pausiert sie, und wir halten den Lock. Bei jedem Öffnen reparieren.
+    const repaired = await this.setProjectJobs(true, false);
+    if (repaired.length > 0) {
+      this.opt.log?.(
+        `WARNUNG: ${repaired.length} pausierte Columnstore-Jobs gefunden (abgebrochener Backfill?) und wieder aktiviert`,
+      );
+    }
     if (this.opt.backfill) {
-      const jobs = await this.db`
-        SELECT job_id FROM timescaledb_information.jobs
-         WHERE proc_name IN ('policy_compression', 'policy_columnstore') AND hypertable_schema = 'public'
-           AND scheduled`;
-      for (const j of jobs)
-        await this.db`SELECT alter_job(${j.job_id as number}, scheduled => false)`;
-      this.pausedJobs = jobs.map((j) => j.job_id as number);
+      this.pausedJobs = await this.setProjectJobs(false, true);
       this.opt.log?.(`Backfill: ${this.pausedJobs.length} Columnstore-Jobs pausiert`);
     }
+  }
+
+  /** Setzt `scheduled` aller Columnstore-Jobs der Projekttabellen, die aktuell `from` sind. */
+  private async setProjectJobs(scheduled: boolean, from: boolean): Promise<number[]> {
+    return this.db.begin(async (tx) => {
+      await this.ensureLock(tx);
+      const jobs = await tx`
+        SELECT job_id FROM timescaledb_information.jobs
+         WHERE proc_name IN ('policy_compression', 'policy_columnstore')
+           AND hypertable_schema = 'public' AND hypertable_name = ANY(${[...DIGEST_TABLES]}::text[])
+           AND scheduled = ${from}`;
+      for (const j of jobs)
+        await tx`SELECT alter_job(${j.job_id as number}, scheduled => ${scheduled})`;
+      return jobs.map((j) => j.job_id as number);
+    });
   }
 
   /** Backfill: alle Chunks der Projekttabellen, die vollständig vor `untilMs` enden, konvertieren. */
   async convertFinishedChunks(untilMs: number): Promise<number> {
     const chunks = await this.db`
-      SELECT format('%I.%I', chunk_schema, chunk_name) AS c FROM timescaledb_information.chunks
-       WHERE hypertable_schema = 'public' AND hypertable_name = ANY(${[...DIGEST_TABLES]}::text[])
-         AND NOT is_compressed AND range_end <= ${new Date(untilMs)}
-       ORDER BY range_start`;
+      SELECT format('%I.%I', c.chunk_schema, c.chunk_name) AS c
+        FROM timescaledb_information.chunks c
+        JOIN timescaledb_information.hypertables h
+          ON h.hypertable_schema = c.hypertable_schema AND h.hypertable_name = c.hypertable_name
+       WHERE c.hypertable_schema = 'public' AND c.hypertable_name = ANY(${[...DIGEST_TABLES]}::text[])
+         AND h.compression_enabled AND c.range_end <= ${new Date(untilMs)}
+       ORDER BY c.range_start`;
     for (const c of chunks) {
       await this.db.unsafe(
-        `CALL convert_to_columnstore('${c.c as string}'::regclass, if_not_columnstore => true, recompress => true)`,
+        'CALL convert_to_columnstore($1::regclass, if_not_columnstore => true, recompress => true)',
+        [c.c as string],
       );
     }
     return chunks.length;
@@ -288,49 +312,83 @@ export class PostgresWriter implements DayWriter {
 
   async close(): Promise<void> {
     if (!this.sql) return;
-    if (this.opt.backfill) {
-      if (this.writtenUntil > 0) {
+    try {
+      if (this.opt.backfill && this.writtenUntil > 0) {
         const n = await this.convertFinishedChunks(this.writtenUntil);
-        this.opt.log?.(`Backfill: ${n} weitere Chunks konvertiert`);
+        this.opt.log?.(`Backfill: ${n} Chunks konvertiert`);
       }
-      for (const j of this.pausedJobs) await this.sql`SELECT alter_job(${j}, scheduled => true)`;
-      this.pausedJobs = [];
+    } finally {
+      try {
+        if (this.pausedJobs.length > 0) {
+          await this.setProjectJobs(true, false);
+          this.pausedJobs = [];
+          this.opt.log?.('Backfill: Columnstore-Jobs wieder aktiviert');
+        }
+      } finally {
+        if (!this.opt.readOnly) await this.sql`SELECT pg_advisory_unlock(${IMPORTER_LOCK_KEY})`;
+        await this.sql.end();
+        this.sql = null;
+      }
     }
-    await this.sql`SELECT pg_advisory_unlock(${IMPORTER_LOCK_KEY})`;
-    await this.sql.end();
-    this.sql = null;
   }
 
-  async isDone(k: ResumeKey): Promise<boolean> {
+  async storedDay(_symbol: string, day: number): Promise<StoredDay | null> {
     const [r] = await this.db`
-      SELECT d.state, d.raw_sha256, d.importer_version, k.origin_sha256 AS kline_sha
-        FROM data_day d
-        LEFT JOIN raw_day k ON k.sym_id = d.sym_id AND k.day = d.day AND k.kind = 'klines'
-       WHERE d.sym_id = ${this.spec.symId} AND d.day = ${formatDay(k.day)}::date`;
-    return (
-      !!r &&
-      (r.state === 'final_ok' || r.state === 'final_bad') &&
-      r.raw_sha256 === k.aggSha256 &&
-      r.kline_sha === k.klineSha256 &&
-      r.importer_version === k.importerVersion
-    );
-  }
-
-  async storedChain(_symbol: string, day: number): Promise<StoredChain | null> {
-    const [r] = await this.db`
-      SELECT carry_q, carry_b, cand_last_q, cand_last_b, last_agg_id FROM data_day
-       WHERE sym_id = ${this.spec.symId} AND day = ${formatDay(day)}::date
-         AND state IN ('final_ok', 'final_bad') AND carry_q IS NOT NULL`;
+      SELECT state, stale, digest, quality_digest, raw_sha256, kline_sha256, importer_version,
+             carry_in_q, carry_in_b, carry_in_origin, prev_last_agg_id,
+             carry_q, carry_b, cand_last_q, cand_last_b, last_agg_id
+        FROM data_day WHERE sym_id = ${this.spec.symId} AND day = ${formatDay(day)}::date`;
     if (!r) return null;
     const n = (v: unknown) => safeNumber(v, 'data_day');
+    const final = r.state === 'final_ok' || r.state === 'final_bad';
     return {
-      carry: { q: n(r.carry_q), b: n(r.carry_b) },
-      cand: { q: n(r.cand_last_q), b: n(r.cand_last_b) },
-      lastAggId: r.last_agg_id === null ? null : n(r.last_agg_id),
+      state: r.state as string,
+      stale: r.stale as boolean,
+      digest: (r.digest as string | null) ?? null,
+      qualityDigest: (r.quality_digest as string | null) ?? null,
+      aggSha256: (r.raw_sha256 as string | null) ?? null,
+      klineSha256: (r.kline_sha256 as string | null) ?? null,
+      importerVersion: (r.importer_version as string | null) ?? null,
+      inputs:
+        r.carry_in_origin === null
+          ? null
+          : {
+              carryIn: { q: n(r.carry_in_q), b: n(r.carry_in_b) },
+              carryInOrigin: r.carry_in_origin as CarryOrigin,
+              prevLastAggId: r.prev_last_agg_id === null ? null : n(r.prev_last_agg_id),
+            },
+      chain:
+        final && r.carry_q !== null
+          ? {
+              carry: { q: n(r.carry_q), b: n(r.carry_b) },
+              cand: { q: n(r.cand_last_q), b: n(r.cand_last_b) },
+              lastAggId: r.last_agg_id === null ? null : n(r.last_agg_id),
+            }
+          : null,
     };
   }
 
-  /** Columnstore-Chunks, die den Tag überdecken, in den Rowstore wandeln; liefert ihre Namen. */
+  async touchDay(day: number, importerVersion: string, rulesVersion: string): Promise<void> {
+    await this.db.begin(async (tx) => {
+      await this.ensureLock(tx);
+      await tx`UPDATE data_day SET importer_version = ${importerVersion}, rules_version = ${rulesVersion}
+                WHERE sym_id = ${this.spec.symId} AND day = ${formatDay(day)}::date`;
+    });
+  }
+
+  async markStale(day: number, _reason: string): Promise<void> {
+    await this.db.begin(async (tx) => {
+      await this.ensureLock(tx);
+      await tx`UPDATE data_day SET stale = true, version = version + 1
+                WHERE sym_id = ${this.spec.symId} AND day = ${formatDay(day)}::date`;
+    });
+  }
+
+  /**
+   * Columnstore-Chunks, die den Tag überdecken, in den Rowstore wandeln; liefert ihre Namen.
+   * Hält bis zum Commit eine exklusive Sperre auf diesen Chunks (Leser warten, Review N5) –
+   * deshalb nur tatsächlich komprimierte, tatsächlich betroffene Chunks.
+   */
   private async rowstoreDay(tx: Tx, from: Date, to: Date): Promise<string[]> {
     const tables = [...DIGEST_TABLES];
     const chunks = await tx`
@@ -339,9 +397,9 @@ export class PostgresWriter implements DayWriter {
        WHERE hypertable_schema = 'public' AND hypertable_name = ANY(${tables}::text[])
          AND is_compressed AND range_start < ${to} AND range_end > ${from}`;
     for (const c of chunks) {
-      await tx.unsafe(
-        `CALL convert_to_rowstore('${c.c as string}'::regclass, if_columnstore => true)`,
-      );
+      await tx.unsafe('CALL convert_to_rowstore($1::regclass, if_columnstore => true)', [
+        c.c as string,
+      ]);
     }
     return chunks.map((c) => c.c as string);
   }
@@ -383,20 +441,26 @@ export class PostgresWriter implements DayWriter {
     const to = new Date((data.day + 1) * DAY_MS);
     const state = stateOf(recon, w.extraBad);
 
-    const prev = await this.db.begin(async (tx) => {
+    // A: 'importing' setzen; den Zustand davor merken (bei einem früher abgebrochenen Import den
+    // dort gemerkten, damit ein Tag mit gültigen finalen Daten final bleibt, Review N4).
+    await this.db.begin(async (tx) => {
       await this.ensureLock(tx);
-      const [r] =
-        await tx`SELECT state FROM data_day WHERE sym_id = ${symId} AND day = ${dayStr}::date FOR UPDATE`;
-      if (r)
-        await tx`UPDATE data_day SET state = 'importing' WHERE sym_id = ${symId} AND day = ${dayStr}::date`;
-      else
+      const [r] = await tx`
+        SELECT state, state_before_import FROM data_day
+         WHERE sym_id = ${symId} AND day = ${dayStr}::date FOR UPDATE`;
+      if (r) {
+        const before = r.state === 'importing' ? r.state_before_import : r.state;
+        await tx`UPDATE data_day SET state = 'importing', state_before_import = ${before as string | null}
+                  WHERE sym_id = ${symId} AND day = ${dayStr}::date`;
+      } else {
         await tx`INSERT INTO data_day (sym_id, day, state) VALUES (${symId}, ${dayStr}::date, 'importing')`;
-      return (r?.state as string | undefined) ?? null;
+      }
     });
 
+    let reconvert: string[] = [];
+    let out: WriteOutcome;
     try {
-      let reconvert: string[] = [];
-      const out = await this.db.begin(async (tx) => {
+      out = await this.db.begin(async (tx) => {
         await this.ensureLock(tx);
         if (!this.opt.directDml) reconvert = await this.rowstoreDay(tx, from, to);
         for (const t of DIGEST_TABLES) {
@@ -452,43 +516,71 @@ export class PostgresWriter implements DayWriter {
                  edge_last_pending = ${recon.cls[1439] === MinuteClass.edge_pending},
                  carry_q = ${recon.carryOut.q}, carry_b = ${recon.carryOut.b},
                  cand_last_q = ${recon.candLast.q}, cand_last_b = ${recon.candLast.b},
-                 digest = ${data.digest}, importer_version = ${w.importerVersion}, imported_at = now()
+                 digest = ${data.digest}, importer_version = ${w.importerVersion}, imported_at = now(),
+                 quality_digest = ${w.qualityDigest}, rules_version = ${w.rulesVersion},
+                 kline_sha256 = ${w.klineFile.sha256},
+                 carry_in_q = ${w.inputs.carryIn.q}, carry_in_b = ${w.inputs.carryIn.b},
+                 carry_in_origin = ${w.inputs.carryInOrigin}, prev_last_agg_id = ${w.inputs.prevLastAggId},
+                 stale = false, state_before_import = NULL
            WHERE sym_id = ${symId} AND day = ${dayStr}::date
           RETURNING version`;
         return { dbDigest, state, version: (v?.version as number) ?? null };
       });
-      // vorher komprimierte Chunks wieder in den Columnstore (eigene Transaktion je Chunk)
+    } catch (e) {
+      await this.restoreAfterFailure(symId, dayStr, e);
+      throw e;
+    }
+    // Ab hier ist der Tag festgeschrieben: nichts darf mehr den Zustand zurücksetzen (Review N4).
+    // Konvertierungsfehler werden nur gemeldet; die Policy bzw. der nächste Backfill holt sie nach.
+    this.writtenUntil = Math.max(this.writtenUntil, (data.day + 1) * DAY_MS);
+    try {
       for (const c of reconvert) {
         await this.db.unsafe(
-          `CALL convert_to_columnstore('${c}'::regclass, if_not_columnstore => true)`,
+          'CALL convert_to_columnstore($1::regclass, if_not_columnstore => true)',
+          [c],
         );
       }
-      this.writtenUntil = Math.max(this.writtenUntil, (data.day + 1) * DAY_MS);
       if (this.opt.backfill) await this.convertFinishedChunks(this.writtenUntil);
-      return out;
     } catch (e) {
-      const restore =
-        prev === 'final_ok' || prev === 'final_bad'
-          ? prev
-          : prev === null
-            ? null
-            : 'provisional_import_failed';
-      try {
-        if (restore === null) {
-          await this
-            .db`DELETE FROM data_day WHERE sym_id = ${symId} AND day = ${dayStr}::date AND state = 'importing'`;
+      this.opt.log?.(
+        `WARNUNG: Columnstore-Konvertierung nach ${dayStr} fehlgeschlagen (Daten sind geschrieben): ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    return out;
+  }
+
+  /**
+   * Zustand nach fehlgeschlagener Transaktion B wiederherstellen – nur mit gehaltenem Lock (sonst
+   * könnte ein Prozess, der den Lock verloren hat, den Zustand eines anderen Importers überschreiben).
+   */
+  private async restoreAfterFailure(
+    symId: number,
+    dayStr: string,
+    original: unknown,
+  ): Promise<void> {
+    try {
+      await this.db.begin(async (tx) => {
+        await this.ensureLock(tx);
+        const [r] = await tx`
+          SELECT state, state_before_import FROM data_day
+           WHERE sym_id = ${symId} AND day = ${dayStr}::date FOR UPDATE`;
+        if (!r || r.state !== 'importing') return;
+        const before = r.state_before_import as string | null;
+        if (before === null) {
+          await tx`DELETE FROM data_day WHERE sym_id = ${symId} AND day = ${dayStr}::date`;
         } else {
-          await this
-            .db`UPDATE data_day SET state = ${restore} WHERE sym_id = ${symId} AND day = ${dayStr}::date`;
+          const restore =
+            before === 'final_ok' || before === 'final_bad' ? before : 'provisional_import_failed';
+          await tx`UPDATE data_day SET state = ${restore}, state_before_import = NULL
+                    WHERE sym_id = ${symId} AND day = ${dayStr}::date`;
         }
-      } catch (e2) {
-        throw new AggregateError(
-          [e, e2],
-          `Import ${dayStr} fehlgeschlagen und Zustand nicht wiederhergestellt`,
-          { cause: e2 },
-        );
-      }
-      throw e;
+      });
+    } catch (e2) {
+      throw new AggregateError(
+        [original, e2],
+        `Import ${dayStr} fehlgeschlagen und Zustand nicht wiederhergestellt`,
+        { cause: e2 },
+      );
     }
   }
 
