@@ -211,3 +211,17 @@ export function tfSwitchAnchorTime(centerSec: number, oldTfSec: number, newTfSec
   if (newTfSec >= oldTfSec) return centerSec;
   return centerSec - (centerSec % oldTfSec) + oldTfSec / 2;
 }
+
+/**
+ * Review b: Eine nach einer Abweichung zurückgestellte Kachel darf erst wieder angefordert werden, wenn
+ * alle ihre neu geladenen Bar-Abschnitte da UND im aktuellen Fenster sind (die Querprüfung vergleicht
+ * gegen die Fenster-Items).
+ */
+export function chunksReadyInWindow(
+  [c0, c1]: [number, number],
+  has: (c: number) => boolean,
+  win: [number, number] | null,
+): boolean {
+  for (let c = c0; c <= c1; c++) if (!has(c)) return false;
+  return !!win && win[0] <= c0 && win[1] >= c1;
+}

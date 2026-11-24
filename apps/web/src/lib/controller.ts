@@ -23,13 +23,14 @@ import {
 } from 'lightweight-charts';
 import { ApiClient, SERVER_MISMATCH } from './api.ts';
 import { GestureTracker } from './gesture.ts';
-import { MismatchRecovery } from './mismatch.ts';
+import { MismatchRecovery, REFETCH_TIMEOUT_MS, RETRY_MS, tileConfigChanged } from './mismatch.ts';
 import {
   BarStore,
   CANDLE_WINDOW_BARS,
   FOOTPRINT_WINDOW_BARS,
   indexAtOrBefore,
   logicalIndexOfTime,
+  chunksReadyInWindow,
   rangeAfterRebuild,
   tfSwitchAnchorTime,
   timeAtLogical,
@@ -331,6 +332,7 @@ export class ChartController {
     this.fpQueue.cancelAll();
     for (const f of this.listeners) f();
     this.gesture.dispose();
+    this.cancelRetry?.();
     if (this.frameReq) cancelAnimationFrame(this.frameReq);
     this.chart.remove();
   }
@@ -684,6 +686,9 @@ export class ChartController {
   private readonly recovery = new MismatchRecovery();
   /** Kachelkonfiguration je laufender Anfrage (W-1) */
   private readonly requestCfg = new Map<string, number>();
+  /** b: Kacheln, die erst nach dem Neuladen ihrer Bar-Abschnitte wieder angefordert werden */
+  private readonly deferredTiles = new Map<string, [number, number]>();
+  private cancelRetry: (() => void) | null = null;
   /** Querprüfungs-Abweichungen je Kachel (W-3) */
   private readonly crossFails = new Map<string, number>();
   /** N3: Fehler beim Fensterwechsel (sichtbar). */
@@ -960,6 +965,11 @@ export class ChartController {
       minK = Math.min(minK, w.k);
       maxK = Math.max(maxK, w.k);
       if (this.fpStore.has(series, w.k)) continue;
+      const def = this.deferredTiles.get(key);
+      if (def) {
+        if (!this.deferredReady(def)) continue;
+        this.deferredTiles.delete(key);
+      }
       if (this.fpQueue.isFinal(key)) this.fpQueue.forgetFailure(key); // abgelaufene Ablehnung (W-3)
       this.requestCfg.set(key, this.sym.tileConfigVersion);
       if (w.priority === 0) visibleMissing++;
@@ -989,9 +999,12 @@ export class ChartController {
     }
     this.wantedFp = pinned;
     this.fpQueue.setWanted(wants, retain);
+    // d: Einträge abgebrochener/nie geladener Anfragen entfernen
+    for (const k of this.requestCfg.keys()) if (!retain.has(k)) this.requestCfg.delete(k);
   }
 
   private onBarChunk(key: string, buf: ArrayBuffer): void {
+    if (this.destroyed) return;
     const [series, c] = key.split('#') as [string, string];
     if (series !== this.bars.series) return;
     const span = chunkSpanSec(this.tfSec) * 1000;
@@ -1004,7 +1017,17 @@ export class ChartController {
     });
     // N3: Fehler beim Fensterwechsel gehören nicht zur Antwort (sonst würde der gültige Abschnitt
     // als Lücke überschrieben) – eigene, sichtbare Meldung
-    if (!this.gestureActive) this.safely('Fensterwechsel', () => this.ensureWindow());
+    // b: gehört der Abschnitt zu einer zurückgestellten Kachel, Fenster sofort aus den neuen Daten bauen
+    const reloaded = [...this.deferredTiles.values()].some(
+      ([a, b]) => Number(c) >= a && Number(c) <= b,
+    );
+    if (reloaded) this.safely('Fensterwechsel', () => this.ensureWindow(true));
+    else if (!this.gestureActive) this.safely('Fensterwechsel', () => this.ensureWindow());
+  }
+
+  /** b: Sind die neu geladenen Abschnitte einer zurückgestellten Kachel im aktuellen Fenster? */
+  private deferredReady(range: [number, number]): boolean {
+    return chunksReadyInWindow(range, (c) => this.bars.has(c), this.win);
   }
 
   /** Führt fn aus; ein Fehler wird sichtbar (Anzeige + Konsole), statt die Ursache zu verschleiern. */
@@ -1020,6 +1043,7 @@ export class ChartController {
 
   /** H3: ein endgültig fehlender Abschnitt wird als Lücke geführt, damit das Fenster darüber wachsen kann. */
   private onBarRejected(key: string): void {
+    if (this.destroyed) return; // d: nach destroy() keine Verarbeitung mehr
     const [series, c] = key.split('#') as [string, string];
     if (series !== this.bars.series) return;
     // N3: einen bereits geladenen Abschnitt nie durch eine Lücke ersetzen
@@ -1029,6 +1053,7 @@ export class ChartController {
   }
 
   private onFpTile(key: string, buf: ArrayBuffer): void {
+    if (this.destroyed) return; // d: nach destroy() keine Verarbeitung mehr
     const i = key.lastIndexOf('#');
     const series = key.slice(0, i);
     if (!series.startsWith(`${this.sym.name}|`)) return;
@@ -1066,8 +1091,11 @@ export class ChartController {
           this.crossFails.set(key, n);
           this.fpQueue.lastError = `Kachel ${key}: ${diff}`;
           if (n === 1) {
+            // b: Abschnitte neu laden; die Kachel erst wieder anfordern, wenn die neuen Abschnitte im
+            // Fenster sind (sonst prüfte sie gegen die alten Items und zählte als zweite Abweichung)
             for (let c = c0; c <= c1; c++) this.bars.drop(c);
             this.fpStore.forget(series, tile.k);
+            this.deferredTiles.set(key, [c0, c1]);
             this.safely('Neuladen', () => this.ensureWindow());
           } else {
             this.fpStore.markRejected(series, tile.k);
@@ -1087,6 +1115,7 @@ export class ChartController {
   }
 
   private onFpRejected(key: string, status: number, err?: unknown): void {
+    if (this.destroyed) return; // d: nach destroy() keine Verarbeitung mehr
     const i = key.lastIndexOf('#');
     const cfg = this.takeRequestCfg(key);
     if (cfg !== this.sym.tileConfigVersion) return; // Antwort der alten Konfiguration (W-1)
@@ -1111,29 +1140,57 @@ export class ChartController {
   private onServerMismatch(responseCfg: number): void {
     const act = this.recovery.onMismatch(responseCfg, this.sym.tileConfigVersion, Date.now());
     if (act !== 'refetch') return;
-    const before = JSON.stringify(this.sym);
+    const before = this.sym;
     this.api
-      .symbols()
+      .symbols(AbortSignal.timeout(REFETCH_TIMEOUT_MS)) // d: nie ewig „refetching"
       .then((r) => {
-        const s = r.symbols.find((x) => x.name === this.sym.name);
-        const changed = !!s && JSON.stringify(s) !== before;
+        if (this.destroyed) return;
+        const s = r.symbols.find((x) => x.name === before.name);
+        // c: nur Kachelkonfiguration zählt (dataTo ändert sich auf einem Live-Server laufend)
+        const changed = !!s && tileConfigChanged(before, s);
         this.recovery.onRefetched(changed, Date.now());
         if (!changed || !s) {
-          this.blocked = SERVER_MISMATCH;
-          this.fpQueue.cancelAll();
+          this.block();
           return;
         }
-        this.blocked = '';
-        this.symbols = r.symbols;
-        this.fpStore = new FootprintStore(s.qtyDecimals);
-        this.crossFails.clear();
-        this.fpQueue.clearFailures();
-        this.setSeries(s.name, this.tf, this.currentAnchor());
+        this.applyNewSymbols(r.symbols);
       })
       .catch((e: unknown) => {
+        if (this.destroyed) return;
         this.recovery.onRefetchFailed(Date.now());
-        this.blocked = `${SERVER_MISMATCH} (${e instanceof Error ? e.message : String(e)})`;
+        this.block(` (${e instanceof Error ? e.message : String(e)})`);
       });
+  }
+
+  /** Sperre setzen; nach RETRY_MS von selbst wieder versuchen (Review a). */
+  private block(detail = ''): void {
+    this.blocked = SERVER_MISMATCH + detail;
+    this.fpQueue.cancelAll();
+    this.requestCfg.clear();
+    this.cancelRetry?.();
+    const id = setTimeout(() => {
+      this.cancelRetry = null;
+      if (this.destroyed) return;
+      if (this.recovery.expire(Date.now())) {
+        this.blocked = '';
+        this.evaluate(); // Footprint-Modus wieder möglich → neue Anfragen → ggf. neue Prüfung
+      }
+    }, RETRY_MS);
+    this.cancelRetry = () => clearTimeout(id);
+  }
+
+  /** Neue /symbols übernehmen (Konfiguration geändert): Kachel-Caches neu, Serie neu aufsetzen. */
+  private applyNewSymbols(symbols: SymbolInfo[]): void {
+    const s = symbols.find((x) => x.name === this.sym.name);
+    if (!s) return;
+    this.blocked = '';
+    this.symbols = symbols;
+    this.fpStore = new FootprintStore(s.qtyDecimals);
+    this.crossFails.clear();
+    this.deferredTiles.clear();
+    this.requestCfg.clear();
+    this.fpQueue.clearFailures();
+    this.setSeries(s.name, this.tf, this.currentAnchor());
   }
 
   /** P95 der |Werte| über die sichtbaren Bars (KONZEPT §6.1), nicht je Frame. */

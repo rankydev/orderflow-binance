@@ -1,6 +1,11 @@
 // W-1: Wiederherstellung nach Konfigurationswechsel.
 import { describe, expect, it } from 'vitest';
-import { MismatchRecovery, RETRY_MS } from '../src/lib/mismatch.ts';
+import {
+  MIN_REFETCH_MS,
+  MismatchRecovery,
+  RETRY_MS,
+  tileConfigChanged,
+} from '../src/lib/mismatch.ts';
 
 describe('MismatchRecovery', () => {
   it('mehrere 409 vor der /symbols-Antwort → nur ein Neuladen, danach Footprint aktiv', () => {
@@ -32,12 +37,34 @@ describe('MismatchRecovery', () => {
     expect(m.blocked).toBe(false);
   });
 
-  it('Abweichung NACH erfolgreichem Wechsel löst wieder ein Neuladen aus (nicht sofort Sperre)', () => {
+  it('Abweichung NACH erfolgreichem Wechsel löst wieder ein Neuladen aus – frühestens nach 30 s', () => {
     const m = new MismatchRecovery();
     m.onMismatch(1, 1, 0);
     m.onRefetched(true, 5);
-    expect(m.onMismatch(2, 2, 6)).toBe('refetch');
-    m.onRefetched(false, 7);
+    expect(m.onMismatch(2, 2, 6)).toBe('ignore'); // c: Mindestabstand
+    expect(m.onMismatch(2, 2, MIN_REFETCH_MS)).toBe('refetch');
+    m.onRefetched(false, MIN_REFETCH_MS + 1);
     expect(m.blocked).toBe(true);
+  });
+
+  it('a: Sperre läuft nach RETRY_MS ab (Timer im Controller), auch ohne neue Abweichung', () => {
+    const m = new MismatchRecovery();
+    m.onMismatch(1, 1, 0);
+    m.onRefetched(false, 100);
+    expect(m.expire(100 + RETRY_MS - 1)).toBe(false);
+    expect(m.blocked).toBe(true);
+    expect(m.expire(100 + RETRY_MS)).toBe(true);
+    expect(m.blocked).toBe(false);
+    expect(m.onMismatch(1, 1, 100 + RETRY_MS + 1)).toBe('refetch');
+  });
+
+  it('c: „geändert" nur bei Kachelkonfiguration, nicht bei dataTo oder Schlüsselreihenfolge', () => {
+    const a = { tileConfigVersion: 3, tiles: { '1m': { '10': 32, '20': 64 } }, dataTo: 1 };
+    expect(tileConfigChanged(a, { ...a, tiles: { '1m': { '20': 64, '10': 32 } } })).toBe(false);
+    expect(tileConfigChanged(a, { ...a, tileConfigVersion: 4 })).toBe(true);
+    expect(tileConfigChanged(a, { ...a, tiles: { '1m': { '10': 64, '20': 64 } } })).toBe(true);
+    expect(tileConfigChanged(a, undefined)).toBe(true);
+    const b = { ...a, dataTo: 999 };
+    expect(tileConfigChanged(a, b)).toBe(false);
   });
 });

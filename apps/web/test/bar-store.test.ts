@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { encodeTile } from '@orderflow/core/browser';
 import {
   BarStore,
+  chunksReadyInWindow,
   indexAtOrAfter,
   indexAtOrBefore,
   logicalIndexOfTime,
@@ -195,5 +196,18 @@ describe('W-3/H-1: Querprüfung Kachel ↔ /bars', () => {
     b.drop(0);
     expect(b.has(0)).toBe(false);
     expect(b.allFinal(0, 0)).toBe(false);
+  });
+});
+
+describe('Review b: zurückgestellte Kachel erst nach neu geladenen Abschnitten im Fenster', () => {
+  it('Kachel vor dem Abschnitt → nicht bereit; Abschnitt da, Fenster alt → nicht bereit; beides → bereit', () => {
+    const loaded = new Set<number>();
+    const has = (c: number) => loaded.has(c);
+    expect(chunksReadyInWindow([3, 4], has, [0, 5])).toBe(false); // Abschnitte noch unterwegs
+    loaded.add(3);
+    loaded.add(4);
+    expect(chunksReadyInWindow([3, 4], has, [0, 3])).toBe(false); // Fenster noch ohne Abschnitt 4
+    expect(chunksReadyInWindow([3, 4], has, null)).toBe(false);
+    expect(chunksReadyInWindow([3, 4], has, [2, 6])).toBe(true);
   });
 });
