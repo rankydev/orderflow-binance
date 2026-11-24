@@ -135,7 +135,8 @@ vorkomprimiert im Server-Cache.
 
 JSON statt Binärformat: Profile sind klein (Auto-R ≈ 60–120 Zeilen; hart ≤ 60 000), das dichte Format braucht
 kein `row`-Array, Notional muss ohnehin als exakter Dezimalstring reisen, und Web-Client und Verifier lesen es
-ohne Decoder. Gemessen (BTC, echte Daten): ein Monat bei R = 100 ≈ 11 kB roh / 4 kB gzip.
+ohne Decoder. Gemessen (BTC, echte Daten, 2026-11-24): Oktober bei R = 100 (≈ 1 200 Zeilen) 16,8 kB roh /
+8,2 kB gzip; ein Tag bei Auto-R = 500 ≈ 1 kB; 30 Tagesprofile bei R = 500 ≈ 27 kB roh / 12 kB gzip.
 
 ## Antwort `quality` (JSON)
 

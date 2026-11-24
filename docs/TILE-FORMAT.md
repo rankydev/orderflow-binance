@@ -181,7 +181,55 @@ nginx ist der Normalfall (§2.4).
 nur beim Start bzw. bei einer Konfigurationsabweichung neu geladen, ein formender Bar fehlt; nicht finale
 Footprint-Kacheln laufen nach 60 s ab. Invalidierung per Live-WS (§5.4) folgt mit dem Recorder.
 
+## Festlegungen der API (Klarstellungen zu diesem Vertrag)
+
+Umgesetzt in `apps/api` (Katalog `src/catalog.ts`, Routen `src/routes/tiles.ts`); geprüft in
+`apps/api/test/api.int.test.ts` mit den Prüfungen des Web-Clients.
+
+- **`tileConfigVersion` ist eine undurchsichtige Ganzzahl** (1 … 2^47): ein Hash über die angebotenen
+  `tiles[tf][R] = n` (plus eine Build-Version der Kacheln). Sie ändert sich genau dann, wenn sich ein n oder die
+  Menge der angebotenen (tf, R) ändert, ist nach einem Neustart und auf einer zweiten Instanz mit denselben Daten
+  gleich und wird **nur auf Gleichheit** geprüft (nicht „+1", nicht monoton). Kein Schreibzugriff nötig: das
+  Maximum der Zeilen je Bar wird je UTC-Tag aus `bar_*` berechnet und mit `data_day.version` als Schlüssel im
+  Speicher gehalten (Bars ≤ 1d überqueren keine Tagesgrenze, das Maximum über die Tage ist also exakt); ändert
+  sich eine Tagesversion, wird nur dieser Tag neu berechnet (Abfrageintervall 1 s).
+- **Angeboten** wird (tf, R) für alle Zeitrahmen aus KONZEPT §5.2 (1m … 1d) und R auf der Leiter bis
+  10 000 Ticks mit `R · tickRefUnits ≥ tickUnits`, wenn die Zellregel oben gilt **und** eine Kachel die
+  Quellzeilengrenze (1,5 Mio., §1.4) sicher einhält: (größte Tageszeilenzahl der gewählten Quelltabelle +
+  Bar-Tabelle) × Kachelspanne in Tagen ≤ 1,5 Mio. Damit gibt es für eine angebotene Kombination nie ein 422.
+- **`cfg` ist Pflicht** (fehlt → 400). Die 409-Antwort trägt die aktuelle Version:
+  `{ "error": …, "tileConfigVersion": <aktuell> }`.
+- **`final`** (Kacheln, Bar-Abschnitte, Profile) gilt genau dann, wenn jeder überdeckte UTC-Tag eine
+  `data_day`-Zeile hat und `immutable` ist. Tage ohne Zeile (Lücken, Zukunft, vor dem Datenbeginn – ein Backfill
+  kann sie noch füllen) sind nie final; Kacheln und Abschnitte, die über `dataTo` hinausreichen, sind daher
+  `final = false`.
+- **`dataVersion`** ist ein undurchsichtiger String (Hash über die Versionen der überdeckten Tage, die
+  Anfrageparameter und bei Footprint die `tileConfigVersion`), gelesen im selben Snapshot (READ ONLY REPEATABLE
+  READ) wie die Daten. Kacheln: `ETag` = `dataVersion`; `/symbols`: `ETag` = Hash der Antwort, `no-cache`.
+- **`dataFrom`/`dataTo`**: erster bzw. letzter UTC-Tag mit `data_day`-Zeile (ein gerade erstmals importierter Tag
+  im Zustand `importing` zählt noch nicht); innerhalb kann es Lücken geben. `tickUnits` = `min_step_units` des
+  jüngsten Tages in `symbol_tick_history` (fehlt er: `tickRefUnits`).
+- **`/bars`**: `from`/`to` am Zeitrahmen ausgerichtet, `to > from`, höchstens 5 000 Bars je Anfrage (der Client
+  fragt 1 000 an). Bars höherer Zeitrahmen entstehen aus der gröbsten passenden Bar-Tabelle (`bar_1m` für
+  1m…30m, `bar_1h` für 1h…4h, `bar_1d`); dieselbe Funktion liefert die Bars der Footprint-Kacheln, daher gilt die
+  Vorbedingung Kachel = `/bars` auf demselben Datenstand per Konstruktion.
+- Unbekannte, doppelte oder leere Query-Parameter → 400. Zahlen nur in kanonischer Dezimalform (`R=050` → 400).
+- **503 + `Retry-After`** (wiederholbar): Überlast (Gleichzeitigkeitslimit/Warteschlange), Sperre durch einen
+  laufenden Import nach begrenzter Wiederholung (`lock_timeout`), Abfragezeitlimit, Datenbank nicht erreichbar.
+- **CORS**: Standard erlaubt nur Loopback-Ursprünge (`http://127.0.0.1|localhost|[::1]:<port>`, Entwicklung mit
+  zweitem Vite-Server); im Betrieb `OF_API_CORS_ORIGINS` (Liste oder `*`). Exponiert `ETag`, `Retry-After`,
+  `X-Cache`, `X-Source`. Diagnose-Header: `X-Cache` (hit/miss), `X-Source` (Quelltabelle), `X-Rows-Estimate`
+  (geschätzte Quellzeilen), `Server-Timing`.
+- Nach einem Neuimport eines bereits finalen Tages ändert sich `dataVersion`, nicht aber die Kachel-URL: Browser-
+  Caches mit `immutable` behalten die alte Kachel, bis sich `cfg` ändert oder die Live-Invalidierung (§5.4, P2)
+  kommt. Der Server-Cache ist davon nicht betroffen (Schlüssel enthält die `dataVersion`).
+
 ## Offener Entwurfspunkt für die API: Kachellänge je Zeitabschnitt (Review, nicht umgesetzt)
+
+**Stand der API:** Die Statistik liegt bereits je UTC-Tag vor (`DayStats` in `apps/api/src/catalog.ts`); eine
+Abschnittstabelle je Kalendermonat ist eine Aggregation dieser Tageswerte in `computeTiles` und eine zweite Form
+von `tileSrc`/`tiles`. Umgesetzt ist die gesamthistorische Regel oben.
+
 
 **Problem der jetzigen Regel:** Mit der gesamten Historie als Referenz und 1,5 × Zuschlag entfernt ein einziger
 Ausreißer-Bar feine Zeilengrößen für **alle** Zeiträume. Gemessen an den Fixture-Tagen (max. Zeilen je 1m-Bar bei
