@@ -5,3 +5,4 @@ export * from './symbols.ts';
 export * from './aggregation/bucket.ts';
 export * from './tile/codec.ts';
 export * from './tile/timeframes.ts';
+export * from './profile/index.ts';

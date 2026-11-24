@@ -9,3 +9,4 @@ export * from './digest.ts';
 export * from './manifest.ts';
 export * from './day-result.ts';
 export * from './tile/index.ts';
+export * from './profile/index.ts';
