@@ -15,7 +15,7 @@ import {
   type PriceToCoordinateConverter,
   type Time,
 } from 'lightweight-charts';
-import { colorIndex, INTENSITY_STEPS, NEUTRAL_INDEX } from './color.ts';
+import { colorIndex, NEUTRAL_INDEX } from './color.ts';
 import type { FootprintStore, PreparedTile } from './footprint-store.ts';
 import {
   L2_MIN_BAR_SPACING,
@@ -34,10 +34,8 @@ type Scope = Parameters<Parameters<Target['useBitmapCoordinateSpace']>[0]>[0];
 export const UP_COLOR = '#26a69a';
 export const DOWN_COLOR = '#ef5350';
 const POC_COLOR = '#f2c94c';
-const TEXT_LIGHT = '#eef1f5';
-/** Dunkle Schrift auf kräftigen Zellen (Kontrast), ab dieser Intensitätsstufe. */
-const TEXT_DARK = '#0b0e13';
-const DARK_TEXT_FROM_STEP = 6;
+/** Zellschrift; die Palette ist so begrenzt, dass der Kontrast auf jeder Stufe ≥ 4,5 : 1 ist (W9). */
+export const TEXT_COLOR = '#eef1f5';
 const DRAW_RING = 4096;
 
 /** Laufende Messwerte je Frame (für Anzeige und Playwright-Messung; nicht reaktiv). */
@@ -148,40 +146,31 @@ class RectBatch {
   }
 }
 
-/** Texte eines Frames: Position, Text-Index, verfügbare Breite (Bitmap-px), dunkle Schrift ja/nein. */
+/** Texte eines Frames: Position, Wert (Lots), verfügbare Breite (Bitmap-px). */
 class TextBatch {
   x = new Float64Array(1024);
   y = new Float64Array(1024);
   w = new Float64Array(1024);
-  s = new Int32Array(1024);
-  dark = new Uint8Array(1024);
+  v = new Float64Array(1024);
   n = 0;
-  push(x: number, y: number, s: number, w: number, dark: boolean): void {
+  push(x: number, y: number, v: number, w: number): void {
     if (this.n === this.x.length) {
-      const g = <T extends Float64Array | Int32Array | Uint8Array>(a: T, mk: (n: number) => T) => {
-        const b = mk(a.length * 2);
+      const g = (a: Float64Array) => {
+        const b = new Float64Array(a.length * 2);
         b.set(a);
         return b;
       };
-      this.x = g(this.x, (n) => new Float64Array(n));
-      this.y = g(this.y, (n) => new Float64Array(n));
-      this.w = g(this.w, (n) => new Float64Array(n));
-      this.s = g(this.s, (n) => new Int32Array(n));
-      this.dark = g(this.dark, (n) => new Uint8Array(n));
+      this.x = g(this.x);
+      this.y = g(this.y);
+      this.w = g(this.w);
+      this.v = g(this.v);
     }
     this.x[this.n] = x;
     this.y[this.n] = y;
     this.w[this.n] = w;
-    this.s[this.n] = s;
-    this.dark[this.n] = dark ? 1 : 0;
+    this.v[this.n] = v;
     this.n++;
   }
-}
-
-/** Dunkle Schrift, wenn die Zellfarbe kräftig ist (Stufe ≥ DARK_TEXT_FROM_STEP, nicht neutral). */
-function darkText(ci: number, mode: ColorMode): boolean {
-  if (mode === 'off' || ci === NEUTRAL_INDEX) return false;
-  return ci % INTENSITY_STEPS >= DARK_TEXT_FROM_STEP;
 }
 
 export class FootprintRenderer implements ICustomSeriesPaneRenderer {
@@ -354,14 +343,13 @@ export class FootprintRenderer implements ICustomSeriesPaneRenderer {
           this.cells.push(cs, x0, yt, Math.max(1, xm - x0 - 1), h);
           this.cells.push(cb, xm, yt, Math.max(1, x1 - xm), h);
           if (lod === 3) {
-            this.texts.push((x0 + xm) / 2, ym, tile.txtSell[j]!, xm - x0 - pad, darkText(cs, mode));
-            this.texts.push((xm + x1) / 2, ym, tile.txtBuy[j]!, x1 - xm - pad, darkText(cb, mode));
+            this.texts.push((x0 + xm) / 2, ym, sl, xm - x0 - pad);
+            this.texts.push((xm + x1) / 2, ym, b, x1 - xm - pad);
           }
         } else {
           const cd = colorIndex(b - sl, cref, false, mode);
           this.cells.push(cd, x0, yt, x1 - x0, h);
-          if (lod === 3)
-            this.texts.push(xc, ym, tile.txtDelta[j]!, x1 - x0 - pad, darkText(cd, mode));
+          if (lod === 3) this.texts.push(xc, ym, b - sl, x1 - x0 - pad);
         }
         if (r === pr) this.misc.push(2, x0 + 0.5, yt + 0.5, x1 - x0 - 1, h - 1);
         cells++;
@@ -383,26 +371,22 @@ export class FootprintRenderer implements ICustomSeriesPaneRenderer {
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       const charW = ctx.measureText('0').width;
-      const full = store.text.strings;
-      const short = store.text.short;
+      const text = store.text;
       const tb = this.texts;
-      for (const dark of [0, 1]) {
-        ctx.fillStyle = dark ? TEXT_DARK : TEXT_LIGHT;
-        for (let q = 0; q < tb.n; q++) {
-          if (tb.dark[q] !== dark) continue;
-          const id = tb.s[q]!;
-          let str = full[id]!;
+      ctx.fillStyle = TEXT_COLOR;
+      for (let q = 0; q < tb.n; q++) {
+        const v = tb.v[q]!;
+        let str = text.full(v);
+        if (str.length * charW > tb.w[q]!) {
+          str = text.short(v);
           if (str.length * charW > tb.w[q]!) {
-            str = short[id]!;
-            if (str.length * charW > tb.w[q]!) {
-              st.textsSkipped++; // nur diese Zahl passt nicht; der Rest des Bars bleibt beschriftet
-              continue;
-            }
-            st.textsShortened++;
+            st.textsSkipped++; // nur diese Zahl passt nicht; der Rest des Bars bleibt beschriftet
+            continue;
           }
-          ctx.fillText(str, tb.x[q]!, tb.y[q]!);
-          st.textsDrawn++;
+          st.textsShortened++;
         }
+        ctx.fillText(str, tb.x[q]!, tb.y[q]!);
+        st.textsDrawn++;
       }
     }
     st.cellsDrawn = cells;

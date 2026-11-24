@@ -1,9 +1,10 @@
 // Kachel-Cache der Footprint-Daten (KONZEPT §5.4, §7.3): dekodierte Typed Arrays plus einmal beim Laden
-// berechnete Ableitungen (POC je Bar, Slot-Tabelle Zeit → Bar, Text-Indizes, Farbreferenz je Bar).
-// Nicht reaktiv; LRU nach Zellzahl (≤ 2 Mio. Zellen), sichtbare Kacheln werden nie verdrängt.
+// berechnete Ableitungen (POC je Bar, Slot-Tabelle Zeit → Bar, Farbreferenz je Bar). Zelltexte
+// formatiert ein begrenzter Cache beim Zeichnen (TextCache; Review W5: die frühere Tabelle je Wert wuchs
+// unbegrenzt). Nicht reaktiv; LRU nach Zellzahl (≤ 2 Mio. Zellen), sichtbare Kacheln bleiben.
 import { decodeTile, type DecodedTile } from '@orderflow/core/browser';
 import { COLOR_REF_PERCENTILE, quantileInPlace } from './color.ts';
-import { TextTable } from './format.ts';
+import { TextCache } from './format.ts';
 
 export const CACHE_MAX_CELLS = 2_000_000;
 
@@ -27,15 +28,47 @@ export interface PreparedTile {
   poc: Int32Array;
   /** slot[(t − fromSec)/tfSec] = Bar-Index oder −1. */
   slot: Int32Array;
-  /** Text-Indizes (TextTable) je Level. */
-  txtDelta: Int32Array;
-  txtBuy: Int32Array;
-  txtSell: Int32Array;
   /** Farbreferenz je Bar (P95 von |Delta| bzw. von buy/sell) für den Bereich „je Bar". */
   refDelta: Float64Array;
   refVol: Float64Array;
   /** Bytes der Typed Arrays (für die Speicheranzeige). */
   bytes: number;
+  /** Alle überdeckten Tage final (unveränderlich); sonst läuft die Kachel nach NONFINAL_TTL_MS ab (W3). */
+  final: boolean;
+  dataVersion: string;
+  loadedAt: number;
+}
+
+/** Nicht finale Kacheln (provisorische Tage) gelten nur so lange (W3; Live-Patches folgen in P2). */
+export const NONFINAL_TTL_MS = 60_000;
+
+/** Erwartung aus der Anfrage; jede Abweichung im Header ist ein Fehler (Review K2). */
+export interface TileExpectation {
+  sym: string;
+  tf: string;
+  R: number;
+  k: number;
+  n: number;
+}
+
+export class TileMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TileMismatchError';
+  }
+}
+
+export function checkTileHeader(dec: DecodedTile, x: TileExpectation): void {
+  const h = dec.header;
+  const bad: string[] = [];
+  if (h.kind !== 'footprint') bad.push(`kind ${h.kind}`);
+  if (h.sym !== x.sym) bad.push(`sym ${h.sym} ≠ ${x.sym}`);
+  if (h.tf !== x.tf) bad.push(`tf ${h.tf} ≠ ${x.tf}`);
+  if (h.R !== x.R) bad.push(`R ${h.R} ≠ ${x.R}`);
+  if (h.tile?.index !== x.k) bad.push(`tile ${h.tile?.index} ≠ ${x.k}`);
+  if (h.tile?.n !== x.n) bad.push(`n ${h.tile?.n} ≠ ${x.n}`);
+  if (bad.length > 0)
+    throw new TileMismatchError(`Kachel passt nicht zur Anfrage: ${bad.join(', ')}`);
 }
 
 /**
@@ -68,7 +101,7 @@ export function pocRow(
   return best;
 }
 
-export function prepareTile(series: string, dec: DecodedTile, text: TextTable): PreparedTile {
+export function prepareTile(series: string, dec: DecodedTile, now = 0): PreparedTile {
   const h = dec.header;
   if (h.kind !== 'footprint' || !h.tile || h.R === null) throw new Error('keine Footprint-Kachel');
   const lv = dec.levels!;
@@ -82,9 +115,6 @@ export function prepareTile(series: string, dec: DecodedTile, text: TextTable): 
   const poc = new Int32Array(nb);
   const refDelta = new Float64Array(nb);
   const refVol = new Float64Array(nb);
-  const txtDelta = new Int32Array(nl);
-  const txtBuy = new Int32Array(nl);
-  const txtSell = new Int32Array(nl);
   let scratch = new Float64Array(64);
   for (let i = 0; i < nb; i++) {
     slot[(dec.bars.time[i]! - fromSec) / tfSec] = i;
@@ -96,12 +126,7 @@ export function prepareTile(series: string, dec: DecodedTile, text: TextTable): 
     const m = e - s;
     if (scratch.length < 2 * m) scratch = new Float64Array(2 * m);
     for (let j = s; j < e; j++) {
-      const b = lv.buy[j]!;
-      const sl = lv.sell[j]!;
-      txtDelta[j] = text.id(b - sl);
-      txtBuy[j] = text.id(b);
-      txtSell[j] = text.id(sl);
-      scratch[j - s] = Math.abs(b - sl);
+      scratch[j - s] = Math.abs(lv.buy[j]! - lv.sell[j]!);
     }
     refDelta[i] = quantileInPlace(scratch, m, COLOR_REF_PERCENTILE);
     for (let j = s; j < e; j++) {
@@ -110,7 +135,7 @@ export function prepareTile(series: string, dec: DecodedTile, text: TextTable): 
     }
     refVol[i] = quantileInPlace(scratch, 2 * m, COLOR_REF_PERCENTILE);
   }
-  const bytes = dec.levels!.row.buffer.byteLength + (n + nb * 3) * 4 + nl * 12 + nb * 16;
+  const bytes = dec.levels!.row.buffer.byteLength + (n + nb * 3) * 4 + nb * 16;
   return {
     series,
     k: h.tile.index,
@@ -128,20 +153,20 @@ export function prepareTile(series: string, dec: DecodedTile, text: TextTable): 
     sell: lv.sell,
     poc,
     slot,
-    txtDelta,
-    txtBuy,
-    txtSell,
     refDelta,
     refVol,
     bytes,
+    final: h.final,
+    dataVersion: h.dataVersion,
+    loadedAt: now,
   };
 }
 
 export type TileState = PreparedTile | 'rejected';
 
 export class FootprintStore {
-  /** Gemeinsame Texttabelle (Werte → vorformatierter Text). */
-  readonly text: TextTable;
+  /** Begrenzter Cache Wert → Text (Kurz-/Langform), beim Zeichnen benutzt. */
+  readonly text: TextCache;
   private readonly bySeries = new Map<string, Map<number, TileState>>();
   /** LRU-Reihenfolge: älteste zuerst. */
   private readonly lru = new Map<string, PreparedTile>();
@@ -150,9 +175,16 @@ export class FootprintStore {
 
   readonly maxCells: number;
 
-  constructor(qtyDecimals: number, maxCells = CACHE_MAX_CELLS) {
-    this.text = new TextTable(qtyDecimals);
+  private readonly now: () => number;
+
+  constructor(
+    qtyDecimals: number,
+    maxCells = CACHE_MAX_CELLS,
+    now: () => number = () => performance.now(),
+  ) {
+    this.text = new TextCache(qtyDecimals);
     this.maxCells = maxCells;
+    this.now = now;
   }
 
   static key(series: string, k: number): string {
@@ -163,8 +195,12 @@ export class FootprintStore {
     return this.bySeries.get(series);
   }
 
+  /** Geladen (oder endgültig abgelehnt) und nicht abgelaufen. Abgelaufene nicht finale Kacheln
+   * bleiben zum Zeichnen erhalten, bis die neue Antwort sie ersetzt. */
   has(series: string, k: number): boolean {
-    return this.bySeries.get(series)?.has(k) ?? false;
+    const t = this.bySeries.get(series)?.get(k);
+    if (t === undefined) return false;
+    return t === 'rejected' || t.final || this.now() - t.loadedAt < NONFINAL_TTL_MS;
   }
 
   get(series: string, k: number): TileState | undefined {
@@ -178,8 +214,11 @@ export class FootprintStore {
     this.lru.set(key, t);
   }
 
-  addEncoded(series: string, buf: ArrayBuffer): PreparedTile {
-    const t = prepareTile(series, decodeTile(buf), this.text);
+  /** Dekodiert, prüft gegen die Anfrage (wirft bei Abweichung) und legt ab. */
+  addEncoded(series: string, buf: ArrayBuffer, expect?: TileExpectation): PreparedTile {
+    const dec = decodeTile(buf);
+    if (expect) checkTileHeader(dec, expect);
+    const t = prepareTile(series, dec, this.now());
     this.add(t);
     return t;
   }

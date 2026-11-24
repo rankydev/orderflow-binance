@@ -4,6 +4,25 @@ import { decodeTile, type BarColumns } from '@orderflow/core/browser';
 import type { UTCTimestamp } from 'lightweight-charts';
 import type { BarItem } from './types.ts';
 
+export interface ChunkExpectation {
+  sym: string;
+  tf: string;
+  from: number;
+  to: number;
+}
+
+const EMPTY_BARS: BarColumns = {
+  time: new Int32Array(0),
+  open: new Int32Array(0),
+  high: new Int32Array(0),
+  low: new Int32Array(0),
+  close: new Int32Array(0),
+  buyQ: new Float64Array(0),
+  sellQ: new Float64Array(0),
+  buyA: new Int32Array(0),
+  sellA: new Int32Array(0),
+};
+
 export const FOOTPRINT_WINDOW_BARS = 5_000;
 export const CANDLE_WINDOW_BARS = 20_000;
 /** Höchstzahl gecachter Abschnitte je Serie (à 1 000 Bars, ≈ 44 kB). */
@@ -23,9 +42,27 @@ export class BarStore {
     return this.chunks.has(c);
   }
 
-  addEncoded(c: number, buf: ArrayBuffer): void {
+  /** Dekodiert und prüft gegen die Anfrage (K2): Art, Symbol, tf, Zeitraum; wirft bei Abweichung. */
+  addEncoded(c: number, buf: ArrayBuffer, expect?: ChunkExpectation): void {
+    const dec = decodeTile(buf);
+    if (expect) {
+      const h = dec.header;
+      const bad: string[] = [];
+      if (h.kind !== 'bars') bad.push(`kind ${h.kind}`);
+      if (h.sym !== expect.sym) bad.push(`sym ${h.sym}`);
+      if (h.tf !== expect.tf) bad.push(`tf ${h.tf}`);
+      if (h.from !== expect.from || h.to !== expect.to) bad.push(`Zeitraum [${h.from}, ${h.to})`);
+      if (bad.length > 0)
+        throw new Error(`Bar-Abschnitt ${c} passt nicht zur Anfrage: ${bad.join(', ')}`);
+    }
+    // Der Decoder garantiert streng aufsteigende Zeiten innerhalb [from, to) → setData-sicher.
     this.chunks.delete(c);
-    this.chunks.set(c, decodeTile(buf).bars);
+    this.chunks.set(c, dec.bars);
+  }
+
+  /** Endgültig fehlender Abschnitt als leere Lücke (das Fenster kann darüber wachsen). */
+  markEmpty(c: number): void {
+    this.chunks.set(c, EMPTY_BARS);
   }
 
   get size(): number {
@@ -91,4 +128,21 @@ export function indexAtOrAfter(items: readonly BarItem[], t: number): number {
     else hi = m;
   }
   return lo;
+}
+
+/** Index des letzten Items mit time ≤ t (−1, wenn keins); W8: der Bar, der t enthält. */
+export function indexAtOrBefore(items: readonly BarItem[], t: number): number {
+  return indexAtOrAfter(items, t + 1e-9) - 1;
+}
+
+/**
+ * Logische Position der Zeit t in `items` für die Ansicht (K1/W8): innerhalb der Daten der Bar, der t
+ * enthält (letzter mit time ≤ t); davor/dahinter mit tf fortgesetzt; auf [0, n − 1] begrenzt, damit
+ * die Ansicht nach einem Fensterwechsel nie neben den Daten landet.
+ */
+export function logicalIndexOfTime(items: readonly BarItem[], t: number, tfSec: number): number {
+  const n = items.length;
+  if (n === 0) return 0;
+  if (t < items[0]!.time) return Math.max(0, Math.floor((t - items[0]!.time) / tfSec));
+  return Math.min(n - 1, Math.max(0, indexAtOrBefore(items, t)));
 }

@@ -22,6 +22,9 @@
   let error = $state('');
 
   let el: HTMLDivElement;
+  // Hover-Text: höchstens einmal je Animation-Frame gesetzt (Controller bündelt per rAF)
+  let hover = $state('');
+  let ready = $state(false);
   let ctl: ChartController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
 
@@ -31,6 +34,7 @@
       (window as unknown as { __of: ChartController }).__of = ctl;
     }
     ctl.setType(type);
+    ctl.onHover = (t) => (hover = t);
     ctl
       .init(sym, tf, rMode === 'auto' ? 'auto' : Number(rMode))
       .then(() => {
@@ -38,6 +42,7 @@
         sym = ctl!.readout().sym;
         symInfo = ctl!.symbols.find((s) => s.name === sym) ?? null;
         rOptions = ctl!.availableR(tf);
+        ready = true;
       })
       .catch((e: unknown) => (error = e instanceof Error ? e.message : String(e)));
     // Anzeige höchstens 4×/s aktualisieren (keine Kopplung an Frames).
@@ -57,12 +62,14 @@
   }
 
   function chooseTf(v: string): void {
+    if (!ready) return; // H3: vor init() keine Umschaltung
     tf = v;
     ctl?.setTimeframe(v); // manuelles R bleibt, falls für v verfügbar (sonst nächstes, mit Hinweis)
     rOptions = ctl?.availableR(v) ?? [];
     syncUrl();
   }
   function chooseSym(v: string): void {
+    if (!ready) return;
     sym = v;
     ctl?.setSymbol(v);
     symInfo = ctl?.symbols.find((s) => s.name === v) ?? null;
@@ -75,6 +82,7 @@
     syncUrl();
   }
   function chooseR(v: string): void {
+    if (!ready) return;
     rMode = v;
     ctl?.setRowMode(v === 'auto' ? 'auto' : Number(v));
     syncUrl();
@@ -111,6 +119,7 @@
     <label>
       Farbe
       <select
+        aria-label="Farbmodus"
         value={colorMode}
         onchange={(e) => {
           colorMode = e.currentTarget.value as ColorMode;
@@ -158,7 +167,13 @@
         Fenster {ro.windowBars} Bars · Kacheln {ro.fpTiles} ({ro.fpCells} Zellen) · Requests {ro.requests}
       </span>
       {#if ro.hint}<span class="hint">{ro.hint}</span>{/if}
+      {#if ro.error}<span class="err">{ro.error}</span>{/if}
     {/if}
+    <span class="legend">
+      Mengen in Basiswährung (BTC) · Delta = Ask − Bid · Bid×Ask: Bid links, Ask rechts · gelber
+      Rahmen = POC
+    </span>
+    <span class="hover">{hover}</span>
     <a class="attr" href={CHARTS_URL} rel="noreferrer">{CHARTS_ATTRIBUTION}</a>
   </footer>
 </main>
@@ -219,6 +234,14 @@
       12px/1.5 ui-monospace,
       Menlo,
       monospace;
+  }
+  .legend {
+    color: #8b949e;
+  }
+  .hover {
+    flex-basis: 100%;
+    min-height: 1.5em;
+    color: #e6edf3;
   }
   .hint {
     color: #f2c94c;

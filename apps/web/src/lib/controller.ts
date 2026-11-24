@@ -25,7 +25,7 @@ import {
   BarStore,
   CANDLE_WINDOW_BARS,
   FOOTPRINT_WINDOW_BARS,
-  indexAtOrAfter,
+  logicalIndexOfTime,
 } from './bar-store.ts';
 import { palette, quantileInPlace, COLOR_REF_PERCENTILE } from './color.ts';
 import { FootprintStore, type PreparedTile } from './footprint-store.ts';
@@ -62,6 +62,10 @@ export type Mode = 'footprint' | 'candle';
 
 /** Höchstzahl sichtbarer Footprint-Kacheln, die gleichzeitig angefordert werden (W1). */
 export const MAX_VISIBLE_TILES = 12;
+/** K3: Geste endet trotz gedrückter Taste, wenn sich so lange nichts bewegt hat. */
+export const POINTER_WATCHDOG_MS = 1000;
+/** K1: Abstand der Abschnittsanforderungen während einer Geste. */
+export const CHUNK_REQUEST_THROTTLE_MS = 250;
 
 export interface Readout {
   sym: string;
@@ -94,6 +98,8 @@ export interface Readout {
   rowsMax: number;
   textsShortened: number;
   textsSkipped: number;
+  /** Sichtbarer Fehler (z. B. unbrauchbare Kachel), sonst ''. */
+  error: string;
 }
 
 interface Anchor {
@@ -142,7 +148,16 @@ export class ChartController {
   private wantedFp = new Set<string>();
   private readonly listeners: (() => void)[] = [];
   /** Zähler für die Messung: Fensterwechsel (setData), Gestenenden, R-Wechsel. */
-  readonly counters = { setData: 0, gestureEnds: 0, rChanges: 0, modeChanges: 0, colorRefs: 0 };
+  readonly counters = {
+    setData: 0,
+    gestureEnds: 0,
+    rChanges: 0,
+    modeChanges: 0,
+    colorRefs: 0,
+    watchdogReleases: 0,
+    /** Längste Dekodier- + Vorbereitungszeit einer Kachel (ms, W4). */
+    maxPrepareMs: 0,
+  };
 
   constructor(container: HTMLElement, api = new ApiClient()) {
     this.api = api;
@@ -181,7 +196,7 @@ export class ChartController {
 
     this.barQueue = new RequestQueue(
       (key, buf) => this.onBarChunk(key, buf),
-      () => {},
+      (key) => this.onBarRejected(key),
     );
     this.fpQueue = new RequestQueue(
       (key, buf) => this.onFpTile(key, buf),
@@ -189,6 +204,17 @@ export class ChartController {
     );
 
     this.chart.timeScale().subscribeVisibleLogicalRangeChange(this.onRangeChange);
+    // Hover-Anzeige (W10): exakte Werte der Zelle unter dem Zeiger, als DOM-Text, höchstens einmal
+    // je Animation-Frame berechnet (O(log Zeilen)); kein Neuzeichnen des Charts.
+    this.chart.subscribeCrosshairMove((p) => {
+      this.hoverParam =
+        p.point && p.time !== undefined ? { t: p.time as number, y: p.point.y } : null;
+      if (this.hoverReq || !this.onHover) return;
+      this.hoverReq = requestAnimationFrame(() => {
+        this.hoverReq = 0;
+        this.onHover?.(this.hoverText());
+      });
+    });
     const on = <K extends keyof HTMLElementEventMap>(
       el: HTMLElement | Window,
       ev: K,
@@ -199,25 +225,97 @@ export class ChartController {
     };
     on(container, 'pointerdown', () => {
       this.pointerDown = true;
+      this.lastRangeChange = performance.now();
       this.beginGesture();
+      this.armWatchdog();
     });
     on(window, 'pointerup', () => this.releasePointer());
     on(window, 'pointercancel', () => this.releasePointer());
-    on(container, 'wheel', () => {
-      this.beginGesture();
-      this.armEnd();
+    // K3: Loslassen außerhalb, Kontextmenü, Fokusverlust, verlorener Pointer-Capture beenden die Geste
+    on(window, 'blur', () => this.releasePointer());
+    on(container, 'contextmenu', () => this.releasePointer());
+    on(container, 'lostpointercapture', () => this.releasePointer());
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') this.releasePointer();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    this.listeners.push(() => document.removeEventListener('visibilitychange', onVis));
+    // W7: Größenänderung (Fenster maximieren/verkleinern) wie ein Gestenende bewerten (entprellt)
+    const ro = new ResizeObserver(() => {
+      if (this.resizeTimer) clearTimeout(this.resizeTimer);
+      this.resizeTimer = setTimeout(() => {
+        this.resizeTimer = null;
+        if (!this.gestureActive && !this.destroyed) this.evaluate();
+      }, GESTURE_DEBOUNCE_MS);
     });
-    on(container, 'keydown', () => {
+    ro.observe(container);
+    this.listeners.push(() => ro.disconnect());
+    on(container, 'wheel', () => {
       this.beginGesture();
       this.armEnd();
     });
   }
 
+  /** Rückruf für die Hover-Anzeige (Text oder ''), gesetzt vom UI. */
+  onHover: ((text: string) => void) | null = null;
+  private hoverParam: { t: number; y: number } | null = null;
+  private hoverReq = 0;
+
+  /** Text der Zelle unter dem Zeiger: Zeit, Zeilenintervall, Bid/Ask/Delta in Lots und Basiswährung. */
+  hoverText(): string {
+    const p = this.hoverParam;
+    if (!p || !this.sym) return '';
+    const s = this.mode === 'footprint' ? this.fp : this.candle;
+    const price = s.coordinateToPrice(p.y);
+    if (price === null) return '';
+    const unit = Math.round(price * this.rc.priceScale);
+    const time = new Date(p.t * 1000).toISOString().slice(0, 16).replace('T', ' ');
+    const hit = this.lookupBar(p.t);
+    if (!hit) return `${time} UTC`;
+    const [tile, bi, width] = hit;
+    const row = Math.floor(unit / width);
+    let lo = tile.levelOffset[bi]!;
+    let hi = tile.levelOffset[bi + 1]!;
+    while (lo < hi) {
+      const m = (lo + hi) >>> 1;
+      if (tile.row[m]! < row) lo = m + 1;
+      else hi = m;
+    }
+    const pd = this.sym.priceDecimals;
+    const qd = this.sym.qtyDecimals;
+    const base = this.sym.name.replace(/USDT$/, '');
+    const px = (u: number) => exactDecimal(u, pd);
+    const q = (lots: number) => `${lots} Lots = ${exactDecimal(lots, qd)} ${base}`;
+    const iv = `[${px(row * width)}, ${px((row + 1) * width)})`;
+    if (lo >= tile.levelOffset[bi + 1]! || tile.row[lo] !== row)
+      return `${time} UTC · Zeile ${iv}: keine Trades`;
+    const b = tile.buy[lo]!;
+    const sl = tile.sell[lo]!;
+    return `${time} UTC · Zeile ${iv} · Bid (Verkäufer) ${q(sl)} · Ask (Käufer) ${q(b)} · Delta ${q(b - sl)}`;
+  }
+
+  /** Kachel und Bar-Index zur Zeit t (aktuelle Zeilengröße, sonst die vorige), mit Zeilenbreite. */
+  private lookupBar(t: number): [PreparedTile, number, number] | null {
+    const cands: [string, number, number][] = [[this.rc.series, this.rc.n, this.rc.width]];
+    if (this.rc.prev) cands.push([this.rc.prev.series, this.rc.prev.n, this.rc.prev.width]);
+    for (const [series, n, width] of cands) {
+      const st = this.fpStore?.get(series, Math.floor(t / (n * this.tfSec)));
+      if (!st || st === 'rejected') continue;
+      const bi = st.slot[(t - st.fromSec) / this.tfSec];
+      if (bi !== undefined && bi >= 0) return [st, bi, width];
+    }
+    return null;
+  }
+
   destroy(): void {
+    this.destroyed = true;
+    if (this.hoverReq) cancelAnimationFrame(this.hoverReq);
     this.barQueue.cancelAll();
     this.fpQueue.cancelAll();
     for (const f of this.listeners) f();
     if (this.endTimer) clearTimeout(this.endTimer);
+    if (this.watchdog) clearTimeout(this.watchdog);
+    if (this.resizeTimer) clearTimeout(this.resizeTimer);
     if (this.frameReq) cancelAnimationFrame(this.frameReq);
     this.chart.remove();
   }
@@ -242,8 +340,11 @@ export class ChartController {
   }
 
   setTimeframe(tf: string): void {
-    if (tf === this.tf) return;
-    this.setSeries(this.sym.name, tf, this.currentAnchor());
+    if (!this.sym || tf === this.tf) return;
+    const a = this.currentAnchor();
+    // W8: beim Wechsel auf einen feineren tf die Mitte des alten Bars verankern, nicht seinen Beginn
+    if (a && tfSeconds(tf) < this.tfSec) a.centerSec += this.tfSec / 2;
+    this.setSeries(this.sym.name, tf, a);
   }
 
   setType(t: FootprintType): void {
@@ -326,6 +427,7 @@ export class ChartController {
       rowsMax: fpMode ? Math.max(0, ...st.rowsPerBar) : 0,
       textsShortened: fpMode ? st.textsShortened : 0,
       textsSkipped: fpMode ? st.textsSkipped : 0,
+      error: this.fpQueue.lastError || this.barQueue.lastError,
     };
   }
 
@@ -374,7 +476,7 @@ export class ChartController {
     this.rc.store = this.fpStore;
     this.rc.priceScale = 10 ** s.priceDecimals;
     const minMove = s.tickRefUnits / 10 ** s.priceDecimals;
-    const precision = Math.max(0, s.priceDecimals - Math.round(Math.log10(s.tickRefUnits)));
+    const precision = pricePrecision(s.tickRefUnits, s.priceDecimals); // H3: auch für Ticks ≠ 10^k
     const priceFormat = { type: 'price' as const, precision, minMove };
     this.candle.applyOptions({ priceFormat });
     this.fp.applyOptions({ priceFormat });
@@ -398,8 +500,10 @@ export class ChartController {
   }
 
   private currentAnchor(): Anchor | null {
+    // W8: ohne Daten (Fenster noch leer) den noch ausstehenden Anker behalten statt zum Datenende zu springen
+    if (this.items.length === 0) return this.anchor ? { ...this.anchor, initial: false } : null;
     const lr = this.chart.timeScale().getVisibleLogicalRange();
-    if (!lr || this.items.length === 0) return null;
+    if (!lr) return null;
     const mid = (lr.from + lr.to) / 2;
     return { centerSec: this.timeAtLogical(mid), logicalWidth: lr.to - lr.from };
   }
@@ -430,9 +534,11 @@ export class ChartController {
     );
   }
 
-  /** Lädt fehlende Abschnitte und wechselt das Fenster, wenn das aktuelle den Bedarf nicht deckt. */
-  /** Liefert true, wenn das Fenster neu gesetzt wurde (setData auf beiden Serien). */
-  private ensureWindow(force = false): boolean {
+  /**
+   * Lädt fehlende Abschnitte und wechselt das Fenster, wenn das aktuelle den Bedarf nicht deckt.
+   * `rebuild = false`: nur anfordern (während einer Geste, K1). Liefert true bei neuem Fenster.
+   */
+  private ensureWindow(force = false, rebuild = true): boolean {
     const [df, dt] = this.dataRangeSec();
     const vis = this.anchor ? null : this.visibleTimeRange();
     const center = this.anchor ? this.anchor.centerSec : vis ? (vis[0] + vis[1]) / 2 : dt;
@@ -452,6 +558,7 @@ export class ChartController {
     }
     this.barQueue.setWanted(wants, new Set(wants.map((w) => w.key)));
     this.bars.evict(c0, c1);
+    if (!rebuild) return false;
     // Deckt das aktuelle Fenster den sichtbaren Bereich ± 1 Abschnitt?
     if (!force && this.win && vis) {
       const n0 = Math.max(c0, chunkIndexAt(vis[0], this.tfSec) - 1);
@@ -477,10 +584,11 @@ export class ChartController {
       anchorTime = a.centerSec;
       width = a.logicalWidth;
     } else {
+      // K1: Ankerzeit über timeAtLogical (setzt außerhalb des alten Fensters mit tf fort), nicht
+      // über den nächsten Index im alten Fenster – sonst geht die Zielzeit bei weiten Gesten verloren.
       const mid = (lr.from + lr.to) / 2;
-      const i = Math.min(this.items.length - 1, Math.max(0, Math.round(mid)));
-      anchorTime = this.items[i]!.time;
-      offset = mid - i;
+      anchorTime = this.timeAtLogical(mid);
+      offset = mid >= 0 && mid <= this.items.length - 1 ? mid - Math.round(mid) : 0;
       width = lr.to - lr.from;
     }
     const items = this.bars.items(run[0], run[1]);
@@ -489,7 +597,8 @@ export class ChartController {
     this.candle.setData(items);
     this.fp.setData(this.mode === 'footprint' ? items : []);
     this.counters.setData++;
-    const idx = Math.min(items.length - 1, indexAtOrAfter(items, anchorTime));
+    // Position der Ankerzeit im neuen Fenster (W8: letzter Bar ≤ t), auf das Fenster begrenzt
+    const idx = logicalIndexOfTime(items, anchorTime, this.tfSec);
     const c = idx + offset;
     if (this.anchor?.initial) this.initialView = true;
     if (this.initialView) {
@@ -524,11 +633,21 @@ export class ChartController {
     }
     // Erstes Fenster einer Serie: Detailstufe sofort bewerten (wie ein Gestenende).
     // Nach dem ersten Zeichnen (Preisskala steht erst dann fest) wie ein Gestenende bewerten.
-    if (hadAnchor) requestAnimationFrame(() => requestAnimationFrame(() => this.evaluate()));
+    if (hadAnchor)
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          if (!this.destroyed) this.evaluate(); // H3: nach destroy() nichts mehr
+        }),
+      );
     this.scheduleFrame();
   }
 
   private manualNote = '';
+  private destroyed = false;
+  private lastRangeChange = 0;
+  private watchdog: ReturnType<typeof setTimeout> | null = null;
+  private resizeTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastChunkRequest = 0;
   /** Vom Nutzer gewähltes R (Ticks) oder null bei Auto. */
   private manualR: number | null = null;
 
@@ -594,9 +713,26 @@ export class ChartController {
   // Gesten beginnen nur mit Nutzereingaben (Zeiger, Rad, Tasten); Bereichsänderungen verlängern eine
   // laufende Geste (z. B. Touch-Kinetik), programmatische Änderungen (setData, Fensterwechsel) nicht.
   private readonly onRangeChange = (): void => {
+    this.lastRangeChange = performance.now();
     if (this.gestureActive) this.armEnd();
     this.scheduleFrame();
   };
+
+  /**
+   * K3-Sicherung: hängt `pointerDown` (kein pointerup kam an), endet die Geste spätestens, wenn sich
+   * der sichtbare Bereich POINTER_WATCHDOG_MS lang nicht geändert hat.
+   */
+  private armWatchdog(): void {
+    if (this.watchdog) clearTimeout(this.watchdog);
+    this.watchdog = setTimeout(() => {
+      this.watchdog = null;
+      if (!this.pointerDown) return;
+      if (performance.now() - this.lastRangeChange >= POINTER_WATCHDOG_MS) {
+        this.counters.watchdogReleases++;
+        this.releasePointer();
+      } else this.armWatchdog();
+    }, POINTER_WATCHDOG_MS);
+  }
 
   private beginGesture(): void {
     this.gestureActive = true;
@@ -687,6 +823,10 @@ export class ChartController {
             : '';
       if (this.manualNote)
         this.hint = this.hint ? `${this.manualNote}; ${this.hint}` : this.manualNote;
+      // K1/§7.3: mehr sichtbare Bars als das Kerzen-Fenster fasst → Hinweis statt leerer Fläche
+      const lr = this.chart.timeScale().getVisibleLogicalRange();
+      if (lr && lr.to - lr.from > CANDLE_WINDOW_BARS)
+        this.hint = `Mehr als ${CANDLE_WINDOW_BARS} Bars sichtbar – größeren Zeitrahmen wählen`;
       const fp = wantsFootprintMode(this.mode === 'footprint', { bs, rh, vc });
       this.setMode(fp ? 'footprint' : 'candle');
     }
@@ -710,6 +850,19 @@ export class ChartController {
     const vis = this.visibleTimeRange();
     if (!vis) return;
     const center = (vis[0] + vis[1]) / 2;
+    // K1: während einer Geste, die den Bereich des Fensters verlässt, Abschnitte schon anfordern
+    // (gedrosselt, ohne Fensterwechsel); am Gestenende wird das Fenster dann aus dem Cache gebaut.
+    if (
+      this.gestureActive &&
+      this.win &&
+      performance.now() - this.lastChunkRequest > CHUNK_REQUEST_THROTTLE_MS
+    ) {
+      const span = chunkSpanSec(this.tfSec);
+      if (vis[0] < this.win[0] * span || vis[1] >= (this.win[1] + 1) * span) {
+        this.lastChunkRequest = performance.now();
+        this.ensureWindow(false, false);
+      }
+    }
     if (!Number.isNaN(this.lastCenter) && center !== this.lastCenter)
       this.panDir = center > this.lastCenter ? 1 : -1;
     this.lastCenter = center;
@@ -760,7 +913,7 @@ export class ChartController {
       if (w.priority === 0) visibleMissing++;
       wants.push({
         key,
-        url: this.api.footprintUrl(this.sym.name, this.tf, this.R, w.k),
+        url: this.api.footprintUrl(this.sym.name, this.tf, this.R, w.k, this.sym.tileConfigVersion),
         priority: w.priority * 1000 + wants.length,
       });
     }
@@ -789,14 +942,43 @@ export class ChartController {
   private onBarChunk(key: string, buf: ArrayBuffer): void {
     const [series, c] = key.split('#') as [string, string];
     if (series !== this.bars.series) return;
-    this.bars.addEncoded(Number(c), buf);
+    const span = chunkSpanSec(this.tfSec) * 1000;
+    // K2: Abschnitt gegen die Anfrage prüfen (wirft → als unbrauchbar gezählt, nicht wiederholt)
+    this.bars.addEncoded(Number(c), buf, {
+      sym: this.sym.name,
+      tf: this.tf,
+      from: Number(c) * span,
+      to: (Number(c) + 1) * span,
+    });
+    if (!this.gestureActive) this.ensureWindow();
+  }
+
+  /** H3: ein endgültig fehlender Abschnitt wird als Lücke geführt, damit das Fenster darüber wachsen kann. */
+  private onBarRejected(key: string): void {
+    const [series, c] = key.split('#') as [string, string];
+    if (series !== this.bars.series) return;
+    this.bars.markEmpty(Number(c));
+    this.hint = `Bar-Abschnitt ${c} nicht ladbar – Lücke`;
     if (!this.gestureActive) this.ensureWindow();
   }
 
   private onFpTile(key: string, buf: ArrayBuffer): void {
-    const series = key.slice(0, key.lastIndexOf('#'));
+    const i = key.lastIndexOf('#');
+    const series = key.slice(0, i);
     if (!series.startsWith(`${this.sym.name}|`)) return;
-    this.fpStore.addEncoded(series, buf);
+    const [sym, tf, R] = series.split('|') as [string, string, string];
+    const n = this.sym.tiles[tf]?.[R];
+    // K2: Header gegen die Anfrage prüfen; Abweichung wirft (→ endgültig, sichtbar, keine Schleife)
+    const t0 = performance.now();
+    this.fpStore.addEncoded(series, buf, {
+      sym,
+      tf,
+      R: Number(R),
+      k: Number(key.slice(i + 1)),
+      n: n ?? -1,
+    });
+    const ms = performance.now() - t0;
+    if (ms > this.counters.maxPrepareMs) this.counters.maxPrepareMs = ms;
     this.fpStore.evict(this.wantedFp);
     if (series === this.rc.series) {
       this.colorRefDirty = true;
@@ -894,4 +1076,23 @@ function median(a: readonly number[]): number {
   const s = [...a].sort((x, y) => x - y);
   const m = s.length >> 1;
   return s.length % 2 ? s[m]! : (s[m - 1]! + s[m]!) / 2;
+}
+
+/** Ganzzahl v mit d Nachkommastellen exakt als Dezimaltext (−1234, 3 → "-1.234"). */
+export function exactDecimal(v: number, d: number): string {
+  const neg = v < 0;
+  const a = String(Math.abs(v)).padStart(d + 1, '0');
+  const t = d === 0 ? a : `${a.slice(0, -d)}.${a.slice(-d)}`;
+  return neg ? `-${t}` : t;
+}
+
+/** Nachkommastellen von minMove = tickRefUnits / 10^priceDecimals (z. B. 25 / 100 = 0.25 → 2). */
+export function pricePrecision(tickRefUnits: number, priceDecimals: number): number {
+  let d = priceDecimals;
+  let t = tickRefUnits;
+  while (d > 0 && t % 10 === 0) {
+    t /= 10;
+    d--;
+  }
+  return d;
 }

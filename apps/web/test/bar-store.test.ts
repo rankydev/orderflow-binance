@@ -1,0 +1,112 @@
+// BarStore, Fenster-Anker (K1/W8) und kleine Helfer des Controllers.
+import { describe, expect, it } from 'vitest';
+import { encodeTile } from '@orderflow/core/browser';
+import {
+  BarStore,
+  indexAtOrAfter,
+  indexAtOrBefore,
+  logicalIndexOfTime,
+} from '../src/lib/bar-store.ts';
+import { exactDecimal, pricePrecision } from '../src/lib/controller.ts';
+import type { BarItem } from '../src/lib/types.ts';
+
+const items = (times: number[]) => times.map((t) => ({ time: t, t }) as unknown as BarItem);
+
+function chunk(sym: string, tf: string, from: number, to: number, times: number[]) {
+  const n = times.length;
+  const i = (v: number) => Int32Array.from({ length: n }, () => v);
+  return encodeTile({
+    meta: {
+      kind: 'bars',
+      sym,
+      tf,
+      tfSec: 60,
+      R: null,
+      priceDecimals: 2,
+      qtyDecimals: 3,
+      tickRefUnits: 10,
+      from,
+      to,
+      tile: null,
+      dataVersion: 'v',
+      final: true,
+    },
+    bars: {
+      time: Int32Array.from(times),
+      open: i(100),
+      high: i(100),
+      low: i(100),
+      close: i(100),
+      buyQ: Float64Array.from(times, () => 1),
+      sellQ: new Float64Array(n),
+      buyA: i(1),
+      sellA: i(0),
+    },
+  }).buffer as ArrayBuffer;
+}
+
+describe('Index-Suche und Anker', () => {
+  const xs = items([600, 660, 780, 840]);
+  it('indexAtOrAfter / indexAtOrBefore', () => {
+    expect(indexAtOrAfter(xs, 700)).toBe(2);
+    expect(indexAtOrBefore(xs, 700)).toBe(1);
+    expect(indexAtOrBefore(xs, 660)).toBe(1);
+    expect(indexAtOrBefore(xs, 599)).toBe(-1);
+  });
+  it('W8: Zeit im Bar → dieser Bar (10:20 im 1h-Bar 10:00, nicht 11:00)', () => {
+    const h = items([36_000, 39_600, 43_200]); // 10:00, 11:00, 12:00
+    expect(logicalIndexOfTime(h, 37_200, 3600)).toBe(0); // 10:20
+  });
+  it('K1: Zeit weit außerhalb wird auf das neue Fenster begrenzt (nie daneben)', () => {
+    expect(logicalIndexOfTime(xs, -1e9, 60)).toBe(0);
+    expect(logicalIndexOfTime(xs, 1e9, 60)).toBe(3);
+  });
+});
+
+describe('BarStore', () => {
+  it('K2: Abschnitt wird gegen die Anfrage geprüft', () => {
+    const b = new BarStore('S|1m', 2);
+    const buf = chunk('S', '1m', 0, 60_000_000, [0, 60]);
+    expect(() =>
+      b.addEncoded(0, buf, { sym: 'S', tf: '1m', from: 0, to: 60_000_000 }),
+    ).not.toThrow();
+    expect(() =>
+      b.addEncoded(1, buf, { sym: 'S', tf: '1m', from: 60_000_000, to: 120_000_000 }),
+    ).toThrow(/Zeitraum/);
+    expect(() => b.addEncoded(0, buf, { sym: 'T', tf: '1m', from: 0, to: 60_000_000 })).toThrow(
+      /sym/,
+    );
+  });
+  it('loadedRun wächst über Lücken (markEmpty), Items sind aufsteigend', () => {
+    const b = new BarStore('S|1m', 2);
+    const span = 60_000_000;
+    b.addEncoded(0, chunk('S', '1m', 0, span, [0, 60]));
+    b.markEmpty(1);
+    b.addEncoded(2, chunk('S', '1m', 2 * span, 3 * span, [120_000]));
+    expect(b.loadedRun(0, 5, 2)).toEqual([0, 2]);
+    expect(b.loadedRun(0, 5, 4)).toBeNull();
+    expect(b.items(0, 2).map((x) => x.time)).toEqual([0, 60, 120_000]);
+  });
+  it('evict hält das Fenster', () => {
+    const b = new BarStore('S|1m', 2);
+    for (let c = 0; c < 90; c++) b.markEmpty(c);
+    b.evict(85, 89);
+    expect(b.size).toBe(80);
+    for (let c = 85; c < 90; c++) expect(b.has(c)).toBe(true);
+  });
+});
+
+describe('Helfer', () => {
+  it('exactDecimal ohne Gleitkomma', () => {
+    expect(exactDecimal(1234, 3)).toBe('1.234');
+    expect(exactDecimal(-5, 3)).toBe('-0.005');
+    expect(exactDecimal(6_123_690, 2)).toBe('61236.90');
+    expect(exactDecimal(7, 0)).toBe('7');
+  });
+  it('H3: Preisgenauigkeit auch für Ticks ≠ 10^k', () => {
+    expect(pricePrecision(10, 2)).toBe(1); // 0.1
+    expect(pricePrecision(25, 2)).toBe(2); // 0.25
+    expect(pricePrecision(100, 2)).toBe(0); // 1
+    expect(pricePrecision(5, 3)).toBe(3); // 0.005
+  });
+});

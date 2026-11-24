@@ -284,6 +284,42 @@ describe('Kachel-Codec', () => {
     expect(() => decodeTile(reHeader((h) => (h.kind = 'bars')))).toThrow(TileFormatError);
   });
 
+  it('H1: riesige Längen im Header und tf/tfSec-Widerspruch → TileFormatError (kein RangeError)', () => {
+    const t = fc.sample(tileArb, { numRuns: 1, seed: 13 })[0]!;
+    const enc = encodeTile(t);
+    const hlen = new DataView(enc.buffer).getUint32(4, true);
+    const h = JSON.parse(new TextDecoder().decode(enc.subarray(8, 8 + hlen))) as {
+      nBars: number;
+      tf: string;
+      tfSec: number;
+      columns: { name: string; length: number }[];
+    };
+    const rebuild = (mut: (x: typeof h) => void) => {
+      const c = structuredClone(h);
+      mut(c);
+      let js = JSON.stringify(c);
+      while ((8 + new TextEncoder().encode(js).length) % 8 !== 0) js += ' ';
+      const hb = new TextEncoder().encode(js);
+      const body = enc.subarray(8 + hlen);
+      const out = new Uint8Array(8 + hb.length + body.length);
+      new DataView(out.buffer).setUint32(0, 0x3154464f, true);
+      new DataView(out.buffer).setUint32(4, hb.length, true);
+      out.set(hb, 8);
+      out.set(body, 8 + hb.length);
+      return out;
+    };
+    const huge = rebuild((x) => {
+      x.nBars = 2 ** 30;
+      for (const c of x.columns)
+        if (!c.name.startsWith('lv.')) c.length = c.name === 'levelOffset' ? 2 ** 30 + 1 : 2 ** 30;
+    });
+    expect(() => decodeTile(huge)).toThrow(TileFormatError);
+    const wrongTf = rebuild((x) => {
+      x.tf = '5m';
+    });
+    if (h.tfSec !== 300) expect(() => decodeTile(wrongTf)).toThrow(/passt nicht zu tfSec/);
+  });
+
   it('Encoder lehnt inkonsistente Daten ab (nie ungültige Kacheln ausliefern)', () => {
     const t = fc.sample(
       tileArb.filter((x) => x.bars.time.length > 1),

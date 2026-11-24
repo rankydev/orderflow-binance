@@ -11,6 +11,8 @@
 // Zähler Int32, Zeit Int32 in Sekunden (UTC). Die Zeile eines Levels ist der Zeilenindex
 // floor(px / (R·tick_ref_units)); die untere Zeilenkante in price_unit ist row · R · tick_ref_units.
 
+import { isTimeframe, TIMEFRAMES } from './timeframes.ts';
+
 export const TILE_MAGIC = 0x3154464f; // "OFT1" als uint32 LE
 export const TILE_FORMAT_VERSION = 1;
 
@@ -128,7 +130,8 @@ function assertLittleEndian(): void {
   if (!LITTLE_ENDIAN) throw new TileFormatError('Plattform ist nicht Little Endian');
 }
 
-const align8 = (n: number) => (n + 7) & ~7;
+// Nicht per Bit-Operation (32 Bit): Längen aus einem fremden Header können > 2^31 sein (Review H1).
+const align8 = (n: number) => Math.ceil(n / 8) * 8;
 const bytesOf = (t: ColumnType) => (t === 'i32' ? 4 : 8);
 
 function columnList(data: TileData): { spec: ColumnSpec; arr: Int32Array | Float64Array }[] {
@@ -211,6 +214,8 @@ function validateHeader(h: TileHeader): void {
   if (typeof h.sym !== 'string' || h.sym.length === 0) fail('sym fehlt');
   if (typeof h.tf !== 'string' || h.tf.length === 0) fail('tf fehlt');
   if (!isInt(h.tfSec) || h.tfSec <= 0) fail('tfSec ungültig');
+  if (isTimeframe(h.tf) && TIMEFRAMES[h.tf] !== h.tfSec)
+    fail(`tf ${h.tf} passt nicht zu tfSec ${h.tfSec}`);
   if (!isInt(h.priceDecimals) || h.priceDecimals < 0 || h.priceDecimals > 8)
     fail('priceDecimals ungültig');
   if (!isInt(h.qtyDecimals) || h.qtyDecimals < 0 || h.qtyDecimals > 8) fail('qtyDecimals ungültig');

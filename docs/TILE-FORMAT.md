@@ -100,3 +100,38 @@ antwortet darüber mit `422` + JSON `{error}` (der Client markiert die Kachel al
 und fragt sie nicht erneut an). Mit den Fixtures: 0 Kacheln über 30 000, 0 abgelehnt, größte Kachel 15 009 Zellen.
 Preis: kürzere Kacheln bei feinen R (z. B. 1m R = 5 Ticks: n = 32 statt 256) und damit mehr Anfragen, aber nur dort,
 wo feine Zeilen angefordert werden.
+
+## Endpunkt-Verträge, die der Client voraussetzt (für die API; Review H2)
+
+`GET /api/v1/symbols` → `application/json`:
+
+```json
+{
+  "symbols": [
+    {
+      "name": "BTCUSDT",
+      "priceDecimals": 2,          // price_unit = 10^-priceDecimals
+      "qtyDecimals": 3,            // Lots: qty_unit = 10^-qtyDecimals
+      "tickRefUnits": 10,          // ein Tick in price_unit; R wird in Ticks angegeben
+      "tickUnits": 10,             // aktueller Tick in price_unit (R · tickRefUnits ≥ tickUnits)
+      "dataFrom": 1795132800000,   // [dataFrom, dataTo) in ms UTC; der Client fordert nichts außerhalb an
+      "dataTo": 1795392000000,
+      "tileConfigVersion": 2,
+      "tiles": { "1m": { "5": 32, "10": 32, "20": 64 }, "5m": { … } }   // nur angebotene (tf, R) → n
+    }
+  ]
+}
+```
+
+`GET /api/v1/footprint?sym&tf&R&tile&cfg` → Kachel `kind = "footprint"`. `cfg` = `tileConfigVersion` (ändert sich n,
+ändert sich die URL). Der Client prüft `sym`, `tf`, `R`, `tile.index`, `tile.n` gegen die Anfrage und verwirft
+Abweichungen endgültig (keine Wiederholung). Leere Kachel (0 Bars) ist eine gültige Antwort.
+
+`GET /api/v1/bars?sym&tf&from&to` → Kachel `kind = "bars"`. Der Client fragt nur **ausgerichtete Abschnitte zu
+1 000 Bars** an: `from = c · 1000 · tfSec · 1000`, `to = from + 1000 · tfSec · 1000`; Header-`from`/`to` müssen genau
+der Anfrage entsprechen. Ein Abschnitt kann leer sein.
+
+Fehler: `400`/`404`/`422` (+ JSON `{error}`) sind endgültig für diese URL; `408`/`425`/`429`/`5xx` werden mit Backoff
+wiederholt, `Retry-After` (Sekunden oder HTTP-Datum) wird beachtet. Kacheln mit `final = false` hält der Client
+höchstens 60 s, danach fragt er neu (bis die Live-Invalidierung aus §5.4 in P2 kommt). ETag/304 sind erlaubt, werden
+aber vom Client nicht vorausgesetzt.

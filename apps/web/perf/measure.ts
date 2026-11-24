@@ -6,6 +6,7 @@
 // Playwright ist keine Projektabhängigkeit; der Pfad zu einem lokal vorhandenen playwright-core wird
 // per PLAYWRIGHT_CORE übergeben (sonst `playwright-core`/`playwright` aus der Modulauflösung).
 // Ergebnisse: <PERF_OUT>/perf-results.json; Screenshots nach apps/web/docs-screenshots/.
+import { execSync } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
@@ -118,10 +119,31 @@ async function main(): Promise<void> {
     }
     await page.waitForTimeout(150);
   };
+  // W4: JS-Heap allein unterschätzt (ArrayBuffer-Speicher, Canvas-Bitmaps). Zusätzlich RSS der
+  // Renderer- und GPU-Prozesse dieses Browsers (ps), nach erzwungener GC.
   const heap = async () => {
     await cdp.send('HeapProfiler.collectGarbage');
     const h = await cdp.send('Runtime.getHeapUsage');
-    return +(h.usedSize / 1e6).toFixed(1);
+    const ps = execSync('ps -axo rss=,command=', { encoding: 'utf8', maxBuffer: 1 << 24 });
+    let renderer = 0;
+    let gpu = 0;
+    for (const line of ps.split('\n')) {
+      if (!line.includes('playwright') && !line.includes('ms-playwright')) continue;
+      const rss = Number(line.trim().split(/\s+/)[0]) / 1024;
+      if (line.includes('--type=renderer')) renderer = Math.max(renderer, rss);
+      if (line.includes('--type=gpu-process')) gpu = Math.max(gpu, rss);
+    }
+    return {
+      jsHeapMB: +(h.usedSize / 1e6).toFixed(1),
+      rendererRssMB: +renderer.toFixed(0),
+      gpuRssMB: +gpu.toFixed(0),
+    };
+  };
+  await cdp.send('Performance.enable');
+  const taskDuration = async () => {
+    const m = await cdp.send('Performance.getMetrics');
+    return (m.metrics as { name: string; value: number }[]).find((x) => x.name === 'TaskDuration')!
+      .value;
   };
   const box = await (async () => {
     await page.goto(URL0);
@@ -186,7 +208,9 @@ async function main(): Promise<void> {
   const scenario = async (name: string, fn: () => Promise<void>) => {
     const m = await perfLen();
     const r0 = requests.length;
+    const td0 = await taskDuration();
     await fn();
+    const td = (await taskDuration()) - td0;
     const p = await perfSince(m);
     const s = await snap();
     results[name] = {
@@ -197,6 +221,9 @@ async function main(): Promise<void> {
       longTaskMax: p.longTasks.reduce((a: number, x: Any) => Math.max(a, x.dur), 0),
       requests: requests.length - r0,
       seconds: +(p.elapsed / 1000).toFixed(1),
+      // W4: gesamte Main-Thread-Zeit (inkl. Canvas-Befehle, Layout, GC) je Frame im Mittel
+      mainThreadMsPerFrame: p.work.length > 0 ? +((td * 1000) / p.work.length).toFixed(2) : 0,
+      maxPrepareMs: +s.counters.maxPrepareMs.toFixed(1),
       readout: s.readout,
       maxVcWithCells: s.maxVcWithCells,
       maxCellsDrawn: s.maxCellsDrawn,
@@ -450,6 +477,88 @@ async function main(): Promise<void> {
     results.stress_pan_near_budget.lodFrames = s.lodFrames;
     results.stress_pan_near_budget.budgetFallbacks = s.budgetFallbacks;
   }
+
+  // K1: eine einzige lange Geste (horizontales Mausrad) weit über das Datenfenster hinaus; danach
+  // muss die Ansicht auf Daten stehen (nicht neben dem Fenster) und die Zielzeit ungefähr stimmen.
+  await page.goto(`${URL0}?sym=BTCUSDT-SYN90&tf=1m&type=delta`);
+  await page.waitForFunction(() => performance.getEntriesByName('of:first-candles').length > 0);
+  await idle();
+  for (let i = 0; i < 8; i++) {
+    await wheel(240, 2);
+    await idle(150);
+  }
+  const before = await page.evaluate(() => {
+    const c = (window as Any).__of;
+    const lr = c.chart.timeScale().getVisibleLogicalRange();
+    return {
+      center: c.timeAtLogical((lr.from + lr.to) / 2),
+      width: lr.to - lr.from,
+      n: c.items.length,
+    };
+  });
+  await scenario('long_swipe_1m', async () => {
+    await page.mouse.move(cx, cy);
+    for (let i = 0; i < 40; i++) {
+      await page.mouse.wheel(-3000, 0);
+      await page.waitForTimeout(30);
+    }
+    await idle(1500);
+  });
+  results.longSwipe = {
+    before,
+    after: await page.evaluate(() => {
+      const c = (window as Any).__of;
+      const lr = c.chart.timeScale().getVisibleLogicalRange();
+      const n = c.items.length;
+      return {
+        center: c.timeAtLogical((lr.from + lr.to) / 2),
+        from: lr.from,
+        to: lr.to,
+        n,
+        onData: lr.to > 0 && lr.from < n - 1,
+        firstItem: c.items[0]?.time,
+        lastItem: c.items[n - 1]?.time,
+        hint: c.readout().hint,
+      };
+    }),
+  };
+  console.log('longSwipe', JSON.stringify(results.longSwipe));
+
+  // W4: gedrosselte Verbindung (20 Mbit/s, 40 ms) – Start und Pannen
+  await cdp.send('Network.enable');
+  await cdp.send('Network.emulateNetworkConditions', {
+    offline: false,
+    latency: 40,
+    downloadThroughput: 20e6 / 8,
+    uploadThroughput: 5e6 / 8,
+  });
+  await page.goto(`${URL0}?sym=BTCUSDT&tf=1m&type=delta`);
+  await page.waitForFunction(
+    () => performance.getEntriesByName('of:first-footprint').length > 0,
+    null,
+    {
+      timeout: 30_000,
+    },
+  );
+  results.throttledFirstRender = await page.evaluate(() =>
+    Object.fromEntries(
+      performance.getEntriesByType('mark').map((m) => [m.name, +m.startTime.toFixed(1)]),
+    ),
+  );
+  await idle();
+  await scenario('pan_1m_throttled', async () => {
+    for (let i = 0; i < 2; i++) {
+      await drag(900, 60);
+      await drag(-900, 60);
+    }
+    await idle(500);
+  });
+  await cdp.send('Network.emulateNetworkConditions', {
+    offline: false,
+    latency: 0,
+    downloadThroughput: -1,
+    uploadThroughput: -1,
+  });
 
   // 4) Langer Zeitraum (synthetisch, 90 Tage): Heap, Pannen über die Historie, L1-Kerzen.
   await page.goto(`${URL0}?sym=BTCUSDT-SYN90&tf=1m&type=delta`);

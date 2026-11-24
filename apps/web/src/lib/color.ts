@@ -45,6 +45,14 @@ export function intensityStep(value: number, ref: number): number {
   return Math.min(INTENSITY_STEPS - 1, Math.floor(t * INTENSITY_STEPS));
 }
 
+/**
+ * Deckkraft der Zellfarben: höchstens 0,62, damit helle Zellschrift (#eef1f5) auf jeder Stufe über dem
+ * Hintergrund #0f1217 einen Kontrast ≥ 4,5 : 1 hat (Review W9; getestet).
+ */
+export const GRADIENT_ALPHA_MIN = 0.1;
+export const GRADIENT_ALPHA_MAX = 0.62;
+export const BACKGROUND_RGB = [15, 18, 23] as const;
+
 export const BUY_RGB = [38, 166, 154] as const;
 export const SELL_RGB = [239, 83, 80] as const;
 export const NEUTRAL_RGB = [120, 128, 140] as const;
@@ -64,9 +72,9 @@ export function palette(mode: ColorMode): string[] {
       const t = (s + 0.5) / INTENSITY_STEPS;
       out.push(
         mode === 'gradient'
-          ? rgba(rgb, 0.12 + 0.78 * t)
+          ? rgba(rgb, GRADIENT_ALPHA_MIN + (GRADIENT_ALPHA_MAX - GRADIENT_ALPHA_MIN) * t)
           : mode === 'fixed'
-            ? rgba(rgb, 0.7)
+            ? rgba(rgb, GRADIENT_ALPHA_MAX)
             : rgba(NEUTRAL_RGB, 0.35),
       );
     }

@@ -16,8 +16,9 @@ export class ApiClient {
     return `${this.base}/api/v1/bars?sym=${encodeURIComponent(sym)}&tf=${tf}&from=${fromMs}&to=${toMs}`;
   }
 
-  footprintUrl(sym: string, tf: string, R: number, tile: number): string {
-    return `${this.base}/api/v1/footprint?sym=${encodeURIComponent(sym)}&tf=${tf}&R=${R}&tile=${tile}`;
+  /** cfg = tileConfigVersion (K2): ändert sich n, ändert sich die URL (kein veralteter Cache-Treffer). */
+  footprintUrl(sym: string, tf: string, R: number, tile: number, cfg: number): string {
+    return `${this.base}/api/v1/footprint?sym=${encodeURIComponent(sym)}&tf=${tf}&R=${R}&tile=${tile}&cfg=${cfg}`;
   }
 
   async symbols(signal?: AbortSignal): Promise<SymbolsResponse> {
