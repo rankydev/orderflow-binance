@@ -16,8 +16,14 @@ import { archive } from './synth.ts';
 const BTC = getSymbol('BTCUSDT');
 const PIN = {
   rules: '1',
-  digest: '687ee0dda5c5d2e888d035ff1f3d23b456611148a759666d37e34000709c4f99',
-  quality: 'a03ae98654604477021d244e48b5eac09c6f567e9851914af18ba28acdef9bcf',
+  digest: 'c07ef0d791154d390f42f74cf13345f131420d35df6fb5eef62155ae00fd7310',
+  quality: '3c85bb6fa313f59f20b54f93b26503f8d2f8dbed9984b2abe70f71417a2a1ba6',
+  candidates: 1,
+  cand: [
+    [0, 0],
+    [13, 13],
+  ],
+  counts: { edge_pending: 0, exact: 1436, mismatch: 1, missing: 1, shift: 2 },
 };
 async function run(
   dataDir: string,
@@ -226,9 +232,20 @@ describe('Review N2/N3 (Dry-Run)', () => {
     // Schlägt dieser Test fehl, hat sich die Berechnung (Parser, Aggregation, Abgleich, Digest,
     // Leser, Pipeline) semantisch geändert: RULES_VERSION in packages/core/src/constants.ts erhöhen
     // und die Pins hier neu setzen – gespeicherte Tage werden dann anhand ihrer Digests neu geschrieben.
-    const dir = archive();
+    // Tag mit Straddlern, einem Mehrfach-Fill knapp unter der Kandidatengrenze (59 850 ms; eine
+    // Grenze von 59 800 würde ihn zählen) und einer fehlenden Straddler-Minute (missing + mismatch
+    // mit Begrenzung des Übertrags).
+    const dir = archive({ nearBoundary: true, dropAggMinute: { day: '2026-09-10', minute: 100 } });
     const [s] = (await run(dir, '2026-09-10', '2026-09-10', 'monthly')).summaries;
-    expect({ rules: RULES_VERSION, digest: s!.digest, quality: s!.ownQualityDigest }).toEqual(PIN);
+    expect(s!.counts.missing + s!.counts.mismatch).toBeGreaterThan(0);
+    expect({
+      rules: RULES_VERSION,
+      digest: s!.digest,
+      quality: s!.ownQualityDigest,
+      candidates: s!.candidates,
+      cand: s!.edges.map((e) => [e.candQ, e.candB]),
+      counts: s!.counts,
+    }).toEqual(PIN);
   });
 });
 

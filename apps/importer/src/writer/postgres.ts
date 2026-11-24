@@ -298,8 +298,14 @@ export class PostgresWriter implements DayWriter {
         FROM timescaledb_information.chunks c
         JOIN timescaledb_information.hypertables h
           ON h.hypertable_schema = c.hypertable_schema AND h.hypertable_name = c.hypertable_name
+        JOIN _timescaledb_catalog.chunk k
+          ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
        WHERE c.hypertable_schema = 'public' AND c.hypertable_name = ANY(${[...DIGEST_TABLES]}::text[])
          AND h.compression_enabled AND c.range_end <= ${new Date(untilMs)}
+         -- nur Chunks mit unkomprimierten Zeilen: nicht komprimiert, oder teilweise (Status-Bit 8
+         -- nach DML auf einem Columnstore-Chunk, in 2.31 auf orderflow_test geprüft; is_compressed
+         -- bleibt dabei true). Bereits vollständig komprimierte Chunks nicht erneut anfassen.
+         AND (NOT c.is_compressed OR (k.status & 8) <> 0)
        ORDER BY c.range_start`;
     for (const c of chunks) {
       await this.db.unsafe(
@@ -335,7 +341,7 @@ export class PostgresWriter implements DayWriter {
   async storedDay(_symbol: string, day: number): Promise<StoredDay | null> {
     const [r] = await this.db`
       SELECT state, stale, digest, quality_digest, raw_sha256, kline_sha256, importer_version,
-             carry_in_q, carry_in_b, carry_in_origin, prev_last_agg_id,
+             carry_in_q, carry_in_b, carry_in_origin, prev_last_agg_id, cand_in_q, cand_in_b,
              carry_q, carry_b, cand_last_q, cand_last_b, last_agg_id
         FROM data_day WHERE sym_id = ${this.spec.symId} AND day = ${formatDay(day)}::date`;
     if (!r) return null;
@@ -354,6 +360,7 @@ export class PostgresWriter implements DayWriter {
           ? null
           : {
               carryIn: { q: n(r.carry_in_q), b: n(r.carry_in_b) },
+              candIn: r.cand_in_q === null ? null : { q: n(r.cand_in_q), b: n(r.cand_in_b) },
               carryInOrigin: r.carry_in_origin as CarryOrigin,
               prevLastAggId: r.prev_last_agg_id === null ? null : n(r.prev_last_agg_id),
             },
@@ -366,6 +373,25 @@ export class PostgresWriter implements DayWriter {
             }
           : null,
     };
+  }
+
+  /**
+   * H-e: Tabelleninhalt gegen data_day.digest prüfen (day_digest_all je Tag, ≈ 1 s/Tag). „Fertig"
+   * vertraut sonst dem gespeicherten Digest; dies deckt nachträgliche Änderungen der Tabellen auf.
+   */
+  async verifyDb(
+    firstDay: number,
+    lastDay: number,
+  ): Promise<{ day: string; stored: string | null; actual: string }[]> {
+    const out: { day: string; stored: string | null; actual: string }[] = [];
+    for (let d = firstDay; d <= lastDay; d++) {
+      const day = formatDay(d);
+      const [r] = await this.db`
+        SELECT digest, day_digest_all(${this.spec.symId}::smallint, ${day}::date) AS actual
+          FROM data_day WHERE sym_id = ${this.spec.symId} AND day = ${day}::date`;
+      if (r) out.push({ day, stored: r.digest as string | null, actual: r.actual as string });
+    }
+    return out;
   }
 
   async touchDay(day: number, importerVersion: string, rulesVersion: string): Promise<void> {
@@ -521,9 +547,23 @@ export class PostgresWriter implements DayWriter {
                  kline_sha256 = ${w.klineFile.sha256},
                  carry_in_q = ${w.inputs.carryIn.q}, carry_in_b = ${w.inputs.carryIn.b},
                  carry_in_origin = ${w.inputs.carryInOrigin}, prev_last_agg_id = ${w.inputs.prevLastAggId},
+                 cand_in_q = ${w.inputs.candIn?.q ?? null}, cand_in_b = ${w.inputs.candIn?.b ?? null},
                  stale = false, state_before_import = NULL
            WHERE sym_id = ${symId} AND day = ${dayStr}::date
           RETURNING version`;
+        // H-b: ein gespeicherter Folgetag, der mit anderen Ausgaben dieses Tages klassifiziert wurde,
+        // wird in derselben Transaktion als veraltet markiert (ein Absturz vor der Kaskade lässt ihn
+        // so nie fälschlich `immutable`).
+        const next = formatDay(data.day + 1);
+        await tx`
+          UPDATE data_day SET stale = true, version = version + 1
+           WHERE sym_id = ${symId} AND day = ${next}::date AND NOT stale
+             AND state IN ('final_ok', 'final_bad')
+             AND (carry_in_q IS DISTINCT FROM ${recon.carryOut.q}::bigint
+               OR carry_in_b IS DISTINCT FROM ${recon.carryOut.b}::bigint
+               OR cand_in_q IS DISTINCT FROM ${recon.candLast.q}::bigint
+               OR cand_in_b IS DISTINCT FROM ${recon.candLast.b}::bigint
+               OR prev_last_agg_id IS DISTINCT FROM ${w.aggManifest.lastAggId}::bigint)`;
         return { dbDigest, state, version: (v?.version as number) ?? null };
       });
     } catch (e) {

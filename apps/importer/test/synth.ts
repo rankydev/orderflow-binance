@@ -26,6 +26,7 @@ function synthMonth(
   month: string,
   holeOnDay?: number,
   straddleAllDay?: number,
+  nearBoundary = false,
 ): { rows: Row[]; first: number; last: number } {
   const [first, last] = monthDays(month);
   const rows: Row[] = [];
@@ -47,6 +48,24 @@ function synthMonth(
         fills: [[t0 + 30_000, q]],
       });
       tid++;
+      if (nearBoundary && m === 200) {
+        // Mehrfach-Fill mit T mod 60 000 = 59 850 (unter der Kandidatengrenze 59 900, beide Fills in m)
+        const T = t0 + 59_850;
+        rows.push({
+          a: a++,
+          px,
+          q: 6,
+          f: tid,
+          l: tid + 1,
+          T,
+          m: true,
+          fills: [
+            [T, 2],
+            [T + 40, 4],
+          ],
+        });
+        tid += 2;
+      }
       if (m === 100 || m === 1439 || (m === 0 && d % 5 === 0) || d === straddleAllDay) {
         // Mehrfach-Fill nahe der Grenze: 4 Lots in m, 9 Lots in m+1 (über Mitternacht bei m = 1439)
         const T = t0 + 59_950;
@@ -151,6 +170,8 @@ export interface ArchiveOptions {
   dropAggMinute?: { day: string; minute: number };
   /** Straddler in jeder Minute dieses Tages: keine kandidatenfreie Minute, s(−1) nicht schätzbar. */
   straddleAllDay?: string;
+  /** Mehrfach-Fill knapp unter der Kandidatengrenze in Minute 200 jedes Tages. */
+  nearBoundary?: boolean;
 }
 
 export function archive(opts: ArchiveOptions = {}) {
@@ -163,6 +184,7 @@ export function archive(opts: ArchiveOptions = {}) {
     '2026-09',
     opts.holeOnDay,
     opts.straddleAllDay ? parseDay(opts.straddleAllDay) : undefined,
+    opts.nearBoundary ?? false,
   );
   const drop = opts.dropAggMinute;
   const dropStart = drop ? parseDay(drop.day) * DAY_MS + drop.minute * MINUTE_MS : -1;

@@ -150,11 +150,11 @@ describe('Migrationen', () => {
 
   it('Rollback aller Migrationen und erneutes Anwenden funktionieren', async () => {
     const rolled = await migrateDown(sql, 'all');
-    expect(rolled).toHaveLength(6);
+    expect(rolled).toHaveLength(8);
     const left = await sql`
       SELECT table_name FROM information_schema.tables
        WHERE table_schema = 'public' AND table_name <> 'schema_migrations'`;
     expect(left).toHaveLength(0);
-    expect(await migrateUp(sql)).toHaveLength(6);
+    expect(await migrateUp(sql)).toHaveLength(8);
   });
 });

@@ -29,6 +29,8 @@ export type CarryOrigin = 'chain' | 'stored' | 'neighbour' | 'estimated';
 
 export interface DayInputs {
   carryIn: { q: number; b: number };
+  /** cand(1439) des Vortags (untere Hüllgrenze für Minute 0); null = unbekannt. */
+  candIn: { q: number; b: number } | null;
   carryInOrigin: CarryOrigin;
   /** last_agg_id des Vortags (null = unbekannt). */
   prevLastAggId: number | null;

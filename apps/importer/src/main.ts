@@ -3,7 +3,7 @@
 // Befehle:
 //   import   --symbol S (--day D | --from D --to D | --month YYYY-MM) [--dry-run | --db]
 //            [--prefer auto|daily|monthly] [--no-neighbours] [--out datei.jsonl] [--resume]
-//            [--sidecar | --sidecar-dir DIR] [--data-dir DIR] [--quiet] [--backfill | --online] [--force] [--plan]
+//            [--sidecar | --sidecar-dir DIR] [--data-dir DIR] [--quiet] [--backfill | --online] [--force] [--plan] [--verify-db]
 //   download --symbol S --kind aggTrades|klines (--day D | --from D --to D)
 // Standard ist --dry-run (schreibt nichts); --db schreibt in die Datenbank aus OF_DB_* (.env).
 import {
@@ -64,6 +64,8 @@ export interface ImportArgs {
   directDml: boolean;
   /** Nur anzeigen, was geschrieben/übersprungen/kaskadiert würde (liest die DB, schreibt nichts). */
   plan: boolean;
+  /** Nach dem Lauf day_digest_all je Tag gegen data_day.digest prüfen (Review H-e). */
+  verifyDb: boolean;
   /** Mehrtägigen historischen DB-Import ohne --backfill ausdrücklich erlauben. */
   online: boolean;
 }
@@ -115,6 +117,7 @@ export function parseImportArgs(
       force: { type: 'boolean' },
       'direct-dml': { type: 'boolean' },
       plan: { type: 'boolean' },
+      'verify-db': { type: 'boolean' },
       online: { type: 'boolean' },
     },
     strict: true,
@@ -123,6 +126,7 @@ export function parseImportArgs(
   getSymbol(v.symbol);
   if (v.backfill && !v.db) throw new UsageError('--backfill nur mit --db');
   if (v.plan && !v.db) throw new UsageError('--plan liest die Datenbank: nur mit --db');
+  if (v['verify-db'] && !v.db) throw new UsageError('--verify-db nur mit --db');
   if (v['dry-run'] && v.db) throw new UsageError('--dry-run und --db schließen sich aus');
   const prefer = (v.prefer ?? 'auto') as Prefer;
   if (!['auto', 'daily', 'monthly'].includes(prefer))
@@ -150,6 +154,7 @@ export function parseImportArgs(
     force: !!v.force,
     directDml: !!v['direct-dml'],
     plan: !!v.plan,
+    verifyDb: !!v['verify-db'],
     online: !!v.online,
   };
   if (v.out) a.out = v.out;
@@ -192,6 +197,7 @@ async function runImport(argv: string[]): Promise<number> {
   const t0 = performance.now();
   await writer.open();
   let summaries: DaySummary[];
+  let verifyFailed = false;
   try {
     const imp = new Importer({
       dataDir: a.dataDir,
@@ -213,6 +219,14 @@ async function runImport(argv: string[]): Promise<number> {
       },
     });
     summaries = await imp.run();
+    if (a.verifyDb && base instanceof PostgresWriter) {
+      const res = await base.verifyDb(a.firstDay, a.lastDay);
+      const bad = res.filter((r) => r.stored !== r.actual);
+      console.log(`verify-db: ${res.length} Tage geprüft, ${bad.length} Abweichungen`);
+      for (const b of bad)
+        console.log(`verify-db ABWEICHUNG ${b.day}: data_day=${b.stored} Tabellen=${b.actual}`);
+      if (bad.length > 0) verifyFailed = true;
+    }
   } finally {
     await writer.close();
     process.off('SIGINT', onSignal);
@@ -237,7 +251,7 @@ async function runImport(argv: string[]): Promise<number> {
       `${Math.round(rows / wall).toLocaleString('en-US')} rows/s, Spitzen-RSS ${rssMb} MB, ` +
       `final_bad=${bad.length}, edge_pending-Minuten=${pend}`,
   );
-  return bad.length > 0 ? 3 : 0;
+  return verifyFailed ? 4 : bad.length > 0 ? 3 : 0;
 }
 
 async function runDownload(argv: string[]): Promise<number> {

@@ -161,7 +161,9 @@ export function writeReasons(
     !si ||
     si.carryIn.q !== now.inputs.carryIn.q ||
     si.carryIn.b !== now.inputs.carryIn.b ||
-    si.prevLastAggId !== now.inputs.prevLastAggId
+    si.prevLastAggId !== now.inputs.prevLastAggId ||
+    si.candIn?.q !== now.inputs.candIn?.q ||
+    si.candIn?.b !== now.inputs.candIn?.b
   ) {
     r.push('Vortagseingaben');
   }
@@ -345,6 +347,11 @@ export function inputsDiffer(
   if (st.inputs.prevLastAggId !== ch.lastAggId) {
     return `letzte aggId des Vortags ${st.inputs.prevLastAggId} → ${ch.lastAggId}`;
   }
+  const k = st.inputs.candIn;
+  if (!k || k.q !== ch.prevIn.cand.q || k.b !== ch.prevIn.cand.b) {
+    return `cand(1439) des Vortags ${k ? `${k.q}/${k.b}` : 'unbekannt'} → ${ch.prevIn.cand.q}/${ch.prevIn.cand.b}`;
+  }
+  if (st.stale) return 'als stale markiert';
   return null;
 }
 
@@ -474,7 +481,14 @@ export class Importer {
     // anderen letzten aggId des Vortags klassifiziert wurde, wird in diesem Lauf mitgerechnet; ohne
     // Quelldateien wird er als veraltet (stale) markiert. Weiter als bis zur ersten unveränderten
     // Folgeminute ohne Kandidat reicht die Wirkung praktisch nie, daher endet die Kaskade dort.
-    for (;;) {
+    const MAX_CASCADE = 7;
+    for (let k = 1; ; k++) {
+      if (k > MAX_CASCADE) {
+        log(
+          `WARNUNG: Kaskade nach ${MAX_CASCADE} Tagen abgebrochen; ${formatDay(lastDay + 1)} prüfen (--plan)`,
+        );
+        break;
+      }
       const next = lastDay + 1;
       const st = await writer.storedDay(spec.name, next);
       const ch = this.chain!;
@@ -488,7 +502,7 @@ export class Importer {
         );
         break;
       }
-      log(`Kaskade: Folgetag ${formatDay(next)} wird neu klassifiziert (${why})`);
+      log(`Kaskade ${k}: Folgetag ${formatDay(next)} wird neu klassifiziert (${why})`);
       lastDay = next;
       await this.processRange(next, next);
     }
@@ -605,6 +619,7 @@ export class Importer {
           const recon = reconcileDay(data.reconcileInput, { prev: prevIn, nextReconciled: false });
           const inputs: DayInputs = {
             carryIn: recon.carryIn,
+            candIn: prevIn ? prevIn.cand : null,
             carryInOrigin: linked ? linked.origin : 'estimated',
             prevLastAggId: linked ? linked.lastAggId : null,
           };

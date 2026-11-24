@@ -420,3 +420,84 @@ describe('Review N1–N6 (DB)', () => {
     expect(b!.immutable).toBe(true);
   });
 });
+
+describe('Review vor dem Backfill (DB)', () => {
+  it('Backfill konvertiert bereits vollständig komprimierte, unberührte Chunks nicht erneut', async () => {
+    const w = new PostgresWriter(cfg, BTC);
+    await w.open();
+    try {
+      const until = Date.UTC(2026, 9, 1);
+      await w.convertFinishedChunks(until); // alles bis 2026-10-01 komprimieren
+      expect(await w.convertFinishedChunks(until)).toBe(0);
+      // INSERT in einen komprimierten Chunk → teilweise komprimiert (Status-Bit 8, is_compressed
+      // bleibt true) → genau dieser eine wird wieder konvertiert
+      const [{ ts }] =
+        (await sql`SELECT min(ts) AS ts FROM fp_1m WHERE ts < '2026-10-01'`) as unknown as [
+          { ts: Date },
+        ];
+      await sql`INSERT INTO fp_1m VALUES (1, ${ts}, 1, 0, 0, 0, 0)`;
+      const [st] = await sql`
+        SELECT c.is_compressed, k.status FROM timescaledb_information.chunks c
+          JOIN _timescaledb_catalog.chunk k ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
+         WHERE c.hypertable_name = 'fp_1m' AND c.range_start <= ${ts} AND c.range_end > ${ts}`;
+      expect(st).toMatchObject({ is_compressed: true, status: 9 });
+      expect(await w.convertFinishedChunks(until)).toBe(1);
+      expect(await w.convertFinishedChunks(until)).toBe(0);
+      await sql`DELETE FROM fp_1m WHERE ts = ${ts} AND px = 1`;
+      await w.convertFinishedChunks(until);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it('H-b: geänderter Tag markiert den gespeicherten Folgetag in derselben Transaktion als stale', async () => {
+    const good = archive();
+    await run(new PostgresWriter(cfg, BTC), '2026-09-28', '2026-09-29', false, good);
+    const w = new PostgresWriter(cfg, BTC);
+    await w.open();
+    // Kaskade bewusst verhindern: storedDay liefert den Folgetag nicht → nur die Transaktion markiert
+    const orig = w.storedDay.bind(w);
+    w.storedDay = async (sym, day) => (day === parseDay('2026-09-29') ? null : orig(sym, day));
+    try {
+      const dropDir = archive({
+        dropAggMinute: { day: '2026-09-28', minute: 1439 },
+        dailyDays: ['2026-09-28'],
+      });
+      await new Importer({
+        dataDir: dropDir,
+        spec: BTC,
+        firstDay: parseDay('2026-09-28'),
+        lastDay: parseDay('2026-09-28'),
+        prefer: 'daily',
+        neighbours: false,
+        writer: w,
+        importerVersion: 'int-test',
+        sidecar: false,
+        log: () => {},
+      }).run();
+    } finally {
+      await w.close();
+    }
+    const [n] = await sql`SELECT stale, immutable FROM data_day WHERE day = '2026-09-29'`;
+    expect(n).toMatchObject({ stale: true, immutable: false });
+    // der nächste Lauf, der 09-28 berührt, rechnet 09-29 per Kaskade neu
+    const res = await run(new PostgresWriter(cfg, BTC), '2026-09-28', '2026-09-28', false, good);
+    expect(res.map((x) => x.day)).toEqual(['2026-09-28', '2026-09-29']);
+    const [m] = await sql`SELECT stale, immutable FROM data_day WHERE day = '2026-09-29'`;
+    expect(m!.stale).toBe(false);
+  });
+
+  it('H-e: verifyDb findet Abweichungen zwischen Tabellen und data_day.digest', async () => {
+    const w = new PostgresWriter(cfg, BTC);
+    await w.open();
+    try {
+      const ok = await w.verifyDb(parseDay('2026-09-28'), parseDay('2026-09-29'));
+      expect(ok.every((r) => r.stored === r.actual)).toBe(true);
+      await sql`UPDATE data_day SET digest = 'x' WHERE day = '2026-09-28'`;
+      const badRes = await w.verifyDb(parseDay('2026-09-28'), parseDay('2026-09-28'));
+      expect(badRes[0]!.stored).not.toBe(badRes[0]!.actual);
+    } finally {
+      await w.close();
+    }
+  });
+});
