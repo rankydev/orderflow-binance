@@ -1,0 +1,20 @@
+[project]
+name = "orderflow-verifier"
+version = "0.0.0"
+description = "Unabhängige Neuberechnung (Python + DuckDB) gegen die TypeScript-Importer-Ergebnisse"
+requires-python = ">=3.12"
+dependencies = ["duckdb==2.0.1", "pyarrow==26.0.1"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = ["slow: Tests auf echten Rohdaten unter data/ (opt-in: OF_VERIFIER_SLOW=1)"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# SQL-Texte und Konzept-Zitate dürfen lang sein; der Formatierer bricht Code ohnehin um.
+ignore = ["E501"]

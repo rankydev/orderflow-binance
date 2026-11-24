@@ -1,0 +1,5 @@
+# Nur für den Datenbankmodus (python -m orderflow_verifier db ...); UNGETESTET gegen eine echte DB.
+# Installation: verifier/.venv/bin/pip install --require-virtualenv -r verifier/requirements-db.txt
+-r requirements.txt
+psycopg==3.3.9
+psycopg-binary==3.3.9
