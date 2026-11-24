@@ -3,7 +3,7 @@
 // Befehle:
 //   import   --symbol S (--day D | --from D --to D | --month YYYY-MM) [--dry-run | --db]
 //            [--prefer auto|daily|monthly] [--no-neighbours] [--out datei.jsonl] [--resume]
-//            [--sidecar | --sidecar-dir DIR] [--data-dir DIR] [--quiet] [--backfill]
+//            [--sidecar | --sidecar-dir DIR] [--data-dir DIR] [--quiet] [--backfill] [--force]
 //   download --symbol S --kind aggTrades|klines (--day D | --from D --to D)
 // Standard ist --dry-run (schreibt nichts); --db schreibt in die Datenbank aus OF_DB_* (.env).
 import {
@@ -80,6 +80,10 @@ export interface ImportArgs {
   dataDir: string;
   quiet: boolean;
   backfill: boolean;
+  /** Fertige Tage trotzdem neu importieren (Resume-Schlüssel ignorieren). */
+  force: boolean;
+  /** Messoption: Ersatz per DML direkt auf Columnstore-Chunks statt Rowstore-Umweg. */
+  directDml: boolean;
 }
 
 function dayRange(v: Record<string, string | boolean | undefined>): [number, number] {
@@ -126,6 +130,8 @@ export function parseImportArgs(
       'data-dir': { type: 'string' },
       quiet: { type: 'boolean' },
       backfill: { type: 'boolean' },
+      force: { type: 'boolean' },
+      'direct-dml': { type: 'boolean' },
     },
     strict: true,
   });
@@ -156,6 +162,8 @@ export function parseImportArgs(
     dataDir: v['data-dir'] ?? env.OF_DATA_DIR ?? 'data',
     quiet: !!v.quiet,
     backfill: !!v.backfill,
+    force: !!v.force,
+    directDml: !!v['direct-dml'],
   };
   if (v.out) a.out = v.out;
   return a;
@@ -168,9 +176,11 @@ async function runImport(argv: string[]): Promise<number> {
     a.mode === 'db'
       ? new PostgresWriter(parseConfig(process.env).db, spec, {
           backfill: a.backfill,
+          directDml: a.directDml,
           log: (s) => console.log(s),
         })
       : new DryRunWriter(a.resume ? a.out : undefined);
+  if (a.force) writer.isDone = async () => false;
   const log = (s: string) => {
     if (!a.quiet) console.log(s);
   };

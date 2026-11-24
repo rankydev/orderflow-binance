@@ -2,11 +2,12 @@
 //
 // Ablauf je Tag (Parse und Checksum sind zu diesem Zeitpunkt bereits vollständig erfolgreich):
 //  1. Transaktion A: Lock prüfen; data_day → 'importing' (anlegen oder umstellen, alter Zustand gemerkt).
-//  2. Transaktion B: Lock prüfen → DELETE des Tages in allen Tabellen (direkt, auch auf Columnstore-
-//     Chunks; TimescaleDB ≥ 2.18 entpackt nur betroffene Batches) → COPY fp_1m, Rollups,
+//  2. Transaktion B: Lock prüfen → den Tag überdeckende Columnstore-Chunks in den Rowstore wandeln
+//     (convert_to_rowstore, §3.9) → DELETE des Tages in allen Tabellen → COPY fp_1m, Rollups,
 //     bar_1m/1h/1d, kline_1m → data_minute_issue (eigene Klasse je Minute), raw_file, raw_day,
 //     symbol_tick_history → day_digest_all (SQL) muss dem TS-Digest gleichen → data_day final_* mit
-//     version + 1, Übertrag und offenen Randminuten → COMMIT.
+//     version + 1, Übertrag und offenen Randminuten → COMMIT → vorher komprimierte Chunks wieder
+//     konvertieren (convert_to_columnstore).
 //  3. Fehler in B: Rollback; data_day zurück auf den vorherigen Zustand (bzw. provisional_import_failed).
 // Single Writer: Session-Advisory-Lock auf einer Verbindung ohne max_lifetime/idle_timeout; vor jeder
 // Transaktion wird geprüft, dass diese Sitzung ihn noch hält (sonst neu erwerben oder Abbruch).
@@ -174,8 +175,12 @@ const COUNT_COL: Record<number, string> = {
 export interface PostgresWriterOptions {
   /** Backfill-Modus (§4.1): Columnstore-Jobs pausieren, fertige Chunks explizit konvertieren. */
   backfill?: boolean;
-  /** Vor dem Ersetzen betroffene Columnstore-Chunks in den Rowstore zurückwandeln (nur Messung). */
-  rowstoreBeforeReplace?: boolean;
+  /**
+   * Ersatz in Columnstore-Chunks: false (Standard) = betroffene Chunks vor dem Ersetzen in den
+   * Rowstore wandeln und danach wieder konvertieren (KONZEPT §3.9; gemessen 5× schneller als
+   * DELETE/COPY direkt auf dem Columnstore); true = direktes DML auf dem Columnstore (Messoption).
+   */
+  directDml?: boolean;
   log?: (s: string) => void;
 }
 
@@ -275,7 +280,7 @@ export class PostgresWriter implements DayWriter {
        ORDER BY range_start`;
     for (const c of chunks) {
       await this.db.unsafe(
-        `CALL convert_to_columnstore('${c.c as string}'::regclass, if_not_columnstore => true)`,
+        `CALL convert_to_columnstore('${c.c as string}'::regclass, if_not_columnstore => true, recompress => true)`,
       );
     }
     return chunks.length;
@@ -325,18 +330,20 @@ export class PostgresWriter implements DayWriter {
     };
   }
 
-  /** Nur für Messungen: Columnstore-Chunks des Tages vor dem Ersetzen in den Rowstore wandeln. */
-  private async rowstoreDay(tx: Tx, from: Date, to: Date): Promise<void> {
+  /** Columnstore-Chunks, die den Tag überdecken, in den Rowstore wandeln; liefert ihre Namen. */
+  private async rowstoreDay(tx: Tx, from: Date, to: Date): Promise<string[]> {
     const tables = [...DIGEST_TABLES];
     const chunks = await tx`
       SELECT format('%I.%I', chunk_schema, chunk_name) AS c
         FROM timescaledb_information.chunks
        WHERE hypertable_schema = 'public' AND hypertable_name = ANY(${tables}::text[])
          AND is_compressed AND range_start < ${to} AND range_end > ${from}`;
-    for (const c of chunks)
+    for (const c of chunks) {
       await tx.unsafe(
         `CALL convert_to_rowstore('${c.c as string}'::regclass, if_columnstore => true)`,
       );
+    }
+    return chunks.map((c) => c.c as string);
   }
 
   private async upsertFile(tx: Tx, f: FileManifest): Promise<void> {
@@ -388,9 +395,10 @@ export class PostgresWriter implements DayWriter {
     });
 
     try {
+      let reconvert: string[] = [];
       const out = await this.db.begin(async (tx) => {
         await this.ensureLock(tx);
-        if (this.opt.rowstoreBeforeReplace) await this.rowstoreDay(tx, from, to);
+        if (!this.opt.directDml) reconvert = await this.rowstoreDay(tx, from, to);
         for (const t of DIGEST_TABLES) {
           await tx.unsafe(`DELETE FROM ${t} WHERE sym_id = $1 AND ts >= $2 AND ts < $3`, [
             symId,
@@ -449,6 +457,12 @@ export class PostgresWriter implements DayWriter {
           RETURNING version`;
         return { dbDigest, state, version: (v?.version as number) ?? null };
       });
+      // vorher komprimierte Chunks wieder in den Columnstore (eigene Transaktion je Chunk)
+      for (const c of reconvert) {
+        await this.db.unsafe(
+          `CALL convert_to_columnstore('${c}'::regclass, if_not_columnstore => true)`,
+        );
+      }
       this.writtenUntil = Math.max(this.writtenUntil, (data.day + 1) * DAY_MS);
       if (this.opt.backfill) await this.convertFinishedChunks(this.writtenUntil);
       return out;
