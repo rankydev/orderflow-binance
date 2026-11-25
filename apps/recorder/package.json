@@ -6,6 +6,7 @@
   "description": "Daemon: WebSocket-aggTrades, L\u00fcckenerkennung + REST-Nachholen, Spool, provisorische Minuten, t\u00e4gliche Finalisierung (Phase P3)",
   "scripts": {
     "start": "node --env-file-if-exists=../../.env src/main.ts",
+    "role:password": "node --env-file-if-exists=../../.env src/cli/recorder-role-password.ts",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {

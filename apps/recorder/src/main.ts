@@ -12,7 +12,9 @@
 //                            und keine Monatsdateien dort; sonst startet der Recorder nicht.
 //   OF_REST_WEIGHT_PER_MIN   eigenes REST-Gewichtsbudget (Standard 1200 = 50 % von 2400, §4.2)
 //   OF_BINANCE_WS_BASE / OF_BINANCE_REST_BASE   Endpunkte (Standard Binance USDⓈ-M, /market)
-//   OF_RECORDER_HTTP_PORT    lokaler Health-/Ereignis-Port auf 127.0.0.1 (Standard 7701, 0 = aus)
+//   OF_RECORDER_HTTP_PORT    Health-/Ereignis-Port (Standard 7701, 0 = aus)
+//   OF_RECORDER_HTTP_HOST    Bind-Adresse (Standard 127.0.0.1; im Container 0.0.0.0 nur ohne Host-Port)
+//   OF_RECORDER_DB_USER / OF_RECORDER_DB_PASSWORD   eigene Rolle (Pflicht; OF_DB_* nur Host/Port/Name)
 //   OF_RECORDER_FINALISE     tägliche Finalisierung im Prozess (Standard 1)
 //
 // Betrieb (Review-Hinweise):
@@ -37,7 +39,15 @@
 //    lastPostCommitError {source: conversion|settle|cascade|close|other}: Tag ist final, aber danach
 //    schlug etwas fehl (Konvertierung, Randminute des Vortags, Kaskade, close-Durchlauf)
 //    (z. B. fehlende Migration 0014 oder Rechte) – nie normal, immer prüfen.
-import { DAY_MS, dayIndex, formatDay, getSymbol, parseConfig, parseDay } from '@orderflow/core';
+import {
+  DAY_MS,
+  dayIndex,
+  formatDay,
+  getSymbol,
+  parseConfig,
+  parseDay,
+  type DbConfig,
+} from '@orderflow/core';
 import { execFile } from 'node:child_process';
 import { createServer, type ServerResponse } from 'node:http';
 import { join } from 'node:path';
@@ -65,7 +75,23 @@ export interface RecorderConfig {
   wsBase: string;
   restBase: string;
   httpPort: number;
+  httpHost: string;
   finalise: boolean;
+}
+
+/**
+ * Datenbankzugang des Recorders (wie die API, apps/api/src/config.ts): eigene Rolle aus
+ * OF_RECORDER_DB_USER (Standard of_recorder) und OF_RECORDER_DB_PASSWORD; Host, Port, Datenbank aus
+ * OF_DB_*. Admin-Zugangsdaten werden nie übernommen – der Recorder-Dienst braucht db.env nicht.
+ */
+export function recorderDbConfig(env: Env): DbConfig {
+  const user = env.OF_RECORDER_DB_USER?.trim() || 'of_recorder';
+  const password = env.OF_RECORDER_DB_PASSWORD?.trim();
+  if (!password)
+    throw new Error('OF_RECORDER_DB_PASSWORD fehlt (Passwort der Rolle of_recorder, recorder.env)');
+  if (env.OF_DB_USER?.trim() && user === env.OF_DB_USER.trim() && user !== 'of_recorder')
+    throw new Error(`OF_RECORDER_DB_USER (${user}) darf nicht die Admin-Rolle OF_DB_USER sein`);
+  return parseConfig({ ...env, OF_DB_USER: user, OF_DB_PASSWORD: password }).db;
 }
 
 export function recorderConfig(env: Env): RecorderConfig {
@@ -95,6 +121,9 @@ export function recorderConfig(env: Env): RecorderConfig {
     wsBase: env.OF_BINANCE_WS_BASE ?? DEFAULT_WS_BASE,
     restBase: env.OF_BINANCE_REST_BASE ?? DEFAULT_REST_BASE,
     httpPort: num('OF_RECORDER_HTTP_PORT', 7701),
+    // Health/Ereignisse: Standard Loopback. Im Container ggf. 0.0.0.0 (nur Compose-Netz), den Port
+    // aber nie auf dem Host veröffentlichen.
+    httpHost: env.OF_RECORDER_HTTP_HOST?.trim() || '127.0.0.1',
     finalise: (env.OF_RECORDER_FINALISE ?? '1') !== '0',
   };
 }
@@ -113,7 +142,7 @@ export function sdNotify(state: string): void {
 async function run(): Promise<number> {
   const cfg = recorderConfig(process.env);
   if (cfg.rawKeepDays > 0) assertRawPrunable(cfg.dataDir); // vor dem Start, nicht erst nach Tagen
-  const db = parseConfig(process.env).db;
+  const db = recorderDbConfig(process.env);
   const writer = new LiveWriter(db, (s) => logLine(s));
   await writer.open();
   // Review H2a – Start-Prüfung: offene Chunks im Columnstore (dürfen seit 0015 nie vorkommen).
@@ -271,7 +300,7 @@ async function run(): Promise<number> {
           } else {
             res.writeHead(404).end();
           }
-        }).listen(cfg.httpPort, '127.0.0.1')
+        }).listen(cfg.httpPort, cfg.httpHost)
       : null;
   sdNotify('READY=1');
   const status = setInterval(() => {

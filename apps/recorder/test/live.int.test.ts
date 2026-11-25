@@ -10,6 +10,7 @@ import {
   PostgresWriter,
   repairOpenChunks,
   assertTestDatabase,
+  otherOpenTransactions,
 } from '@orderflow/importer';
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -209,6 +210,16 @@ describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5
         ch!.c as string,
       ]),
     ).rejects.toThrow(/must be owner/);
+    // die API-Rolle bekommt durch 0013–0016 nichts dazu: keine Recorder-Tabellen, keine
+    // Konvertierungsfunktion, keine Mitgliedschaft in of_recorder
+    const [api] = await sql`
+      SELECT has_function_privilege('of_api', 'of_recompress_chunk(regclass)', 'EXECUTE') AS fn,
+             pg_has_role('of_api', 'of_recorder', 'MEMBER') AS member,
+             has_table_privilege('of_api', 'ingest_status', 'SELECT') AS st,
+             has_table_privilege('of_api', 'recorder_quality', 'SELECT') AS q,
+             has_table_privilege('of_api', 'live_kline_check', 'SELECT') AS k,
+             has_column_privilege('of_api', 'data_day', 'live_frozen', 'SELECT') AS frozen`;
+    expect(api).toEqual({ fn: false, member: false, st: false, q: false, k: false, frozen: true });
     // of_recompress_chunk nimmt nur Chunks der Projekt-Hypertables
     await expect(rsql`SELECT of_recompress_chunk('data_day'::regclass)`).rejects.toMatchObject({
       code: '42501',
@@ -585,7 +596,8 @@ describe('Offene Chunks nie im Columnstore (Migration 0015)', () => {
     expect(wlogs.some((l) => /offene Chunks im Columnstore.*repair-open-chunks/.test(l))).toBe(
       true,
     );
-    // W1: eine andere offene Transaktion (z. B. ein REPEATABLE-READ-Prüfbericht) blockiert die Reparatur
+    // W1: eine lange offene Transaktion (z. B. ein REPEATABLE-READ-Prüfbericht) blockiert die
+    // Reparatur; eine junge (< 5 s) zählt noch nicht
     const maint = connect(cfg);
     const other = connect(cfg);
     let release!: () => void;
@@ -598,13 +610,38 @@ describe('Offene Chunks nie im Columnstore (Migration 0015)', () => {
       await released;
     });
     await isOpen;
-    await expect(repairOpenChunks(maint, {})).rejects.toThrow(/andere offene Transaktion/);
+    expect(await otherOpenTransactions(maint)).toEqual([]); // noch jung
+    await new Promise((r) => setTimeout(r, 5500));
+    expect((await otherOpenTransactions(maint)).length).toBe(1);
+    await expect(repairOpenChunks(maint, {})).rejects.toThrow(/länger als 5 s offen/);
     expect((await repairOpenChunks(maint, { dryRun: true })).length).toBe(before.length);
     release();
     await holding;
     await other.end();
     expect(await assertTestDatabase(maint)).toMatch(/_test_recorder$/);
-    const rep = await repairOpenChunks(maint, { log: (m) => logs.push(m) });
+    // API-artige kurze Lesetransaktionen laufen während der Reparatur weiter und blockieren nicht
+    const api = connect(cfg);
+    let stopApi = false;
+    let apiReads = 0;
+    const apiLoop = (async () => {
+      while (!stopApi) {
+        await api.begin('isolation level repeatable read read only', async (tx) => {
+          await tx`SET LOCAL lock_timeout = '1s'`;
+          await tx`SELECT count(*) FROM bar_1m WHERE sym_id = 1 AND ts >= now() - interval '1 hour'`;
+        });
+        apiReads++;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    })();
+    let rep;
+    try {
+      rep = await repairOpenChunks(maint, { log: (m) => logs.push(m) });
+    } finally {
+      stopApi = true;
+      await apiLoop;
+      await api.end();
+    }
+    expect(apiReads).toBeGreaterThan(0);
     expect(rep.map((r) => r.hypertable).sort()).toEqual(before);
     expect(rep.every((r) => r.convertMs !== null && r.lockWaitMs !== null)).toBe(true);
     expect(await compressedOrPartial()).toEqual([]);
