@@ -20,6 +20,7 @@ import {
 } from '@orderflow/core';
 import {
   absPath,
+  assertTestDatabase,
   isPresent,
   klineRef,
   readAggTrades,
@@ -132,6 +133,14 @@ export async function replayDay(o: {
   if (o.db) {
     writer = new LiveWriter(o.db);
     await writer.open();
+    // löscht und ersetzt einen ganzen Tag: nur auf Test-Datenbanken (Review: gleiche Klasse wie
+    // der Vorfall vom 2026-11-24)
+    try {
+      await assertTestDatabase(writer.db);
+    } catch (e) {
+      await writer.close();
+      throw e;
+    }
     await writer.ensureSymbol(spec);
     // Tag in der (Test-)DB vorher entfernen; data_day des Vortags als finale Kette setzen
     for (const t of [...FP_TABLES, 'bar_1m', 'bar_1h', 'bar_1d', 'data_minute_issue']) {

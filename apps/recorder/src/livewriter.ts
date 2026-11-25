@@ -242,6 +242,25 @@ export class LiveWriter {
     return rows.map((r) => (r.details ?? {}) as Record<string, unknown>);
   }
 
+  /**
+   * Läuft diese Sitzung mit erhöhten Rechten (Superuser, of_admin oder Mitglied davon, CREATE im
+   * Schema)? Der Recorder verweigert dann den Start (Review: die Prüfung über OF_DB_USER greift nur,
+   * wenn die Variable gesetzt ist).
+   */
+  async elevatedRole(): Promise<string | null> {
+    const [r] = await this.db`
+      SELECT current_user AS u, r.rolsuper AS su,
+             EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'of_admin')
+               AND pg_has_role(current_user, 'of_admin', 'MEMBER') AS admin,
+             has_schema_privilege(current_user, 'public', 'CREATE') AS ddl
+        FROM pg_roles r WHERE r.rolname = current_user`;
+    if (!r) return 'Rolle unbekannt';
+    if (r.su) return `${r.u as string} ist Superuser`;
+    if (r.admin) return `${r.u as string} ist of_admin oder Mitglied davon`;
+    if (r.ddl) return `${r.u as string} darf im Schema public Objekte anlegen`;
+    return null;
+  }
+
   /** Teilweise komprimierte Chunks (Status-Bit 8) der Projekttabellen (Review H2). */
   async partialChunks(): Promise<string[]> {
     const rows = await this.db`

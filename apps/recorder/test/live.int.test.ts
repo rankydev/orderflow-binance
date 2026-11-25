@@ -39,6 +39,21 @@ afterAll(async () => {
 });
 
 describe('Recorder ↔ Datenbank', () => {
+  it('replayDay verweigert eine Datenbank außerhalb des Test-Musters, bevor es löscht', async () => {
+    // eigene, nicht nach Test benannte Datenbank anlegen (nie die Entwicklungs-DB berühren)
+    const other: DbConfig = { ...cfg, database: `${base.database}_guardcheck` };
+    await dropAndCreateDatabase(other);
+    const o = connect(other);
+    await migrateUp(o);
+    await o.end();
+    await expect(
+      replayDay({ dataDir: dir, symbol: 'BTCUSDT', day: DAY, db: other, log: () => {} }),
+    ).rejects.toThrow(/nur auf Test-Datenbanken/);
+    const a = connect(cfg);
+    await a.unsafe(`DROP DATABASE IF EXISTS ${other.database} WITH (FORCE)`);
+    await a.end();
+  });
+
   it('Live-Tag über den Recorder-Pfad = Import (minutenweise und je Tabelle); provisional, nie immutable', async () => {
     const r = await replayDay({
       dataDir: dir,
@@ -224,6 +239,17 @@ describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5
     await expect(rsql`SELECT of_recompress_chunk('data_day'::regclass)`).rejects.toMatchObject({
       code: '42501',
     });
+  });
+
+  it('erkennt erhöhte Rechte der Sitzung unabhängig von OF_DB_USER (Admin verweigert, Recorder-Rolle nicht)', async () => {
+    const adm = new LiveWriter(cfg);
+    await adm.open();
+    expect(await adm.elevatedRole()).toMatch(/Superuser|of_admin/);
+    await adm.close();
+    const rec = new LiveWriter(roleCfg);
+    await rec.open();
+    expect(await rec.elevatedRole()).toBeNull();
+    await rec.close();
   });
 
   it('markFrozen macht den Grund in data_day sichtbar, nur für provisorische Tage (W2)', async () => {
@@ -596,10 +622,11 @@ describe('Offene Chunks nie im Columnstore (Migration 0015)', () => {
     expect(wlogs.some((l) => /offene Chunks im Columnstore.*repair-open-chunks/.test(l))).toBe(
       true,
     );
-    // W1: eine lange offene Transaktion (z. B. ein REPEATABLE-READ-Prüfbericht) blockiert die
-    // Reparatur; eine junge (< 5 s) zählt noch nicht
+    // W1: jede offene Transaktion einer fremden Anwendung (z. B. ein REPEATABLE-READ-Prüfbericht)
+    // blockiert die Reparatur sofort, auch wenn sie den Chunk noch nicht gelesen hat; API/Recorder
+    // erst ab 5 s
     const maint = connect(cfg);
-    const other = connect(cfg);
+    const other = connect(cfg); // application_name orderflow-db-tools
     let release!: () => void;
     const released = new Promise<void>((r) => (release = r));
     let opened!: () => void;
@@ -610,17 +637,33 @@ describe('Offene Chunks nie im Columnstore (Migration 0015)', () => {
       await released;
     });
     await isOpen;
-    expect(await otherOpenTransactions(maint)).toEqual([]); // noch jung
-    await new Promise((r) => setTimeout(r, 5500));
-    expect((await otherOpenTransactions(maint)).length).toBe(1);
-    await expect(repairOpenChunks(maint, {})).rejects.toThrow(/länger als 5 s offen/);
+    expect((await otherOpenTransactions(maint)).length).toBe(1); // sofort, nicht erst nach 5 s
+    await expect(repairOpenChunks(maint, {})).rejects.toThrow(/andere offene Transaktion/);
     expect((await repairOpenChunks(maint, { dryRun: true })).length).toBe(before.length);
     release();
     await holding;
     await other.end();
     expect(await assertTestDatabase(maint)).toMatch(/_test_recorder$/);
     // API-artige kurze Lesetransaktionen laufen während der Reparatur weiter und blockieren nicht
-    const api = connect(cfg);
+    // eine Transaktion unter dem Namen der API zählt erst nach 5 s
+    const apiOld = connect(cfg, undefined, { applicationName: 'orderflow-api' });
+    let releaseOld!: () => void;
+    const oldReleased = new Promise<void>((r) => (releaseOld = r));
+    let oldOpened!: () => void;
+    const oldIsOpen = new Promise<void>((r) => (oldOpened = r));
+    const oldHolding = apiOld.begin(async (tx) => {
+      await tx`SELECT 1`;
+      oldOpened();
+      await oldReleased;
+    });
+    await oldIsOpen;
+    expect(await otherOpenTransactions(maint)).toEqual([]);
+    await new Promise((r) => setTimeout(r, 5500));
+    expect((await otherOpenTransactions(maint)).map((t) => t.app)).toEqual(['orderflow-api']);
+    releaseOld();
+    await oldHolding;
+    await apiOld.end();
+    const api = connect(cfg, undefined, { applicationName: 'orderflow-api' });
     let stopApi = false;
     let apiReads = 0;
     const apiLoop = (async () => {

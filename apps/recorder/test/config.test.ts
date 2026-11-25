@@ -1,6 +1,6 @@
 // Server-Konfiguration des Recorders: eigene Rolle, nie Admin-Zugangsdaten; Bind-Adresse.
 import { describe, expect, it } from 'vitest';
-import { recorderConfig, recorderDbConfig } from '../src/main.ts';
+import { main, recorderConfig, recorderDbConfig } from '../src/main.ts';
 
 describe('recorderDbConfig', () => {
   const base = { OF_DB_HOST: 'db', OF_DB_PORT: '5432', OF_DB_NAME: 'orderflow' };
@@ -40,5 +40,13 @@ describe('recorderConfig', () => {
   it('Health standardmäßig nur auf Loopback, Bind-Adresse einstellbar', () => {
     expect(recorderConfig({}).httpHost).toBe('127.0.0.1');
     expect(recorderConfig({ OF_RECORDER_HTTP_HOST: '0.0.0.0' }).httpHost).toBe('0.0.0.0');
+  });
+});
+
+describe('replay --db (Review: ersetzt einen ganzen Tag)', () => {
+  it('verlangt eine ausdrücklich genannte Test-Datenbank, bevor irgendetwas verbunden wird', async () => {
+    await expect(
+      main(['replay', '--symbol', 'BTCUSDT', '--day', '2026-09-10', '--db']),
+    ).rejects.toThrow(/--db-name/);
   });
 });

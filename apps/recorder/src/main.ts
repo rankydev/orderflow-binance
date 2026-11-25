@@ -1,6 +1,6 @@
 // Recorder-Daemon (KONZEPT §2.1, §2.5, §4.2, §4.3). Aufruf aus dem Repo-Wurzelverzeichnis:
 //   node --env-file-if-exists=.env apps/recorder/src/main.ts run
-//   node --env-file-if-exists=.env apps/recorder/src/main.ts replay --symbol BTCUSDT --day 2026-11-21 [--db]
+//   node --env-file-if-exists=.env apps/recorder/src/main.ts replay --symbol BTCUSDT --day 2026-11-21 [--db --db-name orderflow_test_x]
 // Konfiguration über Umgebungsvariablen (OF_DB_* wie überall, dazu):
 //   OF_RECORDER_SYMBOLS      Symbole, Komma-getrennt (Standard BTCUSDT,ETHUSDT)
 //   OF_SPOOL_DIR             Spool-Verzeichnis (Standard <OF_DATA_DIR>/live, §3.1)
@@ -145,6 +145,15 @@ async function run(): Promise<number> {
   const db = recorderDbConfig(process.env);
   const writer = new LiveWriter(db, (s) => logLine(s));
   await writer.open();
+  {
+    const elevated = await writer.elevatedRole();
+    if (elevated) {
+      await writer.close();
+      throw new Error(
+        `Recorder verweigert den Start mit erhöhten Rechten: ${elevated} (of_recorder verwenden)`,
+      );
+    }
+  }
   // Review H2a – Start-Prüfung: offene Chunks im Columnstore (dürfen seit 0015 nie vorkommen).
   // Der Recorder startet trotzdem, meldet aber sofort Alarm und bleibt unhealthy, bis
   // `importer repair-open-chunks` gelaufen ist: Live-Daten jenseits des REST-Fensters (48 h) wären
@@ -420,15 +429,23 @@ async function replay(argv: string[]): Promise<number> {
       symbol: { type: 'string' },
       day: { type: 'string' },
       db: { type: 'boolean' },
+      'db-name': { type: 'string' },
       'data-dir': { type: 'string' },
     },
   });
-  if (!v.symbol || !v.day) throw new Error('replay --symbol S --day YYYY-MM-DD [--db]');
+  if (!v.symbol || !v.day)
+    throw new Error('replay --symbol S --day YYYY-MM-DD [--db --db-name <test-db>]');
+  // --db ersetzt den Tag in der Datenbank: nur mit ausdrücklich genannter Test-Datenbank
+  // (replayDay prüft zusätzlich current_database() gegen TEST_DB_PATTERN)
+  if (v.db && !v['db-name'])
+    throw new Error(
+      'replay --db verlangt --db-name <test-db> (nie die Entwicklungs-/Produktions-DB)',
+    );
   const r = await replayDay({
     dataDir: v['data-dir'] ?? process.env.OF_DATA_DIR ?? 'data',
     symbol: v.symbol,
     day: parseDay(v.day),
-    db: v.db ? parseConfig(process.env).db : null,
+    db: v.db ? { ...parseConfig(process.env).db, database: v['db-name']! } : null,
     log: logLine,
   });
   logLine('replay result', r as unknown as Record<string, unknown>);
@@ -444,7 +461,7 @@ export async function main(argv: string[]): Promise<number> {
     process.exit(code);
   }
   if (cmd === 'replay') return replay(rest);
-  console.error('Verwendung: main.ts run | replay --symbol S --day D [--db]');
+  console.error('Verwendung: main.ts run | replay --symbol S --day D [--db --db-name <test-db>]');
   return 2;
 }
 
