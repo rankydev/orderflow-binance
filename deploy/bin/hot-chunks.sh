@@ -9,6 +9,11 @@
 #   docker exec -i orderflow-db psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow \
 #     < /opt/orderflow-binance/sql/hot-chunks.sql
 set -euo pipefail
+case "${1:-}" in
+  '' | --require-zero) ;;
+  *) echo "hot-chunks: unbekanntes Argument: $1 (nur --require-zero)" >&2; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "hot-chunks: zu viele Argumente" >&2; exit 2; }
 SQL=${OF_HOT_SQL:-/opt/orderflow-binance/sql/hot-chunks.sql}
 C=${OF_DB_CONTAINER:-orderflow-db}
 out=$(docker exec -i "$C" psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow < "$SQL")

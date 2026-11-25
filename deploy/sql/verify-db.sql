@@ -161,7 +161,8 @@ SELECT 'dbsetting|' || coalesce(pg_get_userbyid(nullif(setrole, 0)), '*') || '|'
 -- Informativ (darf abweichen): Größen, Jobzeitpunkte
 SELECT CASE WHEN to_regprocedure('public.of_hot_margin()') IS NULL THEN 'interval ''3 days'''
             ELSE 'public.of_hot_margin()' END AS hot_margin_expr \gset
--- Offene („heiße") Chunks im Columnstore (Prädikat wie hot-chunks.sql / repair-open-chunks): nur
+-- Offene („heiße") Chunks im Columnstore (Prädikat wie hot-chunks.sql / repair-open-chunks; bei
+-- einer Änderung beide Stellen anpassen – hier inline, weil der Bericht eigenständig läuft): nur
 -- informativ, weil die Zahl von der Uhrzeit abhängt (now() − Marge, ab 0016 of_hot_margin()) und Quell- und Zielbericht zu
 -- verschiedenen Zeiten laufen. Den Zustand selbst vergleichen die chunkrange|-Zeilen exakt (Grenzen
 -- + is_compressed). Die harte Prüfung „0" gehört nach repair-open-chunks und vor den

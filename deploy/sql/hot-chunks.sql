@@ -11,23 +11,25 @@
 \pset footer off
 SELECT CASE WHEN to_regprocedure('public.of_hot_margin()') IS NULL THEN 'interval ''3 days'''
             ELSE 'public.of_hot_margin()' END AS hot_margin_expr \gset
-SELECT 'hot|' || format('%I.%I', c.chunk_schema, c.chunk_name) || '|' || c.hypertable_name || '|'
-       || c.range_end || '|status=' || k.status
-  FROM timescaledb_information.chunks c
-  JOIN _timescaledb_catalog.chunk k ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
- WHERE c.hypertable_schema = 'public'
-   AND c.hypertable_name IN ('fp_1m', 'fp_1m_b10', 'fp_5m_b10', 'fp_15m_b100', 'fp_1h_b10',
-                             'fp_1h_b100', 'fp_1d_b100', 'fp_1d_b1000', 'bar_1m', 'bar_1h',
-                             'bar_1d', 'kline_1m')
-   AND (k.status & 1) <> 0 AND (k.status & 4) = 0 AND NOT k.osm_chunk
-   AND c.range_end > now() - :hot_margin_expr
- ORDER BY c.hypertable_name, c.range_start;
-SELECT 'hot_count|' || count(*)
-  FROM timescaledb_information.chunks c
-  JOIN _timescaledb_catalog.chunk k ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
- WHERE c.hypertable_schema = 'public'
-   AND c.hypertable_name IN ('fp_1m', 'fp_1m_b10', 'fp_5m_b10', 'fp_15m_b100', 'fp_1h_b10',
-                             'fp_1h_b100', 'fp_1d_b100', 'fp_1d_b1000', 'bar_1m', 'bar_1h',
-                             'bar_1d', 'kline_1m')
-   AND (k.status & 1) <> 0 AND (k.status & 4) = 0 AND NOT k.osm_chunk
-   AND c.range_end > now() - :hot_margin_expr;
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+-- Prädikat genau einmal (CTE); Liste und Anzahl aus derselben Momentaufnahme
+WITH hot AS (
+  SELECT format('%I.%I', c.chunk_schema, c.chunk_name) AS chunk, c.hypertable_name AS ht,
+         c.range_start, c.range_end, k.status
+    FROM timescaledb_information.chunks c
+    JOIN _timescaledb_catalog.chunk k ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
+   WHERE c.hypertable_schema = 'public'
+     AND c.hypertable_name IN ('fp_1m', 'fp_1m_b10', 'fp_5m_b10', 'fp_15m_b100', 'fp_1h_b10',
+                               'fp_1h_b100', 'fp_1d_b100', 'fp_1d_b1000', 'bar_1m', 'bar_1h',
+                               'bar_1d', 'kline_1m')
+     AND (k.status & 1) <> 0 AND (k.status & 4) = 0 AND NOT k.osm_chunk
+     AND c.range_end > now() - :hot_margin_expr
+)
+SELECT line FROM (
+  SELECT 0 AS o, ht AS h, range_start AS r,
+         'hot|' || chunk || '|' || ht || '|' || range_end || '|status=' || status AS line
+    FROM hot
+  UNION ALL
+  SELECT 1, '', NULL, 'hot_count|' || count(*) FROM hot
+) x ORDER BY o, h, r;
+COMMIT;

@@ -36,6 +36,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -z "$ALLOW" ] || [ "$MIGRATE" = 0 ] || die "--allow-pending-migrations und --migrate schließen sich aus"
+[ -z "$ALLOW" ] || [ "$ROLLBACK" = 0 ] || die "--allow-pending-migrations und --rollback schließen sich aus"
 
 if [ "$ROLLBACK" = 0 ]; then
   [ -n "$ID" ] || die "Release-ID fehlt (Ausgabe von deploy/build-release.sh)"
@@ -78,6 +79,10 @@ else
   st=$(OF_RELEASE=$ID $C run --rm -T ops node packages/db/src/cli.ts status </dev/null)
   printf '%s\n' "$st" >&2
   pending=$(printf '%s\n' "$st" | sed -n 's/^ausstehend *\([0-9]\{4\}\)_.*/\1/p' | sort | paste -sd, -)
+  # jede „ausstehend"-Zeile muss eine erkannte Nummer liefern (sonst wäre die Liste unvollständig)
+  n_lines=$(printf '%s\n' "$st" | grep -c '^ausstehend' || true)
+  n_ids=$(printf '%s' "$pending" | tr ',' '\n' | grep -c . || true)
+  [ "$n_lines" = "$n_ids" ] || { say "Migrationsstatus nicht lesbar ($n_lines ausstehend-Zeilen, $n_ids Nummern) – Abbruch"; exit 1; }
   if [ -n "$ALLOW" ]; then
     want=$(printf '%s' "$ALLOW" | tr ',' '\n' | sort | paste -sd, -)
     say "ausstehend: ${pending:-keine}; erlaubt (ohne Anwendung): $want"

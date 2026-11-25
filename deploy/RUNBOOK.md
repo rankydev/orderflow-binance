@@ -222,20 +222,25 @@ machten ihn dauerhaft teilweise komprimiert, daher vor dem Recorder:
 2. Migrationen 0013–0016 zusammen anwenden (`release.sh <id> --migrate` mit einem Release, das
    alle vier enthält); ab 0015 komprimieren weder Importer noch `of_recompress_chunk` offene
    Chunks, ab 0016 steht die Marge in `of_hot_margin()` (Policies: `compress_after` 4 Tage).
-3. Bestand ansehen (nur lesend): `/opt/orderflow-binance/bin/hot-chunks.sh` bzw. ohne Installation
+3. `deploy/install-server.sh` erneut ausführen (idempotent; installiert dabei auch
+   `compose.prod.yml`, die SQL-Dateien, `bin/` – darunter `hot-chunks.sh` – und die
+   systemd-Units neu; Secrets bleiben, fehlende werden erzeugt).
+4. Bestand ansehen (nur lesend): `/opt/orderflow-binance/bin/hot-chunks.sh` bzw. ohne Installation
    `docker exec -i orderflow-db psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow < /opt/orderflow-binance/sql/hot-chunks.sql`.
-4. Probelauf und Liste prüfen:
+5. Probelauf und Liste prüfen:
    `docker compose … run --rm ops node apps/importer/src/main.ts repair-open-chunks --dry-run </dev/null`
    (als `of_admin`, ops-Container; das Image muss `apps/importer` enthalten – tut es).
-5. Reparatur: `… repair-open-chunks --lock-timeout-ms 500 </dev/null`. Je Chunk eine Transaktion
+6. Reparatur: `… repair-open-chunks --lock-timeout-ms 500 </dev/null`. Je Chunk eine Transaktion
    mit `LOCK … ACCESS EXCLUSIVE` + `convert_to_rowstore` (auf dem Mac: 9 Chunks, längste Sperre
    824 ms, Digests unverändert). Die API bleibt an; kurze 503 sind möglich (API: `lock_timeout`
    1 s, 3 Wiederholungen), der Client wiederholt sie.
-6. Zweiter Probelauf muss **0** melden; `hot-chunks.sh --require-zero` muss Exit 0 liefern.
-7. Prüfbericht vorher/nachher: `verify-db.sql` auf dem Server vor Schritt 5 und nach Schritt 6;
-   die `digest|`- und `data_day|`-Zeilen müssen identisch sein (nur `chunkrange|…|true → false`
-   der reparierten Chunks und `info|`-Zeilen dürfen sich ändern).
-8. Erst dann den Recorder starten und in seinem Health `hotCompressedChunks: 0` verlangen.
+7. Zweiter Probelauf muss **0** melden; `hot-chunks.sh --require-zero` muss Exit 0 liefern.
+8. Prüfbericht vorher/nachher: `verify-db.sql` auf dem Server vor Schritt 6 und nach Schritt 7;
+   verglichen werden nur die `digest|`- und `data_day|`-Zeilen (müssen identisch sein). Alles
+   andere darf sich ändern: `chunkrange|…|true → false` der reparierten Chunks, `info|`-Zeilen
+   und, falls eine Columnstore-Policy dazwischen lief, Chunk-/Job-Zustände – oder die Policies
+   für die Dauer anhalten (`alter_job(…, scheduled => false)` und danach wieder an).
+9. Erst dann den Recorder starten und in seinem Health `hotCompressedChunks: 0` verlangen.
 
 **Harte Regel:** `repair-open-chunks` nie parallel zu `transfer-db.sh` oder einem
 `verify-db.sql`-Bericht. `convert_to_rowstore` ist für ältere Snapshots nicht MVCC-sicher: eine
