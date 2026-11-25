@@ -12,7 +12,7 @@ export const PARTIAL_ALERT_AGE_MS = 3600_000;
 
 export interface PartialChunkState {
   count: number;
-  /** offene Chunks (range_end > now() - 3 Tage) im Columnstore: darf es nie geben (0015) */
+  /** offene Chunks (range_end > now() - of_hot_margin()) im Columnstore: darf es nie geben (0015) */
   hotCompressed: number;
   oldestAgeMs: number;
   firstSeen: Record<string, number>;

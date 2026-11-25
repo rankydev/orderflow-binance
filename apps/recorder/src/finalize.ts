@@ -195,15 +195,18 @@ export async function finaliseDay(o: FinaliseOptions): Promise<FinaliseResult> {
       return (a[0] as { data: { day: number } }).data.day === o.day ? 'conversion' : 'cascade';
     return null;
   };
+  // Review H3: nur die bekannten asynchronen Schreibmethoden umhüllen; alles andere (auch eine
+  // künftige synchrone Methode) bleibt unverändert, nur an den Writer gebunden.
+  const WRAPPED = new Set<PropertyKey>(['writeDay', 'resolveEdge', 'markStale', 'touchDay']);
   const tracked = new Proxy(writer, {
     get(t, k, r) {
       const v = Reflect.get(t, k, r) as unknown;
       if (typeof v !== 'function') return v;
+      if (!WRAPPED.has(k)) return (v as (...x: unknown[]) => unknown).bind(t);
       return async (...a: unknown[]) => {
-        const p = phaseOf(k, a);
-        if (p) phase = p;
+        phase = phaseOf(k, a)!;
         const out = await (v as (...x: unknown[]) => Promise<unknown>).apply(t, a);
-        if (p) phase = 'other';
+        phase = 'other';
         return out;
       };
     },

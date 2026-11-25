@@ -116,6 +116,18 @@ async function run(): Promise<number> {
   const db = parseConfig(process.env).db;
   const writer = new LiveWriter(db, (s) => logLine(s));
   await writer.open();
+  // Review H2a – Start-Prüfung: offene Chunks im Columnstore (dürfen seit 0015 nie vorkommen).
+  // Der Recorder startet trotzdem, meldet aber sofort Alarm und bleibt unhealthy, bis
+  // `importer repair-open-chunks` gelaufen ist: Live-Daten jenseits des REST-Fensters (48 h) wären
+  // bei einer Startverweigerung unwiederbringlich verloren, das Schreiben in einen komprimierten
+  // Chunk ist dagegen korrekt (nur teilweise komprimiert) und durch die Reparatur behebbar.
+  {
+    const hot = await writer.hotCompressedChunks();
+    if (hot.length > 0)
+      logLine('PREFLIGHT ALERT: open chunks in columnstore, run importer repair-open-chunks', {
+        chunks: hot,
+      });
+  }
   const rest = new BinanceRest(cfg.restBase, new WeightBudget(cfg.weightPerMin), getSymbol);
   const clients = new Set<ServerResponse>();
   const rec = new Recorder({
@@ -212,7 +224,11 @@ async function run(): Promise<number> {
     );
     return {
       healthy:
-        fresh && free >= cfg.minFreeBytes && rec.stream?.connected === true && rec.spoolEnabled,
+        fresh &&
+        free >= cfg.minFreeBytes &&
+        rec.stream?.connected === true &&
+        rec.spoolEnabled &&
+        partialState.hotCompressed === 0,
       spoolEnabled: rec.spoolEnabled,
       spoolPrunedDays: rec.spoolPruned.length,
       rawPrunedFiles,

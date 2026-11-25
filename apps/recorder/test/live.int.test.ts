@@ -6,10 +6,10 @@ import { getSymbol, parseConfig, parseDay, type DbConfig } from '@orderflow/core
 import { connect, dropAndCreateDatabase, migrateUp, type Sql } from '@orderflow/db';
 import {
   DryRunWriter,
-  HOT_MARGIN,
   Importer,
   PostgresWriter,
   repairOpenChunks,
+  assertTestDatabase,
 } from '@orderflow/importer';
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -331,6 +331,21 @@ describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5
     }
   });
 
+  it('of_hot_margin() ist die eine Quelle der Marge; Policies komprimieren erst nach 4 Tagen (0016)', async () => {
+    const [m] = await sql`SELECT of_hot_margin()::text AS m`;
+    expect(m!.m).toBe('3 days');
+    const after = await sql`
+      SELECT DISTINCT config ->> 'compress_after' AS a FROM timescaledb_information.jobs
+       WHERE proc_name IN ('policy_compression', 'policy_columnstore')`;
+    expect(after.map((r) => r.a)).toEqual(['4 days']);
+    // unter der Recorder-Rolle aufrufbar
+    const [c] = await sql`
+      SELECT format('%I.%I', chunk_schema, chunk_name) AS c FROM timescaledb_information.chunks
+       WHERE hypertable_name = 'fp_1m' ORDER BY range_start LIMIT 1`;
+    const [h] = await rsql`SELECT of_chunk_is_hot(${c!.c as string}::regclass) AS hot`;
+    expect(h!.hot).toBe(false); // September-Testdaten: kalt
+  });
+
   it('jede Columnstore-Policy eines Projekt-Hypertables hat recompress=false (H2: auch künftige Migrationen)', async () => {
     const rows = await sql`
       SELECT h.hypertable_name AS t, j.job_id, j.config
@@ -350,12 +365,12 @@ describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5
        WHERE proc_name IN ('policy_compression', 'policy_columnstore')
          AND coalesce((config ->> 'recompress')::boolean, true)`;
     expect(odd!.n).toBe(0);
-    // 0015: Policy-Frist mindestens die Marge für offene Chunks (HOT_MARGIN = 3 Tage); die Policy
+    // 0015/0016: Policy-Frist mindestens die Marge für offene Chunks (of_hot_margin()); die Policy
     // vergleicht mit range_end, damit komprimiert auch sie nie einen offenen Chunk
     const [short] = await sql`
       SELECT count(*)::int AS n FROM timescaledb_information.jobs
        WHERE proc_name IN ('policy_compression', 'policy_columnstore')
-         AND coalesce((config ->> 'compress_after')::interval, interval '0') < ${HOT_MARGIN}::interval`;
+         AND coalesce((config ->> 'compress_after')::interval, interval '0') < of_hot_margin()`;
     expect(short!.n).toBe(0);
   });
 
@@ -470,7 +485,7 @@ describe('Offene Chunks nie im Columnstore (Migration 0015)', () => {
       SELECT format('%I.%I', c.chunk_schema, c.chunk_name) AS c, c.hypertable_name AS h, k.status
         FROM timescaledb_information.chunks c
         JOIN _timescaledb_catalog.chunk k ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
-       WHERE c.hypertable_schema = 'public' AND c.range_end > now() - interval '3 days'
+       WHERE c.hypertable_schema = 'public' AND c.range_end > now() - of_hot_margin()
        ORDER BY 2`;
   const compressedOrPartial = async () =>
     (await hotChunks()).filter((c) => ((c.status as number) & 9) !== 0).map((c) => c.h as string);
@@ -562,7 +577,33 @@ describe('Offene Chunks nie im Columnstore (Migration 0015)', () => {
     const [cnt0] =
       await sql`SELECT (SELECT count(*) FROM fp_1m) + (SELECT count(*) FROM bar_1m) AS n`;
     const logs: string[] = [];
+    // H2b: der Importer warnt beim Öffnen
+    const wlogs: string[] = [];
+    const iw = new PostgresWriter(cfg, BTC, { log: (m) => wlogs.push(m) });
+    await iw.open();
+    await iw.close();
+    expect(wlogs.some((l) => /offene Chunks im Columnstore.*repair-open-chunks/.test(l))).toBe(
+      true,
+    );
+    // W1: eine andere offene Transaktion (z. B. ein REPEATABLE-READ-Prüfbericht) blockiert die Reparatur
     const maint = connect(cfg);
+    const other = connect(cfg);
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let opened!: () => void;
+    const isOpen = new Promise<void>((r) => (opened = r));
+    const holding = other.begin('isolation level repeatable read read only', async (tx) => {
+      await tx`SELECT 1`;
+      opened();
+      await released;
+    });
+    await isOpen;
+    await expect(repairOpenChunks(maint, {})).rejects.toThrow(/andere offene Transaktion/);
+    expect((await repairOpenChunks(maint, { dryRun: true })).length).toBe(before.length);
+    release();
+    await holding;
+    await other.end();
+    expect(await assertTestDatabase(maint)).toMatch(/_test_recorder$/);
     const rep = await repairOpenChunks(maint, { log: (m) => logs.push(m) });
     expect(rep.map((r) => r.hypertable).sort()).toEqual(before);
     expect(rep.every((r) => r.convertMs !== null && r.lockWaitMs !== null)).toBe(true);

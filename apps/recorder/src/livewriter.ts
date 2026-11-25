@@ -254,7 +254,7 @@ export class LiveWriter {
     return rows.map((r) => r.c as string);
   }
 
-  /** Offene Chunks (range_end > now() - 3 Tage) der Projekttabellen im Columnstore (Migration 0015). */
+  /** Offene Chunks (range_end > now() - of_hot_margin()) der Projekttabellen im Columnstore (Migration 0015). */
   async hotCompressedChunks(): Promise<string[]> {
     const rows = await this.db`
       SELECT format('%I.%I', c.chunk_schema, c.chunk_name) AS c
@@ -262,7 +262,7 @@ export class LiveWriter {
         JOIN _timescaledb_catalog.chunk k
           ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
        WHERE c.hypertable_schema = 'public' AND (k.status & 1) <> 0
-         AND c.range_end > now() - interval '3 days'
+         AND c.range_end > now() - of_hot_margin()
        ORDER BY 1`;
     return rows.map((r) => r.c as string);
   }
