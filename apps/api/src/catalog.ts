@@ -85,6 +85,7 @@ export interface SymbolState {
 export interface CatalogOptions {
   pollMs: number;
   lockRetries: number;
+  /** Quellzeilengrenze je Kachel für das Angebot (cfg.maxTileSourceRows). */
   maxSourceRows: number;
   log: (level: 'info' | 'warn' | 'error', msg: string, obj?: Record<string, unknown>) => void;
 }
@@ -389,8 +390,8 @@ export function referenceRows(
 
 /**
  * Kachellänge je (tf, R) nach TILE-FORMAT.md: m = ceil(1,5 · P95 der Tagesmaxima der Zeilen je Bar),
- * n = clamp(2^floor(log2(30 000 / m)), 32, 1024), angeboten nur bei 32 · m ≤ 60 000 und wenn eine
- * Kachel die Quellzeilengrenze sicher einhält (größte Tageszeilenzahl der Quelle + Bar-Tabelle,
+ * n = clamp(2^floor(log2(30 000 / m)), 32, 1024), so weit halbiert, dass eine Kachel die
+ * Quellzeilengrenze sicher einhält; angeboten nur bei 32 · m ≤ 60 000 und wenn auch n = 32 sie einhält (größte Tageszeilenzahl der Quelle + Bar-Tabelle,
  * über alle Tage, × Kachelspanne ≤ maxSourceRows) – sonst bekäme der Client für eine angebotene
  * Kombination ein 422. Kacheln, die trotzdem über 60 000 Zellen kommen (Ausreißer-Tage oberhalb des
  * P95, nicht finale Tage), lehnt der Wächter in routes/tiles.ts einzeln mit 422 ab.
@@ -409,14 +410,17 @@ export function computeTiles(
       if (R * s.tickRefUnits < s.tickUnits) return;
       const rows = referenceRows(s, tf, i);
       if (rows === 0) return;
-      const n = tileBarsForMax(rows);
+      let n = tileBarsForMax(rows);
       if (n === null) return;
       const table = chooseFpSource(tfSec / 60, R, avg as Record<FpTableName, number>);
-      const spanDays = (n * tfSec) / 86_400;
       const bar = barTableFor(tfSec / 60);
       let barMax = 0;
       for (const st of s.stats.values()) barMax = Math.max(barMax, st.rows.get(bar) ?? 0);
-      if ((max[table]! + barMax) * spanDays > maxSourceRows) return;
+      // Quellzeilengrenze je Kachel: n halbieren, bis eine Kachel sie sicher einhält; reicht selbst
+      // n = 32 nicht, wird (tf, R) nicht angeboten
+      const est = (bars: number) => ((max[table]! + barMax) * bars * tfSec) / 86_400;
+      while (n > 32 && est(n) > maxSourceRows) n /= 2;
+      if (est(n) > maxSourceRows) return;
       m[String(R)] = n;
       src.set(`${tf}|${R}`, table);
     });

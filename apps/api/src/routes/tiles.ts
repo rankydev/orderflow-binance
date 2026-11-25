@@ -189,9 +189,10 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     const rowsOn = rowsOnFor(s);
     const est = estimateRows(table, from, to, rowsOn) + estimateRows(barTable, from, to, rowsOn);
     req.ctx.rowsEstimate = est;
-    if (est > deps.cfg.maxSourceRows) {
+    const tileCap = Math.min(deps.cfg.maxTileSourceRows, deps.cfg.maxSourceRows);
+    if (est > tileCap) {
       // Kommt bei angebotenen Kombinationen nicht vor (computeTiles prüft dieselbe Grenze).
-      throw unprocessable(`Kachel zu groß (≈ ${est} Quellzeilen > ${deps.cfg.maxSourceRows})`);
+      throw unprocessable(`Kachel zu groß (≈ ${est} Quellzeilen > ${tileCap})`);
     }
     const width = R * s.tickRefUnits;
     return serveVersioned(deps, req, reply, key, pre, async (ctx) => {

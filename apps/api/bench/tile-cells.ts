@@ -11,7 +11,7 @@ const sql = createPool(cfg, 'orderflow-api-tile-cells');
 const cat = new Catalog(sql, {
   pollMs: 1e9,
   lockRetries: 3,
-  maxSourceRows: cfg.maxSourceRows,
+  maxSourceRows: Math.min(cfg.maxTileSourceRows, cfg.maxSourceRows),
   log: () => {},
 });
 await cat.refresh();

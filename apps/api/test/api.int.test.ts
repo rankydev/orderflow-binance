@@ -919,7 +919,7 @@ describe('Grenzen (422 mit Vorschlag)', () => {
   beforeAll(async () => {
     // Grenzen passend zu den synthetischen Daten: Zeilen eines Tages bei R = 100 minus 1
     cells100 = refProfile(dataFrom, dataFrom + DAY_MS, 100 * TICK).buy.length;
-    api = await start({ maxSourceRows: 3_000, maxCells: cells100 - 1 });
+    api = await start({ maxSourceRows: 3_000, maxTileSourceRows: 3_000, maxCells: cells100 - 1 });
   });
   afterAll(async () => api?.close());
 

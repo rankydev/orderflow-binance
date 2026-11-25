@@ -97,9 +97,11 @@ Ref      = P95 von rows(d) über die Referenztage = der (⌊N/20⌋ + 1)-größt
            (N < 20: das Maximum). Referenztage: alle unveränderlichen Tage (data_day.immutable);
            gibt es keinen, alle Tage mit Daten.
 m        = ceil(1,5 · Ref)                      (Sicherheitszuschlag TILE_ROWS_MARGIN)
-n        = clamp(2^floor(log2(30 000 / m)), 32, 1024)
-angeboten nur, wenn 32 · m ≤ 60 000 und (größte Tageszeilenzahl der Quelltabelle + Bar-Tabelle,
-           über alle Tage) × Kachelspanne in Tagen ≤ 1,5 Mio. (Quellzeilengrenze, §1.4)
+n        = clamp(2^floor(log2(30 000 / m)), 32, 1024), dann halbiert (nicht unter 32), solange
+           (größte Tageszeilenzahl der Quelltabelle + Bar-Tabelle, über alle Tage) × n · tf in Tagen
+           > 300 000 (Quellzeilengrenze je Kachel, OF_API_MAX_TILE_SOURCE_ROWS; enger als die
+           1,5 Mio. der Profile, §1.4)
+angeboten nur, wenn 32 · m ≤ 60 000 und die Quellzeilengrenze je Kachel auch bei diesem n gilt
 ```
 
 - **Garantie:** **Jede ausgelieferte Kachel hat ≤ 60 000 Zellen.** Der Server zählt die Zellen jeder Kachel
@@ -110,9 +112,16 @@ angeboten nur, wenn 32 · m ≤ 60 000 und (größte Tageszeilenzahl der Quellta
   `tileConfigVersion` bleiben unverändert. Betroffen sein können nur Kacheln über Tagen oberhalb des P95 und
   über nicht finalen Tagen. Richtwert ohne Ausreißer: Zellen ≤ n · m ≤ 30 000 (bei n = 32: ≤ 60 000).
 - **Gemessen (BTCUSDT, 167 Tage, exakte Zählung über die gesamte Historie, `apps/api/bench/tile-cells.ts`):**
-  für alle 78 angebotenen (tf, R) 0 Kacheln über 30 000 und 0 über 60 000; größte Kachel 14 614 Zellen (1d,
-  R = 50). Neu angeboten gegenüber der Maximum-Regel: 1m R = 10 und 20, 3m/5m/15m/30m R = 20, 1d R = 50; für
-  viele bestehende (tf, R) ist n doppelt so groß.
+  für alle 77 angebotenen (tf, R) 0 Kacheln über 30 000 und 0 über 60 000; größte Kachel 12 811 Zellen (30m,
+  R = 20). Neu angeboten gegenüber der Maximum-Regel: 1m R = 10 und 20, 3m/5m/15m/30m R = 20; für viele
+  bestehende (tf, R) ist n doppelt so groß.
+- **Quellzeilengrenze je Kachel (2026-11-25):** 300 000 statt 1,5 Mio., damit jede angebotene Kachel auch
+  auf dem 2-vCPU-VPS im Budget (p95 ≤ 250 ms warm) bleibt. Gemessen fiel damit nur 1d R = 50 heraus (≈ 325 000
+  geschätzte Zeilen aus `fp_1h_b10` schon bei n = 32, p95 ≈ 100 ms auf dem Mac); bei 3m R ≥ 1 000 und 4h
+  R ≥ 2 000 halbiert sich n von 1 024 auf 512. Die Bedingung ist wie die übrige Regel
+  deterministisch (größte Tageszeilenzahl über alle gespeicherten Tage × feste Kachelspanne); ein Tag mit mehr
+  Zeilen kann eine Kombination aus dem Angebot nehmen (neue `tileConfigVersion`). Profile und `/bars` behalten
+  die Grenze 1,5 Mio. (`OF_API_MAX_SOURCE_ROWS`).
 - **Stabilität:** Nicht finale Tage (der laufende Tag, ab P2 provisorische Live-Minuten) zählen nicht, damit sich
   `tiles` nicht im Tagesverlauf ändert. Ein zusätzlicher oder neu importierter Referenztag verschiebt `Ref`
   höchstens um einen Rang (zum benachbarten Wert der sortierten Tagesmaxima, oder um N/20 einen Rang weiter);
@@ -223,7 +232,7 @@ Umgesetzt in `apps/api` (Katalog `src/catalog.ts`, Routen `src/routes/tiles.ts`)
   neu berechnet.
 - **Angeboten** wird (tf, R) für alle Zeitrahmen aus KONZEPT §5.2 (1m … 1d) und R auf der Leiter bis
   10 000 Ticks mit `R · tickRefUnits ≥ tickUnits`, nach der Regel im Abschnitt „Kachellänge" (P95 der
-  Tagesmaxima, Zellregel, Quellzeilengrenze). Für eine angebotene Kombination gibt es nie ein 422 wegen der
+  Tagesmaxima, Zellregel, Quellzeilengrenze je Kachel 300 000). Für eine angebotene Kombination gibt es nie ein 422 wegen der
   Quellzeilen; ein 422 mit `reason = "tile_cells_exceeded"` betrifft nur die einzelne Ausreißer-Kachel.
 - **`cfg` ist Pflicht** (fehlt → 400). Die 409-Antwort trägt die aktuelle Version:
   `{ "error": …, "tileConfigVersion": <aktuell> }`.

@@ -191,6 +191,30 @@ describe('computeTiles (TILE-FORMAT.md Kachellänge)', () => {
     expect(src.get('1d|100')).toBe('fp_1d_b100');
   });
 
+  it('engere Quellzeilengrenze für Kacheln (300 000) nimmt teure Kombinationen aus dem Angebot', () => {
+    // 1d, Spanne 30 000 Ticks, R = 50 → n = 32, Quelle fp_1h_b10 (10 000 Zeilen/Tag): 32 Tage ≈ 320 000
+    const s = {
+      tickRefUnits: 10,
+      tickUnits: 10,
+      days: new Map(),
+      stats: new Map([[1, stats({ '1d': 30_000 }, rows)]]),
+    };
+    expect(computeTiles(s, 1_500_000).tiles['1d']?.['50']).toBe(32);
+    const capped = computeTiles(s, 300_000);
+    expect(capped.tiles['1d']?.['50']).toBeUndefined();
+    expect(capped.tiles['1d']?.['100']).toBeDefined();
+    // grobe R mit großer Kachel: n wird halbiert statt die Kombination zu streichen
+    const coarse = {
+      ...s,
+      stats: new Map([[1, stats({ '4h': 1000 }, { ...rows, fp_1h_b100: 2_000 })]]),
+    };
+    // 4h R = 10 000: n = 1024 (170 Tage × 2 000 ≈ 341 000 > 300 000) → 512
+    expect(computeTiles(coarse, 1_500_000).tiles['4h']!['10000']).toBe(1024);
+    expect(computeTiles(coarse, 300_000).tiles['4h']!['10000']).toBe(512);
+    // deterministisch: gleiche Eingabe, gleiche Konfiguration
+    expect(configVersion(computeTiles(s, 300_000).tiles)).toBe(configVersion(capped.tiles));
+  });
+
   it('R unter dem aktuellen Tick wird nicht angeboten', () => {
     const s = {
       tickRefUnits: 10,

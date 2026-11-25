@@ -32,7 +32,8 @@ export async function startApi(
   const catalog = new Catalog(catSql, {
     pollMs: cfg.pollMs,
     lockRetries: cfg.lockRetries,
-    maxSourceRows: cfg.maxSourceRows,
+    // Angebot der Kacheln: Quellzeilengrenze je Kachel (nicht die der Profile)
+    maxSourceRows: Math.min(cfg.maxTileSourceRows, cfg.maxSourceRows),
     log: (level, msg, obj) => app?.log[level](obj ?? {}, msg),
   });
   const deps: Deps = { cfg, sql, catalog, cache, limiter };

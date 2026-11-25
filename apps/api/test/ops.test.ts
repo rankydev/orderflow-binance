@@ -47,6 +47,8 @@ describe('Konfiguration (W2, W3, Diagnose)', () => {
     expect(c.adminPort).toBe(8781);
     expect(c.diagHeaders).toBe(false);
     expect(c.nonFinalTtlMs).toBe(10_000);
+    expect(c.maxTileSourceRows).toBe(300_000);
+    expect(c.maxSourceRows).toBe(1_500_000);
     expect(parseApiConfig({ ...env, OF_API_DIAG_HEADERS: '1' }).diagHeaders).toBe(true);
     expect(parseApiConfig({ ...env, OF_API_ADMIN_PORT: '0' }).adminPort).toBe(0);
     expect(() => parseApiConfig({ ...env, OF_API_ADMIN_PORT: '8780' })).toThrow(/ADMIN_PORT/);

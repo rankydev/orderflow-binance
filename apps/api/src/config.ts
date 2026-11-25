@@ -29,6 +29,11 @@ export interface ApiConfig {
   pollMs: number;
   /** Höchstzahl geschätzter Quellzeilen je Anfrage (KONZEPT §1.4). */
   maxSourceRows: number;
+  /**
+   * Höchstzahl geschätzter Quellzeilen je Footprint-Kachel (Standard 300 000): engere Grenze als für
+   * Profile, damit eine angebotene Kachel auch auf dem 2-vCPU-VPS im Budget bleibt (TILE-FORMAT.md).
+   */
+  maxTileSourceRows: number;
   /** Harte Zeilengrenze je Profil-Antwort (KONZEPT §1.4); Kacheln folgen TILE-FORMAT.md (60 000). */
   maxCells: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
@@ -127,6 +132,7 @@ export function parseApiConfig(env: Env): ApiConfig {
     cacheBytes: intIn(problems, env, 'OF_API_CACHE_MB', 200, 0, 4096) * 1024 * 1024,
     pollMs: intIn(problems, env, 'OF_API_POLL_MS', 1_000, 100, 600_000),
     maxSourceRows: intIn(problems, env, 'OF_API_MAX_SOURCE_ROWS', 1_500_000, 1, 1e9),
+    maxTileSourceRows: intIn(problems, env, 'OF_API_MAX_TILE_SOURCE_ROWS', 300_000, 1, 1e9),
     maxCells: intIn(problems, env, 'OF_API_MAX_CELLS', 60_000, 1, 1e7),
     logLevel: base?.logLevel ?? 'info',
     nonFinalTtlMs: intIn(problems, env, 'OF_API_NONFINAL_TTL_MS', 10_000, 0, 600_000),
