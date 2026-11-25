@@ -33,6 +33,11 @@ export const PROVISIONAL_DAY = 20_730;
 export const OUTLIER_MINUTE = 600;
 export const OUTLIER_ROWS = 31_000;
 export const OUTLIER_MS = PROVISIONAL_DAY * 86_400_000 + OUTLIER_MINUTE * 60_000;
+/** Echte Lücke am unveränderlichen BAD_DAY: keine Trades 05:00–09:00 UTC (wie ein Börsenausfall). */
+export const HOLE_FROM_MIN = 300;
+export const HOLE_TO_MIN = 540;
+/** Der provisorische (Live-)Tag hat Daten nur bis 15:00 UTC, danach nichts (unfertiger Tag). */
+export const PROVISIONAL_UNTIL_MIN = 900;
 
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
@@ -74,6 +79,8 @@ function dayTrades(day: number, rnd: () => number, state: { a: number; tid: numb
       }
     }
     if (rnd() < 0.2) continue; // Minuten ohne Trades
+    if (day === BAD_DAY && m >= HOLE_FROM_MIN && m < HOLE_TO_MIN) continue;
+    if (day === PROVISIONAL_DAY && m >= PROVISIONAL_UNTIL_MIN) continue;
     const k = 1 + Math.floor(rnd() * 4);
     let T = t0 + m * MINUTE_MS + Math.floor(rnd() * 1000);
     if (rnd() < 0.03) state.px += (rnd() < 0.5 ? -1 : 1) * 600 * TICK; // breite Bars
@@ -139,6 +146,14 @@ function fpJson(t: FpTable): string {
       `{"sym_id":${SYM_ID},"ts":"${iso(t.ts[i]!)}","px":${t.px[i]},"buy_q":${t.buyQ[i]},"sell_q":${t.sellQ[i]},"buy_a":${t.buyA[i]},"sell_a":${t.sellA[i]}}`,
     );
   return `[${rows.join(',')}]`;
+}
+
+/** bar_1m-Zeilen einfügen (Tests: Wiederherstellung nach absichtlichem Löschen). */
+export async function insertBars1m(admin: Sql, bars: Bar[]): Promise<void> {
+  await admin.unsafe(
+    `INSERT INTO bar_1m SELECT * FROM json_populate_recordset(NULL::bar_1m, ($1::text)::json)`,
+    [barJson(bars, true)],
+  );
 }
 
 function barJson(bars: Bar[], minute: boolean): string {

@@ -63,6 +63,12 @@ export interface DayStats {
   maxRows: Map<Timeframe, Int32Array>;
   /** Zeilen je Tabelle an diesem Tag */
   rows: Map<FpTableName | BarTable, number>;
+  /**
+   * Minuten mit Trades je UTC-Stunde (bar_1m-Zeilen, 24 Einträge), im selben gesperrten Snapshot wie
+   * die Version gezählt: Grundlage der Leerprüfung (consistency.ts) – was der Importer bzw. Recorder für
+   * genau diese Stunde gespeichert hat, keine Schätzung.
+   */
+  hours?: Int16Array;
 }
 
 export interface SymbolState {
@@ -440,8 +446,37 @@ export class Catalog extends EventEmitter {
     for (const r of await tx.rows(cnt.join('\nUNION ALL\n'), [s.symId])) {
       fresh.get(int(r[1]))?.rows.set(String(r[0]) as FpTableName | BarTable, int(r[2]));
     }
+    const hr = await tx.rows(
+      `SELECT (extract(epoch from q.b)::int8 / 3600)::int8, q.c FROM (
+         SELECT time_bucket('1 hour'::interval, ts) AS b, count(*) AS c
+           FROM bar_1m WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 1) q`,
+      [s.symId],
+    );
+    for (const r of hr) {
+      const h = int(r[0]);
+      const st = fresh.get(Math.floor(h / 24));
+      if (!st) continue;
+      st.hours ??= new Int16Array(24);
+      st.hours[h % 24] = int(r[1]);
+    }
+    for (const st of fresh.values()) st.hours ??= new Int16Array(24);
     for (const [d, st] of fresh) s.stats.set(d, st);
   }
+}
+
+/**
+ * Für die Leerprüfung: Minuten mit Trades je Stunde eines Tages – nur, wenn die Statistik zur
+ * Tagesversion des Lese-Snapshots gehört (sonst keine Aussage, also keine Prüfung).
+ */
+export function hoursFor(
+  s: SymbolState,
+  snapVersion: (day: number) => number | undefined,
+): (day: number) => Int16Array | undefined {
+  return (day) => {
+    const st = s.stats.get(day);
+    const v = snapVersion(day);
+    return st?.hours && v !== undefined && st.version === v ? st.hours : undefined;
+  };
 }
 
 /** Zusammenhängende Läufe (je ≤ maxLen Tage) aus einer sortierten Tagesliste. */

@@ -186,6 +186,17 @@ export async function readTx<T>(
       return { value, stats };
     } catch (e) {
       if (opt.signal.aborted) throw new HttpError(499, 'Client hat abgebrochen');
+      // Deadlock (40P01) / Serialisierungsfehler (40001): mit neuem Snapshot wiederholen, dann 503
+      const c0 = pgCode(e);
+      if (c0 === '40P01' || c0 === '40001') {
+        if (attempt < (opt.inconsistencyRetries ?? 2)) {
+          await new Promise((r) => setTimeout(r, base * (attempt + 1)));
+          continue;
+        }
+        throw busy('Datenbank-Konflikt (Deadlock/Serialisierung), bitte gleich erneut', 2, 'lock');
+      }
+      // Sperrtabelle/Shared Memory erschöpft (53200): nicht wiederholen, entlasten
+      if (c0 === '53200') throw busy('Datenbank ausgelastet (Shared Memory)', 5, 'overload');
       if (e instanceof DataInconsistency) {
         // Übergangszustand (Import/Recorder mitten im Ersatz) → mit neuem Snapshot erneut versuchen
         if (attempt < (opt.inconsistencyRetries ?? 2)) {

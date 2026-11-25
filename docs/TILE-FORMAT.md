@@ -345,12 +345,18 @@ Konvertierung schon, wartet der Leser und liest danach mit altem Snapshot 0 Zeil
   Lesen committen – eine laufende wird abgewartet (bis `OF_API_LOCK_TIMEOUT_MS`, dann Wiederholung/503), eine
   spätere wartet auf den Leser. Ein Chunk, der erst nach der Katalogabfrage entsteht, ist nicht gesperrt (neue
   Chunks sind Rowstore; für ihn greift die Leerprüfung unten).
-- Verteidigung in der Tiefe: Bars ohne Level, Level ohne Bars, ungleiche Summen und ein **leerer** Ausschnitt,
-  obwohl der Katalog für die überdeckten Tage Minuten mit Trades kennt (erwartet ≥ 60 Minuten), gelten als
-  inkonsistent – auch für `/bars` und Profile. Die API wiederholt mit neuem Snapshot und antwortet danach
+- Verteidigung in der Tiefe: Bars ohne Level, Level ohne Bars und ungleiche Summen gelten als inkonsistent;
+  ebenso ein **leerer** Ausschnitt (je UTC-Tag; bei Profilen der ganze Zeitraum bzw. jeder Tag), der eine voll
+  überdeckte UTC-Stunde enthält, für die gespeichert ist, dass sie Minuten mit Trades hat. Maßstab ist die
+  Katalogstatistik „Minuten mit Trades je Tag und Stunde" (`bar_1m`), gezählt im gesperrten Snapshot ihrer
+  Tagesversion und nur verwendet, wenn diese Version der des Lese-Snapshots gleicht – keine Schätzung, keine
+  Schwelle. Echte Lücken (Börsenausfall, der unfertige Live-Tag, unvollständig importierte Tage) haben in ihren
+  Stunden 0 Minuten und bleiben gültige leere Antworten (200). Inkonsistent → Wiederholung mit neuem Snapshot →
   **503 + `Retry-After: 2`** (`no-store`, nicht gecacht). Betrifft es nur unveränderliche Tage, gilt es
   zusätzlich als Datenfehler: laut protokolliert, Health `degraded`, in `/quality` unter `apiDataErrors`; ohne
   Wiederholung verfällt die Meldung nach einer Stunde.
+- Deadlock (`40P01`) und Serialisierungsfehler (`40001`) werden mit neuem Snapshot wiederholt, danach 503 +
+  `Retry-After: 2`; erschöpfter Shared Memory/Sperrtabelle (`53200`) sofort 503 + `Retry-After: 5`.
 - `stats=1` antwortet ebenso mit 503 statt mit einem Teilergebnis, wenn eine Teilbar fehlt oder nicht zur Bar
   passt.
 

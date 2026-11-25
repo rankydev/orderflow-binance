@@ -78,40 +78,46 @@ export function checkProfile(
     );
 }
 
-/** Ab so vielen erwarteten Minuten mit Trades gilt ein leerer Ausschnitt als unmöglich. */
-export const EMPTY_SUSPICIOUS_MINUTES = 60;
-
 /**
- * Verteidigung in der Tiefe (Review Pass 5): Ein Snapshot, in dem ein Chunk leer erscheint, sieht in
- * sich konsistent aus (keine Bars UND keine Level). Je überdecktem UTC-Tag mit gespeicherten Minuten
- * (Katalogstatistik bar_1m-Zeilen des Tages) wird die erwartete Zahl Minuten mit Trades im Ausschnitt
- * geschätzt (Dichte × Länge); ist sie ≥ 60 und der Ausschnitt enthält keine einzige Bar, ist der
- * Snapshot unbrauchbar → DataInconsistency (Wiederholung, dann 503; nie leer ausgeliefert/gecacht).
- * Echte Lücken (z. B. 2026-10-27 00:02–00:30, 28 min) liegen unter der Schwelle.
+ * Verteidigung in der Tiefe (Review Pass 5/6): Ein Snapshot, in dem ein Chunk leer erscheint, sieht in
+ * sich konsistent aus (keine Bars UND keine Level). Maßstab ist, was für genau diese Stunden gespeichert
+ * ist: die Katalogstatistik zählt je Tag und UTC-Stunde die Minuten mit Trades (bar_1m), im gesperrten
+ * Snapshot ihrer Tagesversion, und wird nur verwendet, wenn diese Version der des Lese-Snapshots
+ * gleicht. Ein Ausschnitt (je UTC-Tag; bei `whole` der ganze Zeitraum) ist unmöglich leer, wenn er eine
+ * VOLL überdeckte Stunde mit ≥ 1 gespeicherten Minute enthält, aber keine einzige Bar. Echte Lücken
+ * (Ausfälle, der unfertige Live-Tag, unvollständige Tage) haben 0 Minuten in ihren Stunden und lösen
+ * nichts aus – exakt, ohne Schwelle und ohne Tagesdurchschnitt.
  */
 export function checkCoverage(
   barStartsMs: ArrayLike<number>,
   from: number,
   to: number,
-  minutesOn: (day: number) => number | undefined,
+  hoursOn: (day: number) => Int16Array | undefined,
   immutable: boolean,
   where: Record<string, unknown>,
   /** true: der ganze Zeitraum als ein Ausschnitt (Profile); sonst je UTC-Tag. */
   whole = false,
 ): void {
   const DAY = 86_400_000;
-  const parts: [number, number, number][] = []; // [a, b, erwartete Minuten mit Trades]
+  const HOUR = 3_600_000;
+  const pieces: { a: number; b: number; evidence: number | null }[] = [];
   for (let d = Math.floor(from / DAY); d * DAY < to; d++) {
     const a = Math.max(from, d * DAY);
     const b = Math.min(to, (d + 1) * DAY);
-    const e = ((minutesOn(d) ?? 0) / 1440) * ((b - a) / 60_000);
-    if (whole && parts.length > 0) {
-      parts[0]![1] = b;
-      parts[0]![2] += e;
-    } else parts.push([a, b, e]);
+    // erste voll überdeckte Stunde mit gespeicherten Minuten in [a, b)
+    let evidence: number | null = null;
+    const hours = hoursOn(d);
+    if (hours) {
+      for (let h = Math.ceil(a / HOUR) * HOUR; h + HOUR <= b && evidence === null; h += HOUR)
+        if (hours[(h - d * DAY) / HOUR]! > 0) evidence = h;
+    }
+    if (whole && pieces.length > 0) {
+      pieces[0]!.b = b;
+      pieces[0]!.evidence ??= evidence;
+    } else pieces.push({ a, b, evidence });
   }
-  for (const [a, b, expected] of parts) {
-    if (expected < EMPTY_SUSPICIOUS_MINUTES) continue;
+  for (const { a, b, evidence } of pieces) {
+    if (evidence === null) continue;
     let any = false;
     for (let i = 0; i < barStartsMs.length && !any; i++) {
       const t = barStartsMs[i]!;
@@ -119,7 +125,7 @@ export function checkCoverage(
     }
     if (!any)
       throw new DataInconsistency(
-        `Ausschnitt ${new Date(a).toISOString()}…${new Date(b).toISOString()} leer, erwartet ≈ ${Math.round(expected)} Minuten mit Trades`,
+        `Ausschnitt ${new Date(a).toISOString()}…${new Date(b).toISOString()} leer, gespeichert sind Minuten in der Stunde ab ${new Date(evidence).toISOString()}`,
         immutable,
         where,
       );

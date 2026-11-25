@@ -76,23 +76,66 @@ describe('checkTile / checkProfile', () => {
   });
 });
 
-describe('checkCoverage (leerer Ausschnitt, obwohl der Tag Daten hat)', () => {
+describe('checkCoverage (leerer Ausschnitt, obwohl gespeicherte Minuten ihn belegen)', () => {
   const D = 86_400_000;
-  const full = () => 1440; // jede Minute mit Trades
-  it('leer bei erwarteten ≥ 60 Minuten → DataInconsistency; echte kurze Lücken und Tage ohne Daten nicht', () => {
-    expect(() => checkCoverage([], 0, 2 * 3_600_000, full, true, {})).toThrow(/leer/);
-    expect(() => checkCoverage([60_000], 0, 2 * 3_600_000, full, true, {})).not.toThrow();
-    // 28-Minuten-Lücke wie 2026-10-27: unter der Schwelle
-    expect(() => checkCoverage([], 0, 28 * 60_000, full, true, {})).not.toThrow();
-    // Tag ohne Statistik (keine Daten) bzw. dünner Tag
-    expect(() => checkCoverage([], 0, D, () => undefined, true, {})).not.toThrow();
-    expect(() => checkCoverage([], 0, D, () => 30, true, {})).not.toThrow();
-    // je Tag: Daten nur am zweiten Tag vorhanden → der erste darf leer sein, der zweite nicht
+  const H = 3_600_000;
+  /** Minuten je Stunde: `filled` Stunden ab 0 mit 60 Minuten, danach 0 (Loch bis Tagesende). */
+  const hoursUntil = (filled: number) =>
+    Int16Array.from({ length: 24 }, (_, h) => (h < filled ? 60 : 0));
+  it('halb gefüllter Tag: leere Fenster im Loch sind gültig, auch 8 h; im gefüllten Teil nicht', () => {
+    const day = () => hoursUntil(6); // Daten 00:00–06:00, danach nichts (wie der Live-Tag)
+    for (const [a, b] of [
+      [7 * H, 8 * H],
+      [7 * H, 11 * H],
+      [8 * H, 16 * H],
+      [6 * H, D],
+    ])
+      expect(() => checkCoverage([], a!, b!, day, false, {})).not.toThrow();
+    expect(() => checkCoverage([], 1 * H, 5 * H, day, true, {})).toThrow(/leer/);
+    // Teilstunde am Rand allein ist kein Beleg (nur voll überdeckte Stunden zählen)
     expect(() =>
-      checkCoverage([D + 5], 0, 2 * D, (d) => (d === 0 ? undefined : 1440), true, {}),
+      checkCoverage([], 5 * H + 30 * 60_000, 6 * H + 30 * 60_000, day, true, {}),
     ).not.toThrow();
-    expect(() => checkCoverage([5], 0, 2 * D, full, true, {})).toThrow(/leer/);
-    // ganzer Zeitraum als ein Ausschnitt (Profile)
-    expect(() => checkCoverage([5], 0, 2 * D, full, true, {}, true)).not.toThrow();
+  });
+  it('unveränderlicher Tag mit echtem mehrstündigem Loch bleibt gültig; Tag ohne Statistik: keine Prüfung', () => {
+    const hole = () => Int16Array.from({ length: 24 }, (_, h) => (h >= 5 && h < 9 ? 0 : 58));
+    expect(() => checkCoverage([], 5 * H, 9 * H, hole, true, {})).not.toThrow();
+    expect(() => checkCoverage([], 4 * H, 9 * H, hole, true, {})).toThrow(/leer/);
+    expect(() => checkCoverage([], 0, D, () => undefined, true, {})).not.toThrow();
+  });
+  it('über Mitternacht: jedes Tagesstück für sich; whole = der ganze Zeitraum', () => {
+    const hours = (d: number) => (d === 0 ? hoursUntil(24) : hoursUntil(0)); // Tag 1 ohne Daten
+    // Bar nur am ersten Tag, zweites Stück ohne Belege → gültig
+    expect(() => checkCoverage([22 * H], 20 * H, D + 4 * H, hours, true, {})).not.toThrow();
+    // Bars nur im (leeren) zweiten Stück, erstes Stück belegt → ungültig
+    expect(() => checkCoverage([D + H], 20 * H, D + 4 * H, hours, true, {})).toThrow(/leer/);
+    expect(() => checkCoverage([D + H], 20 * H, D + 4 * H, hours, true, {}, true)).not.toThrow();
+  });
+});
+
+describe('readTx: Deadlock, Serialisierung, Shared Memory', () => {
+  it('40P01/40001 → Wiederholung, danach 503; 53200 → sofort 503 + Retry-After 5', async () => {
+    const sql = {
+      begin: async (_m: string, fn: (tx: unknown) => Promise<unknown>) => fn({}),
+    } as unknown as Sql;
+    const opt = { signal: new AbortController().signal, lockRetries: 0, backoffMs: 1 };
+    for (const code of ['40P01', '40001']) {
+      let n = 0;
+      const ok = await readTx(sql, opt, async () => {
+        if (++n < 3) throw Object.assign(new Error(code), { code });
+        return 'ok';
+      });
+      expect([ok.value, n]).toEqual(['ok', 3]);
+      const err = await readTx(sql, opt, async () => {
+        throw Object.assign(new Error(code), { code });
+      }).catch((e: unknown) => e);
+      expect([(err as HttpError).status, (err as HttpError).retryAfter]).toEqual([503, 2]);
+    }
+    let n = 0;
+    const err = await readTx(sql, opt, async () => {
+      n++;
+      throw Object.assign(new Error('out of shared memory'), { code: '53200' });
+    }).catch((e: unknown) => e);
+    expect([(err as HttpError).status, (err as HttpError).retryAfter, n]).toEqual([503, 5, 1]);
   });
 });

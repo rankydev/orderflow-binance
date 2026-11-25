@@ -46,7 +46,11 @@ import {
   generate,
   LAST_DAY,
   MINUTE_MS,
+  HOLE_FROM_MIN,
+  HOLE_TO_MIN,
+  insertBars1m,
   klineTrades,
+  PROVISIONAL_UNTIL_MIN,
   OUTLIER_MS,
   PROVISIONAL_DAY,
   seed,
@@ -1679,5 +1683,92 @@ describe('Profil-Vertrag: Grenzen, Tageslisten, Version je Tag, VWAP', () => {
     );
     const d0 = (one.json() as unknown as DailyProfilesResponse).days[0]!;
     expect(d0.dataVersion).toBe(j.days[0]!.dataVersion);
+  });
+});
+
+describe('Leerprüfung: echte Lücken bleiben gültig, der Gefahrenfall wird erkannt', () => {
+  let api: RunningApi;
+  beforeAll(async () => {
+    api = await start();
+  });
+  afterAll(async () => api?.close());
+  const H = 3_600_000;
+
+  it('unveränderlicher Tag mit 4-Stunden-Loch: /bars, Footprint und Profil im Loch → 200 leer', async () => {
+    const a = BAD_DAY * DAY_MS + HOLE_FROM_MIN * MINUTE_MS;
+    const b = BAD_DAY * DAY_MS + HOLE_TO_MIN * MINUTE_MS;
+    const bars = await get(api, `/api/v1/bars?sym=BTCUSDT&tf=1m&from=${a}&to=${b}`);
+    expect(bars.res.status).toBe(200);
+    expect(decodeTile(bars.buf).header.nBars).toBe(0);
+    const prof = await get(api, `/api/v1/profile?sym=BTCUSDT&from=${a}&to=${b}&R=100`);
+    expect(prof.res.status).toBe(200);
+    expect((prof.json() as unknown as RangeProfileResponse).profile.rowLo).toBeNull();
+    // über Mitternacht hinein: Vortag 20:00 bis ins Loch → Daten des Vortags, gültig
+    const x = await get(
+      api,
+      `/api/v1/bars?sym=BTCUSDT&tf=1h&from=${BAD_DAY * DAY_MS - 4 * H}&to=${a + 3 * H}`,
+    );
+    expect(x.res.status).toBe(200);
+    expect(decodeTile(x.buf).header.nBars).toBe(
+      refBars(3600, BAD_DAY * DAY_MS - 4 * H, a + 3 * H).length,
+    );
+  });
+
+  it('halb gefüllter nicht finaler Tag: Fenster im Loch (auch 8 h) → 200 leer, nie 503', async () => {
+    const a = PROVISIONAL_DAY * DAY_MS + PROVISIONAL_UNTIL_MIN * MINUTE_MS;
+    for (const [from, to] of [
+      [a, a + H],
+      [a, a + 4 * H],
+      [a + H, a + 9 * H],
+    ]) {
+      const r = await get(api, `/api/v1/bars?sym=BTCUSDT&tf=1m&from=${from}&to=${to}`);
+      expect(r.res.status, `${from}`).toBe(200);
+      expect(decodeTile(r.buf).header.nBars).toBe(0);
+      const p = await get(api, `/api/v1/profile?sym=BTCUSDT&from=${from}&to=${to}&R=10`);
+      expect(p.res.status).toBe(200);
+    }
+    const s = ((await get(api, '/api/v1/symbols')).json().symbols as SymJson[])[0]!;
+    // kleinste angebotene Kachel (n Minuten), vollständig im Loch
+    const R = Object.entries(s.tiles['1m']!).sort((x, y) => x[1] - y[1])[0]!;
+    const n = R[1];
+    expect(n * 60_000).toBeLessThanOrEqual(4 * H);
+    const k = Math.ceil((a + H) / (n * 60_000));
+    const t = await get(
+      api,
+      `/api/v1/footprint?sym=BTCUSDT&tf=1m&R=${R[0]}&tile=${k}&cfg=${s.tileConfigVersion}`,
+    );
+    expect(t.res.status).toBe(200);
+    expect(decodeTile(t.buf).header.nBars).toBe(0);
+    // Tagesprofil mit Offset über den unfertigen Tag: gültig
+    const d = await get(
+      api,
+      `/api/v1/profiles/daily?sym=BTCUSDT&from=${PROVISIONAL_DAY * DAY_MS + 6 * H}&to=${(PROVISIONAL_DAY + 1) * DAY_MS + 6 * H}&R=100&offsetH=6`,
+    );
+    expect(d.res.status).toBe(200);
+  });
+
+  it('Gefahrenfall: gespeicherte Minuten belegt, Snapshot liefert keine → Wiederholung → 503, nie gecacht', async () => {
+    const day = FIRST_DAY + 2;
+    const a = day * DAY_MS + 10 * H;
+    const b = a + 2 * H;
+    const gone = data.bars1m.filter((x) => x.ts >= a && x.ts < b);
+    expect(gone.length).toBeGreaterThan(60);
+    // bar_1m der Stunden löschen, ohne neue Tagesversion (wie ein leer gelesener Chunk)
+    await admin.unsafe(
+      `DELETE FROM bar_1m WHERE sym_id = ${SYM_ID} AND ts >= ${tsLit(a)} AND ts < ${tsLit(b)}`,
+    );
+    try {
+      for (let i = 0; i < 2; i++) {
+        const r = await get(api, `/api/v1/bars?sym=BTCUSDT&tf=1m&from=${a}&to=${b}`);
+        expect(r.res.status).toBe(503);
+        expect(r.res.headers.get('cache-control')).toBe('no-store');
+        expect(r.json().error).toMatch(/inkonsistent/);
+      }
+    } finally {
+      await insertBars1m(admin, gone);
+    }
+    expect((await get(api, `/api/v1/bars?sym=BTCUSDT&tf=1m&from=${a}&to=${b}`)).res.status).toBe(
+      200,
+    );
   });
 });
