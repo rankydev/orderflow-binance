@@ -256,3 +256,28 @@ describe('BarStore.settled (W-3: Datenzeit statt Uhr des Besuchers)', () => {
     expect(b.settled(3, 3, 0, DAY)).toBe(false);
   });
 });
+
+import { checkStatsColumns } from '../src/lib/bar-store.ts';
+
+describe('Stats-Spalten (stats=1) prüfen', () => {
+  it('fehlende Spalten sind erlaubt; Länge, Endlichkeit, Anzahl, minDelta ≤ maxDelta', () => {
+    expect(() => checkStatsColumns(undefined, 3)).not.toThrow();
+    expect(() => checkStatsColumns({ 'x.other': Float64Array.of(1) }, 3)).not.toThrow();
+    const ok = {
+      'x.maxDelta': Float64Array.of(5, 0, 2),
+      'x.minDelta': Float64Array.of(-1, 0, 2),
+      'x.cotHigh': Float64Array.of(3, 0, -2),
+      'x.cotLow': Float64Array.of(-3, 0, 2),
+      'x.trades': Int32Array.of(10, 0, 7),
+    };
+    expect(() => checkStatsColumns(ok, 3)).not.toThrow();
+    expect(() => checkStatsColumns({ ...ok, 'x.trades': Int32Array.of(1, 2) }, 3)).toThrow(/Länge/);
+    expect(() => checkStatsColumns({ ...ok, 'x.cotHigh': Float64Array.of(1, NaN, 2) }, 3)).toThrow(
+      /endlich/,
+    );
+    expect(() => checkStatsColumns({ ...ok, 'x.minDelta': Float64Array.of(-1, 1, 2) }, 3)).toThrow(
+      /minDelta/,
+    );
+    expect(() => checkStatsColumns({ 'x.trades': Int32Array.of(-1, 0, 0) }, 3)).toThrow(/Anzahl/);
+  });
+});

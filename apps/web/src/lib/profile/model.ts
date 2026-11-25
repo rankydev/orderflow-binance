@@ -223,6 +223,9 @@ export interface PreparedProfile {
   high: number | null;
   maxVol: number;
   maxAbsDelta: number;
+  /** Version des Tages (PROFILE-API.md) bzw. vwap (price_unit) der Antwort, wenn bekannt */
+  dataVersion?: string;
+  vwap?: number | null;
 }
 
 export function prepareProfile(

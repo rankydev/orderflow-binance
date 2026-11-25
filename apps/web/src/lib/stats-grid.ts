@@ -88,11 +88,12 @@ export const STAT_ROWS: readonly StatRowDef[] = [
   },
   {
     id: 'trades',
-    label: 'Trades',
+    label: 'Trades Bin.',
     unit: 'count',
     signed: false,
     column: 'x.trades',
-    title: 'Σ Kline-Trade-Anzahl',
+    title:
+      'Binance-Trade-Anzahl (Σ Kline-Trades der Minuten), nicht die aggTrades-Zahl; an Tagen mit Lücken in den Binance-Daten kann sie größer sein als die Summe der 1m-Bars',
   },
   {
     id: 'maxDelta',
@@ -135,7 +136,7 @@ export const STATS_DEFAULT_ROWS: readonly StatRow[] = ['vol', 'delta', 'deltaPct
 export const STATS_TEXT_MIN_BS = 30;
 export const STATS_SHADE_MIN_BS = 4;
 export const STATS_ROW_PX = 16;
-export const STATS_LABEL_PX = 84;
+export const STATS_LABEL_PX = 112;
 /** Freiraum unter der letzten Zeile: dort sitzt das Logo der Bibliothek (Attribution, H-5). */
 export const STATS_BOTTOM_PX = 30;
 
@@ -323,6 +324,17 @@ export class StatsContext {
   /** Zeilengröße, mit der Ratios (und Imbalances) gerechnet sind, z. B. „20 USDT" (H-4) */
   rowSize = '';
 
+  /** Hinweise für Zeilen, deren API-Spalte im Fenster fehlt (nicht geliefert ≠ 0). */
+  missingNotes(statsRequested: boolean): Partial<Record<StatRow, string>> {
+    const out: Partial<Record<StatRow, string>> = {};
+    for (const def of STAT_ROWS)
+      if (def.column && !this.cols[def.id])
+        out[def.id] = statsRequested
+          ? `– (${def.column} für diesen Zeitrahmen nicht geliefert)`
+          : `– (${def.column} fehlt)`;
+    return out;
+  }
+
   /** Serie gewechselt (Symbol/tf): Werte der alten Serie verwerfen (H-1). */
   reset(): void {
     this.cols = {};
@@ -433,7 +445,9 @@ class StatsRenderer implements ICustomSeriesPaneRenderer {
       const y = ri * rh;
       const missing = !!def.column && !sc.cols[def.id];
       ctx.fillStyle = missing ? '#6b7380' : '#9aa4b2';
-      ctx.fillText(missing ? `${def.label} (API)` : def.label, Math.round(4 * hpr), y + rh / 2);
+      // H-5: unten links sitzt das Logo der Bibliothek (Attribution) – Etiketten dort eingerückt
+      const logoZone = y + rh > scope.bitmapSize.height - Math.round(30 * vpr);
+      ctx.fillText(def.label, Math.round((logoZone ? 40 : 4) * hpr), y + rh / 2);
       const note =
         sc.notes[def.id] ??
         ((def.id === 'hiRatio' || def.id === 'loRatio') && sc.rowSize ? `Zeile ${sc.rowSize}` : '');

@@ -32,6 +32,11 @@ export interface SymbolInfo {
 
 export interface SymbolsResponse {
   symbols: SymbolInfo[];
+  /** Grenzen der Endpunkte (seit API 60f6264; optional) */
+  limits?: {
+    profile?: { maxRows: number; maxR: number; maxRangeDays: number };
+    tiles?: { statsColumns?: string[] };
+  };
 }
 
 /** Datenitem beider Serien (Kerzen + Footprint); Preise als Gleitkomma für die Bibliothek, Ganzzahlen für Zeilen. */

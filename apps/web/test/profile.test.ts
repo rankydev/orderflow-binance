@@ -336,7 +336,7 @@ function dayBody(from: number, q: number) {
     deltaPoc: 10,
     buyQ: q,
     sellQ: 1,
-    notional: '0',
+    notional: String(105 * (q + 1)),
     vwap: 105,
     dataVersion: 'v',
     low: 100,
@@ -907,5 +907,174 @@ describe('Prüfrunde 0195c61 (W-A, W-B, H-1 … H-4)', () => {
     const h: Hit = { x0: 0, maxW: 6, p, range: false, view: 'total', scale: 8 };
     expect(hitAt([h], 0.7, 135)?.i).toBe(3);
     expect(hitAt([{ ...h, maxW: 3 }], 0.2, 135)).toBeNull(); // 0,375 px < 0,5 px: nicht gezeichnet
+  });
+});
+
+// ---------------------------------------------------------------- Vertrag 60f6264 / 7f1b626 (Teil 1)
+import {
+  dayIndexOfLabel,
+  dayRanges,
+  dayStatus,
+  minRowsR,
+  vwapProblem,
+} from '../src/lib/profile/layer.ts';
+
+describe('Profil-Vertrag: vwap, Tageslisten, 422-Grund, Grenzen, 503', () => {
+  const settle = async () => {
+    for (let i = 0; i < 8; i++) await flush();
+  };
+
+  it('vwap = floor(notional · 10^6 / Volumen) / 10^6 (BigInt), null ohne Volumen', () => {
+    // 1 955 / 17 = 115,0000…  → 115; 2 000 / 3 = 666,666666… → 666,666666 (abgeschnitten)
+    expect(vwapProblem({ notional: '1955', buyQ: 9, sellQ: 8, vwap: 115 })).toBe('');
+    expect(vwapProblem({ notional: '2000', buyQ: 1, sellQ: 2, vwap: 666.666666 })).toBe('');
+    expect(vwapProblem({ notional: '2000', buyQ: 1, sellQ: 2, vwap: 666.666667 })).toContain('≠');
+    // über 2^53 im Zähler
+    expect(
+      vwapProblem({
+        notional: '12345678901234567890',
+        buyQ: 2_000_000,
+        sellQ: 0,
+        vwap: Number('6172839450617.283'),
+      }),
+    ).toBe('');
+    expect(vwapProblem({ notional: '0', buyQ: 0, sellQ: 0, vwap: null })).toBe('');
+    expect(vwapProblem({ notional: '0', buyQ: 0, sellQ: 0, vwap: 1 })).toContain('ohne Volumen');
+  });
+
+  it('Tagesbezeichnung → Index; Tage ohne Daten vs. ohne Trades', () => {
+    expect(dayIndexOfLabel('2026-11-20')).toBe(T0 / D);
+    const e = { emptyDays: new Set([5]), missingDays: new Set([6]) };
+    expect(dayStatus(e, 5)).toBe('empty');
+    expect(dayStatus(e, 6)).toBe('missing');
+    expect(dayStatus(e, 7)).toBe('unknown');
+    expect(dayStatus(undefined, 5)).toBe('unknown');
+  });
+
+  it('Antwort mit emptyDays/missingDays: Tage im Cache unterschieden; Tagesversion hält das Profil', async () => {
+    const { layer } = setup((u) =>
+      json(
+        envelope(u, {
+          kind: 'profiles/daily',
+          offsetH: 0,
+          days: [dayBody(T0, 23)],
+          emptyDays: ['2026-11-21'],
+          missingDays: ['2026-11-22'],
+        }),
+      ),
+    );
+    layer.manualR = 1;
+    layer.frame();
+    await settle();
+    const cache = (
+      layer as unknown as {
+        cache: Map<string, { emptyDays: Set<number>; missingDays: Set<number> }>;
+      }
+    ).cache;
+    const e = [...cache.values()][0]!;
+    expect([...e.emptyDays]).toEqual([T0 / D + 1]);
+    expect([...e.missingDays]).toEqual([T0 / D + 2]);
+  });
+
+  it('nicht finaler Rest: Tage mit gleicher dataVersion behalten ihr vorbereitetes Profil', async () => {
+    let now = 1_000;
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    try {
+      const last = T0 + 2 * D;
+      const { layer } = setup(
+        (u) => {
+          const from = Number(u.searchParams.get('from'));
+          const days = [];
+          for (let d = from; d < T0 + 3 * D; d += D)
+            days.push({ ...dayBody(d, 23), final: d < last, dataVersion: `v${d}` });
+          return json(envelope(u, { kind: 'profiles/daily', offsetH: 0, final: false, days }));
+        },
+        undefined,
+        { barsCoverFinal: () => false },
+      );
+      layer.manualR = 1;
+      layer.frame();
+      await settle();
+      const cache = (layer as unknown as { cache: Map<string, { profiles: Map<number, unknown> }> })
+        .cache;
+      const before = [...cache.values()][0]!.profiles.get(T0);
+      now += 61_000;
+      layer.frame();
+      await settle();
+      expect([...cache.values()][0]!.profiles.get(T0)).toBe(before);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('422 mit reason: Meldung nennt den Grund', async () => {
+    const { layer } = setup(() =>
+      json(
+        { error: 'x', reason: 'profile_rows', rows: 70_000, limit: 60_000, suggestR: null },
+        422,
+      ),
+    );
+    layer.manualR = 1;
+    layer.frame();
+    await settle();
+    expect(layer.readout().error).toContain('zu viele Zeilen');
+  });
+
+  it('Zeilengrenze aus /symbols: R vorab so groß, dass Σ Zeilen ≤ maxRows (kein 422-Umweg)', async () => {
+    // Bars T0…T0+3D mit h 120 / l 100 → je Tag floor(120/w) − floor(100/w) + 1 Zeilen
+    expect(dayRanges(bars(T0, 72, 3600, 1), T0, T0 + 3 * D, 0)).toEqual([
+      [100, 120],
+      [100, 120],
+      [100, 120],
+    ]);
+    // w = R · 10: R 1 → 3 Zeilen je Tag (9 gesamt); maxRows 6 → R 2 (2 Zeilen je Tag … 120/20 − 100/20 + 1 = 2)
+    expect(
+      minRowsR(
+        [
+          [100, 120],
+          [100, 120],
+          [100, 120],
+        ],
+        10,
+        [1, 2, 5, 10],
+        6,
+        1,
+      ),
+    ).toBe(2);
+    const { layer, calls } = setup(
+      (u) => json(envelope(u, { kind: 'profiles/daily', offsetH: 0, days: [] })),
+      undefined,
+      { limits: () => ({ maxRows: 6, maxR: 1_000_000, maxRangeDays: 3660 }) },
+    );
+    layer.manualR = 1;
+    layer.updateRowFloors();
+    layer.frame();
+    await settle();
+    expect(new URL(calls[0]!, 'http://x').searchParams.get('R')).toBe('2');
+  });
+
+  it('503 + Retry-After: die Profil-Warteschlange wiederholt nach der angegebenen Zeit', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      let n = 0;
+      const { layer, calls } = setup((u) =>
+        n++ === 0
+          ? new Response('busy', { status: 503, headers: { 'Retry-After': '3' } })
+          : json(envelope(u, { kind: 'profiles/daily', offsetH: 0, days: [] })),
+      );
+      layer.manualR = 1;
+      layer.frame();
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(calls).toHaveLength(1);
+      expect(layer.readout().error).toContain('HTTP 503');
+      await vi.advanceTimersByTimeAsync(2_500);
+      expect(calls).toHaveLength(1); // noch nicht (Retry-After 3 s)
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(calls).toHaveLength(2);
+      layer.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

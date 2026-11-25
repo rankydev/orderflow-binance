@@ -82,6 +82,8 @@ export interface ProfileHost {
   busy(): boolean;
   /** Läuft gerade eine Geste? Dann keine neuen Profilanfragen (Bedarf erst am Gestenende). */
   gestureActive(): boolean;
+  /** Grenzen aus `/symbols` (falls die API sie liefert) */
+  limits?(): ProfileLimits | null;
 }
 
 /** Farben (Kerzenfarben, halbtransparent, damit Kerzen/Zellen davor lesbar bleiben). */
@@ -112,6 +114,40 @@ export const PROFILE_MAX_HOLD_MS = 2_000;
 const RANGE_MIN_W = 40;
 /** Längster Bereich wie die API (3 660 Tage). */
 const MAX_RANGE_MS = 3_660 * DAY_MS;
+
+/** Grenzen der Profil-Endpunkte aus `/symbols` (`limits.profile`, PROFILE-API.md). */
+export interface ProfileLimits {
+  maxRows: number;
+  maxR: number;
+  maxRangeDays: number;
+}
+
+/** UTC-Datum „YYYY-MM-DD" (Bezeichnung eines Profiltags) → Tagesindex d. */
+export function dayIndexOfLabel(label: string): number {
+  return Math.floor(Date.parse(`${label}T00:00:00Z`) / DAY_MS);
+}
+
+/**
+ * vwap gegen notional / Volumen nach der Regel der API: Ganzzahldivision auf 6 Nachkommastellen
+ * (floor(notional · 10^6 / Volumen) / 10^6), mit BigInt; '' = stimmt.
+ */
+export function vwapProblem(p: {
+  notional: string;
+  buyQ: number;
+  sellQ: number;
+  vwap: number | null;
+}): string {
+  const vol = p.buyQ + p.sellQ;
+  if (vol === 0) return p.vwap === null ? '' : 'vwap ohne Volumen';
+  if (typeof p.vwap !== 'number') return 'vwap fehlt';
+  const q = (BigInt(p.notional) * 1_000_000n) / BigInt(vol);
+  // q ist exakt; die JSON-Zahl vwap trägt q / 10^6 bis auf die Gleitkomma-Darstellung (≤ ½ Einheit der
+  // 6. Nachkommastelle bzw. relative Doppelgenauigkeit bei sehr großen Werten)
+  const qn = Number(q);
+  return Math.abs(p.vwap * 1e6 - qn) <= Math.max(0.5, qn * 1e-15)
+    ? ''
+    : `vwap ${p.vwap} ≠ ${qn / 1e6}`;
+}
 /** Länge des POC-Strichs der Silhouette (CSS-px). */
 const POC_TICK_PX = 6;
 /** Obergrenze der Hilfstabellen (422-Untergrenzen, Querprüfungszähler). */
@@ -126,6 +162,9 @@ interface Entry {
   openFrom: number | null;
   /** Ende des angefragten Zeitraums (ms) */
   to: number;
+  /** Tagesprofile: Tage (Index d) mit Daten, aber ohne Trades bzw. ohne gespeicherte Daten */
+  emptyDays: Set<number>;
+  missingDays: Set<number>;
 }
 
 /** Angefragter Zeitraum je Schlüssel (Antwort wird dagegen geprüft). */
@@ -167,6 +206,7 @@ export interface RangeSummary {
   delta: string;
   poc: string;
   va: string;
+  vwap: string;
 }
 
 /** Gezeichnetes Profil (CSS-px) für den Hover: Balkenlängen aus Ansicht und Skala (W-1). */
@@ -213,8 +253,11 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   private stickyError = '';
   private daysDrawn = 0;
   private daysSkipped = 0;
+  private daysMissing = 0;
+  private daysEmpty = 0;
   /** 422: R-Untergrenze je Anfrage-Bereich (Schlüssel ohne R), höchstens ein Versuch je Bereich. */
   private readonly rFloor = new Map<string, number>();
+  private lastReason = '';
   private readonly crossFails = new Map<string, number>();
   private selectAnchor: number | null = null;
   private selectHover: number | null = null;
@@ -286,7 +329,8 @@ export class ProfileLayer implements IPanePrimitive<Time> {
 
   ladder(): number[] {
     const s = this.host.sym();
-    return s ? profileLadder(s.tickRefUnits, s.tickUnits) : [];
+    const maxR = this.host.limits?.()?.maxR ?? Infinity;
+    return s ? profileLadder(s.tickRefUnits, s.tickUnits).filter((r) => r <= maxR) : [];
   }
 
   /** Symbolwechsel: R neu bestimmen, Bereich verwerfen (gehört zum alten Symbol). */
@@ -317,6 +361,7 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     const s = this.host.sym();
     if (!s || !(pxPerUnit > 0)) return;
     this.autoR = profileRowSize(this.autoR, this.ladder(), pxPerUnit, s.tickRefUnits);
+    this.updateRowFloors();
     this.updateCommonScale();
     this.frame();
     this.redraw();
@@ -479,9 +524,28 @@ export class ProfileLayer implements IPanePrimitive<Time> {
       let openFrom: number | null = null;
       for (const d of x.days) {
         if (d.from < req.from || d.to > req.to) throw new Error('Tag außerhalb der Anfrage');
+        const vw = vwapProblem(d);
+        if (vw) throw new Error(`Tag ${d.day}: ${vw}`);
         const k = `${baseKey}#${d.from}`;
-        profiles.set(d.from, prepareProfile(k, d, d.from, d.to, d.final, R, s.tickRefUnits));
+        // gleiche Tagesversion → vorbereitetes Profil behalten (finale Tage bleiben, PROFILE-API.md)
+        const old = profiles.get(d.from);
+        if (!old || old.dataVersion !== d.dataVersion)
+          profiles.set(d.from, {
+            ...prepareProfile(k, d, d.from, d.to, d.final, R, s.tickRefUnits),
+            dataVersion: d.dataVersion,
+            vwap: d.vwap,
+          });
         if (!d.final && openFrom === null) openFrom = d.from;
+      }
+      // Tage ohne Trades bzw. ohne gespeicherte Daten (Anzeige unterscheidet beide)
+      const empty = target?.emptyDays ?? new Set<number>();
+      const missing = target?.missingDays ?? new Set<number>();
+      for (const label of x.emptyDays ?? []) empty.add(dayIndexOfLabel(label));
+      for (const label of x.missingDays ?? []) missing.add(dayIndexOfLabel(label));
+      for (const d of x.days) {
+        const di = profileDayOf(d.from, req.offsetH);
+        empty.delete(di);
+        missing.delete(di);
       }
       // Antwort nicht final, aber alle gelieferten Tage final (z. B. offener Tag ohne Trades)
       if (!x.final && openFrom === null) openFrom = Math.max(req.from, req.to - DAY_MS);
@@ -492,6 +556,8 @@ export class ProfileLayer implements IPanePrimitive<Time> {
         profiles,
         openFrom: x.final ? null : openFrom,
         to: target ? target.to : req.to,
+        emptyDays: empty,
+        missingDays: missing,
       });
       this.error = '';
       this.crossCheck(baseKey);
@@ -500,13 +566,17 @@ export class ProfileLayer implements IPanePrimitive<Time> {
       const problems = checkRangeProfile(x);
       if (problems.length > 0) throw new Error(problems.slice(0, 3).join('; '));
       if (bad(x)) throw new Error('Antwort passt nicht zur Anfrage');
+      const vw = vwapProblem(x.profile);
+      if (vw) throw new Error(vw);
       const p = prepareProfile(key, x.profile, x.from, x.to, x.final, R, s.tickRefUnits);
       this.put(key, {
         final: x.final,
         loadedAt: performance.now(),
-        profiles: new Map([[0, p]]),
+        profiles: new Map([[0, { ...p, vwap: x.profile.vwap }]]),
         openFrom: null,
         to: x.to,
+        emptyDays: new Set(),
+        missingDays: new Set(),
       });
       this.error = '';
       this.crossCheck(key);
@@ -542,13 +612,21 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     const scope = [parts[0], parts[1], ...parts.slice(3)].join('|');
     if (status === 422) {
       let suggest: number | null = null;
+      let reason = '';
       try {
-        const j = JSON.parse(body ?? '') as { suggestR?: unknown };
+        const j = JSON.parse(body ?? '') as { suggestR?: unknown; reason?: unknown };
         if (typeof j.suggestR === 'number' && Number.isSafeInteger(j.suggestR))
           suggest = j.suggestR;
+        if (typeof j.reason === 'string') reason = j.reason;
       } catch {
         /* kein JSON */
       }
+      this.lastReason =
+        reason === 'profile_rows'
+          ? 'zu viele Zeilen'
+          : reason === 'profile_source_rows'
+            ? 'zu viele Quellzeilen'
+            : '';
       // einmal mit dem Vorschlag wiederholen (gilt nur für den aktuellen Datenstand, daher kein Cache)
       if (suggest !== null && suggest > usedR && !this.rFloor.has(scope)) {
         if (this.rFloor.size >= MAX_AUX_ENTRIES) this.rFloor.clear();
@@ -557,7 +635,7 @@ export class ProfileLayer implements IPanePrimitive<Time> {
         this.onChange?.();
         return;
       }
-      this.error = `${this.queue.label(key)}: Zeitraum zu groß für R ${usedR}`;
+      this.error = `${this.queue.label(key)}: ${this.lastReason || 'Zeitraum zu groß'} für R ${usedR}`;
     } else if (status === 400 && key.startsWith('pr|')) {
       this.error = 'Bereichsprofil: Bereich zu groß oder außerhalb der Daten';
     } else {
@@ -616,6 +694,35 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   /** Nach neuen Bars (Fensterwechsel) die geladenen Profile im Fenster prüfen. */
   crossCheckAll(): void {
     for (const k of [...this.cache.keys()]) this.crossCheck(k);
+    this.updateRowFloors();
+  }
+
+  /**
+   * Zeilengrenze vorab (statt 422-Umweg): je sichtbarem Batch die Zeilen aus den Hoch/Tief der geladenen
+   * Bars schätzen (Σ je Tag floor(high/w) − floor(low/w) + 1, genau die Zählung der API) und, wenn sie
+   * `limits.maxRows` überschreiten, das kleinste passende R der Leiter als Untergrenze setzen. Tage ohne
+   * geladene Bars zählen nicht (dann bleibt der 422-Weg). Nur am Gestenende/Fensterwechsel.
+   */
+  updateRowFloors(): void {
+    const s = this.host.sym();
+    const vis = this.host.visibleTimeRange();
+    const lim = this.host.limits?.();
+    const R = this.R;
+    if (!s || !vis || !lim || R === null || (this.mode !== 'daily' && this.mode !== 'both')) return;
+    const items = this.host.items();
+    if (items.length === 0) return;
+    const ladder = this.ladder();
+    for (const b of wantedDayBatches(vis[0], vis[1], this.offsetH, s.dataFrom, s.dataTo)) {
+      const [from, to] = batchWindow(b, this.offsetH);
+      const ranges = dayRanges(items, from, to, this.offsetH);
+      if (ranges.length === 0) continue;
+      const r = minRowsR(ranges, s.tickRefUnits, ladder, lim.maxRows, R);
+      const scope = this.dailyScope(s.name, b);
+      if (r > R && r > (this.rFloor.get(scope) ?? 0)) {
+        if (this.rFloor.size >= MAX_AUX_ENTRIES) this.rFloor.clear();
+        this.rFloor.set(scope, r);
+      }
+    }
   }
 
   // ---------------------------------------------------------------- Bereichsauswahl (zwei Klicks)
@@ -675,9 +782,10 @@ export class ProfileLayer implements IPanePrimitive<Time> {
       from = Math.max(from, lo);
       to = Math.min(to, hi);
     }
-    if (to - from > MAX_RANGE_MS) {
-      from = to - MAX_RANGE_MS;
-      notes.push('Bereich auf 3 660 Tage gekürzt');
+    const maxMs = (this.host.limits?.()?.maxRangeDays ?? MAX_RANGE_MS / DAY_MS) * DAY_MS;
+    if (to - from > maxMs) {
+      from = to - maxMs;
+      notes.push(`Bereich auf ${maxMs / DAY_MS} Tage gekürzt`);
     }
     this.range = [from, to];
     this.rangeNote = notes.join('; ');
@@ -713,8 +821,10 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     const notes: string[] = [];
     if (floors.length > 0 && floors.some((f) => f > R))
       notes.push(
-        `Server: Profil-R ${R} zu fein → ${floors.filter((f) => f > R).join('/')} (suggestR)`,
+        `Profil-R ${R} zu fein → ${floors.filter((f) => f > R).join('/')} (Zeilengrenze/suggestR)`,
       );
+    if (this.daysMissing > 0) notes.push(`${this.daysMissing} Tage ohne Daten`);
+    if (this.daysEmpty > 0) notes.push(`${this.daysEmpty} Tage ohne Trades`);
     if (this.daysSkipped > 0)
       notes.push(`${this.daysSkipped} Tagesprofile ausgelassen (Tag < ${MIN_DAY_PX} px breit)`);
     if (this.rangeNote) notes.push(this.rangeNote);
@@ -768,7 +878,17 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     const range = `${fmt(this.range[0])} – ${fmt(this.range[1])} UTC`;
     const p = this.rangeProfile();
     if (!p)
-      return { range, loading: true, total: '', buy: '', sell: '', delta: '', poc: '', va: '' };
+      return {
+        range,
+        loading: true,
+        total: '',
+        buy: '',
+        sell: '',
+        delta: '',
+        poc: '',
+        va: '',
+        vwap: '',
+      };
     const q = qtyFormatter(s);
     const px = (u: number) => exactDecimal(u, s.priceDecimals);
     const row = (r: number) => `${px(r * p.width)}–${px((r + 1) * p.width)}`;
@@ -784,6 +904,10 @@ export class ProfileLayer implements IPanePrimitive<Time> {
         p.val === null || p.vah === null
           ? '–'
           : `${px(p.val * p.width)}–${px((p.vah + 1) * p.width)} (${this.va} %)`,
+      vwap:
+        p.vwap === null || p.vwap === undefined
+          ? '–'
+          : (p.vwap / 10 ** s.priceDecimals).toFixed(s.priceDecimals),
     };
   }
 
@@ -860,6 +984,8 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   private drawInner(scope: Scope): void {
     this.daysDrawn = 0;
     this.daysSkipped = 0;
+    this.daysMissing = 0;
+    this.daysEmpty = 0;
     this.hits = [];
     const s = this.host.sym();
     const items = this.host.items();
@@ -915,6 +1041,12 @@ export class ProfileLayer implements IPanePrimitive<Time> {
         }
         const place = profilePlacement(xa, xb, W, footprint);
         const p = this.dayProfileAt(from);
+        if (!p) {
+          // Tag ohne Profil: ohne gespeicherte Daten oder ohne Trades (laut Antwort)
+          const st = dayStatus(this.cache.get(this.dailyKeyFor(s.name, batchOfDay(d))), d);
+          if (st === 'missing') this.daysMissing++;
+          else if (st === 'empty') this.daysEmpty++;
+        }
         if (!place || !p || p.buy.length === 0) continue;
         list.push({ p, ...place, detail });
       }
@@ -1144,4 +1276,55 @@ export function hitAt(hits: readonly Hit[], x: number, unit: number): { h: Hit; 
     if (len >= MIN_BAR_PX && x >= h.x0 && x <= h.x0 + len) return { h, i };
   }
   return null;
+}
+
+/** Hoch/Tief (price_unit) je Profiltag aus den Bars in [fromMs, toMs). */
+export function dayRanges(
+  items: readonly { t: number; h: number; l: number }[],
+  fromMs: number,
+  toMs: number,
+  offsetH: number,
+): [number, number][] {
+  const out: [number, number][] = [];
+  let day = Number.NaN;
+  for (const it of items) {
+    const ms = it.t * 1000;
+    if (ms < fromMs || ms >= toMs) continue;
+    const d = profileDayOf(ms, offsetH);
+    if (d !== day) {
+      day = d;
+      out.push([it.l, it.h]);
+    } else {
+      const r = out[out.length - 1]!;
+      r[0] = Math.min(r[0], it.l);
+      r[1] = Math.max(r[1], it.h);
+    }
+  }
+  return out;
+}
+
+/** Kleinstes R der Leiter (≥ R), bei dem Σ Zeilen je Tag ≤ maxRows; sonst das größte. */
+export function minRowsR(
+  ranges: readonly [number, number][],
+  tickRefUnits: number,
+  ladder: readonly number[],
+  maxRows: number,
+  R: number,
+): number {
+  const rows = (r: number) => {
+    const w = r * tickRefUnits;
+    let n = 0;
+    for (const [lo, hi] of ranges) n += Math.floor(hi / w) - Math.floor(lo / w) + 1;
+    return n;
+  };
+  for (const r of ladder) if (r >= R && rows(r) <= maxRows) return r;
+  return ladder[ladder.length - 1] ?? R;
+}
+
+/** Tag ohne Profil: laut Antwort ohne gespeicherte Daten ('missing'), ohne Trades ('empty') oder unbekannt. */
+export function dayStatus(
+  e: { emptyDays: Set<number>; missingDays: Set<number> } | undefined,
+  d: number,
+): 'missing' | 'empty' | 'unknown' {
+  return e?.missingDays.has(d) ? 'missing' : e?.emptyDays.has(d) ? 'empty' : 'unknown';
 }

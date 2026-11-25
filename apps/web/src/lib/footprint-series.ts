@@ -654,7 +654,7 @@ export class FootprintRenderer implements ICustomSeriesPaneRenderer {
         if (oi < 0) continue;
         for (const [lo, hi, side] of stackZones(st.row, flags, s, e)) {
           if ((hi + 1) * w <= unitBottom || lo * w > unitTop) continue;
-          const key = `${t}|${lo}|${side}`;
+          const key = zoneKey(t, lo, hi, side);
           let end = this.zoneEnd.get(key);
           if (end === undefined) {
             end = -1;
@@ -737,4 +737,10 @@ export class FootprintSeriesView implements ICustomSeriesPaneView<
   defaultOptions(): CustomSeriesOptions {
     return { ...customSeriesDefaultOptions, lastValueVisible: false, priceLineVisible: false };
   }
+}
+
+/** Schlüssel des Projektionsendes einer Zone: Ursprungs-Bar, Unter- UND Oberkante (eine neu geladene
+ * Kachel kann bei gleicher Unterkante eine längere Zone haben), Seite. */
+export function zoneKey(t: number, lo: number, hi: number, side: number): string {
+  return `${t}|${lo}|${hi}|${side}`;
 }

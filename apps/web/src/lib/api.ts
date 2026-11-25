@@ -85,8 +85,9 @@ export class ApiClient {
     return `${this.base}/api/v1/symbols`;
   }
 
-  barsUrl(sym: string, tf: string, fromMs: number, toMs: number): string {
-    return `${this.base}/api/v1/bars?sym=${encodeURIComponent(sym)}&tf=${tf}&from=${fromMs}&to=${toMs}`;
+  /** stats = Stats-Spalten (`x.maxDelta` … `x.trades`, TILE-FORMAT.md) mitliefern lassen. */
+  barsUrl(sym: string, tf: string, fromMs: number, toMs: number, stats = false): string {
+    return `${this.base}/api/v1/bars?sym=${encodeURIComponent(sym)}&tf=${tf}&from=${fromMs}&to=${toMs}${stats ? '&stats=1' : ''}`;
   }
 
   /** cfg = tileConfigVersion (K2): ändert sich n, ändert sich die URL (kein veralteter Cache-Treffer). */

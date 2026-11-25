@@ -478,7 +478,9 @@
         <button
           class:active={prof.mode !== 'off' && prof.view === v}
           aria-pressed={prof.mode !== 'off' && prof.view === v}
-          title="Volumenprofil: Ansicht {t}"
+          title={prof.mode === 'off'
+            ? `Volumenprofil einschalten (Tage) mit Ansicht ${t}`
+            : `Volumenprofil: Ansicht ${t}`}
           onclick={() => setProf(prof.mode === 'off' ? { view: v, mode: 'daily' } : { view: v })}
         >
           {t}
@@ -591,6 +593,7 @@
         <span>Delta {summary.delta}</span>
         <span class="poc">POC {summary.poc}</span>
         <span>VA {summary.va}</span>
+        <span title="notional / Volumen (Anzeige; exakt ist notional)">VWAP {summary.vwap}</span>
       {/if}
     </div>
   {/if}

@@ -60,6 +60,7 @@ export class BarStore {
       if (bad.length > 0)
         throw new Error(`Bar-Abschnitt ${c} passt nicht zur Anfrage: ${bad.join(', ')}`);
     }
+    checkStatsColumns(dec.extra, dec.bars.time.length);
     // Der Decoder garantiert streng aufsteigende Zeiten innerhalb [from, to) → setData-sicher.
     this.chunks.delete(c);
     this.chunks.set(c, dec.bars);
@@ -266,4 +267,34 @@ export function chunksReadyInWindow(
 ): boolean {
   for (let c = c0; c <= c1; c++) if (!has(c)) return false;
   return !!win && win[0] <= c0 && win[1] >= c1;
+}
+
+/** Stats-Spalten der API (TILE-FORMAT.md, `stats=1`); andere `x.`-Spalten werden nicht geprüft. */
+export const STATS_X_COLUMNS = ['x.maxDelta', 'x.minDelta', 'x.cotHigh', 'x.cotLow', 'x.trades'];
+
+/**
+ * Form der Stats-Spalten prüfen, wenn vorhanden (fehlende Spalten sind erlaubt = nicht geliefert): Länge =
+ * Anzahl Bars, endliche Zahlen, x.trades ganzzahlig ≥ 0, minDelta ≤ maxDelta je Bar. Wirft bei Abweichung.
+ */
+export function checkStatsColumns(
+  extra: Record<string, Int32Array | Float64Array> | undefined,
+  nBars: number,
+): void {
+  if (!extra) return;
+  for (const name of STATS_X_COLUMNS) {
+    const c = extra[name];
+    if (!c) continue;
+    if (c.length !== nBars) throw new Error(`${name}: Länge ${c.length} ≠ ${nBars} Bars`);
+    for (let i = 0; i < c.length; i++) {
+      const v = c[i]!;
+      if (!Number.isFinite(v)) throw new Error(`${name}[${i}] nicht endlich`);
+      if (name === 'x.trades' && (v < 0 || !Number.isInteger(v)))
+        throw new Error(`${name}[${i}] = ${v} keine Anzahl`);
+    }
+  }
+  const mx = extra['x.maxDelta'];
+  const mn = extra['x.minDelta'];
+  if (mx && mn)
+    for (let i = 0; i < nBars; i++)
+      if (mn[i]! > mx[i]!) throw new Error(`x.minDelta[${i}] > x.maxDelta[${i}]`);
 }

@@ -152,6 +152,10 @@ export class ChartController {
   readonly rc = new RenderContext();
   /** Stats-Grid (P4): Zustand und Serie der zweiten Pane (null = aus) */
   readonly statsCtx = new StatsContext();
+  /** Bars werden mit `stats=1` geladen (seit das Grid in dieser Sitzung eingeschaltet wurde). */
+  private barsStats = false;
+  /** Profil-Grenzen aus /symbols (limits.profile) */
+  private profileLimits: { maxRows: number; maxR: number; maxRangeDays: number } | null = null;
   private statsSeries: ISeriesApi<'Custom', Time, StatsItem | WhitespaceData<Time>> | null = null;
   /** Volume-Profile (Tages- und Bereichsprofil), als Pane-Primitive unter den Serien. */
   readonly profile: ProfileLayer;
@@ -267,6 +271,7 @@ export class ChartController {
       // H-1: Modus vom Gestenende, nicht die Detailstufe je Frame (sonst springt die Profilbreite)
       footprintActive: () => this.mode === 'footprint',
       gestureActive: () => this.gestureActive,
+      limits: () => this.profileLimits,
       // W-4: Kacheln und Bars zuerst (die API hat 4 Datenbank-Slots)
       busy: () => {
         const f = this.fpQueue.stats;
@@ -446,6 +451,7 @@ export class ChartController {
     this.blocked = ''; // erneuter Start nach einem Fehler (App wiederholt init)
     if (this.destroyed) return;
     this.symbols = r.symbols;
+    this.profileLimits = r.limits?.profile ?? null;
     const s = this.symbols.find((x) => x.name === sym) ?? this.symbols[0];
     if (!s) throw new Error('keine Symbole');
     const tfs = offeredTimeframes(s);
@@ -620,6 +626,11 @@ export class ChartController {
   /** Stats-Grid in einer zweiten Pane (an/aus, Zeilen). */
   setStats(on: boolean, rows: StatRow[]): void {
     this.statsCtx.rows = [...rows];
+    if (on && !this.barsStats) {
+      // einmal je Sitzung: Bars mit Stats-Spalten neu laden (Ansicht bleibt), danach immer mit stats=1
+      this.barsStats = true;
+      if (this.sym) this.setSeries(this.sym.name, this.tf, this.currentAnchor());
+    }
     if (on && !this.statsSeries) {
       // Preisachse der Pane bleibt (eine unsichtbare rechte Achse in nur einer Pane bringt
       // lightweight-charts 5.3 zum Absturz), zeigt aber nichts: leere Beschriftung, keine Striche
@@ -657,7 +668,10 @@ export class ChartController {
         ? this.bars.gapChunks(this.win[0], this.win[1]).map((c) => [c * span, (c + 1) * span])
         : [],
     });
-    this.statsCtx.notes = cvdAligned(offsetH, this.tfSec) ? {} : { cvd: CVD_UNALIGNED_NOTE };
+    this.statsCtx.notes = {
+      ...this.statsCtx.missingNotes(this.barsStats),
+      ...(cvdAligned(offsetH, this.tfSec) ? {} : { cvd: CVD_UNALIGNED_NOTE }),
+    };
     this.statsCtx.rowSize = rowLabel(this.R, this.sym);
     this.statsSeries.applyOptions({});
   }
@@ -784,7 +798,9 @@ export class ChartController {
     this.tfSec = tfSeconds(tf);
     this.barQueue.cancelAll();
     this.fpQueue.cancelAll();
-    this.bars = new BarStore(`${s.name}|${tf}`, s.priceDecimals);
+    // Bars mit Stats-Spalten (stats=1) ab dem ersten Einschalten des Grids in dieser Sitzung: andere URL
+    // und ETag, daher eigene Serie; nicht zwischen beiden Formen hin und her laden
+    this.bars = new BarStore(`${s.name}|${tf}${this.barsStats ? '+s' : ''}`, s.priceDecimals);
     if (symChanged || !this.fpStore) this.fpStore = new FootprintStore(s.qtyDecimals);
     if (symChanged) this.profile.resetForSymbol();
     this.rc.store = this.fpStore;
@@ -864,7 +880,13 @@ export class ChartController {
       const span = chunkSpanSec(this.tfSec);
       wants.push({
         key: `${this.bars.series}#${c}`,
-        url: this.api.barsUrl(this.sym.name, this.tf, c * span * 1000, (c + 1) * span * 1000),
+        url: this.api.barsUrl(
+          this.sym.name,
+          this.tf,
+          c * span * 1000,
+          (c + 1) * span * 1000,
+          this.barsStats,
+        ),
         priority: Math.abs(c - cc),
       });
     }

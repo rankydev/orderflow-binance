@@ -309,3 +309,22 @@ describe('Tages-CVD: Grenzen und Lücken (F-1, F-2, H-1)', () => {
     expect(sc.rowSize).toBe('');
   });
 });
+
+describe('Teil 1: Stats-Spalten im Grid, Zonenschlüssel', () => {
+  it('API-Spalten werden Zeilen; fehlende Spalte = Hinweis (nicht geliefert ≠ 0)', () => {
+    const items = [
+      item(0, 3, 1, 0, 0, { 'x.maxDelta': 4, 'x.minDelta': -1, 'x.cotHigh': 2, 'x.cotLow': -2 }),
+    ];
+    const c = computeStats(items, { offsetH: 0, tfSec: 7200, dataTo: 1e12, windowStartSec: 0 });
+    expect([c.maxDelta![0], c.minDelta![0], c.cotHigh![0], c.cotLow![0]]).toEqual([4, -1, 2, -2]);
+    expect(c.trades).toBeUndefined(); // 2h-Abschnitte: x.trades nicht geliefert
+    const sc = new StatsContext();
+    sc.cols = c;
+    expect(Object.keys(sc.missingNotes(true))).toEqual(['trades']);
+    expect(sc.missingNotes(true).trades).toContain('nicht geliefert');
+  });
+  it('Zonenschlüssel enthält die Oberkante', async () => {
+    const { zoneKey } = await import('../src/lib/footprint-series.ts');
+    expect(zoneKey(60, 10, 12, 0)).not.toBe(zoneKey(60, 10, 13, 0));
+  });
+});
