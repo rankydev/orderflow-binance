@@ -49,7 +49,8 @@ import {
   type DbConfig,
 } from '@orderflow/core';
 import { execFile } from 'node:child_process';
-import { createServer, type ServerResponse } from 'node:http';
+import { createServer } from 'node:http';
+import { EventHub } from './events.ts';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { BinanceRest, DEFAULT_REST_BASE, DEFAULT_WS_BASE, WeightBudget } from './binance.ts';
@@ -167,7 +168,7 @@ async function run(): Promise<number> {
       });
   }
   const rest = new BinanceRest(cfg.restBase, new WeightBudget(cfg.weightPerMin), getSymbol);
-  const clients = new Set<ServerResponse>();
+  const events = new EventHub();
   const rec = new Recorder({
     symbols: cfg.symbols,
     wsUrl: cfg.wsBase,
@@ -181,8 +182,7 @@ async function run(): Promise<number> {
     spoolKeepDays: cfg.keepDays,
     onMinuteCommitted: (symbol, ms) => {
       // lokaler Ereignis-Feed für die API (§4.2 „Minute M committed")
-      const ev = `event: minute\ndata: ${JSON.stringify({ symbol, ts: ms })}\n\n`;
-      for (const c of clients) c.write(ev);
+      events.minute(symbol, ms);
     },
   });
   await rec.start();
@@ -300,12 +300,7 @@ async function run(): Promise<number> {
             res.writeHead(h.healthy ? 200 : 503, { 'content-type': 'application/json' });
             res.end(JSON.stringify(h));
           } else if (req.url === '/events') {
-            res.writeHead(200, {
-              'content-type': 'text/event-stream',
-              'cache-control': 'no-cache',
-            });
-            clients.add(res);
-            req.on('close', () => clients.delete(res));
+            events.attach(req, res);
           } else {
             res.writeHead(404).end();
           }
@@ -416,7 +411,7 @@ async function run(): Promise<number> {
   clearInterval(partialTimer);
   await rec.stop();
   server?.close();
-  for (const c of clients) c.end();
+  events.close();
   await writer.close();
   logLine('stopped', health());
   return 0;
