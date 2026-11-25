@@ -654,6 +654,26 @@ describe('Betriebsschutz: Status-Listener, Diagnose-Header, CORS-Liste, Zeitgren
     }
   });
 
+  it('belegter Port: Start schlägt fehl und schließt die Datenbank-Pools (kein hängender Prozess)', async () => {
+    const busyPort = await freePort();
+    const blocker = createServer().listen(busyPort, '127.0.0.1');
+    await new Promise((r) => blocker.once('listening', r));
+    const count = async () => {
+      const [r] = await admin<{ n: number }[]>`
+        SELECT count(*)::int AS n FROM pg_stat_activity
+         WHERE datname = ${testDb} AND application_name LIKE 'orderflow-api%'`;
+      return r!.n;
+    };
+    try {
+      const before = await count();
+      await expect(start({ port: busyPort })).rejects.toThrow(/EADDRINUSE/);
+      for (let i = 0; i < 40 && (await count()) > before; i++) await sleep(50);
+      expect(await count()).toBe(before);
+    } finally {
+      blocker.close();
+    }
+  });
+
   it('Zeitgrenzen (W2): Leerlauf-Socket und tröpfelnde Kopfzeilen werden geschlossen', async () => {
     const api = await start({ connectionTimeoutMs: 300, requestTimeoutMs: 600 });
     try {

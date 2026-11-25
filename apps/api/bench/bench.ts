@@ -8,6 +8,7 @@
 //   5. Startzeit (Katalog), Speicher (RSS) der API
 //   npm run bench -w @orderflow/api            (Ergebnis: apps/api/bench/results.json + Tabelle)
 import { spawn, type ChildProcess } from 'node:child_process';
+import { createServer, type AddressInfo } from 'node:net';
 import { writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,14 +27,35 @@ const TF_SEC: Record<string, number> = {
 
 interface Api {
   url: string;
+  adminUrl: string;
   proc: ChildProcess;
   startMs: number;
 }
 
-async function spawnApi(port: number, env: Record<string, string>): Promise<Api> {
+/** Freier Loopback-Port (vom Betriebssystem vergeben). */
+function freePort(): Promise<number> {
+  return new Promise((resolve) => {
+    const srv = createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const p = (srv.address() as AddressInfo).port;
+      srv.close(() => resolve(p));
+    });
+  });
+}
+
+async function spawnApi(env: Record<string, string>): Promise<Api> {
+  const port = await freePort();
+  const adminPort = await freePort();
   const t0 = performance.now();
   const proc = spawn(process.execPath, [join(here, '..', 'src', 'main.ts')], {
-    env: { ...process.env, OF_API_PORT: String(port), OF_LOG_LEVEL: 'warn', ...env },
+    env: {
+      ...process.env,
+      OF_API_PORT: String(port),
+      OF_API_ADMIN_PORT: String(adminPort),
+      OF_API_DIAG_HEADERS: '1',
+      OF_LOG_LEVEL: 'warn',
+      ...env,
+    },
     stdio: ['ignore', 'ignore', 'inherit'],
   });
   const url = `http://127.0.0.1:${port}`;
@@ -44,10 +66,10 @@ async function spawnApi(port: number, env: Record<string, string>): Promise<Api>
     } catch {
       /* noch nicht bereit */
     }
-    if (proc.exitCode !== null) throw new Error('API beendet');
+    if (proc.exitCode !== null || proc.signalCode !== null) throw new Error('API beendet');
     await new Promise((r) => setTimeout(r, 50));
   }
-  return { url, proc, startMs: performance.now() - t0 };
+  return { url, adminUrl: `http://127.0.0.1:${adminPort}`, proc, startMs: performance.now() - t0 };
 }
 
 async function stop(api: Api): Promise<void> {
@@ -65,9 +87,13 @@ interface Sample {
   cache: string | null;
 }
 
-async function measure(base: string, path: string): Promise<Sample> {
+async function measure(
+  base: string,
+  path: string,
+  headers: Record<string, string> = {},
+): Promise<Sample & { etag: string | null }> {
   const t0 = performance.now();
-  const r = await fetch(base + path, { headers: { 'Accept-Encoding': 'gzip' } });
+  const r = await fetch(base + path, { headers: { 'Accept-Encoding': 'gzip', ...headers } });
   const body = await r.arrayBuffer();
   const ms = performance.now() - t0;
   const enc = r.headers.get('content-encoding');
@@ -80,6 +106,38 @@ async function measure(base: string, path: string): Promise<Sample> {
     rowsEst: r.headers.has('x-rows-estimate') ? Number(r.headers.get('x-rows-estimate')) : null,
     src: r.headers.get('x-source'),
     cache: r.headers.get('x-cache'),
+    etag: r.headers.get('etag'),
+  };
+}
+
+/** n gleichzeitige Anfragen; Statuscodes, X-Cache-Arten und Wandzeit. */
+async function flood(base: string, paths: string[], headers: Record<string, string> = {}) {
+  const t0 = performance.now();
+  const res = await Promise.all(paths.map((p) => measure(base, p, headers)));
+  const wallMs = r1(performance.now() - t0);
+  const count = (xs: (string | number | null)[]) => {
+    const m: Record<string, number> = {};
+    for (const x of xs) m[String(x)] = (m[String(x)] ?? 0) + 1;
+    return m;
+  };
+  return {
+    n: paths.length,
+    distinctUrls: new Set(paths).size,
+    wallMs,
+    status: count(res.map((r) => r.status)),
+    xCache: count(res.map((r) => r.cache)),
+    p50: r1(
+      q(
+        res.map((r) => r.ms),
+        0.5,
+      ),
+    ),
+    p95: r1(
+      q(
+        res.map((r) => r.ms),
+        0.95,
+      ),
+    ),
   };
 }
 
@@ -131,8 +189,7 @@ function rng(seed: number): () => number {
 }
 
 async function main(): Promise<void> {
-  const port = Number(process.env.BENCH_PORT ?? 8790);
-  const a = await spawnApi(port, {});
+  const a = await spawnApi({});
   const symbols = (await (await fetch(`${a.url}/api/v1/symbols`)).json()) as {
     symbols: {
       name: string;
@@ -266,10 +323,10 @@ async function main(): Promise<void> {
     for (const p of g.paths) ss.push(await measure(a.url, p));
     hit.set(g.name, ss);
   }
-  const healthA = (await (await fetch(`${a.url}/api/v1/health`)).json()) as Record<string, unknown>;
+  const healthA = (await (await fetch(`${a.adminUrl}/health`)).json()) as Record<string, unknown>;
   await stop(a);
 
-  const b = await spawnApi(port + 1, { OF_API_CACHE_MB: '0' });
+  const b = await spawnApi({ OF_API_CACHE_MB: '0' });
   const warm = new Map<string, Sample[]>();
   for (const g of groups) {
     const ss: Sample[] = [];
@@ -286,8 +343,32 @@ async function main(): Promise<void> {
     conc.push(...(await Promise.all(pick.map((p) => measure(b.url, p)))));
     wall.push(performance.now() - t0);
   }
-  const healthB = (await (await fetch(`${b.url}/api/v1/health`)).json()) as Record<string, unknown>;
+  const healthB = (await (await fetch(`${b.adminUrl}/health`)).json()) as Record<string, unknown>;
   await stop(b);
+
+  // Flut (Review W1): frische Instanz mit Standardeinstellungen (Pool 4, Warteschlange 64)
+  const c = await spawnApi({});
+  const lastDay = s.dataTo - DAY;
+  const n1m = s.tiles['1m']!['200']!;
+  const newestTile = Math.floor((s.dataTo - 60_000) / (n1m * 60_000));
+  const tileUrl = `/api/v1/footprint?sym=${SYM}&tf=1m&R=200&tile=${newestTile}&cfg=${s.tileConfigVersion}`;
+  const dayProfile = `/api/v1/profile?sym=${SYM}&from=${lastDay}&to=${s.dataTo}&R=500`;
+  const heavy = Array.from(
+    { length: 300 },
+    (_, i) =>
+      `/api/v1/profile?sym=${SYM}&from=${s.dataFrom + i * 37 * 60_000}&to=${s.dataFrom + i * 37 * 60_000 + DAY}&R=5`,
+  );
+  const floods = {
+    distinctHeavyProfiles: await flood(c.url, heavy),
+    distinctHeavyProfilesAgain: await flood(c.url, heavy),
+    identicalNonFinalTile: await flood(c.url, Array(300).fill(tileUrl)),
+    identicalNonFinalTileAgain: await flood(c.url, Array(300).fill(tileUrl)),
+    identicalNonFinalDayProfile: await flood(c.url, Array(300).fill(dayProfile)),
+  };
+  const etag = (await measure(c.url, tileUrl)).etag!;
+  const tileFinal = (await (await fetch(c.url + tileUrl)).headers.get('cache-control')) ?? '';
+  const revalidate = await flood(c.url, Array(300).fill(tileUrl), { 'If-None-Match': etag });
+  await stop(c);
 
   for (const g of groups) {
     out.push({
@@ -310,6 +391,7 @@ async function main(): Promise<void> {
       cache: healthA.cache,
     },
     concurrent20: { ...summarize(conc), wallMs: wall.map(r1) },
+    flood: { ...floods, revalidate304: revalidate, newestTileCacheControl: tileFinal },
     groups: out,
   };
   await writeFile(join(here, 'results.json'), JSON.stringify(result, null, 2));
@@ -328,6 +410,7 @@ async function main(): Promise<void> {
   console.log(
     `Start: ${JSON.stringify(result.startupMs)} ms; Speicher: ${JSON.stringify(result.memory)}`,
   );
+  console.log(`Flut: ${JSON.stringify(result.flood, null, 1)}`);
 }
 
 await main();

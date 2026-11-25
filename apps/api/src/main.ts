@@ -53,22 +53,30 @@ export async function startApi(
       },
       'Katalog geladen',
     );
-  const url = await app.listen({ host: cfg.host, port: cfg.port });
+  const shutdown = async () => {
+    await app.close();
+    await admin?.close();
+    await catalog.stop();
+    await Promise.all([sql.end({ timeout: 5 }), catSql.end({ timeout: 5 })]);
+  };
   // Status-Listener immer nur auf Loopback, unabhängig von OF_API_HOST (Review W3)
   const admin = cfg.adminPort > 0 ? buildAdminApp(deps) : null;
-  const adminUrl = admin ? await admin.listen({ host: '127.0.0.1', port: cfg.adminPort }) : null;
+  let url: string;
+  let adminUrl: string | null = null;
+  try {
+    url = await app.listen({ host: cfg.host, port: cfg.port });
+    if (admin) adminUrl = await admin.listen({ host: '127.0.0.1', port: cfg.adminPort });
+  } catch (e) {
+    // z. B. Port belegt: Pools schließen, sonst bliebe der Prozess ohne Listener hängen
+    await shutdown().catch(() => {});
+    throw e;
+  }
   let closing: Promise<void> | null = null;
   return {
     url,
     adminUrl,
     deps,
-    close: () =>
-      (closing ??= (async () => {
-        await app.close();
-        await admin?.close();
-        await catalog.stop();
-        await Promise.all([sql.end({ timeout: 5 }), catSql.end({ timeout: 5 })]);
-      })()),
+    close: () => (closing ??= shutdown()),
   };
 }
 
