@@ -14,7 +14,7 @@ export function zoneOf(setting: ZoneSetting): Zone {
 }
 
 export function parseZoneSetting(q: URLSearchParams): ZoneSetting {
-  return q.get('tz') === 'utc' ? 'utc' : 'local';
+  return q.get('tz')?.toLowerCase() === 'utc' ? 'utc' : 'local';
 }
 
 export function zoneSettingQuery(s: ZoneSetting): string {
@@ -97,7 +97,9 @@ export function browserZoneName(): string {
 /**
  * Beschriftung einer Zeitachsenmarke (lightweight-charts tickMarkFormatter). Die Bibliothek gewichtet die
  * Marken nach UTC (Tageswechsel = 00:00 UTC). Eine Datumsmarke, die in der Zone nicht auf Mitternacht
- * fällt, zeigt deshalb Tag und Uhrzeit („25. 01:00"), damit kein falscher Kalendertag entsteht.
+ * fällt, zeigt deshalb Tag und Uhrzeit („25. 01:00"), damit kein falscher Kalendertag entsteht; sie
+ * bleibt so (nicht nur „01:00"), weil sie bei grobem Zoom die einzige Marke mit Datum ist. Die Marke der
+ * Ortsmitternacht (Typ Time) zeigt das Datum („25.").
  */
 export function tickMarkLabel(sec: number, type: TickMarkType, zone: Zone): string {
   const p = parts(sec * 1000, zone);
@@ -112,6 +114,9 @@ export function tickMarkLabel(sec: number, type: TickMarkType, zone: Zone): stri
     case TickMarkType.DayOfMonth:
       return midnight ? String(p.d) : `${p.d}. ${p2(p.h)}:${p2(p.mi)}`;
     case TickMarkType.Time:
+      // Ortsmitternacht (die Bibliothek gewichtet sie nur als Stunde): Datum statt „00:00", damit der
+      // Tageswechsel in der Anzeigezone sichtbar ist (1. des Monats: Monat, 1. Januar: Jahr)
+      if (midnight) return p.d !== 1 ? `${p.d}.` : p.mo !== 1 ? MONTHS[p.mo - 1]! : String(p.y);
       return `${p2(p.h)}:${p2(p.mi)}`;
     case TickMarkType.TimeWithSeconds: {
       const s = new Date(sec * 1000).getUTCSeconds();
@@ -161,4 +166,25 @@ export function fmtShown(ms: number): string {
 /** „YYYY-MM-DD HH:mm UTC+1" in der Anzeigezone, mit Zonenangabe. */
 export function fmtShownZ(ms: number): string {
   return `${fmtShown(ms)} ${zoneLabel(ms, displayZone())}`;
+}
+
+/**
+ * Kurzformen einer Sitzungsbezeichnung, längste zuerst: volle Bezeichnung, nur das UTC-Datum, nichts.
+ * (Kopf der TPO-Spalten: die erste, die in die Spaltenbreite passt.)
+ */
+export function sessionLabelForms(dayStartMs: number, zone: Zone): string[] {
+  const full = sessionLabel(dayStartMs, zone);
+  const date = new Date(dayStartMs).toISOString().slice(0, 10);
+  return full === date ? [full, ''] : [full, date, ''];
+}
+
+/** Erste Form, deren Breite (gleiche Reihenfolge) in avail passt; '' wenn keine. */
+export function fitLabel(
+  forms: readonly string[],
+  widths: readonly number[],
+  avail: number,
+): string {
+  for (let i = 0; i < forms.length; i++)
+    if (forms[i] === '' || widths[i]! <= avail) return forms[i]!;
+  return '';
 }

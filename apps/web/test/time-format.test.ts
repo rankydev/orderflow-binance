@@ -3,7 +3,9 @@
 import { describe, expect, it } from 'vitest';
 import { TickMarkType } from 'lightweight-charts';
 import {
+  fitLabel,
   formatDateTime,
+  sessionLabelForms,
   parseZoneSetting,
   sessionLabel,
   tickMarkLabel,
@@ -111,5 +113,42 @@ describe('Einstellung und URL', () => {
     const local = Intl.DateTimeFormat().resolvedOptions().timeZone;
     expect(zoneOffsetMinutes(t, undefined)).toBe(zoneOffsetMinutes(t, local));
     expect(zoneOffsetMinutes(t + H, undefined)).toBe(-new Date(t + H).getTimezoneOffset());
+  });
+});
+
+describe('Folgeprüfung 86844d8', () => {
+  it('tz=UTC/Utc ohne Rücksicht auf Groß-/Kleinschreibung, ausgegeben klein', () => {
+    expect(parseZoneSetting(new URLSearchParams('tz=UTC'))).toBe('utc');
+    expect(parseZoneSetting(new URLSearchParams('tz=Utc'))).toBe('utc');
+    expect(zoneSettingQuery(parseZoneSetting(new URLSearchParams('tz=UTC')))).toBe('&tz=utc');
+  });
+  it('Ortsmitternacht trägt das Datum, 00:00-UTC-Marke bleibt Tag + Uhrzeit', () => {
+    const s = (iso: string) => u(iso) / 1000;
+    // 2026-11-24 23:00 UTC = 25.11. 00:00 Zürich (Stundenmarke der Bibliothek)
+    expect(tickMarkLabel(s('2026-11-24T23:00'), TickMarkType.Time, ZRH)).toBe('25.');
+    expect(tickMarkLabel(s('2026-11-25T00:00'), TickMarkType.DayOfMonth, ZRH)).toBe('25. 01:00');
+    expect(tickMarkLabel(s('2026-11-25T01:00'), TickMarkType.Time, ZRH)).toBe('02:00');
+    // Monats-/Jahreswechsel in Ortszeit
+    expect(tickMarkLabel(s('2026-10-31T23:00'), TickMarkType.Time, ZRH)).toBe('Nov');
+    expect(tickMarkLabel(s('2025-12-31T23:00'), TickMarkType.Time, ZRH)).toBe('2026');
+    // Sommerzeit: Ortsmitternacht ist 22:00 UTC
+    expect(tickMarkLabel(s('2026-07-14T22:00'), TickMarkType.Time, ZRH)).toBe('15.');
+    // UTC-Anzeige: Time-Marken um 00:00 gibt es nicht als Time-Typ; falls doch, Datum
+    expect(tickMarkLabel(s('2026-11-25T13:00'), TickMarkType.Time, 'UTC')).toBe('13:00');
+  });
+  it('Spaltenkopf: volle Form, sonst Datum, sonst nichts', () => {
+    const forms = sessionLabelForms(u('2026-11-24T00:00'), 'America/St_Johns');
+    expect(forms).toEqual(['2026-11-24 UTC · ab 23.11. 20:30', '2026-11-24', '']);
+    expect(sessionLabelForms(u('2026-11-24T00:00'), 'UTC')).toEqual([
+      '2026-11-24 ab 00:00',
+      '2026-11-24',
+      '',
+    ]);
+    const w = [180, 60, 0];
+    expect(fitLabel(forms, w, 200)).toBe(forms[0]);
+    expect(fitLabel(forms, w, 180)).toBe(forms[0]);
+    expect(fitLabel(forms, w, 179)).toBe('2026-11-24');
+    expect(fitLabel(forms, w, 59)).toBe('');
+    expect(fitLabel(forms, w, -10)).toBe('');
   });
 });

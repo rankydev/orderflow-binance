@@ -7,7 +7,7 @@
 //    60 s neu. Volumenprofil über /profiles/daily (gleiche Zeilengröße wie die TPOs).
 //  - Zeichnen nur in requestAnimationFrame, nur sichtbare Tage und Zeilen; Mausbewegung ohne Taste
 //    berechnet nur die Hover-Zeile (einmal je Frame), Zeilengröße/Bedarf erst am Gestenende.
-import { displayZone, sessionLabel } from '../time-format.ts';
+import { displayZone, fitLabel, sessionLabel, sessionLabelForms } from '../time-format.ts';
 import {
   checkDailyProfiles,
   decodeTile,
@@ -183,6 +183,7 @@ export class TpoView {
   private histMax = new Float64Array(0);
   private histVa = new Uint8Array(0);
   private readonly rects: Rect[] = [];
+  private readonly headCache = new Map<string, { forms: string[]; widths: number[] }>();
   onHover: ((text: string) => void) | null = null;
   onChange: (() => void) | null = null;
   readonly stats = { frames: 0, lastMs: 0, maxMs: 0, drawMs: new Float64Array(512), cells: 0 };
@@ -823,6 +824,23 @@ export class TpoView {
     return `TPO ${dayLabel(day.dayStart)} · Zeile [${px(row * day.width)}, ${px((row + 1) * day.width)})${marks ? ` ${marks}` : ''} · ${day.counts[i]} TPO · ${letters}`;
   }
 
+  /**
+   * Spaltenkopf: längste Form der Tagesbezeichnung, die in die Spalte passt (sonst nur Datum, sonst
+   * nichts) – Köpfe laufen nie in die Nachbarspalte. Formen und Breiten je (Tagesbeginn, Zone) gemerkt.
+   */
+  private headerLabel(ctx: CanvasRenderingContext2D, dayStart: number): string {
+    const zone = displayZone();
+    const key = `${dayStart}|${zone ?? ''}`;
+    let e = this.headCache.get(key);
+    if (!e) {
+      const forms = sessionLabelForms(dayStart, zone);
+      e = { forms, widths: forms.map((f) => (f ? ctx.measureText(f).width : 0)) };
+      if (this.headCache.size > 512) this.headCache.clear();
+      this.headCache.set(key, e);
+    }
+    return fitLabel(e.forms, e.widths, this.colW - 2 * PAD);
+  }
+
   schedule(): void {
     if (this.frameReq) return;
     this.frameReq = requestAnimationFrame(() => {
@@ -875,7 +893,8 @@ export class TpoView {
       ctx.font = '11px system-ui, sans-serif';
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
-      ctx.fillText(dayLabel(tpoDayStart(d, this.host.offsetH())), x0 + PAD, HEADER_H / 2);
+      const head = this.headerLabel(ctx, tpoDayStart(d, this.host.offsetH()));
+      if (head) ctx.fillText(head, x0 + PAD, HEADER_H / 2);
       const day = this.days.get(d);
       if (!day) continue;
       this.drawDay(ctx, s, day, x0, rowH);
