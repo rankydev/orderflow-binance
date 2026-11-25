@@ -367,7 +367,8 @@ describe('Review N1–N6 (DB)', () => {
     let calls = 0;
     const orig = w.convertFinishedChunks.bind(w);
     w.convertFinishedChunks = async (u: number) => {
-      if (++calls === 1) throw new Error('lock timeout (simuliert)');
+      if (++calls === 1)
+        throw Object.assign(new Error('lock timeout (simuliert)'), { code: '55P03' });
       return orig(u);
     };
     const [s] = await run(w, '2026-09-19', '2026-09-19', false);
@@ -375,6 +376,39 @@ describe('Review N1–N6 (DB)', () => {
     const [d] = await sql`SELECT state FROM data_day WHERE day = '2026-09-19'`;
     expect(d!.state).toBe('final_ok');
     expect(logs.some((l) => l.includes('Konvertierung nach 2026-09-19 fehlgeschlagen'))).toBe(true);
+  });
+
+  it('K1: ein anderer Konvertierungsfehler nach dem Commit wird geworfen, der Zustand bleibt', async () => {
+    const w = new PostgresWriter(cfg, BTC, { backfill: true, log: () => {} });
+    let calls = 0;
+    const orig = w.convertFinishedChunks.bind(w);
+    w.convertFinishedChunks = async (u: number) => {
+      if (++calls === 1)
+        throw Object.assign(new Error('must be owner (simuliert)'), { code: '42501' });
+      return orig(u);
+    };
+    await w.open();
+    try {
+      await expect(
+        new Importer({
+          dataDir,
+          spec: BTC,
+          firstDay: parseDay('2026-09-19'),
+          lastDay: parseDay('2026-09-19'),
+          prefer: 'auto',
+          neighbours: false,
+          writer: w,
+          importerVersion: 'int-test',
+          sidecar: false,
+          log: () => {},
+          force: true,
+        }).run(),
+      ).rejects.toThrow(/Konvertierung nach 2026-09-19 fehlgeschlagen.*must be owner/);
+    } finally {
+      await w.close();
+    }
+    const [d] = await sql`SELECT state FROM data_day WHERE day = '2026-09-19'`;
+    expect(d!.state).toBe('final_ok');
   });
 
   it('N3: derselbe Tag aus einer anderen Quelldatei mit identischen Daten gilt als fertig', async () => {
@@ -638,14 +672,145 @@ describe('Re-Import eines historischen Tages ohne --backfill (Review W6)', () =>
     console.log(
       `W6: Re-Import 2026-09-08 ohne --backfill inkl. Nachverdichtung ${Math.round(ms)} ms`,
     );
-    // Belegen, dass auch die Policy teilweise komprimierte Chunks nachverdichtet: Chunk per DML
-    // teilweise machen (No-op-Update auf eine Zeile) und den Policy-Job laufen lassen.
+    // Seit Migration 0014 verdichtet die Policy teilweise komprimierte Chunks NICHT mehr nach (sie
+    // nähme dafür keine Sperre): Chunk per DML teilweise machen, Policy-Job laufen lassen → bleibt 9.
     await sql`UPDATE fp_1m SET buy_q = buy_q WHERE sym_id = ${BTC.symId} AND ts = '2026-09-08 12:00:00+00'`;
     expect(await status()).toBe(9);
     const [job] = await sql`
       SELECT job_id FROM timescaledb_information.jobs WHERE proc_name = 'policy_compression' AND hypertable_name = 'fp_1m'`;
     await sql.unsafe(`CALL run_job(${job!.job_id as number})`);
-    expect(await status()).toBe(1); // die Policy komprimiert teilweise komprimierte Chunks nach
+    expect(await status()).toBe(9);
+    // … das holt der nächste schreibende Importer-Lauf unter Sperre nach (close-Durchlauf)
+    await run(new PostgresWriter(cfg, BTC), '2026-09-08', '2026-09-08', false);
+    expect(await status()).toBe(1);
     expect(ms).toBeGreaterThan(0);
+  });
+
+  it('Sperre für die Nachverdichtung wartet begrenzt (W3): API-artige Leser laufen nie in ihre 1-s-Zeitüberschreitung; ohne Sperre bleibt der Chunk teilweise und close() holt ihn nach', async () => {
+    const [{ c }] = (await sql`
+      SELECT format('%I.%I', chunk_schema, chunk_name) AS c FROM timescaledb_information.chunks
+       WHERE hypertable_name = 'fp_1m' AND range_start = '2026-09-08 00:00:00+00'`) as unknown as [
+      { c: string },
+    ];
+    const status = async () =>
+      (await sql`SELECT status FROM _timescaledb_catalog.chunk WHERE relid = ${c}::regclass`)[0]!
+        .status as number;
+    expect(await status()).toBe(1);
+    // ein langer Leser hält ACCESS SHARE, bis wir ihn loslassen
+    const holder = connect(cfg);
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let held!: () => void;
+    const isHeld = new Promise<void>((r) => (held = r));
+    const holding = holder.begin(async (tx) => {
+      await tx.unsafe(`LOCK TABLE ${c} IN ACCESS SHARE MODE`);
+      held();
+      await released;
+    });
+    await isHeld;
+    // API-artige Leser: lock_timeout 1 s, laufend
+    const api = connect(cfg);
+    let stop = false;
+    const apiErrors: unknown[] = [];
+    let apiReads = 0;
+    const apiLoop = (async () => {
+      while (!stop) {
+        try {
+          await api.begin('isolation level repeatable read read only', async (tx) => {
+            await tx`SET LOCAL lock_timeout = '1s'`;
+            await tx.unsafe(`LOCK TABLE ${c} IN ACCESS SHARE MODE`);
+            await tx`SELECT count(*) FROM fp_1m WHERE ts >= '2026-09-08' AND ts < '2026-09-09'`;
+          });
+          apiReads++;
+        } catch (e) {
+          apiErrors.push(String(e));
+        }
+        await sleep(20);
+      }
+    })();
+    const logs: string[] = [];
+    const w = new PostgresWriter(cfg, BTC, {
+      lockTimeoutMs: 200,
+      lockAttempts: 3,
+      lockRetryMs: 100,
+      log: (m) => logs.push(m),
+    });
+    await w.open();
+    try {
+      // Re-Import ohne --backfill: Chunk wird teilweise; Nachverdichtung bekommt die Sperre nicht
+      const [r] = await new Importer({
+        dataDir,
+        spec: BTC,
+        firstDay: parseDay('2026-09-08'),
+        lastDay: parseDay('2026-09-08'),
+        prefer: 'monthly',
+        neighbours: false,
+        writer: w,
+        importerVersion: 'int-test',
+        sidecar: false,
+        log: () => {},
+        force: true,
+      }).run();
+      expect(r!.dbDigest).toBe(r!.digest);
+      expect(await status()).toBe(9);
+      expect(logs.some((l) => l.includes(`Chunk ${c}`) && l.includes('nicht gesperrt'))).toBe(true);
+      release();
+      await holding;
+      await w.close(); // Durchlauf über übrige teilweise komprimierte Chunks
+      expect(await status()).toBe(1);
+    } finally {
+      release();
+      await holding.catch(() => {});
+      stop = true;
+      await apiLoop;
+      await api.end();
+      await holder.end();
+    }
+    expect(apiErrors).toEqual([]);
+    expect(apiReads).toBeGreaterThan(0);
+  });
+});
+
+describe('Erstkompression gealterter Chunks durch die Policy (Review-Frage)', () => {
+  it('wartet auf Lock-first-Leser; ältere Snapshots (auch ohne Sperre) sehen den Chunk unverändert', async () => {
+    const [{ c }] = (await sql`
+      SELECT format('%I.%I', chunk_schema, chunk_name) AS c FROM timescaledb_information.chunks
+       WHERE hypertable_name = 'fp_1m' AND range_start = '2026-09-08 00:00:00+00'`) as unknown as [
+      { c: string },
+    ];
+    const [job] = await sql`
+      SELECT job_id FROM timescaledb_information.jobs WHERE proc_name = 'policy_compression' AND hypertable_name = 'fp_1m'`;
+    const cnt = async (tx: Sql) =>
+      (
+        await tx`SELECT count(*)::int AS n, sum(buy_q)::text AS q FROM fp_1m WHERE ts >= '2026-09-08' AND ts < '2026-09-09'`
+      )[0]!;
+    const want = await cnt(sql);
+    const reader = connect(cfg);
+    try {
+      for (const lockFirst of [true, false]) {
+        await sql.unsafe(`CALL convert_to_rowstore('${c}'::regclass, if_columnstore => true)`);
+        let jobMs = 0;
+        let job_: Promise<void> = Promise.resolve();
+        const seen = await reader.begin('isolation level repeatable read read only', async (tx) => {
+          if (lockFirst) await tx.unsafe(`LOCK TABLE ${c} IN ACCESS SHARE MODE`);
+          else await tx`SELECT count(*) FROM symbol`; // Snapshot steht, Chunk ungesperrt
+          const t0 = performance.now();
+          job_ = sql.unsafe(`CALL run_job(${job!.job_id as number})`).then(() => {
+            jobMs = performance.now() - t0;
+          });
+          await sleep(800);
+          return cnt(tx as unknown as Sql);
+        });
+        await job_;
+        expect(seen, `lockFirst=${lockFirst}`).toEqual(want);
+        const [st] =
+          await sql`SELECT status FROM _timescaledb_catalog.chunk WHERE relid = ${c}::regclass`;
+        expect(st!.status).toBe(1);
+        if (lockFirst) expect(jobMs).toBeGreaterThan(700); // hat auf den Leser gewartet
+        console.log(`Erstkompression lockFirst=${lockFirst}: Job ${Math.round(jobMs)} ms`);
+      }
+    } finally {
+      await reader.end();
+    }
   });
 });

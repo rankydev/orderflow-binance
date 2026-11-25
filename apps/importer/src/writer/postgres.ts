@@ -183,8 +183,21 @@ export interface PostgresWriterOptions {
   directDml?: boolean;
   /** Nur lesen (--plan): kein Lock, keine Job-Reparatur, keine Schreibzugriffe. */
   readOnly?: boolean;
+  /**
+   * Chunk-Konvertierung (Review W3): so lange wartet die ACCESS-EXCLUSIVE-Sperre höchstens je
+   * Versuch. Kürzer als die lock_timeout der API (1 s): API-Leser, die sich hinter der wartenden
+   * Sperre anstellen, laufen dadurch nicht in ihre eigene Zeitüberschreitung. Standard 500 ms.
+   */
+  lockTimeoutMs?: number;
+  /** Versuche je Chunk bei Sperr-Zeitüberschreitung, danach später (close bzw. nächster Lauf). Standard 10. */
+  lockAttempts?: number;
+  /** Pause zwischen den Versuchen (ms, wächst linear bis 5 s). Standard 1000. */
+  lockRetryMs?: number;
   log?: (s: string) => void;
 }
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const pgCode = (e: unknown): string => String((e as { code?: unknown })?.code ?? '');
 
 export class PostgresWriter implements DayWriter {
   readonly kind = 'postgres' as const;
@@ -264,7 +277,17 @@ export class PostgresWriter implements DayWriter {
     }
     // N1: pausierte Columnstore-Jobs der Projekttabellen stammen von einem abgebrochenen Backfill
     // (kill -9, OOM): niemand sonst pausiert sie, und wir halten den Lock. Bei jedem Öffnen reparieren.
-    const repaired = await this.setProjectJobs(true, false);
+    // W5: alter_job verlangt Eigentum am Job. Ohne (Recorder-Rolle) nicht reparieren, nur warnen –
+    // sonst schlüge jede Finalisierung fehl, solange ein abgebrochener Backfill Jobs pausiert hält.
+    let repaired: number[] = [];
+    try {
+      repaired = await this.setProjectJobs(true, false);
+    } catch (e) {
+      if (pgCode(e) !== '42501' || this.opt.backfill) throw e;
+      this.opt.log?.(
+        `WARNUNG: pausierte Columnstore-Jobs gefunden, aber keine Rechte zur Reparatur (${e instanceof Error ? e.message : String(e)}); ein Importer-Lauf als Eigentümer aktiviert sie wieder`,
+      );
+    }
     if (repaired.length > 0) {
       this.opt.log?.(
         `WARNUNG: ${repaired.length} pausierte Columnstore-Jobs gefunden (abgebrochener Backfill?) und wieder aktiviert`,
@@ -324,34 +347,59 @@ export class PostgresWriter implements DayWriter {
   }
 
   /**
-   * Chunk in den Columnstore wandeln (auch teilweise komprimierte nachverdichten) – unter einer
-   * vorher genommenen ACCESS-EXCLUSIVE-Sperre. Die Nachverdichtung eines teilweise komprimierten
-   * Chunks wartet in 2.31 von sich aus NICHT auf Leser (gemessen) und ist für ältere Snapshots nicht
-   * MVCC-sicher (ein REPEATABLE-READ-Leser sah den Chunk trotz eigener Sperre leer); mit der Sperre
-   * wartet sie, bis laufende Leser fertig sind, und neue Leser warten auf sie.
+   * Teilweise komprimierte Chunks (Status-Bit 8) der Projekttabellen nachverdichten – nur im
+   * Zeitraum [from, to), ohne Zeitraum alle. Seit Migration 0014 tut die Policy das nicht mehr.
+   * Gibt die Zahl der Chunks zurück, die wegen Sperr-Zeitüberschreitung offen blieben.
    */
-  private async recompressPartial(from: Date, to: Date): Promise<number> {
+  private async recompressPartial(from?: Date, to?: Date): Promise<number> {
     const chunks = await this.db`
       SELECT format('%I.%I', c.chunk_schema, c.chunk_name) AS c
         FROM timescaledb_information.chunks c
         JOIN _timescaledb_catalog.chunk k
           ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
        WHERE c.hypertable_schema = 'public' AND c.hypertable_name = ANY(${[...DIGEST_TABLES]}::text[])
-         AND c.range_start < ${to} AND c.range_end > ${from}
+         AND (${to ?? null}::timestamptz IS NULL OR c.range_start < ${to ?? null})
+         AND (${from ?? null}::timestamptz IS NULL OR c.range_end > ${from ?? null})
          AND (k.status & 8) <> 0 AND (k.status & 4) = 0 AND NOT k.osm_chunk
        ORDER BY c.hypertable_name, c.range_start`;
-    for (const c of chunks) await this.convertChunk(c.c as string);
-    return chunks.length;
+    let deferred = 0;
+    for (const c of chunks) if (!(await this.convertChunk(c.c as string))) deferred++;
+    return deferred;
   }
 
-  private async convertChunk(chunk: string): Promise<void> {
-    await this.db.begin(async (tx) => {
-      await tx.unsafe(`LOCK TABLE ${chunk} IN ACCESS EXCLUSIVE MODE`);
-      await tx.unsafe(
-        'CALL convert_to_columnstore($1::regclass, if_not_columnstore => true, recompress => true)',
-        [chunk],
-      );
-    });
+  /**
+   * Chunk in den Columnstore wandeln bzw. nachverdichten – über of_recompress_chunk (Migration
+   * 0014: ACCESS EXCLUSIVE vor der Konvertierung, SECURITY DEFINER, damit auch die Recorder-Rolle
+   * ohne Eigentum es darf). Die Nachverdichtung wartet in 2.31 von sich aus NICHT auf Leser und ist
+   * für ältere Snapshots nicht MVCC-sicher; mit der Sperre wartet sie, bis laufende Leser fertig
+   * sind. Die Sperre wartet je Versuch höchstens lockTimeoutMs (W3: eine wartende ACCESS-EXCLUSIVE-
+   * Anfrage hält alle neuen Leser des Chunks auf); danach Pause und neuer Versuch. Liefert false,
+   * wenn alle Versuche an der Sperre scheiterten (der Chunk bleibt teilweise komprimiert – lesbar
+   * und konsistent, nur weniger kompakt; close() und spätere Läufe versuchen es erneut). Jeder
+   * andere Fehler (Rechte, fehlende Migration) wird geworfen.
+   */
+  private async convertChunk(chunk: string): Promise<boolean> {
+    const timeout = Math.max(1, Math.trunc(this.opt.lockTimeoutMs ?? 500));
+    const attempts = this.opt.lockAttempts ?? 10;
+    const pause = this.opt.lockRetryMs ?? 1000;
+    for (let i = 1; ; i++) {
+      try {
+        await this.db.begin(async (tx) => {
+          await tx.unsafe(`SET LOCAL lock_timeout = '${timeout}ms'`);
+          await tx`SELECT of_recompress_chunk(${chunk}::regclass)`;
+        });
+        return true;
+      } catch (e) {
+        if (pgCode(e) !== '55P03') throw e;
+        if (i >= attempts) {
+          this.opt.log?.(
+            `WARNUNG: Chunk ${chunk} nach ${attempts} Versuchen nicht gesperrt (Leser aktiv); bleibt teilweise komprimiert bis zum nächsten Versuch`,
+          );
+          return false;
+        }
+        await sleep(Math.min(5000, pause * i));
+      }
+    }
   }
 
   async close(): Promise<void> {
@@ -361,6 +409,9 @@ export class PostgresWriter implements DayWriter {
         const n = await this.convertFinishedChunks(this.writtenUntil);
         this.opt.log?.(`Backfill: ${n} Chunks konvertiert`);
       }
+      // Übrig gebliebene teilweise komprimierte Chunks (Sperre nicht bekommen, Abbruch) nachholen.
+      // Auch ohne eigenen Schreibvorgang: so räumt jeder schreibende Lauf Reste früherer Läufe auf.
+      if (!this.opt.readOnly) await this.recompressPartial();
     } finally {
       try {
         if (this.pausedJobs.length > 0) {
@@ -537,6 +588,10 @@ export class PostgresWriter implements DayWriter {
       if (this.opt.backfill && !this.opt.directDml) reconvert = await this.rowstoreDay(from, to);
       out = await this.db.begin(async (tx) => {
         await this.ensureLock(tx);
+        // Direktes DML auf einem Columnstore-Tag entpackt alle betroffenen Batches (echter BTC-Tag
+        // in fp_1m: > 10⁶ Zeilen); Timescales Standardgrenze (100 000 je Transaktion) bräche den
+        // Ersatz ab. Nur für diese Transaktion aufheben (USERSET, auch für of_recorder erlaubt).
+        await tx`SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0`;
         for (const t of DIGEST_TABLES) {
           await tx.unsafe(`DELETE FROM ${t} WHERE sym_id = $1 AND ts >= $2 AND ts < $3`, [
             symId,
@@ -596,7 +651,7 @@ export class PostgresWriter implements DayWriter {
                  carry_in_q = ${w.inputs.carryIn.q}, carry_in_b = ${w.inputs.carryIn.b},
                  carry_in_origin = ${w.inputs.carryInOrigin}, prev_last_agg_id = ${w.inputs.prevLastAggId},
                  cand_in_q = ${w.inputs.candIn?.q ?? null}, cand_in_b = ${w.inputs.candIn?.b ?? null},
-                 stale = false, state_before_import = NULL
+                 stale = false, state_before_import = NULL, live_frozen = NULL
            WHERE sym_id = ${symId} AND day = ${dayStr}::date
           RETURNING version`;
         // H-b: ein gespeicherter Folgetag, der mit anderen Ausgaben dieses Tages klassifiziert wurde,
@@ -619,20 +674,23 @@ export class PostgresWriter implements DayWriter {
       throw e;
     }
     // Ab hier ist der Tag festgeschrieben: nichts darf mehr den Zustand zurücksetzen (Review N4).
-    // Konvertierungsfehler werden nur gemeldet; die Policy bzw. der nächste Backfill holt sie nach.
+    // Sperr-Zeitüberschreitungen bei der Konvertierung holt close() bzw. der nächste Lauf nach.
     this.writtenUntil = Math.max(this.writtenUntil, (data.day + 1) * DAY_MS);
     try {
       for (const c of reconvert) await this.convertChunk(c);
       if (this.opt.backfill) await this.convertFinishedChunks(this.writtenUntil);
       // Online (direktes DML auf einem Columnstore-Chunk): der Chunk ist danach teilweise
-      // komprimiert (Status-Bit 8). Sonst verdichtet ihn später die Policy nach – und die nimmt
-      // keine Sperre, ein Leser mit älterem Snapshot (auch mit LOCK TABLE … ACCESS SHARE) sähe ihn
-      // dann leer. Daher hier sofort unter ACCESS EXCLUSIVE nachverdichten (wartet auf Leser).
+      // komprimiert (Status-Bit 8). Die Policy verdichtet ihn seit Migration 0014 nicht mehr nach
+      // (sie nähme keine Sperre; ein Leser mit älterem Snapshot sähe ihn leer), also hier unter
+      // ACCESS EXCLUSIVE (wartet auf Leser).
       else await this.recompressPartial(from, to);
     } catch (e) {
-      this.opt.log?.(
-        `WARNUNG: Columnstore-Konvertierung nach ${dayStr} fehlgeschlagen (Daten sind geschrieben): ${e instanceof Error ? e.message : String(e)}`,
-      );
+      // Der Tag ist geschrieben (N4: nichts setzt ihn zurück). Eine Sperr-Zeitüberschreitung holt
+      // close() bzw. der nächste Lauf nach; jeder andere Fehler (Rechte, fehlende Migration 0014)
+      // muss auffallen (K1) und wird geworfen.
+      const msg = `Columnstore-Konvertierung nach ${dayStr} fehlgeschlagen (Daten sind geschrieben): ${e instanceof Error ? e.message : String(e)}`;
+      if (pgCode(e) !== '55P03') throw new Error(msg, { cause: e });
+      this.opt.log?.(`WARNUNG: ${msg}`);
     }
     return out;
   }
@@ -679,8 +737,10 @@ export class PostgresWriter implements DayWriter {
     const flag = e.minute === 0 ? 'edge_first_pending' : 'edge_last_pending';
     const other = e.minute === 0 ? 'edge_last_pending' : 'edge_first_pending';
     if (e.minute !== 0 && e.minute !== 1439) throw new Error('resolveEdge: nur Minute 0 oder 1439');
-    return this.db.begin(async (tx) => {
+    const changed = await this.db.begin(async (tx) => {
       await this.ensureLock(tx);
+      // eine bar_1m-Zeile in einem Columnstore-Chunk: entpackt einen ganzen Batch (siehe writeDay)
+      await tx`SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0`;
       const [dd] = await tx.unsafe(
         `SELECT state, ${flag} AS pending FROM data_day WHERE sym_id = $1 AND day = $2::date FOR UPDATE`,
         [symId, dayStr],
@@ -713,6 +773,10 @@ export class PostgresWriter implements DayWriter {
       );
       return true;
     });
+    // Das UPDATE macht einen komprimierten bar_1m-Chunk teilweise: unter Sperre nachverdichten
+    // (die Policy tut es seit 0014 nicht; Sperr-Zeitüberschreitung → close() holt es nach).
+    if (changed) await this.recompressPartial(ts, new Date(ts.getTime() + MINUTE_MS));
+    return changed;
   }
 }
 
