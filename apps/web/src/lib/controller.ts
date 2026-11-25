@@ -248,7 +248,9 @@ export class ChartController {
       priceToY: (price) =>
         (this.mode === 'footprint' ? this.fp : this.candle).priceToCoordinate(price),
       barsCoverFinal: (fromMs, toMs) => this.barsCoverFinal(fromMs, toMs),
-      footprintActive: () => this.mode === 'footprint' && this.rc.stats.lod >= 2,
+      // H-1: Modus vom Gestenende, nicht die Detailstufe je Frame (sonst springt die Profilbreite)
+      footprintActive: () => this.mode === 'footprint',
+      gestureActive: () => this.gestureActive,
       // W-4: Kacheln und Bars zuerst (die API hat 4 Datenbank-Slots)
       busy: () => {
         const f = this.fpQueue.stats;

@@ -5,6 +5,7 @@ import {
   batchWindow,
   compareProfileWithBars,
   dailyKey,
+  commonScale,
   dayDetail,
   profilePlacement,
   rowBarLength,
@@ -30,6 +31,7 @@ import {
   clampBatch,
   hitAt,
   PROFILE_COLORS,
+  PROFILE_MAX_HOLD_MS,
   PROFILE_MAX_PARALLEL,
   PROFILE_NONFINAL_TTL_MS,
   ProfileLayer,
@@ -376,6 +378,7 @@ function setup(
     barsCoverFinal: () => true,
     footprintActive: () => false,
     busy: () => false,
+    gestureActive: () => false,
     ...over,
   };
   const layer = new ProfileLayer(host, (url, init) => {
@@ -759,5 +762,147 @@ describe('URL: Offset ±12 und Skala', () => {
     expect(p.scale).toBe('common');
     expect(p.rangeNote).toContain('vertauscht');
     expect(profileParamsQuery(p)).toContain('&ps=common');
+  });
+});
+
+describe('Prüfrunde 0195c61 (W-A, W-B, H-1 … H-4)', () => {
+  const settle = async () => {
+    for (let i = 0; i < 8; i++) await flush();
+  };
+  const daily = (q: number) => (u: URL) => {
+    const from = Number(u.searchParams.get('from'));
+    const to = Number(u.searchParams.get('to'));
+    const days = [];
+    for (let d = from; d < to; d += D) days.push(dayBody(d, q));
+    return json(envelope(u, { kind: 'profiles/daily', offsetH: 0, days }));
+  };
+
+  it('W-A: Zurückstehen höchstens 2 s, danach eine Profilanfrage gleichzeitig', async () => {
+    let now = 0;
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    try {
+      const sym = { ...SYM, dataFrom: T0 - 40 * D, dataTo: T0 + 7 * D };
+      const { layer, calls } = setup(daily(23), undefined, {
+        busy: () => true,
+        sym: () => sym,
+        visibleTimeRange: () => [sym.dataFrom / 1000, sym.dataTo / 1000],
+        barsCoverFinal: () => false,
+      });
+      layer.manualR = 1;
+      layer.frame();
+      await settle();
+      expect(calls).toHaveLength(0);
+      now = PROFILE_MAX_HOLD_MS - 1;
+      layer.frame();
+      await settle();
+      expect(calls).toHaveLength(0);
+      now = PROFILE_MAX_HOLD_MS;
+      layer.frame();
+      await settle();
+      expect(calls).toHaveLength(1); // nur eine, obwohl mehrere Batches fehlen
+      layer.frame();
+      await settle();
+      expect(calls).toHaveLength(2); // die erste ist fertig → die nächste
+      layer.destroy();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('W-A: der Wartetimer startet während einer Geste nichts', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let gesture = true;
+      const { layer } = setup(daily(23), undefined, {
+        busy: () => true,
+        gestureActive: () => gesture,
+      });
+      layer.manualR = 1;
+      layer.frame();
+      expect(layer.counters.held).toBe(1);
+      vi.advanceTimersByTime(1_000);
+      expect(layer.counters.held).toBe(1); // Timer feuerte, aber kein frame() in der Geste
+      gesture = false;
+      layer.frame();
+      vi.advanceTimersByTime(160);
+      expect(layer.counters.held).toBe(3);
+      layer.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('W-B: gemeinsame Skala nur über Profile der aktuellen Zeilenbreite; fest bis Datenankunft', async () => {
+    const mk = (width: number, maxVol: number, maxAbsDelta: number) => ({
+      width,
+      maxVol,
+      maxAbsDelta,
+    });
+    expect(commonScale([mk(10, 5, 2), mk(10, 9, 1), mk(20, 99, 99)], 10)).toEqual({
+      width: 10,
+      total: 9,
+      delta: 2,
+    });
+    let vis: [number, number] = [T0 / 1000, (T0 + 3 * D) / 1000];
+    let q = 23;
+    const sym = { ...SYM, dataFrom: T0 - 60 * D };
+    const { layer } = setup((u) => daily(q)(u), undefined, {
+      sym: () => sym,
+      visibleTimeRange: () => vis,
+      barsCoverFinal: () => false,
+    });
+    layer.manualR = 1;
+    layer.scaleMode = 'common';
+    layer.frame();
+    await settle();
+    const common = () => (layer as unknown as { common: { total: number } }).common.total;
+    expect(common()).toBe(23);
+    // Pannen (sichtbarer Bereich ändert sich, kein Gestenende, keine Daten) → unverändert
+    vis = [(T0 - 40 * D) / 1000, (T0 - 37 * D) / 1000];
+    layer.redraw();
+    expect(common()).toBe(23);
+    // neue Daten mit größerem Maximum → erst bei Ankunft übernommen
+    q = 50;
+    layer.frame();
+    await settle();
+    expect(common()).toBe(50);
+  });
+
+  it('H-1: Profilbreite folgt dem Modus vom Gestenende, nicht der Detailstufe je Frame', () => {
+    // der Controller übergibt mode === 'footprint'; hier nur der Vertrag der Lage-Funktion
+    expect(profilePlacement(-60_000, 6_240, 1000, true)?.maxW).toBe(250);
+    expect(profilePlacement(-60_000, 6_240, 1000, false)?.maxW).toBe(300);
+  });
+
+  it('H-2: Schließen löscht auch den Fehler der Anfragewarteschlange', async () => {
+    const { layer } = setup(() => new Response('x', { status: 500 }));
+    layer.manualR = 1;
+    layer.frame();
+    await settle();
+    expect(layer.readout().error).toContain('HTTP 500');
+    layer.dismissError();
+    expect(layer.readout().error).toBe('');
+    layer.destroy();
+  });
+
+  it('H-3: nach der stehenden Meldung lädt eine spätere Abweichung wieder zuerst neu', async () => {
+    const { layer, calls, inits } = setup(daily(99)); // Bars: 24 Lots je Tag
+    layer.manualR = 1;
+    layer.frame();
+    await settle();
+    expect(calls).toHaveLength(2);
+    expect(layer.readout().sticky).toBe(true);
+    layer.crossCheckAll(); // z. B. nach einem Fensterwechsel
+    await settle();
+    expect(calls).toHaveLength(3);
+    expect(inits[2]).toBe('reload');
+  });
+
+  it('H-4: Hover trifft Balken ab derselben Mindestlänge wie das Zeichnen (0,5 px)', () => {
+    const p = mini();
+    // Zeile 13: Volumen 1 von 8 bei 6 px → 0,75 px
+    const h: Hit = { x0: 0, maxW: 6, p, range: false, view: 'total', scale: 8 };
+    expect(hitAt([h], 0.7, 135)?.i).toBe(3);
+    expect(hitAt([{ ...h, maxW: 3 }], 0.2, 135)).toBeNull(); // 0,375 px < 0,5 px: nicht gezeichnet
   });
 });

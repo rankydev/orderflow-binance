@@ -338,6 +338,27 @@ export function profileRects(
   return out;
 }
 
+/** Kürzeste gezeichnete Balkenlänge (CSS-px); Hover trifft dieselben Balken (H-4). */
+export const MIN_BAR_PX = 0.5;
+
+/**
+ * Gemeinsame Skala (W-B): größtes Zeilenvolumen bzw. |Delta| über alle Profile der Zeilenbreite `width`
+ * (andere Breiten, z. B. nach einem 422-Vorschlag, zählen nicht).
+ */
+export function commonScale(
+  profiles: Iterable<Pick<PreparedProfile, 'width' | 'maxVol' | 'maxAbsDelta'>>,
+  width: number,
+): { width: number; total: number; delta: number } {
+  let total = 0;
+  let delta = 0;
+  for (const p of profiles) {
+    if (p.width !== width) continue;
+    total = Math.max(total, p.maxVol);
+    delta = Math.max(delta, p.maxAbsDelta);
+  }
+  return { width, total, delta };
+}
+
 /** Skala eines Profils: größtes Volumen bzw. größtes |Delta| einer Zeile. */
 export function profileScale(
   p: Pick<PreparedProfile, 'maxVol' | 'maxAbsDelta'>,

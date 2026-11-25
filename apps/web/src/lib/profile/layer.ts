@@ -26,6 +26,8 @@ import type { BarItem, SymbolInfo } from '../types.ts';
 import {
   batchOfDay,
   batchWindow,
+  commonScale,
+  MIN_BAR_PX,
   compareProfileWithBars,
   DAY_MS,
   dailyKey,
@@ -78,6 +80,8 @@ export interface ProfileHost {
   footprintActive(): boolean;
   /** Laden gerade Kacheln oder Bars (laufend oder wartend)? Dann stehen Profile zurück (W-4). */
   busy(): boolean;
+  /** Läuft gerade eine Geste? Dann keine neuen Profilanfragen (Bedarf erst am Gestenende). */
+  gestureActive(): boolean;
 }
 
 /** Farben (Kerzenfarben, halbtransparent, damit Kerzen/Zellen davor lesbar bleiben). */
@@ -102,6 +106,8 @@ export const PROFILE_NONFINAL_TTL_MS = 60_000;
 export const PROFILE_MAX_PARALLEL = 2;
 /** Wartezeit, bis zurückgestellter Profilbedarf erneut geprüft wird (ms). */
 export const PROFILE_HOLD_MS = 150;
+/** Längstes Zurückstehen hinter Kacheln/Bars (W-A); danach höchstens eine Profilanfrage gleichzeitig. */
+export const PROFILE_MAX_HOLD_MS = 2_000;
 /** Mindestbreite des Bereichsprofils (px), auch bei schmalem Bereich. */
 const RANGE_MIN_W = 40;
 /** Längster Bereich wie die API (3 660 Tage). */
@@ -215,6 +221,10 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   private readonly rects: Rect[] = [];
   private hits: Hit[] = [];
   private holdTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Beginn des aktuellen Zurückstehens (performance.now) oder null */
+  private holdSince: number | null = null;
+  /** W-B: gemeinsame Skala, nur bei Datenankunft/Gestenende/Einstellung neu bestimmt */
+  private common = { width: 0, total: 0, delta: 0 };
   /** Naked-Level-Ergebnisse je (Profil, Zeile) für das aktuelle Item-Array (nicht je Frame) */
   private nakedItems: readonly BarItem[] | null = null;
   private readonly naked = new Map<string, number>();
@@ -297,6 +307,8 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   dismissError(): void {
     this.stickyError = '';
     this.error = '';
+    this.queue.lastError = ''; // H-2
+    this.crossFails.clear(); // H-3: nächste Abweichung lädt wieder zuerst neu
     this.onChange?.();
   }
 
@@ -305,12 +317,14 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     const s = this.host.sym();
     if (!s || !(pxPerUnit > 0)) return;
     this.autoR = profileRowSize(this.autoR, this.ladder(), pxPerUnit, s.tickRefUnits);
+    this.updateCommonScale();
     this.frame();
     this.redraw();
   }
 
   /** Einstellungen geändert (UI): Bedarf neu, neu zeichnen. */
   changed(): void {
+    this.updateCommonScale();
     this.frame();
     this.redraw();
     this.onChange?.();
@@ -403,17 +417,26 @@ export class ProfileLayer implements IPanePrimitive<Time> {
           base: null,
         });
     }
-    // W-4: Kacheln und Bars haben Vorrang – solange sie laden, keine neuen Profilanfragen
+    // W-4: Kacheln und Bars haben Vorrang – solange sie laden, keine neuen Profilanfragen; W-A: höchstens
+    // PROFILE_MAX_HOLD_MS lang, danach eine Profilanfrage gleichzeitig (Profile verhungern nicht)
     if (wants.length > 0 && this.host.busy()) {
-      this.counters.held++;
-      this.queue.setWanted([], retain);
+      this.holdSince ??= now;
+      if (now - this.holdSince >= PROFILE_MAX_HOLD_MS) {
+        const first = [...wants].sort((a, b) => a.priority - b.priority).slice(0, 1);
+        this.queue.setWanted(this.queue.stats.inFlight > 0 ? [] : first, retain);
+      } else {
+        this.counters.held++;
+        this.queue.setWanted([], retain);
+      }
       if (!this.holdTimer)
         this.holdTimer = setTimeout(() => {
           this.holdTimer = null;
-          this.frame();
+          // während einer Geste nichts starten – der Controller bestimmt den Bedarf am Gestenende
+          if (!this.host.gestureActive()) this.frame();
         }, PROFILE_HOLD_MS);
       return;
     }
+    this.holdSince = null;
     this.queue.setWanted(wants, retain);
   }
 
@@ -488,8 +511,28 @@ export class ProfileLayer implements IPanePrimitive<Time> {
       this.error = '';
       this.crossCheck(key);
     }
+    this.updateCommonScale();
     this.onChange?.();
     this.redraw();
+  }
+
+  /**
+   * W-B: gemeinsame Skala = größte Zeile über alle geladenen Tagesprofile mit der Zeilenbreite des
+   * aktuellen R in den sichtbaren Batches ± 1 – nur bei Datenankunft, Gestenende und Einstellungen neu
+   * bestimmt, nicht je Frame (sonst springen die Balken, wenn ein großer Tag hereinscrollt).
+   */
+  updateCommonScale(): void {
+    const s = this.host.sym();
+    const vis = this.host.visibleTimeRange();
+    if (!s || !vis || this.R === null) return;
+    const b0 = batchOfDay(profileDayOf(vis[0] * 1000, this.offsetH)) - 1;
+    const b1 = batchOfDay(profileDayOf(vis[1] * 1000, this.offsetH)) + 1;
+    const profiles: PreparedProfile[] = [];
+    for (let b = b0; b <= b1; b++) {
+      const e = this.cache.get(this.dailyKeyFor(s.name, b));
+      if (e) for (const p of e.profiles.values()) profiles.push(p);
+    }
+    this.common = commonScale(profiles, this.R * s.tickRefUnits);
   }
 
   private onRejected(key: string, status: number, body?: string): void {
@@ -564,6 +607,7 @@ export class ProfileLayer implements IPanePrimitive<Time> {
         this.frame();
       } else {
         this.stickyError = `Profil ab ${day} UTC passt nicht zu den Bars (${diff})`;
+        this.crossFails.delete(ck); // H-3: eine spätere Abweichung lädt wieder zuerst neu
       }
       return;
     }
@@ -874,23 +918,13 @@ export class ProfileLayer implements IPanePrimitive<Time> {
         if (!place || !p || p.buy.length === 0) continue;
         list.push({ p, ...place, detail });
       }
-      // gemeinsame Skala: größte Zeile über die sichtbaren, gleich gebinnten Tagesprofile
-      const common = { total: 0, delta: 0 };
-      if (this.scaleMode === 'common' && list.length > 0) {
-        const w = list[0]!.p.width;
-        for (const x of list) {
-          if (x.p.width !== w) continue;
-          common.total = Math.max(common.total, x.p.maxVol);
-          common.delta = Math.max(common.delta, x.p.maxAbsDelta);
-        }
-      }
+      // gemeinsame Skala: festgehalten (W-B); Profile anderer Zeilenbreite (422-Vorschlag) eigene Skala
+      const common = this.common;
       for (const x of list) {
         const view: ProfileView = x.detail === 'silhouette' ? 'total' : this.view;
         const c =
-          this.scaleMode === 'common' && x.p.width === list[0]!.p.width
-            ? view === 'delta'
-              ? common.delta
-              : common.total
+          this.scaleMode === 'common' && x.p.width === common.width
+            ? Math.max(view === 'delta' ? common.delta : common.total, profileScale(x.p, view))
             : 0;
         this.drawProfile(g, x.p, x.x0, x.maxW, x.detail, view, c || profileScale(x.p, view), false);
         this.daysDrawn++;
@@ -963,7 +997,7 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     const rTop = Math.floor(uAt(0) / p.width);
     const rBot = Math.floor(uAt(H / vpr) / p.width);
     this.rects.length = 0;
-    profileRects(p, view, bx, bw, yU, 0, H, gap, this.rects, 0.5, scale, [rBot, rTop]);
+    profileRects(p, view, bx, bw, yU, 0, H, gap, this.rects, MIN_BAR_PX * hpr, scale, [rBot, rTop]);
     this.counters.rectsDrawn += this.rects.length;
     for (const paint of PAINT_ORDER) {
       let any = false;
@@ -1101,13 +1135,13 @@ function mapView(items: readonly BarItem[], f: (it: BarItem) => number): Float64
 
 /**
  * Hover-Treffer (W-1): erstes gezeichnetes Profil, dessen Balken der Zeile unter `unit` bis `x` reicht
- * (x0 ≤ x ≤ x0 + Balkenlänge, Balken ≥ 1 px). Rand rechts vom Balken = kein Treffer → Footprint/Kerze.
+ * (x0 ≤ x ≤ x0 + Balkenlänge, Balken ≥ MIN_BAR_PX wie beim Zeichnen, H-4). Rand rechts vom Balken = kein Treffer → Footprint/Kerze.
  */
 export function hitAt(hits: readonly Hit[], x: number, unit: number): { h: Hit; i: number } | null {
   for (const h of hits) {
     const i = Math.floor(unit / h.p.width) - h.p.rowLo;
     const len = rowBarLength(h.p, h.view, i, h.maxW, h.scale);
-    if (len >= 1 && x >= h.x0 && x <= h.x0 + len) return { h, i };
+    if (len >= MIN_BAR_PX && x >= h.x0 && x <= h.x0 + len) return { h, i };
   }
   return null;
 }
