@@ -58,9 +58,9 @@ systemctl daemon-reload
 rm -rf -- "$STAGE"
 
 C="docker compose -p orderflow-binance -f $R/compose.prod.yml --env-file $R/.env"
-$C config -q
-$C pull -q db
-$C up -d --wait db
+$C config -q </dev/null
+$C pull -q db </dev/null
+$C up -d --wait db </dev/null
 docker exec orderflow-db psql -X -At -U of_admin -d orderflow -c "SELECT 'db ok: ' || version()" -c "SELECT 'timescaledb ' || extversion FROM pg_extension WHERE extname='timescaledb'"
 if [ "$MON" = 1 ]; then
   systemctl enable --now orderflow-monitor.timer

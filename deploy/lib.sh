@@ -41,8 +41,12 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o Ser
 # Befehl(e) auf dem Server per bash ausführen; Skripttext von stdin, Argumente als $1…
 # Beispiel: remote <<'EOF' … EOF     bzw.  remote_args a b <<'EOF' … EOF
 remote() {
+  # Skript als Argument (bash -c), nicht als stdin: ein Befehl im Skript, der stdin liest (z. B.
+  # `docker compose run`), würde sonst den Rest des Skripts verschlucken (beim Rollout passiert).
+  local script
+  script=$(cat)
   # shellcheck disable=SC2029
-  ssh "${SSH_OPTS[@]}" "$DEPLOY_HOST" "bash -s -- $(printf '%q ' "$@")"
+  ssh "${SSH_OPTS[@]}" "$DEPLOY_HOST" "bash -c $(printf '%q' "$script") remote $(printf '%q ' "$@")" </dev/null
 }
 
 # Interaktive Bestätigung (überspringbar mit OF_YES=1, z. B. wenn der Nutzer den Lauf freigab)

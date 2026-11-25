@@ -119,7 +119,7 @@ src_psql -c "SELECT 'jobsched|' || job_id || '|' || scheduled FROM timescaledb_i
 log "5/7 Restore auf dem Server (Ziel muss leer sein${REPLACE:+, --replace})"
 remote "$SRV_ROOT" "/transfer/$NAME" "$REPLACE" <<'EOF' > "$WORK/report-target.txt"
 set -euo pipefail
-"$1/bin/restore-db.sh" --container orderflow-db --dump "$2" --sql-dir "$1/sql" $3
+"$1/bin/restore-db.sh" --container orderflow-db --dump "$2" --sql-dir "$1/sql" $3 </dev/null
 EOF
 
 

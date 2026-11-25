@@ -110,7 +110,7 @@ if [ ! -f "$CERT" ]; then
   # deploy-hook nur für diese Lineage (steht in renewal/orderflow.rankyhub.com.conf)
   certbot certonly --account "$acct" --webroot -w /var/www/orderflow-acme -d orderflow.rankyhub.com \
     --cert-name orderflow.rankyhub.com --non-interactive --keep-until-expiring \
-    --deploy-hook 'nginx -t && systemctl reload nginx'
+    --deploy-hook 'nginx -t && systemctl reload nginx' </dev/null
 fi
 
 say "Phase 2: endgültige Site (80 → 308, 443 mit App und /api/)"

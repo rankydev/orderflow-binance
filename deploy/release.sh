@@ -60,27 +60,29 @@ else
   rm -f api-image.tar.gz
   cd ..
   # Migrationsstand mit dem NEUEN Image prüfen (Migrationsdateien liegen im Image)
-  st=$(OF_RELEASE=$ID $C run --rm -T ops node packages/db/src/cli.ts status)
+  # </dev/null überall: dieses Skript kommt per stdin (bash -s); `compose run` läse sonst den Rest
+  # des Skripts als Eingabe des Containers und die folgenden Befehle liefen nie (so geschehen)
+  st=$(OF_RELEASE=$ID $C run --rm -T ops node packages/db/src/cli.ts status </dev/null)
   printf '%s\n' "$st" >&2
   if printf '%s\n' "$st" | grep -q '^ausstehend'; then
     if [ "$MIGRATE" != 1 ]; then say "ausstehende Migrationen – erneut mit --migrate (nach Prüfung)"; exit 1; fi
     say "Migrationen anwenden"
-    OF_RELEASE=$ID $C run --rm -T ops node packages/db/src/cli.ts up
+    OF_RELEASE=$ID $C run --rm -T ops node packages/db/src/cli.ts up </dev/null
   fi
   say "Passwort der Rolle of_api aus api.env setzen"
-  OF_RELEASE=$ID $C run --rm -T ops node apps/api/src/cli/api-role-password.ts
+  OF_RELEASE=$ID $C run --rm -T ops node apps/api/src/cli/api-role-password.ts </dev/null
 fi
 
 printf 'OF_RELEASE=%s\n' "$ID" > "$R/.env.new" && mv -f "$R/.env.new" "$R/.env"
-if ! $C up -d --wait --wait-timeout 120 api; then
+if ! $C up -d --wait --wait-timeout 120 api </dev/null; then
   say "API $ID nicht healthy – Logs:"
   docker logs --tail 30 orderflow-api >&2 || true
   if [ -n "$PREV" ] && [ "$PREV" != none ]; then
     say "zurück auf $PREV"
     printf 'OF_RELEASE=%s\n' "$PREV" > "$R/.env"
-    $C up -d --wait --wait-timeout 120 api || true
+    $C up -d --wait --wait-timeout 120 api </dev/null || true
   else
-    $C stop api || true
+    $C stop api </dev/null || true
   fi
   exit 1
 fi
