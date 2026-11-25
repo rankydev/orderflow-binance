@@ -84,7 +84,8 @@ ANALYZE + Prüfbericht Ziel (≈ 8–12 min auf 2 vCPU, lokal 5,5 min; Columnsto
 und danach wieder aktiv, `jobsched|`-Zeilen vergleichen den Zustand) · **6/7 Pflichtvergleich – bei Abweichung Abbruch mit Exit 1,
 weiter erst nach Klärung** · 7/7 Härtung (`harden-db.sql`: PUBLIC ohne CONNECT/TEMP) und Löschen
 der Dumps auf beiden Seiten.
-Prüfung: Ausgabe `Prüfberichte identisch`, `digest|days=334|match=334|mismatch=0`, `grant|of_api|tables=23|select=16|write=0`.
+Prüfung: Ausgabe `Prüfberichte identisch`, `digest|days=334|match=334|mismatch=0`, `grant|of_api|tables=23|select=16|write=0|…` (ab Quelle 0013 zusätzlich `role|of_recorder|…`,
+`grant|of_recorder|…`, `grant_write|of_recorder|…`).
 **Rücknahme / Wiederholung:** API stoppen (falls schon gestartet) und
 `deploy/transfer-db.sh --replace` (DROP/CREATE der Ziel-DB, dann alles erneut), oder Volume
 löschen: `… down -v` und Schritt 2 erneut. Danach `deploy/postcheck.sh "$BASE" --neighbours-only`.
@@ -161,6 +162,45 @@ Startzeit, pm2 ohne Neustart, Ports, Dateien, Statuscodes innen/außen, Standard
 eigene Site 308/200/200/404, keine Diagnose-Header, keine nginx-Version, alle eigenen Ports nur
 auf 127.0.0.1. Danach im Browser `https://orderflow.rankyhub.com/` öffnen (Konsole ohne
 CSP-Fehler, Kacheln laden, kein 429 beim Schwenken).
+
+## Später: Recorder-Rollout (Migration 0013 auf einen bei 0012 übertragenen Server) – vorbereitet, nicht ausgeführt
+
+Der Server wurde am 2026-11-25 bei Migration 0012 übertragen; es gibt dort **keine** Rolle
+`of_recorder`. Ein Release ab 0013 mit `deploy/release.sh <id> --migrate` wendet 0013 über den
+ops-Container als `of_admin` an:
+
+- `CREATE ROLE of_recorder` steht in der Migration unter `IF NOT EXISTS` – kein Konflikt mit
+  `roles.sql`/`roles-source.sql` (die legen `of_recorder` nur an, wenn die Quelle eines Transfers
+  sie schon hatte; dann ist 0013 auf dem Server bereits angewendet und nichts ausstehend).
+- `GRANT CONNECT ON DATABASE orderflow TO of_recorder` aus der Migration ist nach der Härtung
+  nötig und ausreichend (PUBLIC hat kein CONNECT mehr); TEMPORARY bekommt die Rolle nicht.
+  Danach `harden-db.sql` erneut ausführen (idempotent; prüft beide Rollen):
+  `docker exec -i orderflow-db psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow < /opt/orderflow-binance/sql/harden-db.sql`.
+- Passwort: wie bei der API nur auf dem Server, z. B. `/etc/orderflow-binance/recorder.env`
+  (0600, `openssl rand`), gesetzt mit einem Werkzeug analog `api-role-password.ts` (SCRAM-Verifier
+  im Client). **Offen, hängt vom Backend ab:** Name der Variablen und des Werkzeugs (es gibt noch
+  keins), ob der Recorder als eigener Compose-Dienst (gleiches Image, `apps/recorder` müsste dann
+  ins Image) oder als systemd-Unit läuft, und ob eine SECURITY-DEFINER-Funktion bzw.
+  Default-Privilegien für `of_recorder` dazukommen (der Prüfbericht vergleicht Tabellenrechte,
+  Schreibliste und Ausführungsrechte; Default-ACLs als `default_acl|`-Zeilen).
+- **0013 und 0014 gehören zusammen:** beide müssen angewendet sein, bevor ein neuer Importer oder
+  der Recorder läuft (ohne 0014 scheitert eine Chunk-Konvertierung jetzt laut). 0014 setzt
+  `recompress: false` auf den Columnstore-Policies, legt die SECURITY-DEFINER-Funktion
+  `of_recompress_chunk(regclass)` (Eigentümer `of_admin`, EXECUTE nur für `of_recorder`) an und
+  gibt `of_recorder` per Default-Privileg SELECT auf künftige Tabellen. Lokal geprüft: 0013 + 0014
+  auf einer bei 0012 übertragenen und gehärteten DB angewendet → `of_recorder` hat danach CONNECT
+  nur auf `orderflow`, kein TEMPORARY; `harden-db.sql` erneut ausführen ändert daran nichts.
+- **Rohdaten-Fenster des Recorders:** Löschen alter Rohdateien (`OF_RAW_KEEP_DAYS > 0`) verlangt
+  die Markierungsdatei `<OF_DATA_DIR>/raw/binance-vision/.of-recorder-raw-cache` und verweigert
+  Verzeichnisse mit Monatsdateien. Auf dem VPS die Markierung **vor** `OF_RAW_KEEP_DAYS=14`
+  anlegen; im Import-Archiv auf dem Mac darf sie **nie** existieren.
+- `transfer-db.sh` funktioniert für Quellen bei 0012, 0013 und 0014 (lokal getestet), ein erneuter
+  Transfer (`--replace`) nach dem Recorder-Start würde aber Live-Daten des VPS überschreiben – dann
+  nicht mehr ohne Abstimmung verwenden.
+
+**Hinweis Transfer:** Dump und Quellbericht halten auf der Mac-DB einen exportierten Snapshot
+offen (≈ 6 min bei zwei Symbolen). Sperrende Vorgänge auf `orderflow` (Chunk-Konvertierung,
+Lock-Proben) warten so lange; während Schritt 3 nichts dergleichen auf dem Mac starten.
 
 ## Nach dem Rollout – wichtig
 

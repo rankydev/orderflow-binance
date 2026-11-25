@@ -89,21 +89,52 @@ SELECT 'content|' || c.relname || '|'
 SELECT 'migration|' || version || '|' || name || '|' || checksum FROM schema_migrations ORDER BY version;
 
 -- Nur lesende API-Rolle: Attribute, Rolleneinstellungen, Rechte
+-- Anwendungsrollen (of_api ab 0009, of_recorder ab 0013): Attribute, Einstellungen, Rechte.
+-- Zeilen nur für Rollen, die existieren – auf beiden Seiten gleich, wenn roles-source.sql stimmt.
 SELECT 'role|' || rolname || '|super=' || rolsuper || '|login=' || rolcanlogin || '|inherit='
        || rolinherit || '|createdb=' || rolcreatedb || '|createrole=' || rolcreaterole
        || '|replication=' || rolreplication || '|bypassrls=' || rolbypassrls || '|connlimit='
        || rolconnlimit || '|config=' || coalesce(array_to_string(ARRAY(SELECT unnest(rolconfig) ORDER BY 1), ','), '')
-  FROM pg_roles WHERE rolname = 'of_api';
-SELECT 'grant|of_api|connect=' || has_database_privilege('of_api', current_database(), 'CONNECT')
-       || '|create_db=' || has_database_privilege('of_api', current_database(), 'CREATE')
-       || '|schema_usage=' || has_schema_privilege('of_api', 'public', 'USAGE')
-       || '|schema_create=' || has_schema_privilege('of_api', 'public', 'CREATE');
-SELECT 'grant|of_api|tables=' || count(*)
-       || '|select=' || count(*) FILTER (WHERE has_table_privilege('of_api', c.oid, 'SELECT'))
-       || '|write=' || count(*) FILTER (WHERE has_table_privilege('of_api', c.oid,
+  FROM pg_roles WHERE rolname IN ('of_api', 'of_recorder') ORDER BY rolname;
+SELECT 'grant|' || r.rolname || '|connect=' || has_database_privilege(r.oid, current_database(), 'CONNECT')
+       || '|create_db=' || has_database_privilege(r.oid, current_database(), 'CREATE')
+       || '|temp=' || has_database_privilege(r.oid, current_database(), 'TEMPORARY')
+       || '|schema_usage=' || has_schema_privilege(r.oid, 'public', 'USAGE')
+       || '|schema_create=' || has_schema_privilege(r.oid, 'public', 'CREATE')
+  FROM pg_roles r WHERE r.rolname IN ('of_api', 'of_recorder') ORDER BY r.rolname;
+SELECT 'grant|' || r.rolname || '|tables=' || count(*)
+       || '|select=' || count(*) FILTER (WHERE has_table_privilege(r.oid, c.oid, 'SELECT'))
+       || '|write=' || count(*) FILTER (WHERE has_table_privilege(r.oid, c.oid,
                                               'INSERT,UPDATE,DELETE,TRUNCATE'))
-  FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace
- WHERE s.nspname = 'public' AND c.relkind IN ('r', 'p', 'v');
+       || '|insert=' || count(*) FILTER (WHERE has_table_privilege(r.oid, c.oid, 'INSERT'))
+       || '|update=' || count(*) FILTER (WHERE has_table_privilege(r.oid, c.oid, 'UPDATE'))
+       || '|delete=' || count(*) FILTER (WHERE has_table_privilege(r.oid, c.oid, 'DELETE'))
+       || '|truncate=' || count(*) FILTER (WHERE has_table_privilege(r.oid, c.oid, 'TRUNCATE'))
+       || '|owner=' || count(*) FILTER (WHERE c.relowner = r.oid)
+  FROM pg_roles r CROSS JOIN pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace
+ WHERE r.rolname IN ('of_api', 'of_recorder') AND s.nspname = 'public' AND c.relkind IN ('r', 'p', 'v')
+ GROUP BY r.rolname ORDER BY r.rolname;
+-- Welche Tabellen jede Rolle schreiben darf (Liste, damit eine Verschiebung auffällt)
+SELECT 'grant_write|' || r.rolname || '|' || coalesce(string_agg(c.relname, ',' ORDER BY c.relname), '')
+  FROM pg_roles r CROSS JOIN pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace
+ WHERE r.rolname IN ('of_api', 'of_recorder') AND s.nspname = 'public' AND c.relkind IN ('r', 'p')
+   AND has_table_privilege(r.oid, c.oid, 'INSERT,UPDATE,DELETE')
+ GROUP BY r.rolname ORDER BY r.rolname;
+-- Projektfunktionen in public (nicht die der Timescale-Erweiterung): wer darf sie ausführen,
+-- welche sind SECURITY DEFINER (z. B. of_recompress_chunk ab Migration 0014)
+SELECT 'grant_exec|' || r.rolname || '|' || coalesce(string_agg(p.oid::regprocedure::text, ',' ORDER BY p.oid::regprocedure::text), '')
+  FROM pg_roles r CROSS JOIN pg_proc p JOIN pg_namespace s ON s.oid = p.pronamespace
+ WHERE r.rolname IN ('of_api', 'of_recorder') AND s.nspname = 'public'
+   AND NOT EXISTS (SELECT FROM pg_depend dp WHERE dp.classid = 'pg_proc'::regclass AND dp.objid = p.oid AND dp.deptype = 'e')
+   AND has_function_privilege(r.oid, p.oid, 'EXECUTE')
+ GROUP BY r.rolname ORDER BY r.rolname;
+SELECT 'function|' || p.oid::regprocedure::text || '|owner=' || pg_get_userbyid(p.proowner)
+       || '|secdef=' || p.prosecdef || '|config=' || coalesce(array_to_string(p.proconfig, ','), '')
+       || '|acl=' || coalesce(array_to_string(ARRAY(SELECT unnest(p.proacl)::text ORDER BY 1), ','), 'default')
+  FROM pg_proc p JOIN pg_namespace s ON s.oid = p.pronamespace
+ WHERE s.nspname = 'public'
+   AND NOT EXISTS (SELECT FROM pg_depend dp WHERE dp.classid = 'pg_proc'::regclass AND dp.objid = p.oid AND dp.deptype = 'e')
+ ORDER BY 1;
 SELECT 'default_acl|' || pg_get_userbyid(defaclrole) || '|' || defaclobjtype::text || '|'
        || array_to_string(defaclacl, ',')
   FROM pg_default_acl ORDER BY 1;
@@ -115,7 +146,7 @@ SELECT 'dbsetting|' || coalesce(pg_get_userbyid(nullif(setrole, 0)), '*') || '|'
        || array_to_string(ARRAY(SELECT unnest(setconfig) ORDER BY 1), ',')
   FROM pg_db_role_setting
  WHERE setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
-    OR (setdatabase = 0 AND setrole = (SELECT oid FROM pg_roles WHERE rolname = 'of_api'))
+    OR (setdatabase = 0 AND setrole IN (SELECT oid FROM pg_roles WHERE rolname IN ('of_api', 'of_recorder')))
  ORDER BY 1;
 
 -- Informativ (darf abweichen): Größen, Jobzeitpunkte

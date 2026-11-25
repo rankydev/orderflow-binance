@@ -89,9 +89,7 @@ docker run --rm --network "$NET" -e PGPASSWORD -v "$WORK:/dump" "$IMAGE" \
 log "pg_dump: $(( $(date +%s) - t0 )) s, $(du -sh "$WORK/db" | cut -f1)"
 
 log "2/7 Rolleneinstellungen + Prüfsummen"
-src_psql_c -c "SELECT s FROM (SELECT 0 AS o, 'ALTER ROLE of_api RESET ALL;' AS s UNION ALL
-  SELECT 1, format('ALTER ROLE of_api SET %s = %L;', split_part(c, '=', 1), substr(c, strpos(c, '=') + 1))
-    FROM pg_roles, unnest(rolconfig) c WHERE rolname = 'of_api') x ORDER BY o, s" > "$WORK/db/roles-source.sql"
+src_psql < "$DEPLOY_DIR/sql/export-roles.sql" > "$WORK/db/roles-source.sql"
 sha256_manifest "$WORK/db"
 
 log "3/7 Prüfbericht der Quelle im selben Snapshot (Hintergrund, ≈ 3–4 min)"
@@ -140,10 +138,12 @@ set -euo pipefail
 docker exec -i orderflow-db psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow < "$1/sql/harden-db.sql"
 EOF
 cat "$WORK/harden.txt" >&2
-# Erwartet: of_api nur in orderflow verbindbar, nirgends TEMP; PUBLIC ohne CONNECT/TEMP
+# Erwartet: keine Anwendungsrolle (of_api, of_recorder) außerhalb von orderflow verbindbar, nirgends
+# TEMP; of_api verbindet sich mit orderflow; PUBLIC ohne CONNECT/TEMP. of_recorder hat CONNECT auf
+# orderflow genau dann, wenn die Quelle es hatte (Migration 0013) – das prüft schon datacl| im Bericht.
 grep -qx 'dbpriv|orderflow|of_api_connect=true|of_api_temp=false' "$WORK/harden.txt" \
   && ! grep -E '^dbpriv\|' "$WORK/harden.txt" | grep -v '^dbpriv|orderflow|' | grep -q 'connect=true' \
-  && ! grep -q 'of_api_temp=true' "$WORK/harden.txt" \
+  && ! grep -q '_temp=true' "$WORK/harden.txt" \
   && grep -q '^public_connect|false|public_temp|false|' "$WORK/harden.txt" \
   || die "Härtung nicht wie erwartet (siehe oben)"
 if [ "$KEEP" = 0 ]; then

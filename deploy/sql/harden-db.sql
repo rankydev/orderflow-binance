@@ -8,15 +8,24 @@ BEGIN
   EXECUTE format('REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC', current_database());
   EXECUTE format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO of_admin', current_database());
   EXECUTE format('GRANT CONNECT ON DATABASE %I TO of_api', current_database());
+  -- of_recorder (ab Migration 0013) behält sein ausdrückliches CONNECT aus der Migration bzw. aus
+  -- roles-source.sql; hier wird nichts hinzugefügt (vor 0013 soll die Rolle nicht verbinden) und
+  -- TEMPORARY bekommt sie nie
+  IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'of_recorder') THEN
+    EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM of_recorder', current_database());
+  END IF;
 END
 $$;
 -- Wartungsdatenbanken: keine Verbindung für Anwendungsrollen (CREATE DATABASE als Superuser geht weiter)
 REVOKE CONNECT, TEMPORARY ON DATABASE postgres FROM PUBLIC;
 REVOKE CONNECT, TEMPORARY ON DATABASE template1 FROM PUBLIC;
 -- Kontrolle: of_api darf sich nur mit orderflow verbinden und nirgends TEMP anlegen
-SELECT 'dbpriv|' || datname || '|of_api_connect=' || has_database_privilege('of_api', datname, 'CONNECT')
-       || '|of_api_temp=' || has_database_privilege('of_api', datname, 'TEMPORARY')
-  FROM pg_database WHERE datallowconn ORDER BY datname;
+SELECT 'dbpriv|' || d.datname || '|' || r.rolname || '_connect='
+       || has_database_privilege(r.oid, d.datname, 'CONNECT')
+       || '|' || r.rolname || '_temp=' || has_database_privilege(r.oid, d.datname, 'TEMPORARY')
+  FROM pg_database d CROSS JOIN pg_roles r
+ WHERE d.datallowconn AND r.rolname IN ('of_api', 'of_recorder')
+ ORDER BY d.datname, r.rolname;
 -- Kontrolle: PUBLIC ohne c/T, of_api nur c
 SELECT 'datacl|' || array_to_string(ARRAY(SELECT unnest(datacl)::text ORDER BY 1), ',')
   FROM pg_database WHERE datname = current_database();

@@ -102,7 +102,8 @@ dafür umgebaut werden.
 
 `pg_dump -Fd -j 4 -Z zstd:3` über einen Wegwerf-Client-Container (gleiches Image → gleiche
 pg_dump-Version) → SHA256SUMS → `rsync` → `sha256sum -c` → leere DB: Rollen (`roles.sql`) +
-Rolleneinstellungen der Quelle (`roles-source.sql`, pg_dump sichert keine Rollen) →
+Rollen und Rolleneinstellungen der Quelle (`roles-source.sql` aus `sql/export-roles.sql`: `of_api`
+und, ab Migration 0013, `of_recorder`; pg_dump sichert keine Rollen) →
 `timescaledb_pre_restore()` → `pg_restore` **seriell** → `timescaledb_post_restore()` +
 `GRANT CONNECT` (pg_dump ohne `--create` sichert keine Datenbankrechte) → `ANALYZE` →
 Prüfbericht `verify-db.sql` auf beiden Seiten, **Pflichtvergleich** (Zeilenzahlen aller Tabellen,
@@ -253,6 +254,33 @@ CONNECTION_TIMEOUT_MS/ADMIN_PORT/DIAG_HEADERS/NONFINAL_TTL_MS/MAX_CONNECTIONS/MA
   If-None-Match; Health 404; keine Diagnose-Header; Quality-Burst 6 × 200 / 6 × 429 (JSON,
   `Retry-After: 1`); 96 gemischte Anfragen über 6 Verbindungen alle 200; API-Log bei `warn` leer;
   API 151 MiB.
+
+## Transfer-Werkzeuge ab Migration 0013/0014 (lokal geprüft, noch nicht auf dem Server)
+
+- `sql/export-roles.sql` (Quelle, nur lesend) erzeugt `roles-source.sql`: Anlage/Angleichung von
+  `of_api` und `of_recorder` (falls auf der Quelle vorhanden; Rollen sind clusterweit, auf dem
+  Mac existiert `of_recorder` schon, auch wenn `orderflow` noch bei 0012 ist), deren
+  Rolleneinstellungen und die Datenbankrechte von `of_api`, `of_recorder` und PUBLIC auf
+  `orderflow` (pg_dump ohne `--create` sichert sie nicht). Keine Passwörter. Bricht ab, wenn eine
+  Anwendungsrolle auf der Quelle erhöhte Rechte hat.
+- `verify-db.sql` vergleicht für beide Rollen: Attribute und Einstellungen, Datenbank-/Schemarechte
+  (inkl. TEMPORARY), Tabellenrechte je Art samt Liste der beschreibbaren Tabellen, ausführbare
+  Projektfunktionen und je Projektfunktion Eigentümer, SECURITY DEFINER, `search_path` und ACL
+  (`of_recompress_chunk` aus 0014), Default-ACLs; Policy-Konfiguration (`recompress: false`) steht
+  in den `job|`-Zeilen.
+- `harden-db.sql`: `of_recorder` behält nur sein ausdrückliches CONNECT (aus 0013 bzw. vom
+  Transfer), nie TEMPORARY; die Härtungsprüfung gilt für beide Rollen.
+- Trockenläufe (Wegwerf-Container, 2-GB-Limit):
+  - A, Quelle Mac-DB bei 0012 (`of_recorder` existiert clusterweit ohne Rechte): Berichte identisch
+    (396 Zeilen), Härtung OK, `of_recorder` ohne CONNECT.
+  - Migration 0013 + 0014 auf dem gehärteten Ziel von A (= späteres `release.sh --migrate`):
+    `of_recorder` bekommt CONNECT nur auf `orderflow`, kein TEMPORARY.
+  - B, Quelle = dieses Ziel bei 0014 (gehärtet): Dump 5 s / 848 MB, `pg_restore` 18 s, Berichte
+    identisch (400 Zeilen) inkl. `of_recorder` (CONNECT, kein TEMP, SELECT auf 23 Tabellen,
+    Schreibrechte auf 21, `of_recompress_chunk` SECURITY DEFINER nur für ihn ausführbar,
+    Default-ACL `of_recorder=r`, Policies `recompress: false`); Härtung OK. Der erste Lauf zeigte,
+    dass eine gehärtete Quelle die PUBLIC-Rechte mitliefern muss (behoben). Gegenprobe: der
+    Export einer ungehärteten Quelle ergibt auf einer frischen Datenbank exakt deren datacl.
 
 ## Rollout 2026-11-25 (ausgeführt)
 
