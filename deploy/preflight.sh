@@ -49,7 +49,7 @@ check "nginx -t" '[ "$nginx_t" = ok ]'
 check "DNS $PUBLIC_HOST → $dns = Server $ip" '[ "$dns" = "$ip" ]'
 check "Uhr synchron" '[ "$ntp" = yes ]'
 check "certbot.timer aktiv" '[ "$certbot_timer" = active ]'
-check "Let'\''s Encrypt: Renewal-Dateien nutzen genau 1 Produktionskonto, das existiert ($le_accounts Konten)" '[ "$le_renewal_accounts" = 1 ] && [ "$le_renewal_account_exists" = yes ]'
+check "Let's Encrypt: Renewal-Dateien nutzen genau 1 Produktionskonto, das existiert ($le_accounts Konten)" '[ "$le_renewal_accounts" = 1 ] && [ "$le_renewal_account_exists" = yes ]'
 check "keine Container orderflow-db/-api, keine Zonen orderflow_*" '[ "$ports_ours" -gt 0 ] || { [ "$name_clash" = 0 ] && [ "$nginx_zone_clash" = 0 ]; }'
 check "Docker ≥ 24, Compose v2+ ($docker / $compose)" '[ "${docker%%.*}" -ge 24 ]'
 

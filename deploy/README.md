@@ -230,6 +230,30 @@ CONNECTION_TIMEOUT_MS/ADMIN_PORT/DIAG_HEADERS/NONFINAL_TTL_MS/MAX_CONNECTIONS/MA
 - Cache: finale Kacheln `max-age=604800` u. a. kommen unverändert von der API; nginx setzt keine
   API-Cache-Header und cacht nicht.
 
+## Stand 2026-11-25 (zweiter Abgleich)
+
+- Daten: BTCUSDT + ETHUSDT je 167 Tage, Migration 0012 (0011 Recorder-Tabellen `ingest_status`,
+  `live_kline_check`, `recorder_quality`, `data_day.live_until/live_minutes`; 0012 entzieht
+  `of_api` SELECT darauf). `verify-db.sql` erfasst neue Tabellen und Spalten generisch (Zeilenzahl,
+  Inhalt, `data_day` vollständig); `grant|of_api|tables=23|select=16|write=0` auf beiden Seiten.
+- Ein leerer, nicht komprimierter `fp_1m`-Chunk 2026-11-24…25 (Rest von Recorder-Testdaten) wird
+  auf beiden Seiten gleich gezählt (`chunks|fp_1m|total=168|columnstore=167`). Unschädlich; vor
+  dem Dump gelöscht wäre der Stand sauberer (die Policy versucht ihn sonst ab 2026-11-28 zu
+  komprimieren) – Entscheidung beim Eigentümer der Mac-DB.
+- Trockenlauf (Mac, 2-GB-Limit): Dump im Snapshot 3 s, 848 MB / 543 Dateien; `pg_restore` 22 s;
+  ANALYZE 2 s; Prüfbericht 5 min 25 s je Seite (parallel); Berichte identisch (388 Zeilen,
+  334/334 Digests); Härtung geprüft. Ziel-DB 1 199 MB (Quelle 1 255 MB inkl. Bloat).
+- `build-release.sh` baut aus `git archive <commit>` (Standard HEAD) in einem eigenen Verzeichnis
+  mit `npm ci`; uncommittete Änderungen im Arbeitsbaum gehören nie zum Release, RELEASE nennt den
+  Commit. Image 352 MB (81 MB gzip), Recorder-Quellen nicht im Image (nur sein Manifest für
+  `npm ci`), Prozess im Container nur die API.
+- Funktionstest Release-Image + restaurierte DB + nginx 1.18 mit Stub-Nachbarn: beide Symbole,
+  Bars (auch `stats=1`), Kacheln 1m/15m bei feinster und mittlerer Zeilengröße, Profil und
+  Tagesprofile → 200, gzip, `public, max-age=604800` für unveränderliche Tage, 304 mit
+  If-None-Match; Health 404; keine Diagnose-Header; Quality-Burst 6 × 200 / 6 × 429 (JSON,
+  `Retry-After: 1`); 96 gemischte Anfragen über 6 Verbindungen alle 200; API-Log bei `warn` leer;
+  API 151 MiB.
+
 ## Offen
 
 - HTTP/2 (betrifft alle Sites auf 443) – Entscheidung des Nutzers.

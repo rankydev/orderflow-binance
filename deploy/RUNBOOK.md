@@ -4,7 +4,8 @@ Alle Befehle laufen **auf dem Mac** im Repo-Wurzelverzeichnis; die Skripte sprec
 SSH an (`ssh -o BatchMode=yes`). Ziel-Host: `deploy/.env.deploy` (aus `deploy/env.deploy.example`,
 git-ignoriert) oder als erstes Argument `root@<host>`. Begründungen: [`README.md`](README.md).
 
-Gesamtdauer ≈ 30–45 min (davon ≈ 10 min Prüfberichte, Upload je nach Leitung).
+Gesamtdauer ≈ 45–60 min (davon ≈ 15 min Prüfberichte, Upload ≈ 0,85 GB je nach Leitung). Stand der
+Daten: BTCUSDT + ETHUSDT je 167 Tage (2026-06-10…2026-11-23), Migration 0012, Mac-DB 1 255 MB.
 
 ## Was unangetastet bleiben muss
 
@@ -71,33 +72,33 @@ Prüfung: Skript zeigt `db ok` + `timescaledb 2.31.2`.
 `rm -rf /opt/orderflow-binance /etc/orderflow-binance /var/lib/orderflow-binance /var/www/orderflow-acme /etc/systemd/system/orderflow-monitor.*`,
 `systemctl daemon-reload`, `userdel orderflow`, `docker image rm timescale/timescaledb:2.31.2-pg17`.
 
-## Schritt 3 – Datenbank übertragen (≈ 10–15 min)
+## Schritt 3 – Datenbank übertragen (≈ 15–25 min)
 
 ```bash
 deploy/transfer-db.sh
 ```
 
-1/7 Snapshot exportieren + Dump im Snapshot (lokal ≈ 2 s, ≈ 0,5 GB) · 2/7 Rolleneinstellungen + SHA256SUMS · 3/7 Prüfbericht Quelle
-im selben Snapshot (Hintergrund, ≈ 3,5 min; Jobs/Importe auf dem Mac stören den Vergleich nicht) · 4/7 rsync + `sha256sum -c` auf dem Server · 5/7 Restore (≈ 15–30 s) +
-ANALYZE + Prüfbericht Ziel (≈ 4–6 min; Columnstore-Policies des Ziels sind währenddessen angehalten
+1/7 Snapshot exportieren + Dump im Snapshot (lokal ≈ 3 s, ≈ 850 MB, 543 Dateien) · 2/7 Rolleneinstellungen + SHA256SUMS · 3/7 Prüfbericht Quelle
+im selben Snapshot (Hintergrund, ≈ 6 min; Jobs/Importe auf dem Mac stören den Vergleich nicht) · 4/7 rsync + `sha256sum -c` auf dem Server · 5/7 Restore (≈ 15–30 s) +
+ANALYZE + Prüfbericht Ziel (≈ 8–12 min auf 2 vCPU, lokal 5,5 min; Columnstore-Policies des Ziels sind währenddessen angehalten
 und danach wieder aktiv, `jobsched|`-Zeilen vergleichen den Zustand) · **6/7 Pflichtvergleich – bei Abweichung Abbruch mit Exit 1,
 weiter erst nach Klärung** · 7/7 Härtung (`harden-db.sql`: PUBLIC ohne CONNECT/TEMP) und Löschen
 der Dumps auf beiden Seiten.
-Prüfung: Ausgabe `Prüfberichte identisch`, `digest|days=167|match=167|mismatch=0`.
+Prüfung: Ausgabe `Prüfberichte identisch`, `digest|days=334|match=334|mismatch=0`, `grant|of_api|tables=23|select=16|write=0`.
 **Rücknahme / Wiederholung:** API stoppen (falls schon gestartet) und
 `deploy/transfer-db.sh --replace` (DROP/CREATE der Ziel-DB, dann alles erneut), oder Volume
 löschen: `… down -v` und Schritt 2 erneut. Danach `deploy/postcheck.sh "$BASE" --neighbours-only`.
 
 **Daten später ergänzen** (neue Tage/Symbole vom Mac, solange es auf dem VPS keinen Importer gibt):
 derzeit nur über `--replace`, also API stoppen → Ziel-DB ersetzen → Prüfbericht → API starten;
-≈ 10–15 min ohne API (die Web-Seite zeigt solange Fehler/Retry). Spätere Verbesserung ohne
+≈ 20–25 min ohne API (die Web-Seite zeigt solange Fehler/Retry). Spätere Verbesserung ohne
 Ausfall: in eine zweite Datenbank (`orderflow_next`) restaurieren, prüfen, dann per
 `ALTER DATABASE … RENAME` tauschen (kurzer API-Neustart) oder Teilübertragung nach KONZEPT §2.3.
 
-## Schritt 4 – Release bauen und ausrollen (Bau ≈ 3–5 min, Rollout ≈ 2 min)
+## Schritt 4 – Release bauen und ausrollen (Bau ≈ 1–5 min, Rollout ≈ 2 min)
 
 ```bash
-ID=$(deploy/build-release.sh)    # Web-Bundle + API-Image linux/amd64, ~/.cache/orderflow-binance/releases/$ID
+ID=$(deploy/build-release.sh)    # aus `git archive HEAD` (nie aus dem Arbeitsbaum): Web-Bundle + API-Image linux/amd64
 deploy/release.sh "$ID"          # ausstehende Migrationen? → nach Prüfung: deploy/release.sh "$ID" --migrate
 ```
 
@@ -198,6 +199,6 @@ CSP-Fehler, Kacheln laden, kein 429 beim Schwenken).
 | certbot fasst andere Zertifikate an                            | nur `certonly --cert-name orderflow…`, Webroot, Deploy-Hook in der eigenen Renewal-Datei; Postcheck vergleicht Renewal-Dateien und Ablaufdaten |
 | Docker-Namenskonflikte                                         | eigener Projektname, Präfix `orderflow-` für Container/Netz/Volume; Preflight prüft                                                            |
 | Docker-Logs füllen die Platte                                  | journald-Treiber nur für unsere Container (daemon.json unverändert)                                                                            |
-| Platte                                                         | Dump ≈ 0,5 GB, Image-Pull ≈ 1 GB; Preflight ≥ 15 GB; Dumps werden gelöscht                                                                     |
+| Platte                                                         | Dump ≈ 0,85 GB, DB ≈ 1,2 GB, Image-Pull ≈ 1 GB; Preflight ≥ 15 GB; Dumps werden gelöscht                                                       |
 | Node 20 von PulseBot                                           | kein Node auf dem Host installiert, API im Container                                                                                           |
 | Unattended-Upgrades starten Docker/nginx neu                   | außerhalb unserer Kontrolle; Postcheck zeigt es (Startzeitpunkte) – dann nicht uns zuschreiben, sondern im Journal prüfen                      |
