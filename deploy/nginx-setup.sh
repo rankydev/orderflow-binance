@@ -104,7 +104,13 @@ if [ ! -f "$CERT" ]; then
   install -d -m 755 /var/www/orderflow-acme/.well-known/acme-challenge
   probe=probe-$(openssl rand -hex 8)
   echo ok > "/var/www/orderflow-acme/.well-known/acme-challenge/$probe"
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://orderflow.rankyhub.com/.well-known/acme-challenge/$probe")
+  # nach dem Reload übernehmen die neuen Worker erst nach kurzer Zeit → bis 15 s wiederholen
+  code=000
+  for _ in $(seq 1 15); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://orderflow.rankyhub.com/.well-known/acme-challenge/$probe")
+    [ "$code" = 200 ] && break
+    sleep 1
+  done
   rm -f "/var/www/orderflow-acme/.well-known/acme-challenge/$probe"
   [ "$code" = 200 ] || { say "Challenge-Pfad liefert $code statt 200"; exit 1; }
   # deploy-hook nur für diese Lineage (steht in renewal/orderflow.rankyhub.com.conf)
