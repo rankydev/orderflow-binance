@@ -159,6 +159,23 @@ SELECT 'dbsetting|' || coalesce(pg_get_userbyid(nullif(setrole, 0)), '*') || '|'
  ORDER BY 1;
 
 -- Informativ (darf abweichen): Größen, Jobzeitpunkte
+SELECT CASE WHEN to_regprocedure('public.of_hot_margin()') IS NULL THEN 'interval ''3 days'''
+            ELSE 'public.of_hot_margin()' END AS hot_margin_expr \gset
+-- Offene („heiße") Chunks im Columnstore (Prädikat wie hot-chunks.sql / repair-open-chunks): nur
+-- informativ, weil die Zahl von der Uhrzeit abhängt (now() − Marge, ab 0016 of_hot_margin()) und Quell- und Zielbericht zu
+-- verschiedenen Zeiten laufen. Den Zustand selbst vergleichen die chunkrange|-Zeilen exakt (Grenzen
+-- + is_compressed). Die harte Prüfung „0" gehört nach repair-open-chunks und vor den
+-- Recorder-Start (deploy/bin/hot-chunks.sh --require-zero), nicht in einen Transfer.
+SELECT 'info|hot_compressed_chunks|' || count(*) || '|'
+       || coalesce(string_agg(format('%I.%I', c.chunk_schema, c.chunk_name), ',' ORDER BY c.chunk_name), '')
+  FROM timescaledb_information.chunks c
+  JOIN _timescaledb_catalog.chunk k ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
+ WHERE c.hypertable_schema = 'public'
+   AND c.hypertable_name IN ('fp_1m', 'fp_1m_b10', 'fp_5m_b10', 'fp_15m_b100', 'fp_1h_b10',
+                             'fp_1h_b100', 'fp_1d_b100', 'fp_1d_b1000', 'bar_1m', 'bar_1h',
+                             'bar_1d', 'kline_1m')
+   AND (k.status & 1) <> 0 AND (k.status & 4) = 0 AND NOT k.osm_chunk
+   AND c.range_end > now() - :hot_margin_expr;
 SELECT 'info|db_size|' || pg_size_pretty(pg_database_size(current_database()));
 SELECT 'info|hypertable_size|' || hypertable_name || '|'
        || pg_size_pretty(hypertable_size(format('%I.%I', hypertable_schema, hypertable_name)::regclass))

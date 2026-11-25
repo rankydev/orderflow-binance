@@ -189,7 +189,7 @@ ops-Container als `of_admin` an:
   ins Image) oder als systemd-Unit läuft, und ob eine SECURITY-DEFINER-Funktion bzw.
   Default-Privilegien für `of_recorder` dazukommen (der Prüfbericht vergleicht Tabellenrechte,
   Schreibliste und Ausführungsrechte; Default-ACLs als `default_acl|`-Zeilen).
-- **0013 und 0014 gehören zusammen:** beide müssen angewendet sein, bevor ein neuer Importer oder
+- **0013–0016 gehören zusammen:** alle müssen angewendet sein, bevor ein neuer Importer oder
   der Recorder läuft (ohne 0014 scheitert eine Chunk-Konvertierung jetzt laut). 0014 setzt
   `recompress: false` auf den Columnstore-Policies, legt die SECURITY-DEFINER-Funktion
   `of_recompress_chunk(regclass)` (Eigentümer `of_admin`, EXECUTE nur für `of_recorder`) an und
@@ -203,6 +203,49 @@ ops-Container als `of_admin` an:
 - `transfer-db.sh` funktioniert für Quellen bei 0012, 0013 und 0014 (lokal getestet), ein erneuter
   Transfer (`--replace`) nach dem Recorder-Start würde aber Live-Daten des VPS überschreiben – dann
   nicht mehr ohne Abstimmung verwenden.
+
+### Offene Chunks im Columnstore reparieren (vor dem Recorder-Start, Pflicht)
+
+Ausgangslage: Ein Messskript hat am 2026-11-24 auf dem Mac **alle** Chunks komprimiert, auch noch
+offene (Zeitraum nicht seit 3 Tagen vorbei). Der Transfer überträgt den Komprimierungszustand 1:1
+(`pg_restore` legt die Chunks so an, wie sie auf der Quelle waren; der Pflichtvergleich prüft das
+über die `chunkrange|`-Zeilen). Der VPS hat diese offenen komprimierten Chunks also sehr
+wahrscheinlich auch – harmlos, solange niemand schreibt. Live-Minuten in einen solchen Chunk
+machten ihn dauerhaft teilweise komprimiert, daher vor dem Recorder:
+
+1. Recorder läuft nicht (Unit/Dienst gestoppt bzw. noch nicht eingerichtet).
+2. Migrationen 0013–0016 zusammen anwenden (`release.sh <id> --migrate` mit einem Release, das
+   alle vier enthält); ab 0015 komprimieren weder Importer noch `of_recompress_chunk` offene
+   Chunks, ab 0016 steht die Marge in `of_hot_margin()` (Policies: `compress_after` 4 Tage).
+3. Bestand ansehen (nur lesend): `/opt/orderflow-binance/bin/hot-chunks.sh` bzw. ohne Installation
+   `docker exec -i orderflow-db psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow < /opt/orderflow-binance/sql/hot-chunks.sql`.
+4. Probelauf und Liste prüfen:
+   `docker compose … run --rm ops node apps/importer/src/main.ts repair-open-chunks --dry-run </dev/null`
+   (als `of_admin`, ops-Container; das Image muss `apps/importer` enthalten – tut es).
+5. Reparatur: `… repair-open-chunks --lock-timeout-ms 500 </dev/null`. Je Chunk eine Transaktion
+   mit `LOCK … ACCESS EXCLUSIVE` + `convert_to_rowstore` (auf dem Mac: 9 Chunks, längste Sperre
+   824 ms, Digests unverändert). Die API bleibt an; kurze 503 sind möglich (API: `lock_timeout`
+   1 s, 3 Wiederholungen), der Client wiederholt sie.
+6. Zweiter Probelauf muss **0** melden; `hot-chunks.sh --require-zero` muss Exit 0 liefern.
+7. Prüfbericht vorher/nachher: `verify-db.sql` auf dem Server vor Schritt 5 und nach Schritt 6;
+   die `digest|`- und `data_day|`-Zeilen müssen identisch sein (nur `chunkrange|…|true → false`
+   der reparierten Chunks und `info|`-Zeilen dürfen sich ändern).
+8. Erst dann den Recorder starten und in seinem Health `hotCompressedChunks: 0` verlangen.
+
+**Harte Regel:** `repair-open-chunks` nie parallel zu `transfer-db.sh` oder einem
+`verify-db.sql`-Bericht. `convert_to_rowstore` ist für ältere Snapshots nicht MVCC-sicher: eine
+REPEATABLE-READ-Transaktion, die den Chunk noch nicht berührt hat, sähe ihn leer – der
+Pflichtvergleich schlüge dann laut fehl (falsche Zeilenzahlen/Digests).
+
+**Transfer und offene Chunks:** `transfer-db.sh`/`restore-db.sh` komprimieren selbst nie. Sie
+übertragen den Zustand der Quelle, halten die Columnstore-Policies während des Prüfberichts an
+(`alter_job … scheduled => false`) und schalten sie danach wieder ein. Die Policies vergleichen
+in TimescaleDB 2.31 mit `range_end` und komprimieren offene Chunks nicht (0015/0016 verschärfen
+die Frist auf 4 Tage); bei einem Server vor 0014 steht `recompress` noch auf true, was ohne
+Schreibzugriffe dort nichts bewirkt. Wer offene komprimierte Chunks auf dem Server vermeiden will,
+repariert die Quelle (Mac) vor dem Transfer oder den Server danach (Abschnitt oben).
+`verify-db.sql` meldet die Zahl als `info|hot_compressed_chunks|…` (nur informativ: sie hängt von
+der Uhrzeit ab; die harte Prüfung „0" gehört hierher, nicht in einen Transfer).
 
 **Hinweis Transfer:** Dump und Quellbericht halten auf der Mac-DB einen exportierten Snapshot
 offen (≈ 6 min bei zwei Symbolen). Sperrende Vorgänge auf `orderflow` (Chunk-Konvertierung,

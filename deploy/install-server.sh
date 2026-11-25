@@ -35,7 +35,7 @@ install -d -m 755 -o root -g root "$R" "$R/bin" "$R/sql" "$R/releases" /var/www/
 install -d -m 700 -o root -g root "$E" "$V" "$V/transfer"
 install -m 644 "$STAGE/compose.prod.yml" "$R/compose.prod.yml"
 install -m 644 "$STAGE"/sql/*.sql "$R/sql/"
-install -m 755 "$STAGE/bin/restore-db.sh" "$STAGE/bin/orderflow-monitor" "$R/bin/"
+install -m 755 "$STAGE/bin/restore-db.sh" "$STAGE/bin/orderflow-monitor" "$STAGE/bin/hot-chunks.sh" "$R/bin/"
 [ -f "$R/.env" ] || printf 'OF_RELEASE=none\n' > "$R/.env"
 chmod 644 "$R/.env"
 
