@@ -380,6 +380,21 @@ describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5
     await lw.open();
     try {
       expect(await lw.partialChunks()).toEqual([]);
+      // H2a: persistierte „zuerst gesehen"-Zeitpunkte werden unter der Rolle gelesen
+      await lw.writeStatus({
+        sym_id: 1,
+        last_agg_id: null,
+        last_trade_ms: null,
+        ws_connected: false,
+        open_gaps: 0,
+        unwritten_minutes: 0,
+        rest_weight_1m: 0,
+        spool_lag_ms: 0,
+        last_committed_minute: null,
+        last_finalised_day: null,
+        details: { partialChunkFirstSeen: { x: 123 } },
+      });
+      expect(await lw.statusDetails()).toContainEqual({ partialChunkFirstSeen: { x: 123 } });
       await sql`UPDATE fp_1m SET buy_q = buy_q WHERE sym_id = 1 AND ts = ${ROLE_DAY}::date + interval '12 hours'`;
       const p = await lw.partialChunks();
       expect(p).toHaveLength(1);
@@ -418,9 +433,12 @@ describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5
       });
       expect(res).toMatchObject({
         quality: { identical: 1440 },
-        conversionError: expect.stringMatching(
-          /permission denied for function of_recompress_chunk/,
-        ),
+        postCommitError: {
+          source: 'conversion',
+          message: expect.stringMatching(
+            /Konvertierung nach 2026-09-15 fehlgeschlagen.*permission denied for function of_recompress_chunk/,
+          ),
+        },
       });
     } finally {
       await sql`GRANT EXECUTE ON FUNCTION of_recompress_chunk(regclass) TO of_recorder`;

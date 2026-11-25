@@ -124,18 +124,40 @@ export interface FinaliseOptions {
   log: (s: string) => void;
 }
 
+/** Wo nach dem Festschreiben des Tages ein Fehler auftrat (Review H3a). */
+export type PostCommitSource = 'conversion' | 'settle' | 'cascade' | 'close' | 'other';
+export interface PostCommitError {
+  source: PostCommitSource;
+  message: string;
+}
+export type FinaliseResult =
+  | 'done'
+  | 'not_available'
+  | 'lock_busy'
+  | { quality: QualityResult | null; postCommitError?: PostCommitError };
+
+interface DayRow {
+  state: string;
+  version: number;
+}
+
+/**
+ * Entscheidung nach einem Fehler im Import (Review H3): Erfolg (der Tag ist durch DIESEN Lauf final
+ * geworden – final und Version gestiegen) oder Fehler weiterwerfen. Ein Tag, der schon vorher final
+ * war und unverändert blieb, oder der nicht final ist, ist kein Erfolg.
+ */
+export function decideAfterError(before: DayRow | null, after: DayRow | null): 'success' | 'throw' {
+  const final = after?.state === 'final_ok' || after?.state === 'final_bad';
+  if (!after || !final) return 'throw';
+  if (before !== null && after.version <= before.version) return 'throw';
+  return 'success';
+}
+
 /**
  * Lädt die offiziellen Dateien für Tag d (falls noch nicht vorhanden) und importiert d.
  * Liefert 'not_available', solange Binance die Dateien noch nicht anbietet (HTTP 404).
  */
-export async function finaliseDay(
-  o: FinaliseOptions,
-): Promise<
-  | 'done'
-  | 'not_available'
-  | 'lock_busy'
-  | { quality: QualityResult | null; conversionError?: string }
-> {
+export async function finaliseDay(o: FinaliseOptions): Promise<FinaliseResult> {
   const ds = formatDay(o.day);
   const refs: FileRef[] = [
     { kind: 'aggTrades', origin: 'daily', symbol: o.spec.name, period: ds },
@@ -160,28 +182,58 @@ export async function finaliseDay(
   const versionOf = async () =>
     ((
       await o.sql`SELECT state, version FROM data_day WHERE sym_id = ${o.spec.symId} AND day = ${ds}::date`
-    )[0] ?? null) as { state: string; version: number } | null;
+    )[0] ?? null) as DayRow | null;
   const before = await versionOf();
+  // Welcher Schreibschritt gerade läuft (für die Quelle eines Fehlers nach dem Festschreiben):
+  // writeDay des Zieltags → Konvertierung danach; writeDay/markStale eines anderen Tages → Kaskade;
+  // resolveEdge → Randminute (settle). Nach erfolgreichem Schritt zurück auf 'other'.
+  let phase: PostCommitSource = 'other';
+  const phaseOf = (k: PropertyKey, a: unknown[]): PostCommitSource | null => {
+    if (k === 'resolveEdge') return 'settle';
+    if (k === 'markStale' || k === 'touchDay') return 'cascade';
+    if (k === 'writeDay')
+      return (a[0] as { data: { day: number } }).data.day === o.day ? 'conversion' : 'cascade';
+    return null;
+  };
+  const tracked = new Proxy(writer, {
+    get(t, k, r) {
+      const v = Reflect.get(t, k, r) as unknown;
+      if (typeof v !== 'function') return v;
+      return async (...a: unknown[]) => {
+        const p = phaseOf(k, a);
+        if (p) phase = p;
+        const out = await (v as (...x: unknown[]) => Promise<unknown>).apply(t, a);
+        if (p) phase = 'other';
+        return out;
+      };
+    },
+  });
   let err: unknown = null;
+  let source: PostCommitSource = 'other';
   try {
     await runImport();
   } catch (e) {
     err = e;
+    source = phase;
   }
   try {
     await writer.close();
   } catch (e) {
-    err ??= e; // den ersten Fehler melden
+    if (err === null) {
+      err = e; // sonst den ersten Fehler melden
+      source = 'close';
+    }
   }
   if (err !== null) {
     const e = err;
     // Review H3: ein Fehler NACH dem Festschreiben (Columnstore-Konvertierung, close-Durchlauf)
     // lässt einen finalen Tag zurück. Der gilt für die Schleife als finalisiert; der Fehler wird
     // getrennt gemeldet, statt alle Folgetage provisorisch hängen zu lassen.
-    const after = await versionOf();
-    const final = after?.state === 'final_ok' || after?.state === 'final_bad';
-    if (!final || (before !== null && after!.version <= before.version)) throw e;
-    return { quality, conversionError: e instanceof Error ? e.message : String(e) };
+    if (decideAfterError(before, await versionOf()) === 'throw') throw e;
+    return {
+      quality,
+      postCommitError: { source, message: e instanceof Error ? e.message : String(e) },
+    };
   }
   return { quality };
 
@@ -193,7 +245,7 @@ export async function finaliseDay(
       lastDay: o.day,
       prefer: 'daily',
       neighbours: true,
-      writer,
+      writer: tracked,
       importerVersion: IMPORTER_VERSION,
       sidecar: false,
       log: o.log,

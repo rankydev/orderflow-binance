@@ -236,6 +236,12 @@ export class LiveWriter {
   }
 
   /** Grund, warum ein Tag nicht weiter live geschrieben wird (data_day.live_frozen; nur provisorische Tage). */
+  /** Zuletzt geschriebene details des Recorders je Symbol (Neustart: persistierte Zustände). */
+  async statusDetails(): Promise<Record<string, unknown>[]> {
+    const rows = await this.db`SELECT details FROM ingest_status WHERE component = 'recorder'`;
+    return rows.map((r) => (r.details ?? {}) as Record<string, unknown>);
+  }
+
   /** Teilweise komprimierte Chunks (Status-Bit 8) der Projekttabellen (Review H2). */
   async partialChunks(): Promise<string[]> {
     const rows = await this.db`

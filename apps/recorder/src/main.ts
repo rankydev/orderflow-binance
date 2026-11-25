@@ -29,9 +29,11 @@
 //    ≈ 40 s je Chunk, während der Importer-Advisory-Lock die ganze Zeit gehalten wird (ein paralleler
 //    Importer-Lauf wartet bzw. bricht mit „lock_busy" ab). Gelingt die Sperre nicht, bleibt der Chunk
 //    teilweise (lesbar, konsistent) und der nächste schreibende Lauf versucht es erneut.
-//  - Health/ingest_status: partialChunks und partialChunkOldestAgeMs (teilweise komprimierte Chunks,
-//    Alter seit erster Beobachtung durch diesen Prozess) – Alarm, wenn > 24 h; finaliseConversion-
-//    Errors / lastFinaliseConversionError: Tag ist final, aber die Konvertierung danach schlug fehl
+//  - Health/ingest_status: partialChunks, partialChunkOldestAgeMs (Alter seit erster Beobachtung,
+//    über Neustarts in details.partialChunkFirstSeen gehalten), partialChunkAlert/-Reason (> 24 h,
+//    oder teilweise Chunks bei mehr als einem Tag Finalisierungsrückstand); postCommitErrors /
+//    lastPostCommitError {source: conversion|settle|cascade|close|other}: Tag ist final, aber danach
+//    schlug etwas fehl (Konvertierung, Randminute des Vortags, Kaskade, close-Durchlauf)
 //    (z. B. fehlende Migration 0014 oder Rechte) – nie normal, immer prüfen.
 import { DAY_MS, dayIndex, formatDay, getSymbol, parseConfig, parseDay } from '@orderflow/core';
 import { execFile } from 'node:child_process';
@@ -39,7 +41,9 @@ import { createServer, type ServerResponse } from 'node:http';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { BinanceRest, DEFAULT_REST_BASE, DEFAULT_WS_BASE, WeightBudget } from './binance.ts';
-import { finaliseDay, nextAttempt } from './finalize.ts';
+import { finaliseDay } from './finalize.ts';
+import { finaliseDue } from './finaliseloop.ts';
+import { PartialChunkTracker, type PartialChunkState } from './partialchunks.ts';
 import { LiveWriter } from './livewriter.ts';
 import { Recorder } from './recorder.ts';
 import { replayDay } from './replay.ts';
@@ -132,23 +136,32 @@ async function run(): Promise<number> {
   await rec.start();
   let lastFinalised: Record<string, string | null> = {};
   let rawPrunedFiles = 0;
-  // Review H3: Fehler nach dem Festschreiben eines finalen Tages (Columnstore-Konvertierung)
-  let finaliseConversionErrors = 0;
-  let lastFinaliseConversionError: string | null = null;
-  // Review H2: teilweise komprimierte Chunks der Projekttabellen (Status-Bit 8). Seit Migration 0014
-  // verdichtet nur ein schreibender Importer-Lauf sie (unter Sperre) nach; ein lange bestehender
-  // teilweiser Chunk ist lesbar, aber ein Zeichen, dass das Nachverdichten nicht gelingt.
-  // Alter = seit der Recorder ihn zuerst gesehen hat (der Katalog führt keinen Zeitpunkt).
-  const partialSeen = new Map<string, number>();
-  let partialChunks = { count: 0, oldestAgeMs: 0 };
+  // Review H3/H3a: Fehler nach dem Festschreiben eines finalen Tages, mit Quelle
+  // (conversion / settle / cascade / close / other)
+  let postCommitErrors = 0;
+  let lastPostCommitError: { symbol: string; day: string; source: string; message: string } | null =
+    null;
+  // Review H2/H2a: teilweise komprimierte Chunks, „zuerst gesehen" überdauert Neustarts
+  const partial = new PartialChunkTracker();
+  for (const d of await writer.statusDetails())
+    partial.seed(d.partialChunkFirstSeen as Record<string, unknown> | undefined);
+  let partialState: PartialChunkState = {
+    count: 0,
+    oldestAgeMs: 0,
+    firstSeen: partial.firstSeen(), // bis zur ersten Prüfung die übernommenen Zeitpunkte erhalten
+    alert: false,
+    alertReason: null,
+  };
   const checkPartialChunks = async () => {
-    const rows = await writer.partialChunks();
     const now = Date.now();
-    const cur = new Set(rows);
-    for (const k of partialSeen.keys()) if (!cur.has(k)) partialSeen.delete(k);
-    for (const c of cur) if (!partialSeen.has(c)) partialSeen.set(c, now);
-    const oldest = Math.min(now, ...partialSeen.values());
-    partialChunks = { count: cur.size, oldestAgeMs: now - oldest };
+    const finals = [...rec.sym.values()].map((x) => x.final?.day ?? null);
+    const lastFinal = finals.includes(null) ? null : Math.min(...(finals as number[]));
+    partialState = partial.update(await writer.partialChunks(), now, lastFinal, dayIndex(now));
+    if (partialState.alert)
+      logLine('PARTIAL CHUNK ALERT', {
+        reason: partialState.alertReason,
+        count: partialState.count,
+      });
   };
   const partialTimer = setInterval(() => {
     checkPartialChunks().catch((e: unknown) =>
@@ -194,10 +207,12 @@ async function run(): Promise<number> {
       spoolEnabled: rec.spoolEnabled,
       spoolPrunedDays: rec.spoolPruned.length,
       rawPrunedFiles,
-      partialChunks: partialChunks.count,
-      partialChunkOldestAgeMs: partialChunks.oldestAgeMs,
-      finaliseConversionErrors,
-      lastFinaliseConversionError,
+      partialChunks: partialState.count,
+      partialChunkOldestAgeMs: partialState.oldestAgeMs,
+      partialChunkAlert: partialState.alert,
+      partialChunkAlertReason: partialState.alertReason,
+      postCommitErrors,
+      lastPostCommitError,
       wsConnected: rec.stream?.connected ?? false,
       wsReconnects: rec.stream?.reconnects ?? 0,
       wsRotations: rec.stream?.rotations ?? 0,
@@ -253,7 +268,11 @@ async function run(): Promise<number> {
             ...x,
             partialChunks: h.partialChunks,
             partialChunkOldestAgeMs: h.partialChunkOldestAgeMs,
-            finaliseConversionErrors: h.finaliseConversionErrors,
+            partialChunkAlert: h.partialChunkAlert,
+            partialChunkAlertReason: h.partialChunkAlertReason,
+            partialChunkFirstSeen: partialState.firstSeen, // H2a: übersteht Neustarts
+            postCommitErrors: h.postCommitErrors,
+            lastPostCommitError: h.lastPostCommitError,
           },
         })
         .catch((e: unknown) => logLine('status write failed', { error: String(e) }));
@@ -270,62 +289,51 @@ async function run(): Promise<number> {
   // tägliche Finalisierung: Tage vor heute, die noch nicht final sind, ab 06:00 UTC des Folgetags
   const fin = setInterval(async () => {
     if (!cfg.finalise) return;
-    const now = Date.now();
-    for (const [name, s] of rec.sym) {
-      const today = dayIndex(now);
-      const from = s.final ? s.final.day + 1 : today - 1;
-      for (let d = from; d < today; d++) {
-        const key = `${name}|${d}`;
-        const at = nextAttempt(d, now, attempts.get(key) ?? null, 15 * 60_000);
-        if (now < at) break;
-        // erst nach dem letzten geschriebenen Tagesende (+ Marge) des Recorders
-        const di = s.days.get(d);
-        if (di && !di.frozen && di.completeBefore < 1440) break;
-        attempts.set(key, now);
-        try {
-          const r = await finaliseDay({
-            dataDir: cfg.dataDir,
-            cfg: db,
-            spec: s.spec,
-            day: d,
-            sql: writer.db,
-            log: (m) => logLine(m),
-          });
-          if (r === 'not_available' || r === 'lock_busy') {
-            logLine('finalise later', { symbol: name, day: formatDay(d), reason: r });
-            break;
-          }
-          if (r !== 'done' && r.conversionError) {
-            // Tag ist final (zählt für die Schleife), aber die Konvertierung schlug fehl: laut melden
-            finaliseConversionErrors++;
-            lastFinaliseConversionError = `${name} ${formatDay(d)}: ${r.conversionError}`;
-            logLine('FINALISE CONVERSION ERROR (day is final)', {
-              symbol: name,
-              day: formatDay(d),
-              error: r.conversionError,
-            });
-          }
-          const st = await writer.startState(s.spec);
-          if (st.final) rec.markFinal(name, st.final);
-          lastFinalised = { ...lastFinalised, [name]: formatDay(d) };
-          logLine('finalised', { symbol: name, day: formatDay(d) });
-          if (cfg.rawKeepDays > 0) {
-            const finalDay = rec.sym.get(name)!.final?.day ?? -1;
-            const gone = pruneRaw(
-              cfg.dataDir,
-              name,
-              dayIndex(Date.now()) - cfg.rawKeepDays,
-              (x) => x <= finalDay,
-            );
-            rawPrunedFiles += gone.length;
-            if (gone.length) logLine('raw files pruned', { symbol: name, files: gone.length });
-          }
-        } catch (e) {
-          logLine('finalise failed', { symbol: name, day: formatDay(d), error: String(e) });
-          break;
+    await finaliseDue({
+      now: Date.now(),
+      symbols: rec.sym,
+      attempts,
+      finalise: (spec, day) =>
+        finaliseDay({
+          dataDir: cfg.dataDir,
+          cfg: db,
+          spec,
+          day,
+          sql: writer.db,
+          log: (m) => logLine(m),
+        }),
+      afterFinal: async (name, spec) => {
+        const st = await writer.startState(spec);
+        if (st.final) rec.markFinal(name, st.final);
+        const finalDay = rec.sym.get(name)!.final?.day ?? -1;
+        lastFinalised = {
+          ...lastFinalised,
+          [name]: finalDay >= 0 ? formatDay(finalDay) : null,
+        };
+        if (cfg.rawKeepDays > 0) {
+          const gone = pruneRaw(
+            cfg.dataDir,
+            name,
+            dayIndex(Date.now()) - cfg.rawKeepDays,
+            (x) => x <= finalDay,
+          );
+          rawPrunedFiles += gone.length;
+          if (gone.length) logLine('raw files pruned', { symbol: name, files: gone.length });
         }
-      }
-    }
+      },
+      onPostCommitError: (name, day, e) => {
+        // Tag ist final (zählt für die Schleife), aber danach schlug etwas fehl: laut melden
+        postCommitErrors++;
+        lastPostCommitError = { symbol: name, day: formatDay(day), ...e };
+        logLine('FINALISE POST-COMMIT ERROR (day is final)', {
+          symbol: name,
+          day: formatDay(day),
+          source: e.source,
+          error: e.message,
+        });
+      },
+      log: (m, f) => logLine(m, f),
+    });
   }, 60_000);
   void DAY_MS;
   await new Promise<void>((resolve) => {
