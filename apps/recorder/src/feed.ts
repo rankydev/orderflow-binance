@@ -109,6 +109,10 @@ export class SymbolFeed {
     if (this.expected === null || id <= this.expected) return null;
     const r = { from: this.expected, to: id - 1 };
     this.expected = id;
+    // gepufferte Nachrichten vor dem Ziel werden nie mehr ausgegeben: verwerfen, sonst bliebe die
+    // Lücke für immer „offen" (gapOpen)
+    for (const k of [...this.buffer.keys()]) if (k < id) this.buffer.delete(k);
+    this.stats.buffered = this.buffer.size;
     return r;
   }
 

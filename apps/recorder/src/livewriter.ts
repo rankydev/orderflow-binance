@@ -223,6 +223,11 @@ export class LiveWriter {
    * Minuten einer nicht füllbaren Lücke als `gap` vermerken (§4.2; werden nicht geschrieben).
    * Begrenzt auf 3 Tage (≤ 4 321 Zeilen) – ein falscher Anfang (z. B. 0) kann keinen Speicherlauf auslösen.
    */
+  /**
+   * Minuten [fromMs, toMs] als `gap` vermerken – beide Enden inklusive: die Minute des letzten
+   * Trades vor und die des ersten Trades nach einer Lücke sind betroffen (Trades derselben Minute
+   * fehlen). Wer eine Lücke bis zu einer Minutengrenze meint, übergibt Grenze − 1.
+   */
   async markGap(spec: SymbolSpec, fromMs: number, toMs: number): Promise<void> {
     if (!(toMs >= fromMs) || toMs - fromMs > 3 * DAY_MS) {
       throw new Error(`markGap: unplausibler Bereich ${fromMs}…${toMs}`);
@@ -235,7 +240,6 @@ export class LiveWriter {
     await this.db`INSERT INTO data_minute_issue ${this.db(rows)} ON CONFLICT DO NOTHING`;
   }
 
-  /** Grund, warum ein Tag nicht weiter live geschrieben wird (data_day.live_frozen; nur provisorische Tage). */
   /** Zuletzt geschriebene details des Recorders je Symbol (Neustart: persistierte Zustände). */
   async statusDetails(): Promise<Record<string, unknown>[]> {
     const rows = await this.db`SELECT details FROM ingest_status WHERE component = 'recorder'`;

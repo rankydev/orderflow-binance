@@ -112,6 +112,15 @@ export interface RawAgg {
   m: boolean;
 }
 
+/**
+ * Binance USDⓈ-M: aggTrades mit fromId außerhalb des Suchfensters (gemessen 2026-11-25, HTTP 400):
+ * {"code":-4166,"msg":"Search window is restricted to recent 2 days only."}
+ */
+export const TOO_OLD_CODE = -4166;
+export function isTooOld(e: unknown): boolean {
+  return e instanceof RestError && e.status === 400 && e.code === TOO_OLD_CODE;
+}
+
 export class RestError extends Error {
   readonly status: number;
   readonly code: number | undefined;

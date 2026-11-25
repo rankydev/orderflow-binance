@@ -15,7 +15,7 @@ import {
   type MinuteDelta,
   type SymbolSpec,
 } from '@orderflow/core';
-import { RestError, toItem, type RestSource } from './binance.ts';
+import { isTooOld, toItem, type RestSource } from './binance.ts';
 import { SymbolFeed, type FeedItem } from './feed.ts';
 import type { LiveWriter, MinuteWriteResult, StoredFinal } from './livewriter.ts';
 import { pruneSpool, readSpoolDay, SpoolWriter } from './spool.ts';
@@ -416,8 +416,10 @@ export class Recorder {
     try {
       rows = await this.o.rest.aggTrades(s.spec.name, from, 1000);
     } catch (e) {
-      if (e instanceof RestError && e.status === 400) {
-        // z. B. älter als 48 h. Liegt der Anfang vor heute: ab dem ersten Trade des heutigen Tages
+      // Nur Binances „Suchfenster überschritten" (-4166) heißt: nicht mehr füllbar. Jeder andere
+      // Fehler (auch ein anderer 400) ist ein gewöhnlicher Fehler: catchUpLoop versucht es erneut.
+      if (isTooOld(e)) {
+        // älter als 48 h. Liegt der Anfang vor heute: ab dem ersten Trade des heutigen Tages
         // weiter nachholen (heute wird vollständig), nur die Tage davor gelten als Lücke. Sonst (oder
         // wenn der Tagesanfang nicht bestimmbar ist) Lücke aufgeben, betroffene Tage einfrieren.
         if (await this.skipToToday(s, String(e))) return true;
@@ -472,8 +474,10 @@ export class Recorder {
     for (let d = dayIndex(fromMs); d < dayIndex(today0); d++) {
       this.freeze(s, d, `nicht füllbare Lücke aggId ${gap.from}…${gap.to} (vor heute)`);
     }
+    // Ende exklusiv: alle übersprungenen IDs liegen vor today0 (die erste ID von heute ist die
+    // erste mit T >= today0); Minute 00:00 schreibt der Recorder vollständig.
     await this.o.sink
-      .markGap(s.spec, fromMs, today0)
+      .markGap(s.spec, fromMs, today0 - 1)
       .catch((e: unknown) =>
         this.o.log('mark gap failed', { symbol: s.spec.name, error: String(e) }),
       );

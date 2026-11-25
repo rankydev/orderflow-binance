@@ -252,6 +252,22 @@ describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5
     await rec.close();
   });
 
+  it('markGap: Enden inklusive; Grenze − 1 lässt die Minute an der Grenze frei', async () => {
+    const w = new LiveWriter(cfg);
+    await w.open();
+    const d0 = parseDay('2026-09-20') * 86_400_000;
+    await w.markGap(BTC, d0 - 3 * 60_000, d0 - 1); // 23:57 … 23:59 des Vortags
+    await w.close();
+    const r = await sql`
+      SELECT ts FROM data_minute_issue WHERE sym_id = 1 AND kind = 'gap'
+         AND ts >= ${new Date(d0 - 3 * 60_000)} AND ts <= ${new Date(d0)} ORDER BY ts`;
+    expect(r.map((x) => (x.ts as Date).getTime())).toEqual([
+      d0 - 3 * 60_000,
+      d0 - 2 * 60_000,
+      d0 - 60_000,
+    ]);
+  });
+
   it('markFrozen macht den Grund in data_day sichtbar, nur für provisorische Tage (W2)', async () => {
     const w = new LiveWriter(cfg);
     await w.open();

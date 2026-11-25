@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   BinanceRest,
+  isTooOld,
   RestError,
   toItem,
   WeightBudget,
@@ -199,6 +200,17 @@ describe('Abnahme 1: Lücke außerhalb des REST-Fensters (K1, W1)', () => {
   });
 });
 
+describe('Binance-Fehler für fromId außerhalb des Suchfensters', () => {
+  it('nur -4166 gilt als „zu alt" (gemessen: HTTP 400, Search window is restricted to recent 2 days only.)', () => {
+    expect(
+      isTooOld(new RestError(400, -4166, 'Search window is restricted to recent 2 days only.')),
+    ).toBe(true);
+    expect(isTooOld(new RestError(400, -1100, 'Illegal characters'))).toBe(false);
+    expect(isTooOld(new RestError(429, -1003, 'Too many requests'))).toBe(false);
+    expect(isTooOld(new Error('x'))).toBe(false);
+  });
+});
+
 describe('Erster Start mit letztem finalem Tag außerhalb des REST-Fensters (Review)', () => {
   // REST: fromId älter als der heutige Tagesanfang → 400 (zu alt); ab heute lückenlos
   const today = rows(0, 500, 8000); // heute 00:00–08:19, IDs 8000…8999
@@ -222,9 +234,11 @@ describe('Erster Start mit letztem finalem Tag außerhalb des REST-Fensters (Rev
     await f.rec.start();
     const s = f.rec.sym.get('BTCUSDT')!;
     const live1 = rows(500, 3, 9000); // Stream ab 08:20
+    // eine verspätete Nachricht von gestern (ID unter dem Sprungziel) liegt schon im Puffer
+    const stale = rows(1439, 1, 7990, (DAY - 1) * DAY_MS)[0]!;
     f.rec.handle(
       s,
-      live1.map((r) => toItem(r, BTC, false)),
+      [stale, ...live1].map((r) => toItem(r, BTC, false)),
       true,
     );
     while (await f.rec.catchUpOnce(s)) {
@@ -232,13 +246,40 @@ describe('Erster Start mit letztem finalem Tag außerhalb des REST-Fensters (Rev
     }
     // nur die zwei Tage vor heute: eingefroren und als Lücke vermerkt; heute nicht
     expect(f.frozen.map(([d]) => d)).toEqual([DAY - 2, DAY - 1]);
-    expect(f.gaps).toEqual([[(DAY - 2) * DAY_MS, D0]]);
+    // Ende exklusiv: Minute 00:00 von heute ist keine Lücke (W1)
+    expect(f.gaps).toEqual([[(DAY - 2) * DAY_MS, D0 - 1]]);
     expect(s.gapsAbandoned).toBe(1);
-    expect(s.feed.gapOpen()).toBe(false);
+    expect(s.feed.gapOpen()).toBe(false); // die alte gepufferte ID hält die Lücke nicht offen
     f.rec.completeMinutes(s, D0 + 503 * MINUTE_MS + 2000);
     await f.rec.drain();
     const mins = f.written.filter((d) => d.day === DAY).map((d) => d.minute);
     expect(mins).toEqual(Array.from({ length: 503 }, (_, i) => i)); // 00:00 bis 08:22 lückenlos
+    await f.rec.stop();
+  });
+
+  it('ein anderer 400 (nicht -4166) ist ein gewöhnlicher Fehler: kein Sprung, nichts eingefroren', async () => {
+    const f = make({
+      final: { day: DAY - 3, lastAggId: 100 },
+      rest: {
+        ...rest,
+        aggTrades: async () => {
+          throw new RestError(400, -1100, 'Illegal characters found in parameter');
+        },
+      },
+      now: () => D0 + 505 * MINUTE_MS,
+    });
+    await f.rec.start();
+    const s = f.rec.sym.get('BTCUSDT')!;
+    f.rec.handle(
+      s,
+      rows(500, 3, 9000).map((r) => toItem(r, BTC, false)),
+      true,
+    );
+    await expect(f.rec.catchUpOnce(s)).rejects.toThrow(/Illegal/);
+    expect(f.frozen).toEqual([]);
+    expect(f.gaps).toEqual([]);
+    expect(s.gapsAbandoned).toBe(0);
+    expect(s.feed.expected).toBe(101);
     await f.rec.stop();
   });
 
