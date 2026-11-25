@@ -49,7 +49,7 @@ export class EventHub {
     });
     res.write(': ok\n\n');
     this.clients.add(res);
-    req.on('close', () => this.clients.delete(res));
+    res.on('close', () => this.clients.delete(res));
   }
 
   minute(symbol: string, ts: number): void {

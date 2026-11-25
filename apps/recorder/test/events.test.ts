@@ -108,3 +108,33 @@ describe('EventHub: Grenzen', () => {
     hub.close();
   });
 });
+
+describe('EventHub: echter Server, Client liest nicht (S4)', () => {
+  it('ein ins Stocken geratener Client wird nach > 1 MB Puffer getrennt, der Prozess puffert nicht weiter', async () => {
+    const { connect } = await import('node:net');
+    const hub = new EventHub(60_000);
+    const server = createServer((req, res) => hub.attach(req, res));
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as AddressInfo).port;
+    const sock = connect(port, '127.0.0.1');
+    await new Promise<void>((r) => sock.once('connect', () => r()));
+    sock.write('GET /events HTTP/1.1\r\nHost: x\r\n\r\n');
+    sock.pause(); // liest nie: Kernel- und Prozesspuffer laufen voll
+    try {
+      while (hub.size === 0) await new Promise((r) => setTimeout(r, 5));
+      let sent = 0;
+      while (hub.dropped === 0 && sent < 500_000) {
+        for (let i = 0; i < 2000; i++) hub.minute('BTCUSDT', 1_795_600_000_000 + sent++);
+        await new Promise((r) => setImmediate(r));
+      }
+      expect(hub.dropped).toBe(1);
+      expect(hub.size).toBe(0);
+      // getrennt, bevor der Puffer weit über die Grenze wuchs (~65 Byte je Ereignis)
+      expect(sent * 65).toBeLessThan(64 * 1024 * 1024);
+    } finally {
+      sock.destroy();
+      hub.close();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+});
