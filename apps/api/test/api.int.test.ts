@@ -971,6 +971,8 @@ describe('Grenzen (422 mit Vorschlag)', () => {
     const rows = await get(api, `/api/v1/profile?sym=BTCUSDT&${two}&R=5`);
     expect(rows.res.status).toBe(422);
     expect(rows.json().error).toMatch(/Quellzeilen/);
+    expect(rows.json()).toMatchObject({ reason: 'profile_source_rows', limit: 3_000 });
+    expect(rows.json().rowsEstimate).toBeGreaterThan(3_000);
     expect(Number(rows.res.headers.get('x-rows-estimate'))).toBeGreaterThan(3_000);
     const sr = rows.json().suggestR as number;
     expect(sr).toBeGreaterThan(5);
@@ -980,6 +982,11 @@ describe('Grenzen (422 mit Vorschlag)', () => {
     const cells = await get(api, `/api/v1/profile?sym=BTCUSDT&${day}&R=100`);
     expect(cells.res.status).toBe(422);
     expect(cells.json().error).toMatch(/Zeilen/);
+    expect(cells.json()).toMatchObject({
+      reason: 'profile_rows',
+      rows: cells100,
+      limit: cells100 - 1,
+    });
     expect(cells.json().suggestR).toBe(200);
     const ok = await get(api, `/api/v1/profile?sym=BTCUSDT&${day}&R=200`);
     expect(ok.res.status).toBe(200);
@@ -1566,5 +1573,55 @@ describe('Stats-Spalten (x.trades, x.maxDelta, x.minDelta, x.cotHigh, x.cotLow)'
     expect(
       (await get(api, `/api/v1/bars?sym=BTCUSDT&tf=1m&from=0&to=60000&stats=2`)).res.status,
     ).toBe(400);
+  });
+});
+
+describe('Profil-Vertrag: Grenzen, Tageslisten, Version je Tag, VWAP', () => {
+  let api: RunningApi;
+  beforeAll(async () => {
+    api = await start();
+  });
+  afterAll(async () => api?.close());
+
+  it('/symbols veröffentlicht die Grenzen der Endpunkte', async () => {
+    const j = (await get(api, '/api/v1/symbols')).json();
+    expect(checkSymbolsResponse(j)).toEqual([]);
+    expect(j.limits).toMatchObject({
+      tiles: { maxCells: 60_000, maxSourceRows: 300_000 },
+      bars: { maxBars: 5_000 },
+      profile: { maxRows: 60_000, maxSourceRows: 1_500_000, maxR: 1_000_000, maxDailyDays: 400 },
+      quality: { maxDays: 400, maxIssues: 5_000 },
+    });
+  });
+
+  it('Tagesprofile: emptyDays/missingDays, dataVersion je Tag, VWAP = notional / Volumen', async () => {
+    const from = (FIRST_DAY - 2) * DAY_MS;
+    const to = (LAST_DAY + 3) * DAY_MS;
+    const r = await get(api, `/api/v1/profiles/daily?sym=BTCUSDT&from=${from}&to=${to}&R=1000`);
+    expect(r.res.status).toBe(200);
+    const j = r.json() as unknown as DailyProfilesResponse;
+    expect(checkDailyProfiles(j)).toEqual([]);
+    const fmt = (d: number) => new Date(d * DAY_MS).toISOString().slice(0, 10);
+    expect(j.missingDays).toEqual([
+      fmt(FIRST_DAY - 2),
+      fmt(FIRST_DAY - 1),
+      fmt(LAST_DAY + 1),
+      fmt(LAST_DAY + 2),
+    ]);
+    expect(j.emptyDays).toEqual([]);
+    expect(j.days.length).toBe(LAST_DAY - FIRST_DAY + 1);
+    expect(new Set(j.days.map((d) => d.dataVersion)).size).toBe(j.days.length);
+    for (const d of j.days) {
+      const vol = d.buyQ + d.sellQ;
+      expect(d.vwap).toBeCloseTo(Number(BigInt(d.notional)) / vol, 3);
+      expect(d.final).toBe(expFinal(d.from, d.to));
+    }
+    // dataVersion eines Tages hängt nur von seinen UTC-Tagen ab: gleich in einer anderen Anfrage
+    const one = await get(
+      api,
+      `/api/v1/profiles/daily?sym=BTCUSDT&from=${FIRST_DAY * DAY_MS}&to=${(FIRST_DAY + 1) * DAY_MS}&R=1000`,
+    );
+    const d0 = (one.json() as unknown as DailyProfilesResponse).days[0]!;
+    expect(d0.dataVersion).toBe(j.days[0]!.dataVersion);
   });
 });

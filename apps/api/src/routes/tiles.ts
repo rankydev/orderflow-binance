@@ -28,7 +28,9 @@ import {
   type BarRows,
   type LevelRows,
 } from '../queries.ts';
-import { statsColumns, TRADES_MAX_ROWS } from '../stats.ts';
+import { STATS_COLUMNS, statsColumns, TRADES_MAX_ROWS } from '../stats.ts';
+import { MAX_DAILY_DAYS, MAX_RANGE_MS, PROFILE_MAX_R } from './profile.ts';
+import { MAX_ISSUES, MAX_QUALITY_DAYS } from './status.ts';
 import { versionOf } from '../versions.ts';
 
 export const SYMBOLS_SCHEMA = 2;
@@ -36,9 +38,33 @@ export const SYMBOLS_SCHEMA = 2;
 export const MAX_BARS_PER_REQUEST = 5_000;
 const BIN = 'application/octet-stream';
 
-export function symbolsBody(syms: SymbolState[]): string {
+/** Grenzen der Endpunkte für Clients (statisch je Konfiguration; ändert sich nicht mit den Daten). */
+export function apiLimits(cfg: Deps['cfg']) {
+  return {
+    tiles: {
+      maxCells: TILE_MAX_CELLS,
+      maxSourceRows: Math.min(cfg.maxTileSourceRows, cfg.maxSourceRows),
+      statsColumns: [...STATS_COLUMNS],
+    },
+    bars: { maxBars: MAX_BARS_PER_REQUEST },
+    profile: {
+      maxRows: cfg.maxCells,
+      maxSourceRows: cfg.maxSourceRows,
+      // R: Leiter {1, 2, 5}·10^k Ticks, R · tickRefUnits ≥ tickUnits, R ≤ maxR
+      maxR: PROFILE_MAX_R,
+      maxRangeDays: MAX_RANGE_MS / 86_400_000,
+      maxDailyDays: MAX_DAILY_DAYS,
+      offsetH: { min: -23, max: 23 },
+      va: { min: 1, max: 100, default: 70 },
+    },
+    quality: { maxDays: MAX_QUALITY_DAYS, maxIssues: MAX_ISSUES },
+  };
+}
+
+export function symbolsBody(syms: SymbolState[], limits?: ReturnType<typeof apiLimits>): string {
   return JSON.stringify({
     schema: SYMBOLS_SCHEMA,
+    ...(limits ? { limits } : {}),
     symbols: syms.map((s) => ({
       name: s.name,
       priceDecimals: s.priceDecimals,
@@ -132,7 +158,7 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
   app.get('/api/v1/symbols', async (req, reply) => {
     new Params(req.query).done();
     assertFresh(deps);
-    const body = Buffer.from(symbolsBody(deps.catalog.symbols()));
+    const body = Buffer.from(symbolsBody(deps.catalog.symbols(), apiLimits(deps.cfg)));
     const r = await makeResponse(
       body,
       'application/json',

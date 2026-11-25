@@ -20,6 +20,11 @@ export interface ProfileBody {
   sellQ: number;
   /** Σ px·lots in price_unit·qty_unit als Dezimalstring (kann 2^53 überschreiten; nie als Number lesen). */
   notional: string;
+  /**
+   * VWAP in price_unit (notional / (buyQ + sellQ), auf 6 Nachkommastellen exakt); null ohne Volumen.
+   * Nur zur Anzeige; exakt ist `notional`.
+   */
+  vwap: number | null;
   /** Niedrigster/höchster gehandelter Preis in price_unit; null bei leerem Profil. */
   low: number | null;
   high: number | null;
@@ -55,11 +60,17 @@ export interface RangeProfileResponse extends ProfileEnvelope {
 }
 
 export interface DailyProfile extends ProfileBody {
-  /** UTC-Datum des Tages d (YYYY-MM-DD); der Tag überdeckt [d·24h + offsetH, (d+1)·24h + offsetH). */
+  /**
+   * Bezeichnung: UTC-Datum des Tages d (YYYY-MM-DD); der Tag überdeckt [d·24h + offsetH,
+   * (d+1)·24h + offsetH). Maßgeblich für den Zeitraum sind `from`/`to`, nicht `day`.
+   */
   day: string;
   from: number;
   to: number;
+  /** Alle UTC-Tage, die dieser Tag überdeckt, sind unveränderlich. */
   final: boolean;
+  /** Version nur dieses Tages (ändert sich nur, wenn sich einer seiner UTC-Tage ändert). */
+  dataVersion: string;
 }
 
 export interface DailyProfilesResponse extends ProfileEnvelope {
@@ -67,6 +78,10 @@ export interface DailyProfilesResponse extends ProfileEnvelope {
   offsetH: number;
   /** Nur Tage mit Trades, aufsteigend. */
   days: DailyProfile[];
+  /** Tage des Bereichs mit gespeicherten Daten, aber ohne Trades (Bezeichnung wie `day`). */
+  emptyDays: string[];
+  /** Tage des Bereichs ohne gespeicherte Daten (Lücke, Zukunft, vor dem Datenbeginn). */
+  missingDays: string[];
 }
 
 const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v);
@@ -95,6 +110,8 @@ export function checkProfileBody(p: ProfileBody, where = 'profile'): string[] {
   if (sb !== p.buyQ || ss !== p.sellQ) bad('Zeilensummen ≠ buyQ/sellQ');
   if (typeof p.notional !== 'string' || !/^\d+$/.test(p.notional))
     bad('notional kein Dezimalstring');
+  if (sb + ss > 0 !== (typeof p.vwap === 'number' && p.vwap > 0))
+    bad('vwap passt nicht zum Volumen');
   if (n === 0) {
     if (p.rowLo !== null || p.poc !== null || p.low !== null || p.high !== null)
       bad('leeres Profil mit Werten');

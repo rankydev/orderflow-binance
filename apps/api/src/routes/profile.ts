@@ -105,6 +105,12 @@ function suggestR(
 
 const rowOf = (px: number, w: number) => (px - (px % w)) / w;
 
+/** VWAP in price_unit (Gleitkomma, 6 Nachkommastellen exakt per BigInt-Division); null ohne Volumen. */
+export function vwapOf(notional: bigint, lots: number): number | null {
+  if (lots <= 0) return null;
+  return Number((notional * 1_000_000n) / BigInt(lots)) / 1_000_000;
+}
+
 /** Dichtes Profil aus Bars (Bereich, Summen) und Level-Zeilen [i0, i1) eines Tages bzw. Bereichs. */
 function buildBody(
   bar: ProfileBarRow | undefined,
@@ -127,6 +133,7 @@ function buildBody(
       buyQ: 0,
       sellQ: 0,
       notional: '0',
+      vwap: null,
       low: null,
       high: null,
     };
@@ -157,6 +164,7 @@ function buildBody(
     buyQ: sb,
     sellQ: ss,
     notional: bar.notional.toString(),
+    vwap: vwapOf(bar.notional, sb + ss),
     low: bar.low,
     high: bar.high,
   };
@@ -196,6 +204,9 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
       throw unprocessable(
         `≈ ${plan.estimate} Quellzeilen > ${deps.cfg.maxSourceRows}; gröberes R wählen`,
         {
+          reason: 'profile_source_rows',
+          rowsEstimate: plan.estimate,
+          limit: deps.cfg.maxSourceRows,
           suggestR: suggestR(deps, s, R, from, to, false, null),
         },
       );
@@ -215,6 +226,9 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
           const cells = rowOf(b.high, w) - rowOf(b.low, w) + 1;
           if (cells > deps.cfg.maxCells) {
             throw unprocessable(`${cells} Zeilen > ${deps.cfg.maxCells}; gröberes R wählen`, {
+              reason: 'profile_rows',
+              rows: cells,
+              limit: deps.cfg.maxCells,
               suggestR: suggestR(deps, s, R, from, to, false, (r) => {
                 const x = r * s.tickRefUnits;
                 return rowOf(b.high, x) - rowOf(b.low, x) + 1;
@@ -266,6 +280,9 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
       throw unprocessable(
         `≈ ${plan.estimate} Quellzeilen > ${deps.cfg.maxSourceRows}; gröberes R wählen`,
         {
+          reason: 'profile_source_rows',
+          rowsEstimate: plan.estimate,
+          limit: deps.cfg.maxSourceRows,
           suggestR: suggestR(deps, s, R, from, to, true, null),
         },
       );
@@ -285,6 +302,9 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
         const cells = cellsOf(bars, w);
         if (cells > deps.cfg.maxCells) {
           throw unprocessable(`${cells} Zeilen > ${deps.cfg.maxCells}; gröberes R wählen`, {
+            reason: 'profile_rows',
+            rows: cells,
+            limit: deps.cfg.maxCells,
             suggestR: suggestR(deps, s, R, from, to, true, (r) =>
               cellsOf(bars, r * s.tickRefUnits),
             ),
@@ -311,18 +331,31 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
         // überdeckte UTC-Tage des Tagesprofils
         const u0 = Math.floor(dayFrom / DAY_MS);
         const u1 = Math.floor((dayFrom + DAY_MS - 1) / DAY_MS);
-        let final = true;
-        for (let u = u0; u <= u1; u++) if (!days.get(u)?.immutable) final = false;
+        const dv = versionOf(['daily-day', s.name, dayFrom, R, va], u0, u1, (d) => days.get(d));
         out.push({
           day: formatDay(b.day),
           from: dayFrom,
           to: dayFrom + DAY_MS,
-          final,
+          final: dv.final,
+          dataVersion: dv.dataVersion,
           ...buildBody(b, levels, i, j, w, va),
         });
         i = j;
       }
       if (i !== levels.length) throw new HttpError(500, 'Level ohne Bars');
+      // Tage ohne Profil unterscheiden: mit Daten, aber ohne Trades (leer) vs. ohne Daten (fehlend)
+      const withProfile = new Set(bars.map((b) => b.day));
+      const emptyDays: string[] = [];
+      const missingDays: string[] = [];
+      for (let a = from; a < to; a += DAY_MS) {
+        const dd = Math.floor((a - off) / DAY_MS);
+        if (withProfile.has(dd)) continue;
+        const u0 = Math.floor(a / DAY_MS);
+        const u1 = Math.floor((a + DAY_MS - 1) / DAY_MS);
+        let any = false;
+        for (let u = u0; u <= u1; u++) if (days.has(u)) any = true;
+        (any ? emptyDays : missingDays).push(formatDay(dd));
+      }
       const res: DailyProfilesResponse = {
         ...envelope(s, R, from, to, va),
         kind: 'profiles/daily',
@@ -332,6 +365,8 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
         sources: plan.segs,
         sourceRowsEstimate: plan.estimate,
         days: out,
+        emptyDays,
+        missingDays,
       };
       const body = Buffer.from(JSON.stringify(res));
       return makeResponse(body, 'application/json', ver.dataVersion, ver.final, true);

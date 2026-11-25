@@ -125,6 +125,7 @@ describe('profileMarks / checkProfileBody', () => {
       buyQ: 8,
       sellQ: 8,
       notional: '123456789012345678901',
+      vwap: 1019.5,
       low: 1000,
       high: 1039,
     };
@@ -132,6 +133,7 @@ describe('profileMarks / checkProfileBody', () => {
     expect(checkProfileBody({ ...body, buyQ: 9 })).not.toEqual([]);
     expect(checkProfileBody({ ...body, poc: 99 })).not.toEqual([]);
     expect(checkProfileBody({ ...body, notional: '1e21' })).not.toEqual([]);
+    expect(checkProfileBody({ ...body, vwap: null })).not.toEqual([]);
     expect(
       checkProfileBody({ ...body, buy: [0, 0, 5, 2], buyQ: 7, sell: [0, 0, 7, 1] }),
     ).not.toEqual([]);
