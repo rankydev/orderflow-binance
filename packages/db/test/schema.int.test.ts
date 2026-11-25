@@ -32,6 +32,10 @@ const P1_TABLES = [
   'bar_1h',
   'bar_1d',
   'kline_1m',
+  // P3 (Migration 0011)
+  'ingest_status',
+  'live_kline_check',
+  'recorder_quality',
 ];
 // KONZEPT §3.9: Chunk-Intervall und Columnstore-Frist je Hypertable
 // afterDays null = kein Columnstore (Jahres-Chunk-Tabellen, Migration 0006 / Review N5)

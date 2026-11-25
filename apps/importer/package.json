@@ -16,5 +16,8 @@
     "@orderflow/core": "0.0.0",
     "@orderflow/db": "0.0.0",
     "postgres": "4.1.1"
+  },
+  "exports": {
+    ".": "./src/index.ts"
   }
 }

@@ -84,6 +84,11 @@ export interface ImportOptions {
   onSummary?: (s: DaySummary) => void;
   /** Tage des Bereichs immer neu schreiben (auch wenn identisch gespeichert). */
   force?: boolean;
+  /**
+   * Unmittelbar vor dem Schreiben eines Tages (nur wenn geschrieben wird): z. B. der Recorder
+   * vergleicht den live geschriebenen Tag mit dem offiziellen, bevor dieser ihn ersetzt.
+   */
+  onBeforeWrite?: (data: DayData, stored: StoredDay | null) => Promise<void>;
 }
 
 export interface MinuteDetail {
@@ -805,6 +810,7 @@ export class Importer {
         await writer.touchDay(p.day, importerVersion, RULES_VERSION);
       }
     } else {
+      await this.o.onBeforeWrite?.(p.data, st);
       outcome = await writer.writeDay({
         data: p.data,
         recon,

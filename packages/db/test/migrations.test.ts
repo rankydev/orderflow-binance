@@ -20,6 +20,8 @@ describe('Migrationsdateien im Repo', () => {
       '0008',
       '0009',
       '0010',
+      '0011',
+      '0012',
     ]);
     for (const m of real) {
       expect(m.upSql.trim().length).toBeGreaterThan(0);
@@ -66,7 +68,7 @@ describe('Migrationsdateien im Repo', () => {
       .map((m) => m.upSql)
       .join('\n')
       .replace(/--.*$/gm, ''); // Kommentare ignorieren
-    for (const later of ['size_hist', 'big_order', 'ingest_status']) {
+    for (const later of ['size_hist', 'big_order']) {
       expect(all).not.toContain(later);
     }
   });

@@ -64,6 +64,9 @@ export class DayAggregator {
   private lvBA: number[] = [];
   private lvSA: number[] = [];
   private finished = false;
+  /** Für den Live-Pfad: je abgeschlossener Minute Zeilenbereich in fp und Index in bars. */
+  private readonly flushed = new Map<number, { from: number; to: number; bar: number }>();
+  private onFlush: ((minute: number) => void) | null = null;
 
   constructor(day: number) {
     this.day = day;
@@ -84,8 +87,12 @@ export class DayAggregator {
           `aggTrade ${t.a}: Zeit läuft über eine Minutengrenze zurück (Minute ${minute} nach ${this.cur})`,
         );
       }
-      if (this.cur >= 0) this.flushMinute();
+      if (this.cur >= 0 && !this.flushed.has(this.cur)) this.flushMinute();
       this.cur = minute;
+    } else if (this.flushed.has(minute)) {
+      throw new Error(
+        `aggTrade ${t.a}: Minute ${minute} ist bereits abgeschlossen (verspäteter Trade)`,
+      );
     }
     let s = this.slot.get(t.px);
     if (s === undefined) {
@@ -119,6 +126,7 @@ export class DayAggregator {
 
   private flushMinute(): void {
     const ts = this.dayStart + this.cur * MINUTE_MS;
+    const from = this.fp.n;
     const idx = new Array<number>(this.lvN);
     for (let i = 0; i < this.lvN; i++) idx[i] = i;
     const px = this.lvPx;
@@ -132,15 +140,48 @@ export class DayAggregator {
       this.fp.push(ts, px[i]!, bq, sq, this.lvBA[i]!, this.lvSA[i]!);
     }
     this.bars.push(this.bar.finish(ts));
+    this.flushed.set(this.cur, { from, to: this.fp.n, bar: this.bars.length - 1 });
+    const done = this.cur;
     this.bar.reset();
     this.slot.clear();
     this.lvN = 0;
+    this.onFlush?.(done);
+  }
+
+  /**
+   * Live-Pfad: Rückruf je abgeschlossener Minute (sobald der erste Trade der Folgeminute kommt
+   * oder `closeOpenMinute` aufgerufen wird). Rechnet nichts anders als der Tagesimport.
+   */
+  setOnFlush(cb: ((minute: number) => void) | null): void {
+    this.onFlush = cb;
+  }
+
+  /** Offene Minute < `beforeMinute` abschließen (Live-Pfad, ruhiger Markt ohne Folgetrade). */
+  closeOpenMinute(beforeMinute: number): void {
+    if (this.cur >= 0 && this.cur < beforeMinute && !this.flushed.has(this.cur)) this.flushMinute();
+  }
+
+  /** Zeilen und Bar einer abgeschlossenen Minute (Kopie bzw. Referenz); undefined ohne Trades. */
+  minute(m: number): { fp: FpTable; bar: Bar } | undefined {
+    const f = this.flushed.get(m);
+    if (!f) return undefined;
+    return { fp: this.fp.slice(f.from, f.to), bar: this.bars[f.bar]! };
+  }
+
+  /** Kandidatensummen je Minute bisher (Live-Kline-Abgleich; Referenzen, nicht kopiert). */
+  candidates(): { candQ: Float64Array; candB: Float64Array; count: number } {
+    return { candQ: this.candQ, candB: this.candB, count: this.candCount };
+  }
+
+  /** Anzahl aggTrades bisher. */
+  get tradeCount(): number {
+    return this.trades;
   }
 
   finish(): DayAggregate {
     if (this.finished) throw new Error('DayAggregator.finish zweimal aufgerufen');
     this.finished = true;
-    if (this.cur >= 0) this.flushMinute();
+    if (this.cur >= 0 && !this.flushed.has(this.cur)) this.flushMinute();
     return {
       day: this.day,
       trades: this.trades,

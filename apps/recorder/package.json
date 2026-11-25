@@ -3,12 +3,19 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Daemon: WebSocket-aggTrades, Lückenerkennung, Spool (Phase P2)",
+  "description": "Daemon: WebSocket-aggTrades, L\u00fcckenerkennung + REST-Nachholen, Spool, provisorische Minuten, t\u00e4gliche Finalisierung (Phase P3)",
   "scripts": {
     "start": "node --env-file-if-exists=../../.env src/main.ts",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {
-    "@types/node": "24.19.2"
+    "@types/node": "24.19.2",
+    "fast-check": "4.11.0"
+  },
+  "dependencies": {
+    "@orderflow/core": "0.0.0",
+    "@orderflow/db": "0.0.0",
+    "@orderflow/importer": "0.0.0",
+    "postgres": "4.1.1"
   }
 }

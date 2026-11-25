@@ -60,6 +60,19 @@ export class FpBuilder {
     this.sellA[i] = sellA;
   }
 
+  /** Kopie der Zeilen [from, to). */
+  slice(from: number, to: number): FpTable {
+    return {
+      n: to - from,
+      ts: this.ts.slice(from, to),
+      px: this.px.slice(from, to),
+      buyQ: this.buyQ.slice(from, to),
+      sellQ: this.sellQ.slice(from, to),
+      buyA: this.buyA.slice(from, to),
+      sellA: this.sellA.slice(from, to),
+    };
+  }
+
   /**
    * Ansichten (subarray) statt Kopien, solange der Puffer höchstens 1,5× überdimensioniert ist;
    * sonst eine passgenaue Kopie, damit der übergroße Puffer freigegeben werden kann (Review W5/H5).
@@ -129,4 +142,20 @@ export function fpTotals(t: FpTable): { buyQ: number; sellQ: number; buyA: numbe
     sellA += t.sellA[i]!;
   }
   return { buyQ, sellQ, buyA, sellA };
+}
+
+/** Tabellen in gegebener Reihenfolge aneinanderhängen (Aufrufer garantiert Sortierung nach (ts, px)). */
+export function concatFp(parts: readonly FpTable[]): FpTable {
+  const b = new FpBuilder(
+    Math.max(
+      16,
+      parts.reduce((a, p) => a + p.n, 0),
+    ),
+  );
+  for (const p of parts) {
+    for (let i = 0; i < p.n; i++) {
+      b.push(p.ts[i]!, p.px[i]!, p.buyQ[i]!, p.sellQ[i]!, p.buyA[i]!, p.sellA[i]!);
+    }
+  }
+  return b.build();
 }
