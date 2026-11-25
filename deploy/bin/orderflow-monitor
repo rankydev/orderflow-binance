@@ -9,6 +9,7 @@ set -uo pipefail
 # Namen/Pfade für lokale Tests überschreibbar
 DBC=${OF_DB_CONTAINER:-orderflow-db} APIC=${OF_API_CONTAINER:-orderflow-api} RECC=${OF_REC_CONTAINER:-orderflow-recorder}
 HOT_SQL=${OF_HOT_SQL:-/opt/orderflow-binance/sql/hot-chunks.sql}
+ROOT=${OF_ROOT:-/opt/orderflow-binance}
 reasons=()
 
 health() { docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$1" 2>/dev/null || echo missing; }
@@ -27,7 +28,10 @@ fi
 # Recorder (nur wenn der Container existiert, d. h. einmal mit recorder-ctl.sh start angelegt):
 # läuft er nicht oder ist nicht healthy → Alarm. Aus seiner Health zusätzlich offene komprimierte
 # Chunks, Alarm zu teilweise komprimierten Chunks, Fehler nach der Finalisierung, Schreibfehler.
-if docker inspect "$RECC" >/dev/null 2>&1; then
+if docker inspect "$RECC" >/dev/null 2>&1 && [ -f "$ROOT/recorder.stopped" ] \
+   && [ "$(docker inspect -f '{{.State.Running}}' "$RECC")" != true ]; then
+  echo "info: Recorder bewusst angehalten seit $(cat "$ROOT/recorder.stopped") (recorder.sh start hebt das auf)"
+elif docker inspect "$RECC" >/dev/null 2>&1; then
   h=$(health "$RECC")
   [ "$h" = healthy ] || reasons+=("$RECC: $h")
   r=$(docker exec "$RECC" node -e "fetch('http://127.0.0.1:7701/health').then(r=>r.json()).then(j=>{const o=[];if(j.hotCompressedChunks)o.push('hotCompressedChunks='+j.hotCompressedChunks);if(j.partialChunkAlert)o.push('partialChunkAlert '+(j.partialChunkAlertReason||''));if(j.postCommitErrors)o.push('postCommitErrors='+j.postCommitErrors);if(!j.spoolEnabled)o.push('spool disabled');console.log(o.join('; '))},e=>console.log('recorder health unreachable'))" 2>/dev/null) || r="recorder health unreachable"

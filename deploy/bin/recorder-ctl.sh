@@ -95,6 +95,7 @@ case "$cmd" in
   start)
     [ -d "$DATA/live" ] || { say "zuerst prepare"; exit 1; }
     wait_min=${1:-150}
+    rm -f "$R/recorder.stopped"
     $C --profile recorder up -d recorder </dev/null
     for _ in $(seq 1 $(( wait_min * 6 ))); do
       st=$(docker inspect -f '{{.State.Health.Status}}' "$RECC" 2>/dev/null || echo missing)
@@ -110,6 +111,8 @@ case "$cmd" in
   health) rec_health ;;
   stop)
     $C --profile recorder stop recorder </dev/null
+    # bewusst angehalten: der Monitor meldet das als Hinweis statt als Alarm (start entfernt es)
+    date -u +%FT%TZ > "$R/recorder.stopped"
     say "Recorder angehalten: $(docker inspect -f '{{.State.Status}}' "$RECC" 2>/dev/null || echo fehlt)"
     ;;
   *) sed -n '2,20p' "$0" >&2; exit 2 ;;

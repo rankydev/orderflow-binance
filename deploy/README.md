@@ -285,6 +285,14 @@ unless-stopped`, Health-Startphase 2,5 h (REST-Nachholen: ≈ 7 Daten-Minuten je
   `final_ok`, `db=match`); Recorder startet als `of_recorder`, holt per REST nach (≈ 14
   Daten-Minuten je Minute mit einem Symbol im Rückstand, ≈ 7 je Symbol mit zweien) und finalisiert ETHUSDT 2026-11-24 selbst (Download in `/data`);
   alte API ba55a90 gegen Schema 0016: alle Endpunkte 200.
+  Zweiter Lauf mit HEAD 53af8a4: Produktionsmarker gesetzt (`prodmarker|true`), `down` danach
+  verweigert; API ohne laufenden Recorder healthy (Ereignis-Feed verbindet mit Backoff neu, keine
+  Logzeilen), nach dem Recorder-Start `recorderEvents.connected:true` (1 403 Ereignisse);
+  `catchup-range 2026-11-24` beider Symbole 35 s (`final_ok`, `db=match`), zweiter Lauf
+  `UNCHANGED`; Recorder-Nachholen mit beiden Symbolen im Rückstand ≈ 9 (BTC) bzw. ≈ 12 (ETH)
+  Daten-Minuten je Minute; `stop` < 1 s, Exit 0, „stopped" im Log; kein Host-Port 7701 (der
+  Container veröffentlicht nichts). Ein bewusster Stopp hinterlässt
+  `/opt/orderflow-binance/recorder.stopped`; der Monitor meldet ihn dann als Hinweis statt Alarm.
 - **API-Umschalten ohne Ausfall (bewertet, nicht gebaut):** Der veröffentlichte Port
   `127.0.0.1:8780` gehört genau einem Container; ein Container bekommt einen Port nur beim
   Anlegen, und nginx darf nicht angefasst werden. Ohne Ausfall ginge es nur mit einem kleinen
