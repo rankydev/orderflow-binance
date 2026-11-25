@@ -15,8 +15,22 @@ import {
   type PriceToCoordinateConverter,
   type Time,
 } from 'lightweight-charts';
-import { colorIndex, NEUTRAL_INDEX } from './color.ts';
-import type { FootprintStore, PreparedTile } from './footprint-store.ts';
+import { colorIndex, colorIndexVolume, NEUTRAL_INDEX } from './color.ts';
+import {
+  IMB_BUY,
+  IMB_BUY_STACK,
+  IMB_SELL,
+  IMB_SELL_STACK,
+  stackZones,
+  zoneTouch,
+  type ImbalanceOptions,
+} from './footprint-marks.ts';
+import {
+  tileImbalance,
+  tileValueArea,
+  type FootprintStore,
+  type PreparedTile,
+} from './footprint-store.ts';
 import {
   L2_MIN_BAR_SPACING,
   L2_MIN_ROW_HEIGHT,
@@ -24,7 +38,7 @@ import {
   VISIBLE_CELL_BUDGET,
   visibleCells,
 } from './lod.ts';
-import type { BarItem, ColorMode, ColorScope, FootprintType, Lod } from './types.ts';
+import type { BarItem, ColorMode, ColorScope, FootprintMode, FootprintType, Lod } from './types.ts';
 
 export type FpItem = BarItem & CustomData<Time>;
 
@@ -34,6 +48,38 @@ type Scope = Parameters<Parameters<Target['useBitmapCoordinateSpace']>[0]>[0];
 export const UP_COLOR = '#26a69a';
 export const DOWN_COLOR = '#ef5350';
 const POC_COLOR = '#f2c94c';
+
+// Marken im Footprint (P4): Indizes in die Markenbündel und ihre Farben
+export const MK_DPOC_POS = 0;
+export const MK_DPOC_NEG = 1;
+export const MK_VA = 2;
+export const MK_IMB_BUY = 3;
+export const MK_IMB_SELL = 4;
+export const MK_STACK_BUY = 5;
+export const MK_STACK_SELL = 6;
+export const MK_PROJ_BUY = 7;
+export const MK_PROJ_SELL = 8;
+export const MARK_STYLES: readonly string[] = [
+  '#5ee7f0', // Delta-POC positiv (Rahmen)
+  '#ff9a5c', // Delta-POC negativ (Rahmen)
+  'rgba(200, 208, 225, 0.85)', // Value Area je Bar
+  '#3cf0b4', // Buy-Imbalance
+  '#ff5c7a', // Sell-Imbalance
+  'rgba(60, 240, 180, 0.16)', // Stacked Buy (Zone)
+  'rgba(255, 92, 122, 0.16)', // Stacked Sell (Zone)
+  'rgba(60, 240, 180, 0.08)', // Stacked Buy (Projektion)
+  'rgba(255, 92, 122, 0.08)', // Stacked Sell (Projektion)
+];
+/** Gefüllte Marken (die Delta-POC-Rahmen werden gestrichen). */
+const MARK_FILLS = [
+  MK_VA,
+  MK_STACK_BUY,
+  MK_STACK_SELL,
+  MK_PROJ_BUY,
+  MK_PROJ_SELL,
+  MK_IMB_BUY,
+  MK_IMB_SELL,
+];
 /** Zellschrift; die Palette ist so begrenzt, dass der Kontrast auf jeder Stufe ≥ 4,5 : 1 ist (W9). */
 export const TEXT_COLOR = '#eef1f5';
 const DRAW_RING = 4096;
@@ -83,10 +129,20 @@ export class RenderContext {
   /** 10^priceDecimals. */
   priceScale = 100;
   type: FootprintType = 'delta';
+  /** Box (Zahl in gefärbter Zelle) oder Profil (Balken je Zeile) */
+  mode: FootprintMode = 'box';
+  showPoc = true;
+  showDeltaPoc = false;
+  showBarVa = false;
+  vaPct = 70;
+  /** Imbalance-Optionen; null = aus */
+  imbalance: ImbalanceOptions | null = null;
   colorMode: ColorMode = 'gradient';
   colorScope: ColorScope = 'visible';
   /** Farbreferenz (P95) über die sichtbaren Bars, am Gestenende/Laden berechnet. */
   colorRef = 1;
+  /** Farbreferenz der Volumen-Hälfte (Typ Delta + Volume). */
+  colorRef2 = 1;
   palette: string[] = [];
   /**
    * Vorige Zeilengröße nach einem R-Wechsel (W6): Bars, deren Kachel der neuen Größe noch fehlt, werden
@@ -142,8 +198,9 @@ class RectBatch {
     a[n * 4 + 3] = h;
     this.count[c] = n + 1;
   }
-  fill(ctx: CanvasRenderingContext2D, styles: readonly string[]): void {
+  fill(ctx: CanvasRenderingContext2D, styles: readonly string[], only?: readonly number[]): void {
     for (let c = 0; c < this.colors; c++) {
+      if (only && !only.includes(c)) continue;
       const n = this.count[c]!;
       if (n === 0) continue;
       const a = this.data[c]!;
@@ -195,11 +252,15 @@ export class FootprintRenderer implements ICustomSeriesPaneRenderer {
   private readonly cells = new RectBatch(NEUTRAL_INDEX + 1);
   /** 0 = up, 1 = down, 2 = POC. */
   private readonly misc = new RectBatch(3);
+  /** Marken: Delta-POC, VA, Imbalance, Stacked, Projektion (Indizes MK_*). */
+  private readonly marks = new RectBatch(MARK_STYLES.length);
   private readonly texts = new TextBatch();
   private readonly rowsPerBar: number[] = [];
   private readonly fallback: number[] = [];
   private readonly highs: number[] = [];
   private readonly lows: number[] = [];
+  /** sichtbare Bars als {h, l} (Projektion der Stacked-Zonen, ohne Kopie der Werte) */
+  private readonly hl: { h: number; l: number }[] = [];
 
   readonly rc: RenderContext;
   constructor(rc: RenderContext) {
@@ -235,10 +296,12 @@ export class FootprintRenderer implements ICustomSeriesPaneRenderer {
     const rh = -A * width;
     this.highs.length = 0;
     this.lows.length = 0;
+    this.hl.length = 0;
     for (let i = from; i < to; i++) {
       const it = d.bars[i]!.originalData;
       this.highs.push(it.h);
       this.lows.push(it.l);
+      this.hl.push(it);
     }
     const vc = visibleCells(
       {
@@ -283,16 +346,22 @@ export class FootprintRenderer implements ICustomSeriesPaneRenderer {
     const store = rc.store!;
     const tiles = store.tiles(rc.series);
     const span = rc.n * rc.tfSec;
-    const colW = bs * (rc.type === 'bidask' ? 0.92 : 0.86) * hpr;
-    const bid = rc.type === 'bidask';
+    const type = rc.type;
+    const twoCol = type === 'bidask' || type === 'deltavol';
+    const colW = bs * (twoCol ? 0.92 : 0.86) * hpr;
     const mode = rc.colorMode;
     const perBar = rc.colorScope === 'bar';
+    const profile = rc.mode === 'profile';
+    const imbOpts = rc.imbalance;
     this.cells.reset();
     this.misc.reset();
+    this.marks.reset();
     this.texts.n = 0;
     this.rowsPerBar.length = 0;
     // Innenabstand der Zahl zur Zellkante (Bitmap-px), damit sie den Nachbarbar nie berührt.
     const pad = 2 * hpr;
+    const mw = Math.max(1, Math.round(2 * hpr)); // Imbalance-Markierung
+    const W = scope.bitmapSize.width;
     let cells = 0;
     let curK = Number.NaN;
     let curTile: PreparedTile | undefined;
@@ -301,6 +370,7 @@ export class FootprintRenderer implements ICustomSeriesPaneRenderer {
     const prevSpan = prev ? prev.n * rc.tfSec : 1;
     let prevK = Number.NaN;
     let prevTile: PreparedTile | undefined;
+    const allBars = d.bars;
     for (let i = from; i < to; i++) {
       const bar = d.bars[i]!;
       const t = bar.originalData.t;
@@ -340,11 +410,27 @@ export class FootprintRenderer implements ICustomSeriesPaneRenderer {
       const s = tile.levelOffset[bi]!;
       const e = tile.levelOffset[bi + 1]!;
       let barRows = 0;
-      const cref = perBar ? (bid ? tile.refVol[bi]! : tile.refDelta[bi]!) : rc.colorRef;
+      // Farbreferenzen: erste Größe (Delta/Seiten/Volumen) und Volumen-Hälfte bei Delta + Volume
+      const cref = perBar
+        ? type === 'bidask'
+          ? tile.refVol[bi]!
+          : type === 'volume'
+            ? tile.refTot[bi]!
+            : tile.refDelta[bi]!
+        : rc.colorRef;
+      const cref2 = perBar ? tile.refTot[bi]! : rc.colorRef2;
       const row = tile.row;
       const buy = tile.buy;
       const sell = tile.sell;
-      const pr = tile.poc[bi]!;
+      const pr = rc.showPoc ? tile.poc[bi]! : NaN;
+      const dpr = rc.showDeltaPoc ? tile.deltaPoc[bi]! : NaN;
+      const flags = imbOpts ? tileImbalance(tile, imbOpts) : null;
+      // Profilmodus: Länge ∝ Wert / Max im Bar
+      const mVol = tile.maxVol[bi]!;
+      const mSide = tile.maxSide[bi]!;
+      const mDelta = tile.maxAbsDelta[bi]!;
+      const len = (v: number, max: number, full: number) =>
+        v === 0 || max <= 0 ? 0 : Math.max(1, Math.round((Math.abs(v) / max) * full));
       for (let j = s; j < e; j++) {
         const r = row[j]!;
         if (r < rowMin || r > rowMax) continue;
@@ -354,30 +440,110 @@ export class FootprintRenderer implements ICustomSeriesPaneRenderer {
         const b = buy[j]!;
         const sl = sell[j]!;
         const ym = yt + h / 2;
-        if (bid) {
-          const cs = colorIndex(sl, cref, true, mode);
-          const cb = colorIndex(b, cref, false, mode);
-          this.cells.push(cs, x0, yt, Math.max(1, xm - x0 - 1), h);
-          this.cells.push(cb, xm, yt, Math.max(1, x1 - xm), h);
+        if (twoCol) {
+          // links: Bid (Bid×Ask) bzw. Delta (Delta + Volume); rechts: Ask bzw. Volumen
+          const lv = type === 'bidask' ? sl : b - sl;
+          const rv = type === 'bidask' ? b : b + sl;
+          const cl = colorIndex(lv, cref, type === 'bidask', mode);
+          const cr =
+            type === 'bidask'
+              ? colorIndex(rv, cref, false, mode)
+              : colorIndexVolume(rv, cref2, mode);
+          if (!profile) {
+            this.cells.push(cl, x0, yt, Math.max(1, xm - x0 - 1), h);
+            this.cells.push(cr, xm, yt, Math.max(1, x1 - xm), h);
+          } else if (type === 'bidask') {
+            // Bid wächst von der Mitte nach links, Ask nach rechts (Länge ∝ Seite / größte Seite im Bar)
+            const wl = len(lv, mSide, xm - x0 - 1);
+            const wr = len(rv, mSide, x1 - xm);
+            if (wl > 0) this.cells.push(cl, xm - 1 - wl, yt, wl, h);
+            if (wr > 0) this.cells.push(cr, xm, yt, wr, h);
+          } else {
+            const wl = len(lv, mDelta, xm - x0 - 1);
+            const wr = len(rv, mVol, x1 - xm);
+            if (wl > 0) this.cells.push(cl, x0, yt, wl, h);
+            if (wr > 0) this.cells.push(cr, xm, yt, wr, h);
+          }
           if (lod === 3) {
-            this.texts.push((x0 + xm) / 2, ym, sl, xm - x0 - pad);
-            this.texts.push((xm + x1) / 2, ym, b, x1 - xm - pad);
+            this.texts.push((x0 + xm) / 2, ym, lv, xm - x0 - pad);
+            this.texts.push((xm + x1) / 2, ym, rv, x1 - xm - pad);
           }
         } else {
-          const cd = colorIndex(b - sl, cref, false, mode);
-          this.cells.push(cd, x0, yt, x1 - x0, h);
-          if (lod === 3) this.texts.push(xc, ym, b - sl, x1 - x0 - pad);
+          const v = type === 'volume' ? b + sl : b - sl;
+          const c =
+            type === 'volume' ? colorIndexVolume(v, cref, mode) : colorIndex(v, cref, false, mode);
+          if (!profile) this.cells.push(c, x0, yt, x1 - x0, h);
+          else {
+            const w = len(v, type === 'volume' ? mVol : mDelta, x1 - x0);
+            if (w > 0) this.cells.push(c, x0, yt, w, h);
+          }
+          if (lod === 3) this.texts.push(xc, ym, v, x1 - x0 - pad);
         }
         if (r === pr) this.misc.push(2, x0 + 0.5, yt + 0.5, x1 - x0 - 1, h - 1);
+        if (r === dpr) {
+          // Delta-POC: eigener Rahmen innerhalb des POC-Rahmens, Farbe nach Vorzeichen
+          const q = Math.max(1, Math.round(2 * hpr));
+          this.marks.push(
+            b - sl >= 0 ? MK_DPOC_POS : MK_DPOC_NEG,
+            x0 + q + 0.5,
+            yt + q + 0.5,
+            x1 - x0 - 2 * q - 1,
+            Math.max(1, h - 2 * q - 1),
+          );
+        }
+        if (flags) {
+          const f = flags[j]!;
+          // Buy-Imbalance am rechten (Ask-)Rand, Sell-Imbalance am linken (Bid-)Rand; Stacked breiter
+          if (f & IMB_BUY)
+            this.marks.push(
+              MK_IMB_BUY,
+              x1 - (f & IMB_BUY_STACK ? 2 * mw : mw),
+              yt,
+              f & IMB_BUY_STACK ? 2 * mw : mw,
+              h,
+            );
+          if (f & IMB_SELL)
+            this.marks.push(MK_IMB_SELL, x0, yt, f & IMB_SELL_STACK ? 2 * mw : mw, h);
+        }
         cells++;
         barRows++;
+      }
+      // Value Area je Bar: schmaler Balken links neben der Spalte (VAL … VAH)
+      if (rc.showBarVa) {
+        const [vlo, vhi] = tileValueArea(tile, rc.vaPct);
+        const lo = vlo[bi]!;
+        const hi = vhi[bi]!;
+        if (lo >= 0) {
+          const yt = Math.round(yU((Math.min(hi, rowMax) + 1) * width));
+          const yb = Math.round(yU(Math.max(lo, rowMin) * width));
+          if (yb > yt) this.marks.push(MK_VA, x0 - 2 * mw, yt, mw, yb - yt);
+        }
+      }
+      // Stacked-Zonen: Fläche über der Spalte, nach rechts projiziert bis ein späterer Bar hineinhandelt
+      if (flags) {
+        for (const [lo, hi, side] of stackZones(row, flags, s, e)) {
+          if (hi < rowMin || lo > rowMax) continue;
+          const yt = Math.round(yU((hi + 1) * width));
+          const yb = Math.round(yU(lo * width));
+          this.marks.push(side === 0 ? MK_STACK_BUY : MK_STACK_SELL, x0, yt, x1 - x0, yb - yt);
+          const touch = zoneTouch(this.hl, i + 1 - from, to - from, lo * width, (hi + 1) * width);
+          const tIdx = touch < 0 ? -1 : touch + from;
+          const xe = tIdx < 0 ? W : Math.round(allBars[tIdx]!.x * hpr - colW / 2);
+          if (xe > x1)
+            this.marks.push(side === 0 ? MK_PROJ_BUY : MK_PROJ_SELL, x1, yt, xe - x1, yb - yt);
+        }
       }
       this.rowsPerBar.push(barRows);
     }
     this.cells.fill(ctx, rc.palette);
+    this.marks.fill(ctx, MARK_STYLES, MARK_FILLS);
     ctx.lineWidth = Math.max(1, Math.floor(vpr));
     ctx.strokeStyle = POC_COLOR;
     this.misc.stroke(ctx, 2);
+    for (const m of [MK_DPOC_POS, MK_DPOC_NEG]) {
+      ctx.strokeStyle = MARK_STYLES[m]!;
+      this.marks.stroke(ctx, m);
+    }
     st.textsDrawn = 0;
     st.textsShortened = 0;
     st.textsSkipped = 0;

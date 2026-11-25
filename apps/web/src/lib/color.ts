@@ -56,18 +56,20 @@ export const BACKGROUND_RGB = [15, 18, 23] as const;
 export const BUY_RGB = [38, 166, 154] as const;
 export const SELL_RGB = [239, 83, 80] as const;
 export const NEUTRAL_RGB = [120, 128, 140] as const;
+/** Typ Volume (ohne Seite): eigener Farbton. */
+export const VOLUME_RGB = [86, 132, 214] as const;
 
 function rgba(rgb: readonly number[], a: number): string {
   return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${a.toFixed(3)})`;
 }
 
 /**
- * Farbtabelle: Index = Seite·STEPS + Stufe (Seite 0 = Kauf/positiv, 1 = Verkauf/negativ), dazu
- * Index 2·STEPS = neutral (Wert 0 bzw. Modus „aus").
+ * Farbtabelle: Index = Seite·STEPS + Stufe (Seite 0 = Kauf/positiv, 1 = Verkauf/negativ, 2 = Volumen),
+ * dazu Index 3·STEPS = neutral (Wert 0 bzw. Modus „aus").
  */
 export function palette(mode: ColorMode): string[] {
   const out: string[] = [];
-  for (const rgb of [BUY_RGB, SELL_RGB]) {
+  for (const rgb of [BUY_RGB, SELL_RGB, VOLUME_RGB]) {
     for (let s = 0; s < INTENSITY_STEPS; s++) {
       const t = (s + 0.5) / INTENSITY_STEPS;
       out.push(
@@ -83,7 +85,7 @@ export function palette(mode: ColorMode): string[] {
   return out;
 }
 
-export const NEUTRAL_INDEX = 2 * INTENSITY_STEPS;
+export const NEUTRAL_INDEX = 3 * INTENSITY_STEPS;
 
 /** Farbindex eines Werts mit Vorzeichen (Delta) bzw. einer Seite (Bid×Ask: positive Werte). */
 export function colorIndex(value: number, ref: number, sellSide: boolean, mode: ColorMode): number {
@@ -92,4 +94,13 @@ export function colorIndex(value: number, ref: number, sellSide: boolean, mode: 
   if (mode === 'off') return side * INTENSITY_STEPS;
   if (mode === 'fixed') return side * INTENSITY_STEPS + INTENSITY_STEPS - 1;
   return side * INTENSITY_STEPS + intensityStep(value, ref);
+}
+
+/** Farbindex eines Volumens (Typ Volume, Volumen-Hälfte von Delta + Volume). */
+export function colorIndexVolume(value: number, ref: number, mode: ColorMode): number {
+  if (value === 0) return NEUTRAL_INDEX;
+  const base = 2 * INTENSITY_STEPS;
+  if (mode === 'off') return base;
+  if (mode === 'fixed') return base + INTENSITY_STEPS - 1;
+  return base + intensityStep(value, ref);
 }

@@ -4,7 +4,9 @@
 import type { UTCTimestamp } from 'lightweight-charts';
 
 /** P1-Typen (KONZEPT §6.1): Delta (Default) und Bid×Ask. Volume, Delta+Volume folgen in P4. */
-export type FootprintType = 'delta' | 'bidask';
+export type FootprintType = 'delta' | 'bidask' | 'volume' | 'deltavol';
+/** Darstellung der Zellen (§6.1): Box = Zahl in gefärbter Zelle, Profil = Balken je Zeile ∝ Wert / Max im Bar. */
+export type FootprintMode = 'box' | 'profile';
 /** Farbmodi v1 (KONZEPT §6.1): aus, fest, Verlauf. */
 export type ColorMode = 'off' | 'fixed' | 'gradient';
 /** Bereich der Farbreferenz (KONZEPT §6.1): sichtbare Bars (Default) oder je Bar. */
@@ -49,4 +51,11 @@ export interface BarItem {
   /** buyQ + sellQ in Lots (Querprüfung gegen Footprint-Kacheln). */
   v: number;
   c: number;
+  /** buyQ, sellQ (Lots), buyA, sellA (aggTrades) – Stats-Grid */
+  b: number;
+  s: number;
+  ba: number;
+  sa: number;
+  /** Zusatzspalten `x.*` der Bar-Kachel je Bar (falls die API sie liefert) */
+  x?: Record<string, number>;
 }

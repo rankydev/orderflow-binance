@@ -89,7 +89,7 @@ Produktion (statisches Bundle, spricht `/api/v1` am **eigenen Ursprung** an, z. 
 `/api/` → API auf 127.0.0.1:8780):
 
 ```bash
-npm run build -w @orderflow/web                          # → apps/web/dist (≈ 308 kB JS, ≈ 105 kB gzip)
+npm run build -w @orderflow/web                          # → apps/web/dist (≈ 330 kB JS, ≈ 113 kB gzip)
 API_PROXY=http://127.0.0.1:8780 npx -w @orderflow/web vite preview   # Build lokal gegen die echte API prüfen
 API_PROXY=http://127.0.0.1:8780 npm run dev -w @orderflow/web        # Entwicklung gegen die echte API statt Fixtures
 ```
@@ -117,6 +117,18 @@ künftigen API; mit `VITE_API_BASE=<url>` spricht das Frontend stattdessen die e
 für den Zellbudget-Test). Kachelformat: [`docs/TILE-FORMAT.md`](docs/TILE-FORMAT.md). Offen für die Live-Phase: Bar-Abschnitte und `/symbols` werden im Browser nicht aktualisiert (siehe
 TILE-FORMAT.md, „Offen für die Live-Phase"). Messung (T11) im Browser:
 `PLAYWRIGHT_CORE=<pfad zu playwright-core> node apps/web/perf/measure.ts` bei laufendem Dev-Server.
+
+**Footprint komplett + Stats-Grid (P4, §6.1/§6.2):** Typen Delta (Standard), Bid×Ask, Volume (b + s) und Δ + Vol
+(Delta links, Volumen rechts); „Balken" = Profilmodus (Balken je Zeile ∝ Wert / Maximum im Bar) statt Box. Marken:
+POC (Standard an), Δ-POC (größtes |Delta|, Rahmen türkis/orange nach Vorzeichen), Bar-VA (VA-% wie beim Profil,
+Paarverfahren des Kerns), Imbalance (Standard aus; diagonal, Faktor 300 %, Mindestdifferenz, „Gegenseite 0 zählt",
+horizontal, Stacked ab 3 Zeilen mit Zone und Projektion bis zur ersten Berührung) – ganzzahlig, je Kachel einmal je
+Einstellung für die gezeichnete Zeilengröße berechnet. „Stats" blendet das Stats-Grid als zweite Pane ein (an den
+Bars ausgerichtet, Zeilen wählbar, K-Format, Schattierung z über die sichtbaren Bars, Text ab 30 px Bar-Abstand,
+darunter nur Farbe, unter 4 px aus). Zeilen ohne API-Spalte (Trades, Max/Min Δ, COT High/Low) zeigen „(API)" und
+keine Werte, bis `/bars` die `x.`-Spalten liefert. Standard: `FOOTPRINT_DEFAULTS` in
+`apps/web/src/lib/footprint-options.ts`. URL: `type=delta|bidask|volume|deltavol`, `fm=profile`, `poc=0`, `dpoc=1`,
+`bva=1`, `imb=1`, `imbr=<%>`, `imbd=<Lots>`, `imbz=1`, `imbh=1`, `imbs=<n>`, `sg=1`, `sgr=<Zeilen>`.
 
 **Volumenprofil + Delta** (Vertrag: [`docs/PROFILE-API.md`](docs/PROFILE-API.md)): standardmäßig je sichtbarem Tag
 ein Profil ab dem Tagesbeginn nach rechts, unter Kerzen/Footprint gezeichnet (Pane-Primitive, kein DOM-Overlay).

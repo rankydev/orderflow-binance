@@ -63,11 +63,15 @@ export class BarStore {
     // Der Decoder garantiert streng aufsteigende Zeiten innerhalb [from, to) → setData-sicher.
     this.chunks.delete(c);
     this.chunks.set(c, dec.bars);
+    if (dec.extra) this.extra.set(c, dec.extra);
+    else this.extra.delete(c);
     this.state.set(c, dec.header.final ? 'final' : 'provisional');
     this.dataToAt.set(c, dataToMs);
   }
 
   private readonly dataToAt = new Map<number, number>();
+  /** Zusatzspalten `x.*` je Abschnitt (z. B. künftige Stats-Felder), durchgereicht */
+  private readonly extra = new Map<number, Record<string, Int32Array | Float64Array>>();
 
   /**
    * Bars c0…c1 für den Zeitraum bis `endMs` vergleichbar? Geladen, keine Lücke und je Abschnitt final
@@ -133,6 +137,8 @@ export class BarStore {
     for (let c = c0; c <= c1; c++) {
       const b = this.chunks.get(c);
       if (!b) throw new Error(`Abschnitt ${c} fehlt`);
+      const ex = this.extra.get(c);
+      const exKeys = ex ? Object.keys(ex).filter((k) => ex[k]!.length === b.time.length) : [];
       for (let i = 0; i < b.time.length; i++) {
         const o = b.open[i]!;
         const h = b.high[i]!;
@@ -150,6 +156,13 @@ export class BarStore {
           l,
           c: cl,
           v: b.buyQ[i]! + b.sellQ[i]!,
+          b: b.buyQ[i]!,
+          s: b.sellQ[i]!,
+          ba: b.buyA[i]!,
+          sa: b.sellA[i]!,
+          ...(exKeys.length > 0
+            ? { x: Object.fromEntries(exKeys.map((k) => [k, ex![k]![i]!])) }
+            : {}),
         });
       }
     }

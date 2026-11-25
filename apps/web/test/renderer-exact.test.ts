@@ -1,9 +1,22 @@
 // H4: Renderer gegen eine von Hand gerechnete Mini-Kachel – Koordinaten, Farben, Seiten, Texte, POC.
 import { describe, expect, it } from 'vitest';
 import { encodeTile, type TileData } from '@orderflow/core/browser';
-import { INTENSITY_STEPS, palette } from '../src/lib/color.ts';
+import { INTENSITY_STEPS, NEUTRAL_INDEX, palette } from '../src/lib/color.ts';
 import { FootprintStore } from '../src/lib/footprint-store.ts';
-import { FootprintRenderer, RenderContext, type FpItem } from '../src/lib/footprint-series.ts';
+import {
+  FootprintRenderer,
+  MARK_STYLES,
+  MK_DPOC_NEG,
+  MK_IMB_BUY,
+  MK_IMB_SELL,
+  MK_PROJ_SELL,
+  MK_STACK_SELL,
+  MK_VA,
+  RenderContext,
+  type FpItem,
+} from '../src/lib/footprint-series.ts';
+import { IMBALANCE_DEFAULTS } from '../src/lib/footprint-marks.ts';
+import type { FootprintType } from '../src/lib/types.ts';
 
 interface Rect {
   x: number;
@@ -87,7 +100,7 @@ function tile(): TileData {
   };
 }
 
-function draw(type: 'delta' | 'bidask') {
+function draw(type: FootprintType, over: Partial<RenderContext> = {}) {
   const rc = new RenderContext();
   const store = new FootprintStore(3);
   store.addEncoded('X|1m|5', encodeTile(tile()).buffer as ArrayBuffer);
@@ -100,6 +113,8 @@ function draw(type: 'delta' | 'bidask') {
     priceScale: 100,
     type,
     colorRef: 4,
+    colorRef2: 4,
+    ...over,
   });
   rc.palette = palette('gradient');
   const r = new FootprintRenderer(rc);
@@ -116,6 +131,10 @@ function draw(type: 'delta' | 'bidask') {
     l: 50_000,
     c: 50_149,
     v: 11,
+    b: 4,
+    s: 7,
+    ba: 0,
+    sa: 0,
   };
   r.data = {
     bars: [{ x: 50, time: 0, originalData: it, barColor: '' }],
@@ -188,6 +207,104 @@ describe('Renderer exakt (Mini-Kachel)', () => {
     expect(row).toEqual(['0.001', '0.003']); // sell 1 links, buy 3 rechts
     // Nullen werden als "0" geschrieben, neutral gefärbt
     const top = ctx.rects.filter((r) => r.op === 'fill' && r.y === 0);
-    expect(top.some((r) => r.style === pal[2 * INTENSITY_STEPS])).toBe(true); // buy 0 → neutral
+    expect(top.some((r) => r.style === pal[NEUTRAL_INDEX])).toBe(true); // buy 0 → neutral
+  });
+});
+
+const isVol = (s: string) =>
+  pal.indexOf(s) >= 2 * INTENSITY_STEPS && pal.indexOf(s) < 3 * INTENSITY_STEPS;
+const texts = (ctx: Ctx, y: number) =>
+  ctx.texts
+    .filter((t) => t.y === y)
+    .sort((a, b) => a.x - b.x)
+    .map((t) => t.s);
+
+describe('Renderer exakt: Typen Volume und Delta + Volume, Profilmodus (P4)', () => {
+  it('Volume: eine Zahl b + s je Zeile, Volumen-Farbton', () => {
+    const { ctx } = draw('volume');
+    const cells = ctx.rects.filter((r) => r.op === 'fill' && r.w === 172).sort((a, b) => b.y - a.y);
+    expect(cells).toHaveLength(3);
+    expect(cells.every((c) => isVol(c.style))).toBe(true);
+    expect(texts(ctx, 499)).toEqual(['0.004']); // Zeile 1000: 3 + 1
+    expect(texts(ctx, 299)).toEqual(['0.003']); // Zeile 1001: 1 + 2
+    expect(texts(ctx, 99)).toEqual(['0.004']); // Zeile 1002: 0 + 4
+  });
+
+  it('Delta + Volume: Delta links (Vorzeichenfarbe), Volumen rechts (Volumen-Farbton)', () => {
+    const { ctx } = draw('deltavol');
+    expect(texts(ctx, 499)).toEqual(['0.002', '0.004']);
+    expect(texts(ctx, 99)).toEqual(['-0.004', '0.004']);
+    const row = ctx.rects.filter((r) => r.op === 'fill' && r.y === 400);
+    const left = row.reduce((a, b) => (a.x < b.x ? a : b));
+    const right = row.reduce((a, b) => (a.x > b.x ? a : b));
+    expect(isBuy(left.style)).toBe(true); // +2
+    expect(isVol(right.style)).toBe(true);
+    expect(right.x).toBe(100);
+  });
+
+  it('Profilmodus Delta: Balken ab der linken Kante, Länge ∝ |Delta| / max |Delta| im Bar', () => {
+    const { ctx } = draw('delta', { mode: 'profile' });
+    const fills = ctx.rects.filter((r) => r.op === 'fill').sort((a, b) => b.y - a.y);
+    // max |Delta| = 4; Spalte 172 px ab x = 14
+    expect(fills.map((r) => [r.x, r.w])).toEqual([
+      [14, 86], // +2 → 2/4
+      [14, 43], // −1 → 1/4
+      [14, 172], // −4 → 4/4
+    ]);
+  });
+
+  it('Profilmodus Bid×Ask: Bid von der Mitte nach links, Ask nach rechts (∝ Seite / größte Seite)', () => {
+    const { ctx } = draw('bidask', { mode: 'profile' });
+    const row = ctx.rects.filter((r) => r.op === 'fill' && r.y === 400); // sell 1, buy 3, max Seite 4
+    const left = row.find((r) => r.x < 100)!;
+    const right = row.find((r) => r.x >= 100)!;
+    // linke Hälfte xm − x0 − 1 = 100 − 8 − 1 = 91 px (Spalte 0,92 · 100 → x0 = 8)
+    expect(left.w).toBe(Math.round((1 / 4) * 91));
+    expect(left.x + left.w).toBe(99);
+    expect(right).toMatchObject({ x: 100, w: Math.round((3 / 4) * 92) });
+  });
+});
+
+describe('Renderer exakt: Marken (P4)', () => {
+  const marks = (ctx: Ctx, i: number) => ctx.rects.filter((r) => r.style === MARK_STYLES[i]);
+
+  it('ohne includeZero keine Imbalance (Mini-Kachel); POC aus → kein Rahmen', () => {
+    const { ctx } = draw('delta', { imbalance: { ...IMBALANCE_DEFAULTS }, showPoc: false });
+    expect(marks(ctx, MK_IMB_BUY)).toHaveLength(0);
+    expect(marks(ctx, MK_IMB_SELL)).toHaveLength(0);
+    expect(ctx.rects.filter((r) => r.op === 'stroke')).toHaveLength(0);
+  });
+
+  it('includeZero + Stacked ab 2: Sell 1001/1002 als Stack (Rand breiter), Zone und Projektion', () => {
+    const { ctx } = draw('delta', {
+      imbalance: { ...IMBALANCE_DEFAULTS, includeZero: true, stack: 2 },
+    });
+    // Buy in der untersten Zeile (fehlende Vergleichszeile, includeZero): rechter Rand, 4 px
+    expect(marks(ctx, MK_IMB_BUY)).toEqual([
+      { x: 182, y: 400, w: 4, h: 198, style: MARK_STYLES[MK_IMB_BUY], op: 'fill' },
+    ]);
+    // Sell 1001 (Gegenseite 0) und 1002 (oberste Zeile): linker Rand, gestapelt 8 px
+    const sells = marks(ctx, MK_IMB_SELL).sort((a, b) => a.y - b.y);
+    expect(sells.map((r) => [r.x, r.y, r.w])).toEqual([
+      [14, 0, 8],
+      [14, 200, 8],
+    ]);
+    expect(marks(ctx, MK_STACK_SELL)).toEqual([
+      { x: 14, y: 0, w: 172, h: 400, style: MARK_STYLES[MK_STACK_SELL], op: 'fill' },
+    ]);
+    // keine späteren Bars → Projektion bis zum rechten Rand (Bitmap 400)
+    expect(marks(ctx, MK_PROJ_SELL)).toEqual([
+      { x: 186, y: 0, w: 214, h: 400, style: MARK_STYLES[MK_PROJ_SELL], op: 'fill' },
+    ]);
+  });
+
+  it('Delta-POC (−4 in Zeile 1002, orange Rahmen innen) und Bar-VA [1000, 1002] links der Spalte', () => {
+    const { ctx } = draw('delta', { showDeltaPoc: true, showBarVa: true, vaPct: 70 });
+    expect(marks(ctx, MK_DPOC_NEG)).toEqual([
+      { x: 18.5, y: 4.5, w: 163, h: 189, style: MARK_STYLES[MK_DPOC_NEG], op: 'stroke' },
+    ]);
+    expect(marks(ctx, MK_VA)).toEqual([
+      { x: 6, y: 0, w: 4, h: 600, style: MARK_STYLES[MK_VA], op: 'fill' },
+    ]);
   });
 });

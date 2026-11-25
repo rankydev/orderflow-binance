@@ -132,6 +132,10 @@ function setup(nBars: number, bs: number, heightPx: number, visible: [number, nu
       l: 50_000,
       c: 51_999,
       v: 0,
+      b: 0,
+      s: 0,
+      ba: 0,
+      sa: 0,
     };
     return { x: i * bs + bs / 2, time: i, originalData: it, barColor: '' };
   });

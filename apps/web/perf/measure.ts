@@ -641,6 +641,57 @@ async function main(): Promise<void> {
     await page.screenshot({ path: join(SHOTS, 'l1-candles-90d-15m.png') });
   }
 
+  // ---------------------------------------------------------------- P4: Typen, Marken, Stats-Grid
+  // Alle Footprint-Typen mit Imbalances (includeZero, Stacked ab 2 → viele Marken), Delta-POC, Bar-VA,
+  // Profilmodus und Stats-Grid mit allen Zeilen; gepannt und gezoomt. Budgets: Frame-Arbeit p95 ≤ 16 ms,
+  // Footprint-Zeichnen p95 ≤ 8 ms, Stats-Grid-Zeichnen max ≤ 8 ms, Zellbudget, keine Long Tasks, keine
+  // zusätzlichen Anfragen durch Marken/Grid (gleiche Kachel-/Bar-URLs wie ohne).
+  if (process.env.PERF_ONLY !== 'profile') {
+    const allRows =
+      'vol,buy,sell,delta,deltaPct,cvd,aggN,aggDelta,volSec,hiRatio,loRatio,trades,maxDelta,minDelta,cotHigh,cotLow';
+    for (const [type, fm] of [
+      ['delta', 'box'],
+      ['bidask', 'box'],
+      ['volume', 'profile'],
+      ['deltavol', 'profile'],
+    ] as const) {
+      const name = `p4_${type}_${fm}`;
+      await page.goto(
+        `${URL0}?sym=BTCUSDT-SYN90&tf=1m&type=${type}&fm=${fm}&dpoc=1&bva=1&imb=1&imbz=1&imbs=2&sg=1&sgr=${allRows}`,
+      );
+      await page.waitForFunction(
+        () => performance.getEntriesByName('of:first-footprint').length > 0,
+      );
+      await idle(600);
+      const r0 = requests.length;
+      await scenario(name, async () => {
+        for (let i = 0; i < 2; i++) {
+          await drag(700, 40);
+          await drag(-700, 40);
+        }
+        await wheel(240, 3, 30);
+        await idle(300);
+        await wheel(-240, 3, 30);
+        await idle(300);
+      });
+      const sg = await page.evaluate(() => ({ ...(window as Any).__of.statsCtx.stats }));
+      results[name].stats = sg;
+      results[name].requestsDuring = requests.length - r0;
+      check(
+        `${name}: Frame-Arbeit p95 ${results[name].frameWork.p95} ≤ 16 ms`,
+        results[name].frameWork.p95 <= 16,
+      );
+      check(
+        `${name}: Footprint-Zeichnen p95 ${results[name].footprintDraw.p95} ≤ 8 ms`,
+        results[name].footprintDraw.p95 <= 8,
+      );
+      check(`${name}: Stats-Zeichnen max ${sg.maxMs.toFixed(2)} ≤ 8 ms`, sg.maxMs <= 8);
+      check(`${name}: keine Long Tasks`, results[name].longTasks === 0);
+      if (type === 'deltavol')
+        await page.screenshot({ path: join(OUT, 'p4-deltavol-profile.png') });
+    }
+  }
+
   // ---------------------------------------------------------------- Volume Profile
   // Tagesprofile über 30 und ~150 Tage (herausgezoomt, 1h bzw. 4h – 4h nur, wenn angeboten; sonst 1h
   // über den ganzen Datenbereich), Pannen mit Profilen, Bereichsprofil über einen Monat. Budgets:

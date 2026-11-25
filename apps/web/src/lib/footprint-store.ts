@@ -5,6 +5,13 @@
 import { decodeTile, type DecodedTile } from '@orderflow/core/browser';
 import { COLOR_REF_PERCENTILE, quantileInPlace } from './color.ts';
 import { TextCache } from './format.ts';
+import {
+  barValueArea,
+  deltaPocRow,
+  imbalanceFlags,
+  imbalanceKey,
+  type ImbalanceOptions,
+} from './footprint-marks.ts';
 
 export const CACHE_MAX_CELLS = 2_000_000;
 
@@ -24,13 +31,30 @@ export interface PreparedTile {
   row: Int32Array;
   buy: Float64Array;
   sell: Float64Array;
+  /** Zeilenbreite in price_unit (R · tick_ref_units). */
+  width: number;
   /** Zeilenindex des POC je Bar. */
   poc: Int32Array;
+  /** Zeilenindex des Delta-POC je Bar (−1: jedes Delta 0). */
+  deltaPoc: Int32Array;
+  /** Größtes Zeilenvolumen, größte Einzelseite, größtes |Delta| je Bar (Profilmodus im Footprint). */
+  maxVol: Float64Array;
+  maxSide: Float64Array;
+  maxAbsDelta: Float64Array;
+  /** Imbalance-Bits je Level für die Optionen `imbKey` (beim ersten Zeichnen berechnet, P4). */
+  imb: Uint8Array | null;
+  imbKey: string;
+  /** Value Area je Bar (Zeilen) für `vaPct` (beim ersten Zeichnen berechnet; −1 ohne Volumen). */
+  vaLo: Int32Array | null;
+  vaHi: Int32Array | null;
+  vaPct: number;
   /** slot[(t − fromSec)/tfSec] = Bar-Index oder −1. */
   slot: Int32Array;
   /** Farbreferenz je Bar (P95 von |Delta| bzw. von buy/sell) für den Bereich „je Bar". */
   refDelta: Float64Array;
   refVol: Float64Array;
+  /** P95 von b + s je Bar (Typ Volume). */
+  refTot: Float64Array;
   /** buyQ + sellQ je Bar (Querprüfung gegen /bars, H-1). */
   vol: Float64Array;
   /** Bytes der Typed Arrays (für die Speicheranzeige). */
@@ -119,6 +143,11 @@ export function prepareTile(series: string, dec: DecodedTile, now = 0): Prepared
   const poc = new Int32Array(nb);
   const refDelta = new Float64Array(nb);
   const refVol = new Float64Array(nb);
+  const refTot = new Float64Array(nb);
+  const deltaPoc = new Int32Array(nb);
+  const maxVol = new Float64Array(nb);
+  const maxSide = new Float64Array(nb);
+  const maxAbsDelta = new Float64Array(nb);
   const vol = new Float64Array(nb);
   for (let i = 0; i < nb; i++) vol[i] = dec.bars.buyQ[i]! + dec.bars.sellQ[i]!;
   let scratch = new Float64Array(64);
@@ -128,8 +157,18 @@ export function prepareTile(series: string, dec: DecodedTile, now = 0): Prepared
     const e = lv.levelOffset[i + 1]!;
     const lo = dec.bars.low[i]!;
     const hi = dec.bars.high[i]!;
-    poc[i] = pocRow(lv.row, lv.buy, lv.sell, s, e, Math.floor(lo / width), Math.floor(hi / width));
+    const rl = Math.floor(lo / width);
+    const rh = Math.floor(hi / width);
+    poc[i] = pocRow(lv.row, lv.buy, lv.sell, s, e, rl, rh);
+    deltaPoc[i] = deltaPocRow(lv.row, lv.buy, lv.sell, s, e, rl, rh);
     const m = e - s;
+    for (let j = s; j < e; j++) {
+      const b = lv.buy[j]!;
+      const x = lv.sell[j]!;
+      maxVol[i] = Math.max(maxVol[i]!, b + x);
+      maxSide[i] = Math.max(maxSide[i]!, b, x);
+      maxAbsDelta[i] = Math.max(maxAbsDelta[i]!, Math.abs(b - x));
+    }
     if (scratch.length < 2 * m) scratch = new Float64Array(2 * m);
     for (let j = s; j < e; j++) {
       scratch[j - s] = Math.abs(lv.buy[j]! - lv.sell[j]!);
@@ -140,8 +179,10 @@ export function prepareTile(series: string, dec: DecodedTile, now = 0): Prepared
       scratch[2 * (j - s) + 1] = lv.sell[j]!;
     }
     refVol[i] = quantileInPlace(scratch, 2 * m, COLOR_REF_PERCENTILE);
+    for (let j = s; j < e; j++) scratch[j - s] = lv.buy[j]! + lv.sell[j]!;
+    refTot[i] = quantileInPlace(scratch, m, COLOR_REF_PERCENTILE);
   }
-  const bytes = dec.levels!.row.buffer.byteLength + (n + nb * 3) * 4 + nb * 16;
+  const bytes = dec.levels!.row.buffer.byteLength + (n + nb * 4) * 4 + nb * 56;
   return {
     series,
     k: h.tile.index,
@@ -157,16 +198,75 @@ export function prepareTile(series: string, dec: DecodedTile, now = 0): Prepared
     row: lv.row,
     buy: lv.buy,
     sell: lv.sell,
+    width,
     poc,
+    deltaPoc,
+    maxVol,
+    maxSide,
+    maxAbsDelta,
+    imb: null,
+    imbKey: '',
+    vaLo: null,
+    vaHi: null,
+    vaPct: 0,
     slot,
     refDelta,
     refVol,
+    refTot,
     vol,
     bytes,
     final: h.final,
     dataVersion: h.dataVersion,
     loadedAt: now,
   };
+}
+
+/** Imbalance-Bits der Kachel für die Optionen (einmal je Optionswechsel, nicht je Frame). */
+export function tileImbalance(t: PreparedTile, o: ImbalanceOptions): Uint8Array {
+  const key = imbalanceKey(o);
+  if (t.imb && t.imbKey === key) return t.imb;
+  const out = t.imb ?? new Uint8Array(t.cells);
+  for (let i = 0; i < t.nBars; i++)
+    imbalanceFlags(
+      t.row,
+      t.buy,
+      t.sell,
+      t.levelOffset[i]!,
+      t.levelOffset[i + 1]!,
+      Math.floor(t.low[i]! / t.width),
+      Math.floor(t.high[i]! / t.width),
+      o,
+      out,
+    );
+  t.imb = out;
+  t.imbKey = key;
+  return out;
+}
+
+/** Value Area je Bar (Zeilen, −1 ohne Volumen) für va_pct, einmal je Wert berechnet. */
+export function tileValueArea(t: PreparedTile, vaPct: number): [Int32Array, Int32Array] {
+  if (t.vaLo && t.vaHi && t.vaPct === vaPct) return [t.vaLo, t.vaHi];
+  const lo = t.vaLo ?? new Int32Array(t.nBars);
+  const hi = t.vaHi ?? new Int32Array(t.nBars);
+  for (let i = 0; i < t.nBars; i++) {
+    const va = barValueArea(
+      t.row,
+      t.buy,
+      t.sell,
+      t.levelOffset[i]!,
+      t.levelOffset[i + 1]!,
+      Math.floor(t.low[i]! / t.width),
+      Math.floor(t.high[i]! / t.width),
+      t.poc[i]!,
+      vaPct,
+    );
+    lo[i] = va ? va[0] : -1;
+    hi[i] = va ? va[1] : -1;
+  }
+  t.vaLo = lo;
+  t.vaHi = hi;
+  t.vaPct = vaPct;
+  return [lo, hi];
 }
 
 export type TileState = PreparedTile | 'rejected';

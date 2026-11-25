@@ -5,6 +5,12 @@
   import type { ColorMode, ColorScope, FootprintType, SymbolInfo } from './lib/types.ts';
   import type { ProfileReadout, RangeSummary } from './lib/profile/layer.ts';
   import {
+    footprintParamsQuery,
+    parseFootprintParams,
+    type FootprintOptions,
+  } from './lib/footprint-options.ts';
+  import { STAT_ROWS, type StatRow } from './lib/stats-grid.ts';
+  import {
     parseProfileParams,
     profileParamsQuery,
     type ProfileMode,
@@ -22,7 +28,9 @@
   const atParam = Number(params.get('at'));
   // Diagnosezeile: in der Entwicklung offen, sonst eingeklappt (für Fehlerberichte aufklappbar)
   let diagOpen = $state(import.meta.env.DEV || params.has('debug'));
-  let type = $state<FootprintType>(params.get('type') === 'bidask' ? 'bidask' : 'delta');
+  // Footprint-Typ, Marken, Stats-Grid (URL: type, fm, poc, dpoc, bva, imb*, sg, sgr)
+  let fpo = $state<FootprintOptions>(parseFootprintParams(params));
+  const type = $derived(fpo.type);
   // Zeilengröße: 'auto' oder Ticks (URL-Parameter r, z. B. r=50 = 5 USDT bei BTC)
   const rParam = params.get('r');
   // nur positive ganze Ticks; alles andere (z. B. r=0) = Auto
@@ -54,8 +62,9 @@
     if (import.meta.env.DEV || params.has('debug')) {
       (window as unknown as { __of: ChartController }).__of = ctl;
     }
-    ctl.setType(type);
+    ctl.setType(fpo.type);
     applyProfile();
+    applyFootprint();
     ctl.onProfile = () => {
       readProfile();
       syncUrl();
@@ -162,11 +171,40 @@
   function setProf(patch: Partial<ProfileParams>): void {
     prof = { ...prof, ...patch };
     applyProfile();
+    applyFootprint(); // VA % und Tagesgrenze gelten auch für Bar-VA und Stats-CVD
     syncUrl();
   }
+  function applyFootprint(): void {
+    if (!ctl) return;
+    ctl.setFootprintOptions($state.snapshot(fpo) as FootprintOptions, prof.va);
+    ctl.refreshStats();
+  }
+  function setFp(patch: Partial<FootprintOptions>): void {
+    fpo = { ...fpo, ...patch };
+    applyFootprint();
+    syncUrl();
+  }
+  function setImb(patch: Partial<FootprintOptions['imb']>): void {
+    setFp({ imb: { ...fpo.imb, ...patch } });
+  }
+  function toggleStatRow(r: StatRow): void {
+    const has = fpo.statsRows.includes(r);
+    const rows = STAT_ROWS.map((x) => x.id).filter((x) =>
+      x === r ? !has : fpo.statsRows.includes(x),
+    );
+    if (rows.length > 0) setFp({ statsRows: rows });
+  }
+  const TYPES: [FootprintType, string][] = [
+    ['delta', 'Delta'],
+    ['bidask', 'Bid×Ask'],
+    ['volume', 'Volume'],
+    ['deltavol', 'Δ + Vol'],
+  ];
+  const RATIOS = [150, 200, 250, 300, 400, 500];
+  const MINDIFF_BASE = [0, 0.1, 0.5, 1, 5, 10];
 
   function syncUrl(): void {
-    const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${profileParamsQuery(prof)}${params.has('debug') ? '&debug' : ''}`;
+    const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${footprintParamsQuery(fpo)}${profileParamsQuery(prof)}${params.has('debug') ? '&debug' : ''}`;
     history.replaceState(null, '', q);
     document.title = `${sym} ${tf} · ${APP_TITLE}`;
   }
@@ -194,9 +232,7 @@
     syncUrl();
   }
   function chooseType(v: FootprintType): void {
-    type = v;
-    ctl?.setType(v);
-    syncUrl();
+    setFp({ type: v });
   }
   function chooseR(v: string): void {
     if (!ready) return;
@@ -251,8 +287,132 @@
       {/each}
     </div>
     <div class="group" role="group" aria-label="Footprint-Typ">
-      <button class:active={type === 'delta'} onclick={() => chooseType('delta')}>Delta</button>
-      <button class:active={type === 'bidask'} onclick={() => chooseType('bidask')}>Bid×Ask</button>
+      {#each TYPES as [t, l] (t)}
+        <button class:active={type === t} aria-pressed={type === t} onclick={() => chooseType(t)}>
+          {l}
+        </button>
+      {/each}
+    </div>
+    <div class="group" role="group" aria-label="Footprint-Marken">
+      <button
+        class:active={fpo.mode === 'profile'}
+        aria-pressed={fpo.mode === 'profile'}
+        title="Profil im Footprint: Balken je Zeile (Länge ∝ Wert / Maximum im Bar) statt gefärbter Box"
+        onclick={() => setFp({ mode: fpo.mode === 'profile' ? 'box' : 'profile' })}
+      >
+        Balken
+      </button>
+      <button
+        class:active={fpo.poc}
+        aria-pressed={fpo.poc}
+        title="POC je Bar (gelber Rahmen)"
+        onclick={() => setFp({ poc: !fpo.poc })}
+      >
+        POC
+      </button>
+      <button
+        class:active={fpo.deltaPoc}
+        aria-pressed={fpo.deltaPoc}
+        title="Delta-POC je Bar: Zeile mit größtem |Delta|, Rahmen türkis (+) bzw. orange (−)"
+        onclick={() => setFp({ deltaPoc: !fpo.deltaPoc })}
+      >
+        Δ-POC
+      </button>
+      <button
+        class:active={fpo.barVa}
+        aria-pressed={fpo.barVa}
+        title="Value Area je Bar (VA-% wie beim Profil) als schmaler Balken links der Spalte"
+        onclick={() => setFp({ barVa: !fpo.barVa })}
+      >
+        Bar-VA
+      </button>
+      <button
+        class:active={fpo.imbalance}
+        aria-pressed={fpo.imbalance}
+        title="Imbalances (Markierung am Zellrand) und Stacked Imbalances (Zone, nach rechts projiziert)"
+        onclick={() => setFp({ imbalance: !fpo.imbalance })}
+      >
+        Imbalance
+      </button>
+      <details class="menu">
+        <summary aria-label="Imbalance-Einstellungen">▾</summary>
+        <div class="panel">
+          <label>
+            Faktor
+            <select
+              aria-label="Imbalance-Faktor"
+              value={String(fpo.imb.ratio)}
+              onchange={(e) => setImb({ ratio: Number(e.currentTarget.value) })}
+            >
+              {#each RATIOS as r (r)}<option value={String(r)}>{r} %</option>{/each}
+            </select>
+          </label>
+          <label>
+            Mindestdifferenz
+            <select
+              aria-label="Imbalance-Mindestdifferenz"
+              value={String(fpo.imb.minDiff)}
+              onchange={(e) => setImb({ minDiff: Number(e.currentTarget.value) })}
+            >
+              {#each MINDIFF_BASE as m (m)}<option
+                  value={String(Math.round(m * 10 ** (symInfo?.qtyDecimals ?? 3)))}
+                >
+                  {m}
+                  {sym.replace(/USDT$/, '')}
+                </option>{/each}
+            </select>
+          </label>
+          <label>
+            Stacked ab
+            <select
+              aria-label="Stacked-Länge"
+              value={String(fpo.imb.stack)}
+              onchange={(e) => setImb({ stack: Number(e.currentTarget.value) })}
+            >
+              {#each [2, 3, 4, 5, 6] as n (n)}<option value={String(n)}>{n} Zeilen</option>{/each}
+            </select>
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={fpo.imb.includeZero}
+              onchange={(e) => setImb({ includeZero: e.currentTarget.checked })}
+            /> Gegenseite 0 zählt
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={fpo.imb.horizontal}
+              onchange={(e) => setImb({ horizontal: e.currentTarget.checked })}
+            /> horizontal (statt diagonal)
+          </label>
+        </div>
+      </details>
+    </div>
+    <div class="group" role="group" aria-label="Stats-Grid">
+      <button
+        class:active={fpo.stats}
+        aria-pressed={fpo.stats}
+        title="Stats-Grid unter dem Chart (an den Bars ausgerichtet)"
+        onclick={() => setFp({ stats: !fpo.stats })}
+      >
+        Stats
+      </button>
+      <details class="menu">
+        <summary aria-label="Stats-Zeilen">▾</summary>
+        <div class="panel">
+          {#each STAT_ROWS as r (r.id)}
+            <label title={r.title}>
+              <input
+                type="checkbox"
+                checked={fpo.statsRows.includes(r.id)}
+                onchange={() => toggleStatRow(r.id)}
+              />
+              {r.label}{r.column ? ` (API: ${r.column})` : ''}
+            </label>
+          {/each}
+        </div>
+      </details>
     </div>
     <label>
       R
@@ -466,9 +626,12 @@
       {/if}
     {/if}
     <span class="legend">
-      Mengen in Basiswährung (BTC) · Delta = Ask − Bid · Bid×Ask: Bid links, Ask rechts · gelber
-      Rahmen = POC · Profil: Bid (rot) links, Ask (grün) rechts; Delta grün/rot nach Vorzeichen;
-      gelbe Linie = POC, graue Linien = VAH/VAL; Skala {prof.scale === 'common'
+      Mengen in Basiswährung (BTC) · Delta = Ask − Bid · Bid×Ask: Bid links, Ask rechts · Δ + Vol:
+      Delta links, Volumen (blau) rechts · gelber Rahmen = POC · türkis/orange Rahmen = Δ-POC (+/−)
+      · Imbalance: grüner Strich rechts = Ask dominiert (diagonal gegen Bid eine Zeile tiefer),
+      roter Strich links = Bid dominiert, breit + Fläche = Stacked (nach rechts bis zur Berührung) ·
+      Bar-VA: Balken links der Spalte · Profil: Bid (rot) links, Ask (grün) rechts; Delta grün/rot
+      nach Vorzeichen; gelbe Linie = POC, graue Linien = VAH/VAL; Skala {prof.scale === 'common'
         ? 'gemeinsam über die sichtbaren Tage'
         : 'je Profil (längster Balken = größte Zeile des Tages)'}
     </span>
@@ -569,6 +732,33 @@
     flex-basis: 100%;
     min-height: 1.5em;
     color: #e6edf3;
+  }
+  .menu {
+    position: relative;
+    display: inline-block;
+  }
+  .menu summary {
+    list-style: none;
+    cursor: pointer;
+    background: #171c24;
+    border: 1px solid #2a313c;
+    padding: 3px 6px;
+  }
+  .menu summary::-webkit-details-marker {
+    display: none;
+  }
+  .menu .panel {
+    position: absolute;
+    z-index: 10;
+    top: 100%;
+    left: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 220px;
+    padding: 8px;
+    background: #12161d;
+    border: 1px solid #2a313c;
   }
   .summary {
     display: flex;

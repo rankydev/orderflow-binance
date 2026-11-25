@@ -3,7 +3,12 @@
 import type { FootprintType, Lod } from './types.ts';
 
 export const VISIBLE_CELL_BUDGET = 25_000;
-export const L3_MIN_BAR_SPACING: Record<FootprintType, number> = { delta: 44, bidask: 80 };
+export const L3_MIN_BAR_SPACING: Record<FootprintType, number> = {
+  delta: 44,
+  volume: 44,
+  bidask: 80,
+  deltavol: 80,
+};
 export const L3_MIN_ROW_HEIGHT = 11;
 export const L2_MIN_BAR_SPACING = 6;
 export const L2_MIN_ROW_HEIGHT = 2;

@@ -67,7 +67,17 @@ import {
   type RowClass,
   type ViewGeometry,
 } from './lod.ts';
+import type { FootprintOptions } from './footprint-options.ts';
 import { ProfileLayer } from './profile/layer.ts';
+import {
+  computeStats,
+  highLowRatio,
+  STATS_ROW_PX,
+  StatsContext,
+  StatsSeriesView,
+  type StatRow,
+  type StatsItem,
+} from './stats-grid.ts';
 import { isTransient, RequestQueue, type Want } from './request-queue.ts';
 import { BAR_CHUNK_BARS, chunkIndexAt, chunkSpanSec, wantedTiles, windowChunks } from './tiles.ts';
 import type { BarItem, ColorMode, ColorScope, FootprintType, Lod, SymbolInfo } from './types.ts';
@@ -137,6 +147,9 @@ export class ChartController {
   private readonly candle: ISeriesApi<'Candlestick'>;
   private readonly fp: ISeriesApi<'Custom', Time, FpItem | WhitespaceData<Time>>;
   readonly rc = new RenderContext();
+  /** Stats-Grid (P4): Zustand und Serie der zweiten Pane (null = aus) */
+  readonly statsCtx = new StatsContext();
+  private statsSeries: ISeriesApi<'Custom', Time, StatsItem | WhitespaceData<Time>> | null = null;
   /** Volume-Profile (Tages- und Bereichsprofil), als Pane-Primitive unter den Serien. */
   readonly profile: ProfileLayer;
   private readonly api: ApiClient;
@@ -259,6 +272,21 @@ export class ChartController {
       },
     });
     this.chart.panes()[0]!.attachPrimitive(this.profile);
+    // Stats-Grid: High/Low Ratio aus den Leveln der gezeichneten Zeilengröße
+    this.statsCtx.hlRatio = (t) => {
+      const hit = this.lookupBar(t);
+      if (!hit) return null;
+      const [tile, bi, w] = hit;
+      return highLowRatio(
+        tile.row,
+        tile.buy,
+        tile.sell,
+        tile.levelOffset[bi]!,
+        tile.levelOffset[bi + 1]!,
+        Math.floor(tile.low[bi]! / w),
+        Math.floor(tile.high[bi]! / w),
+      );
+    };
     // Bereichsauswahl (zwei Klicks, Bar-genau); außerhalb des Auswahlmodus ohne Wirkung
     this.chart.subscribeClick((p) => {
       if (p.time !== undefined && this.profile.click(p.time as number)) this.onProfile?.();
@@ -569,6 +597,61 @@ export class ChartController {
     this.redraw();
   }
 
+  /**
+   * Footprint-Marken und Stats-Grid (P4). Typwechsel über setType (Bar-Abstand/Detailstufe); Marken
+   * werden je Kachel beim nächsten Zeichnen (einmal je Optionswechsel) berechnet, nicht je Frame.
+   */
+  setFootprintOptions(o: FootprintOptions, vaPct: number): void {
+    const rc = this.rc;
+    rc.mode = o.mode;
+    rc.showPoc = o.poc;
+    rc.showDeltaPoc = o.deltaPoc;
+    rc.showBarVa = o.barVa;
+    rc.vaPct = vaPct;
+    rc.imbalance = o.imbalance ? { ...o.imb } : null;
+    if (o.type !== rc.type) this.setType(o.type);
+    this.setStats(o.stats, o.statsRows);
+    this.redraw();
+  }
+
+  /** Stats-Grid in einer zweiten Pane (an/aus, Zeilen). */
+  setStats(on: boolean, rows: StatRow[]): void {
+    this.statsCtx.rows = [...rows];
+    if (on && !this.statsSeries) {
+      // Preisachse der Pane bleibt (eine unsichtbare rechte Achse in nur einer Pane bringt
+      // lightweight-charts 5.3 zum Absturz), zeigt aber nichts: leere Beschriftung, keine Striche
+      this.statsSeries = this.chart.addCustomSeries(
+        new StatsSeriesView(this.statsCtx),
+        { priceFormat: { type: 'custom', formatter: () => '', minMove: 1 } },
+        1,
+      );
+      this.statsSeries.priceScale().applyOptions({ ticksVisible: false, borderVisible: false });
+      this.statsSeries.setData(this.items);
+      this.refreshStats();
+    } else if (!on && this.statsSeries) {
+      this.chart.removeSeries(this.statsSeries);
+      this.statsSeries = null;
+      if (this.chart.panes().length > 1) this.chart.removePane(1);
+    }
+    const pane = this.chart.panes()[1];
+    if (pane) pane.setHeight(rows.length * STATS_ROW_PX + 10);
+    this.statsSeries?.applyOptions({});
+  }
+
+  /** Stats-Spalten des Fensters neu (Fensterwechsel, Tagesgrenze/offsetH geändert). */
+  refreshStats(): void {
+    if (!this.statsSeries || !this.sym) return;
+    const span = chunkSpanSec(this.tfSec);
+    this.statsCtx.qtyDecimals = this.sym.qtyDecimals;
+    this.statsCtx.cols = computeStats(this.items, {
+      offsetH: this.profile.offsetH,
+      tfSec: this.tfSec,
+      dataTo: this.sym.dataTo,
+      windowStartSec: this.win ? this.win[0] * span : Infinity,
+    });
+    this.statsSeries.applyOptions({});
+  }
+
   setColorScope(s: ColorScope): void {
     this.rc.colorScope = s;
     this.colorRefDirty = true;
@@ -808,6 +891,10 @@ export class ChartController {
     this.items = items;
     this.win = run;
     this.candle.setData(items);
+    if (this.statsSeries) {
+      this.statsSeries.setData(items);
+      this.refreshStats();
+    }
     this.fp.setData(this.mode === 'footprint' ? items : []);
     this.counters.setData++;
     // neue Bars im Fenster: geladene finale Profile gegen sie prüfen (Auftrag 6)
@@ -1403,14 +1490,17 @@ export class ChartController {
 
   /** P95 der |Werte| über die sichtbaren Bars (KONZEPT §6.1), nicht je Frame. */
   private scratch = new Float64Array(1 << 15);
+  private scratch2 = new Float64Array(1 << 12);
   private recomputeColorRef(): void {
     const lr = this.logicalRange();
     const tiles = this.fpStore.tiles(this.rc.series);
     if (!lr || !tiles) return;
     const from = Math.max(0, Math.floor(lr.from));
     const to = Math.min(this.items.length - 1, Math.ceil(lr.to));
-    const bid = this.rc.type === 'bidask';
+    const type = this.rc.type;
+    const bid = type === 'bidask';
     let m = 0;
+    let m2 = 0;
     const push = (v: number) => {
       if (m === this.scratch.length) {
         const b = new Float64Array(m * 2);
@@ -1418,6 +1508,15 @@ export class ChartController {
         this.scratch = b;
       }
       this.scratch[m++] = v;
+    };
+    // Typ Delta + Volume: zweite Referenz für die Volumen-Hälfte
+    const push2 = (v: number) => {
+      if (m2 === this.scratch2.length) {
+        const b = new Float64Array(m2 * 2);
+        b.set(this.scratch2);
+        this.scratch2 = b;
+      }
+      this.scratch2[m2++] = v;
     };
     const prev = this.rc.prev;
     const prevTiles = prev ? this.fpStore.tiles(prev.series) : undefined;
@@ -1439,15 +1538,23 @@ export class ChartController {
       if (!hit) continue;
       const [tile, bi] = hit;
       for (let j = tile.levelOffset[bi]!; j < tile.levelOffset[bi + 1]!; j++) {
+        const b = tile.buy[j]!;
+        const x = tile.sell[j]!;
         if (bid) {
-          push(tile.buy[j]!);
-          push(tile.sell[j]!);
-        } else push(Math.abs(tile.buy[j]! - tile.sell[j]!));
+          push(b);
+          push(x);
+        } else if (type === 'volume') push(b + x);
+        else {
+          push(Math.abs(b - x));
+          if (type === 'deltavol') push2(b + x);
+        }
       }
       if (m > 200_000) break;
     }
     if (m === 0) return;
     this.rc.colorRef = Math.max(1, quantileInPlace(this.scratch, m, COLOR_REF_PERCENTILE));
+    if (m2 > 0)
+      this.rc.colorRef2 = Math.max(1, quantileInPlace(this.scratch2, m2, COLOR_REF_PERCENTILE));
     this.counters.colorRefs++;
     this.redraw();
   }
@@ -1455,6 +1562,7 @@ export class ChartController {
   /** Neuzeichnen anstoßen, ohne Daten zu setzen (die Bibliothek zeichnet im nächsten Frame). */
   private redraw(): void {
     this.fp.applyOptions({});
+    this.statsSeries?.applyOptions({});
   }
 
   /** Profil-Zeilengröße nach der Pixelhöhe der Preisskala (Gestenende, unabhängig vom Footprint-R). */
