@@ -38,11 +38,7 @@
     "rowsEstMax": 380328,
     "src": "fp_1m,fp_1m_b10,fp_5m_b10,fp_1h_b100,bar_1m,bar_1h,fp_1d_b100,fp_1h_b10,fp_15m_b100,fp_1d_b1000,fp_1m_b10+fp_15m_b100+fp_1h_b100+fp_5m_b10,bar_1d",
     "errors": 0,
-    "wallMs": [
-      81,
-      64.5,
-      60.7
-    ]
+    "wallMs": [81, 64.5, 60.7]
   },
   "flood": {
     "distinctHeavyProfiles": {
