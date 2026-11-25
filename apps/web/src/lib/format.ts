@@ -130,3 +130,11 @@ export class TextCache {
     return this.fullMap.size + this.shortMap.size;
   }
 }
+
+/** Ganzzahl v mit d Nachkommastellen exakt als Dezimaltext (ohne Gleitkomma). */
+export function exactDecimal(v: number, d: number): string {
+  const neg = v < 0;
+  const a = String(Math.abs(v)).padStart(d + 1, '0');
+  const t = d === 0 ? a : `${a.slice(0, -d)}.${a.slice(-d)}`;
+  return neg ? `-${t}` : t;
+}

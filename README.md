@@ -89,7 +89,7 @@ Produktion (statisches Bundle, spricht `/api/v1` am **eigenen Ursprung** an, z. 
 `/api/` → API auf 127.0.0.1:8780):
 
 ```bash
-npm run build -w @orderflow/web                          # → apps/web/dist (≈ 273 kB JS, ≈ 93 kB gzip)
+npm run build -w @orderflow/web                          # → apps/web/dist (≈ 302 kB JS, ≈ 102 kB gzip)
 API_PROXY=http://127.0.0.1:8780 npx -w @orderflow/web vite preview   # Build lokal gegen die echte API prüfen
 API_PROXY=http://127.0.0.1:8780 npm run dev -w @orderflow/web        # Entwicklung gegen die echte API statt Fixtures
 ```
@@ -111,12 +111,29 @@ Anfragelast je Tab (gemessen gegen die Fixture-API, 90-Tage-Datensatz): Seitenst
 (Symbole, Bar-Abschnitte, 2–3 Kacheln); 10 s schnelles Pannen 3–13 Anfragen, Spitze 2/s (auch herausgezoomt).
 Höchstens 4 parallel (Client). `limit_req` 10 r/s mit Burst 40 je IP reicht mit großer Reserve.
 
-Die Dev-Middleware (`apps/web/dev/fixture-api.ts`) bedient `/api/v1/symbols|bars|footprint` in der URL-Form der
+Die Dev-Middleware (`apps/web/dev/fixture-api.ts`) bedient `/api/v1/symbols|bars|footprint|profile|profiles/daily` in der URL-Form der
 künftigen API; mit `VITE_API_BASE=<url>` spricht das Frontend stattdessen die echte API an. Symbole: `BTCUSDT`
 (echt), `BTCUSDT-SYN90` (90 Tage, 30× wiederholte echte Tage, nur Performance), `STRESS-FLAT` (Seitwärtsdaten
 für den Zellbudget-Test). Kachelformat: [`docs/TILE-FORMAT.md`](docs/TILE-FORMAT.md). Offen für die Live-Phase: Bar-Abschnitte und `/symbols` werden im Browser nicht aktualisiert (siehe
 TILE-FORMAT.md, „Offen für die Live-Phase"). Messung (T11) im Browser:
 `PLAYWRIGHT_CORE=<pfad zu playwright-core> node apps/web/perf/measure.ts` bei laufendem Dev-Server.
+
+**Volumenprofil + Delta** (Vertrag: [`docs/PROFILE-API.md`](docs/PROFILE-API.md)): standardmäßig je sichtbarem Tag
+ein Profil ab dem Tagesbeginn nach rechts (80 % der Tagesbreite), unter Kerzen/Footprint gezeichnet (Pane-Primitive,
+kein DOM-Overlay). Ansichten „Total", „Buy/Sell" (Standard; Bid rot links, Ask grün rechts gestapelt) und „Delta"
+(|Ask − Bid| ab dem Tagesbeginn, grün/rot nach Vorzeichen) – ein Klick in der Werkzeugleiste. Gelbe Linie = POC,
+VA-Fläche + graue VAH/VAL („VA"), „verlängern" = POC/VAH/VAL bis zur ersten Berührung durch den Preis (naked).
+„Bereich wählen": zwei Klicks im Chart (Bar-genau, auf Minuten gerundet, Esc bricht ab) → Bereichsprofil mit
+Zusammenfassung unter dem Chart (Zeitraum, gesamt/Ask/Bid/Delta in Lots und BTC, POC, VA). Profil-Zeilengröße
+automatisch nach Pixelhöhe (≈ 5 px, unabhängig vom Footprint-R) oder fest („Profilzeile"); lehnt der Server mit 422
+ab, wird einmal mit `suggestR` neu angefragt (Hinweis in der Anzeige). Tage schmaler als 8 px werden ausgelassen
+(Anzeige sagt es). Tagesprofile werden in Blöcken à 16 Tage geladen (`/profiles/daily`), nur sichtbar ± 1 Tag, mit
+Abbruch und LRU; finale Tage werden gegen die geladenen Bars geprüft (Abweichung → einmal neu laden, dann Fehler).
+URL: `pm=off|daily|range|both`, `pv=total|buysell|delta`, `va=<1…100>`, `oh=<−12…12>` (Tagesbeginn UTC + h),
+`pr=<Ticks>` (fest), `pe=1` (verlängern), `pl=0` (ohne VA), `pf=`/`pt=` (Bereich, ISO-Minute UTC, z. B.
+`2026-10-27T00:00`); nur vom Standard Abweichendes steht in der URL (Standard: `PROFILE_DEFAULTS` in
+`apps/web/src/lib/profile/model.ts`). Messung nur der Profil-Szenarien, auch gegen die echte API:
+`PERF_ONLY=profile PERF_PROFILE_SYM=BTCUSDT PERF_URL=… node apps/web/perf/measure.ts`.
 
 ## Importer (P1)
 

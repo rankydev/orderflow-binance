@@ -61,6 +61,23 @@ export class BarStore {
     this.chunks.delete(c);
     this.chunks.set(c, dec.bars);
     this.state.set(c, dec.header.final ? 'final' : 'provisional');
+    this.loadedAt.set(c, Date.now());
+  }
+
+  private readonly loadedAt = new Map<number, number>();
+
+  /**
+   * Bars c0…c1 für den Zeitraum bis `endMs` vergleichbar? Geladen, keine Lücke und je Abschnitt final
+   * oder – bei einem vorläufigen Abschnitt (enthält den laufenden Tag) – erst geladen, als `endMs`
+   * schon länger als `settleMs` zurücklag (dann ändern sich diese Bars nicht mehr).
+   */
+  settled(c0: number, c1: number, endMs: number, settleMs: number): boolean {
+    for (let c = c0; c <= c1; c++) {
+      const st = this.state.get(c);
+      if (st === 'final') continue;
+      if (st !== 'provisional' || (this.loadedAt.get(c) ?? 0) < endMs + settleMs) return false;
+    }
+    return true;
   }
 
   /** Endgültig fehlender Abschnitt als leere Lücke (das Fenster kann darüber wachsen). */
@@ -73,6 +90,7 @@ export class BarStore {
   drop(c: number): void {
     this.chunks.delete(c);
     this.state.delete(c);
+    this.loadedAt.delete(c);
   }
 
   /** Alle Abschnitte c0…c1 geladen, final und keine Lücke? */

@@ -13,6 +13,12 @@ import type { Plugin } from 'vite';
 import {
   decodeTile,
   encodeTile,
+  profileMarks,
+  PROFILE_FORMAT,
+  type DailyProfile,
+  type DailyProfilesResponse,
+  type ProfileBody,
+  type RangeProfileResponse,
   tfSeconds,
   tileBarsForMax,
   TILE_MAX_CELLS,
@@ -187,6 +193,174 @@ export class FixtureStore {
     return guarded(tile);
   }
 
+  // ------------------------------------------------------------ Volume Profile (docs/PROFILE-API.md)
+  // Aus den 1m-Footprint-Kacheln mit der größten Zeilengröße, die R teilt (exakt, da Zeilen ausgerichtet).
+  // notional ist eine Näherung (Zeilenuntergrenze × Lots): die Kacheln kennen keine Einzelpreise.
+
+  private profileBase(
+    sym: SymbolMeta,
+    R: number,
+    from: number,
+    to: number,
+  ): { series: Series; Rb: number } {
+    const rs = Object.keys(sym.tiles['1m'] ?? {})
+      .map(Number)
+      .filter((r) => R % r === 0)
+      .sort((a, b) => b - a);
+    const Rb = rs[0];
+    if (Rb === undefined) {
+      const ok = Object.keys(sym.tiles['1m'] ?? {})
+        .map(Number)
+        .sort((a, b) => a - b);
+      const suggest = PROFILE_LADDER.find((r) => r > R && ok.some((b) => r % b === 0)) ?? null;
+      throw new HttpError(422, `R=${R} feiner als die Fixture-Daten`, { suggestR: suggest });
+    }
+    const wb = Rb * sym.tickRefUnits;
+    if (sym.stress) return { series: stressSeries(sym, from, to, wb), Rb };
+    const base = this.baseSeries(this.baseOf(sym), '1m', Rb);
+    return { series: sym.synthetic ? this.slice(sym, base, from, to, wb) : base, Rb };
+  }
+
+  private profileBody(
+    sym: SymbolMeta,
+    R: number,
+    from: number,
+    to: number,
+    va: number,
+  ): ProfileBody {
+    const { series, Rb } = this.profileBase(sym, R, from, to);
+    const t = series.bars.time;
+    const i0 = lowerBound(t, from / 1000);
+    const i1 = lowerBound(t, to / 1000);
+    const L = series.levels!;
+    const w = R * sym.tickRefUnits;
+    const f = R / Rb;
+    let low = Infinity;
+    let high = -Infinity;
+    for (let i = i0; i < i1; i++) {
+      low = Math.min(low, series.bars.low[i]!);
+      high = Math.max(high, series.bars.high[i]!);
+    }
+    if (i1 <= i0) {
+      return {
+        rowLo: null,
+        buy: [],
+        sell: [],
+        poc: null,
+        vah: null,
+        val: null,
+        deltaPoc: null,
+        buyQ: 0,
+        sellQ: 0,
+        notional: '0',
+        low: null,
+        high: null,
+      };
+    }
+    const rowLo = Math.floor(low / w);
+    const n = Math.floor(high / w) - rowLo + 1;
+    if (n > PROFILE_MAX_ROWS)
+      throw new HttpError(422, `${n} Zeilen > ${PROFILE_MAX_ROWS}`, {
+        suggestR:
+          PROFILE_LADDER.find(
+            (r) => r > R && (high - low) / (r * sym.tickRefUnits) < PROFILE_MAX_ROWS,
+          ) ?? null,
+      });
+    const buy = new Array<number>(n).fill(0);
+    const sell = new Array<number>(n).fill(0);
+    let notional = 0n;
+    for (let q = L.levelOffset[i0]!; q < L.levelOffset[i1]!; q++) {
+      const k = Math.floor(L.row[q]! / f) - rowLo;
+      buy[k] = buy[k]! + L.buy[q]!;
+      sell[k] = sell[k]! + L.sell[q]!;
+      notional += BigInt(L.row[q]! * Rb * sym.tickRefUnits) * BigInt(L.buy[q]! + L.sell[q]!);
+    }
+    const buyQ = buy.reduce((a, b) => a + b, 0);
+    const sellQ = sell.reduce((a, b) => a + b, 0);
+    return {
+      rowLo,
+      buy,
+      sell,
+      ...profileMarks(rowLo, buy, sell, va),
+      buyQ,
+      sellQ,
+      notional: notional.toString(),
+      low,
+      high,
+    };
+  }
+
+  private profileEnvelope(sym: SymbolMeta, R: number, from: number, to: number, va: number) {
+    return {
+      format: PROFILE_FORMAT,
+      sym: sym.name,
+      R,
+      priceDecimals: sym.priceDecimals,
+      qtyDecimals: sym.qtyDecimals,
+      tickRefUnits: sym.tickRefUnits,
+      from,
+      to,
+      va,
+      dataVersion: `fixture:${sym.name}:v1`,
+      final: true,
+      sources: [{ table: `fixture_1m_footprint`, from, to }],
+      sourceRowsEstimate: 0,
+    };
+  }
+
+  profile(symName: string, from: number, to: number, R: number, va: number): string {
+    const sym = this.mustSymbol(symName);
+    if (from % 60_000 !== 0 || to % 60_000 !== 0 || to <= from)
+      throw new HttpError(400, 'from/to nicht an Minuten ausgerichtet');
+    const out: RangeProfileResponse = {
+      ...this.profileEnvelope(sym, R, from, to, va),
+      kind: 'profile',
+      profile: this.profileBody(sym, R, from, to, va),
+    };
+    return JSON.stringify(out);
+  }
+
+  dailyProfiles(
+    symName: string,
+    from: number,
+    to: number,
+    R: number,
+    offsetH: number,
+    va: number,
+  ): string {
+    const sym = this.mustSymbol(symName);
+    const off = offsetH * 3_600_000;
+    const D = 86_400_000;
+    if ((from - off) % D !== 0 || (to - off) % D !== 0 || to <= from || from - off < 0)
+      throw new HttpError(400, 'from/to nicht an Tagesgrenzen (mit offsetH)');
+    if ((to - from) / D > 400) throw new HttpError(400, 'höchstens 400 Tage');
+    const days: DailyProfile[] = [];
+    let rows = 0;
+    for (let d = from; d < to; d += D) {
+      const body = this.profileBody(sym, R, d, d + D, va);
+      if (body.buy.length === 0) continue;
+      rows += body.buy.length;
+      days.push({
+        day: new Date(d - off).toISOString().slice(0, 10),
+        from: d,
+        to: d + D,
+        final: true,
+        ...body,
+      });
+    }
+    if (rows > PROFILE_MAX_ROWS)
+      throw new HttpError(422, `${rows} Zeilen > ${PROFILE_MAX_ROWS}`, {
+        suggestR: PROFILE_LADDER.find((r) => r > R && (rows * R) / r < PROFILE_MAX_ROWS) ?? null,
+      });
+    const out: DailyProfilesResponse = {
+      ...this.profileEnvelope(sym, R, from, to, va),
+      kind: 'profiles/daily',
+      offsetH,
+      days,
+    };
+    return JSON.stringify(out);
+  }
+
   private mustSymbol(name: string): SymbolMeta {
     const s = this.symbol(name);
     if (!s) throw new HttpError(404, `unbekanntes Symbol ${name}`);
@@ -285,11 +459,20 @@ export class FixtureStore {
 
 export class HttpError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  /** Zusätzliche Felder der Fehlerantwort (z. B. suggestR bei 422). */
+  readonly extra: Record<string, unknown>;
+  constructor(status: number, message: string, extra: Record<string, unknown> = {}) {
     super(message);
     this.status = status;
+    this.extra = extra;
   }
 }
+
+/** Grenze der Profilzeilen wie die API (Summe über alle Tage einer Antwort). */
+export const PROFILE_MAX_ROWS = 60_000;
+const PROFILE_LADDER: number[] = [];
+for (let p = 1; p <= 1_000_000; p *= 10)
+  for (const m of [1, 2, 5]) if (m * p <= 1_000_000) PROFILE_LADDER.push(m * p);
 
 /** Deterministische Seitwärtsdaten (nur 1m): Bar t überspannt ≈ 300 Ticks um STRESS_BASE, jede Zeile belegt. */
 function stressSeries(sym: SymbolMeta, from: number, to: number, width: number | null): Series {
@@ -484,6 +667,30 @@ export function handleApi(
     );
     return { status: 200, body, type: 'application/octet-stream' };
   }
+  if (path === '/api/v1/profile') {
+    const va = url.searchParams.has('va') ? intParam(url, 'va') : 70;
+    const body = store.profile(
+      strParam(url, 'sym'),
+      intParam(url, 'from'),
+      intParam(url, 'to'),
+      intParam(url, 'R'),
+      va,
+    );
+    return { status: 200, body, type: 'application/json' };
+  }
+  if (path === '/api/v1/profiles/daily') {
+    const va = url.searchParams.has('va') ? intParam(url, 'va') : 70;
+    const oh = url.searchParams.has('offsetH') ? intParam(url, 'offsetH') : 0;
+    const body = store.dailyProfiles(
+      strParam(url, 'sym'),
+      intParam(url, 'from'),
+      intParam(url, 'to'),
+      intParam(url, 'R'),
+      oh,
+      va,
+    );
+    return { status: 200, body, type: 'application/json' };
+  }
   throw new HttpError(404, `unbekannter Endpunkt ${path}`);
 }
 
@@ -528,7 +735,10 @@ export function fixtureApi(opt: FixtureApiOptions): Plugin {
         const status = e instanceof HttpError ? e.status : 500;
         send(
           status,
-          JSON.stringify({ error: e instanceof Error ? e.message : String(e) }),
+          JSON.stringify({
+            error: e instanceof Error ? e.message : String(e),
+            ...(e instanceof HttpError ? e.extra : {}),
+          }),
           'application/json',
         );
       }

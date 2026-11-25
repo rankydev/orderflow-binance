@@ -64,7 +64,12 @@ export class RequestQueue {
   label: (key: string) => string = (key) => key;
 
   private readonly onLoaded: (key: string, buf: ArrayBuffer) => void;
-  private readonly onRejected: (key: string, status: number, error?: unknown) => void;
+  private readonly onRejected: (
+    key: string,
+    status: number,
+    error?: unknown,
+    body?: string,
+  ) => void;
   private readonly fetchFn: FetchFn;
   readonly maxParallel: number;
   private readonly now: () => number;
@@ -72,7 +77,7 @@ export class RequestQueue {
 
   constructor(
     onLoaded: (key: string, buf: ArrayBuffer) => void,
-    onRejected: (key: string, status: number, error?: unknown) => void,
+    onRejected: (key: string, status: number, error?: unknown, body?: string) => void,
     fetchFn: FetchFn = (u, i) => fetch(u, i),
     maxParallel = 4,
     now: () => number = () => performance.now(),
@@ -202,7 +207,10 @@ export class RequestQueue {
         } else if (!isTransient(res.status)) {
           this.stats.failed++;
           this.failures.set(w.key, { attempts: 1, retryAt: Infinity, final: true });
-          this.onRejected(w.key, res.status);
+          // Text der Fehlerantwort (z. B. 422 {error, suggestR}) für den Verbraucher; nie in die Anzeige
+          const body = await res.text().catch(() => '');
+          if (ac.signal.aborted) return;
+          this.onRejected(w.key, res.status, undefined, body.slice(0, 4096));
         } else {
           // sichtbar machen (A): wiederholte Serverfehler dürfen nicht still bleiben
           this.lastError = `${this.label(w.key)}: HTTP ${res.status} – neuer Versuch folgt`;

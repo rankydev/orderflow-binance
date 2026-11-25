@@ -21,6 +21,7 @@ import {
   type WhitespaceData,
 } from 'lightweight-charts';
 import { ApiClient, IncompatibleServerError, SERVER_MISMATCH, timeoutSignal } from './api.ts';
+import { exactDecimal } from './format.ts';
 import { GestureTracker } from './gesture.ts';
 import { MismatchRecovery, REFETCH_TIMEOUT_MS, RETRY_MS, tileConfigChanged } from './mismatch.ts';
 import {
@@ -60,6 +61,7 @@ import {
   type RowClass,
   type ViewGeometry,
 } from './lod.ts';
+import { ProfileLayer } from './profile/layer.ts';
 import { RequestQueue, type Want } from './request-queue.ts';
 import { BAR_CHUNK_BARS, chunkIndexAt, chunkSpanSec, wantedTiles, windowChunks } from './tiles.ts';
 import type { BarItem, ColorMode, ColorScope, FootprintType, Lod, SymbolInfo } from './types.ts';
@@ -73,6 +75,8 @@ export type Mode = 'footprint' | 'candle';
 export const MAX_VISIBLE_TILES = 24;
 /** K1: Abstand der Abschnittsanforderungen während einer Geste. */
 export const CHUNK_REQUEST_THROTTLE_MS = 250;
+/** Profil-Querprüfung mit vorläufigen Bar-Abschnitten erst für Tage, die so lange vor dem Laden endeten. */
+export const PROFILE_SETTLE_MS = 86_400_000;
 
 export interface Readout {
   sym: string;
@@ -127,6 +131,8 @@ export class ChartController {
   private readonly candle: ISeriesApi<'Candlestick'>;
   private readonly fp: ISeriesApi<'Custom', Time, FpItem | WhitespaceData<Time>>;
   readonly rc = new RenderContext();
+  /** Volume-Profile (Tages- und Bereichsprofil), als Pane-Primitive unter den Serien. */
+  readonly profile: ProfileLayer;
   private readonly api: ApiClient;
   symbols: SymbolInfo[] = [];
   private sym!: SymbolInfo;
@@ -226,12 +232,34 @@ export class ChartController {
     );
     this.fpQueue.label = (k) => `Kachel ${tileLabel(k)}`;
 
+    this.profile = new ProfileLayer({
+      chart: this.chart,
+      apiBase: api.base,
+      sym: () => this.sym ?? null,
+      tfSec: () => this.tfSec,
+      items: () => this.items,
+      visibleTimeRange: () => this.visibleTimeRange(),
+      priceToY: (price) =>
+        (this.mode === 'footprint' ? this.fp : this.candle).priceToCoordinate(price),
+      barsCoverFinal: (fromMs, toMs) => this.barsCoverFinal(fromMs, toMs),
+    });
+    this.chart.panes()[0]!.attachPrimitive(this.profile);
+    // Bereichsauswahl (zwei Klicks, Bar-genau); außerhalb des Auswahlmodus ohne Wirkung
+    this.chart.subscribeClick((p) => {
+      if (p.time !== undefined && this.profile.click(p.time as number)) this.onProfile?.();
+    });
+
     this.chart.timeScale().subscribeVisibleLogicalRangeChange(this.onRangeChange);
     // Hover-Anzeige (W10): exakte Werte der Zelle unter dem Zeiger, als DOM-Text, höchstens einmal
     // je Animation-Frame berechnet (O(log Zeilen)); kein Neuzeichnen des Charts.
     this.chart.subscribeCrosshairMove((p) => {
       this.hoverParam =
-        p.point && p.time !== undefined ? { t: p.time as number, y: p.point.y } : null;
+        p.point && p.time !== undefined
+          ? { t: p.time as number, x: p.point.x, y: p.point.y }
+          : null;
+      // Auswahlvorschau: nur im Auswahlmodus mit gesetztem Anfang wird neu gezeichnet
+      if (this.profile.selecting)
+        this.profile.pointer(p.time === undefined ? null : (p.time as number));
       if (this.hoverReq || !this.onHover) return;
       this.hoverReq = requestAnimationFrame(() => {
         this.hoverReq = 0;
@@ -271,7 +299,9 @@ export class ChartController {
 
   /** Rückruf für die Hover-Anzeige (Text oder ''), gesetzt vom UI. */
   onHover: ((text: string) => void) | null = null;
-  private hoverParam: { t: number; y: number } | null = null;
+  private hoverParam: { t: number; x: number; y: number } | null = null;
+  /** Rückruf nach Änderungen am Profilzustand durch Chart-Eingaben (Bereich gewählt). */
+  onProfile: (() => void) | null = null;
   private hoverReq = 0;
 
   /** Text der Zelle unter dem Zeiger: Zeit, Zeilenintervall, Bid/Ask/Delta in Lots und Basiswährung. */
@@ -283,6 +313,9 @@ export class ChartController {
     if (price === null) return '';
     const unit = Math.round(price * this.rc.priceScale);
     const time = new Date(p.t * 1000).toISOString().slice(0, 16).replace('T', ' ');
+    // über einem gezeichneten Profil: dessen Zeile (exakte Werte)
+    const prof = this.profile.hoverText(p.x, unit);
+    if (prof) return `${time} UTC · ${prof}`;
     // N8: wo Kerzen gezeichnet werden, Kerzenwerte zeigen (keine Footprint-Werte aus dem Cache)
     const candles = this.mode === 'candle' || this.rc.stats.lod === 1;
     const hit = candles ? null : this.lookupBar(p.t);
@@ -333,6 +366,7 @@ export class ChartController {
     if (this.hoverReq) cancelAnimationFrame(this.hoverReq);
     this.barQueue.cancelAll();
     this.fpQueue.cancelAll();
+    this.profile.destroy();
     for (const f of this.listeners) f();
     this.gesture.dispose();
     this.cancelRetry?.();
@@ -638,6 +672,7 @@ export class ChartController {
     this.fpQueue.cancelAll();
     this.bars = new BarStore(`${s.name}|${tf}`, s.priceDecimals);
     if (symChanged || !this.fpStore) this.fpStore = new FootprintStore(s.qtyDecimals);
+    if (symChanged) this.profile.resetForSymbol();
     this.rc.store = this.fpStore;
     this.rc.priceScale = 10 ** s.priceDecimals;
     const minMove = s.tickRefUnits / 10 ** s.priceDecimals;
@@ -754,6 +789,8 @@ export class ChartController {
     this.candle.setData(items);
     this.fp.setData(this.mode === 'footprint' ? items : []);
     this.counters.setData++;
+    // neue Bars im Fenster: geladene finale Profile gegen sie prüfen (Auftrag 6)
+    this.profile.crossCheckAll();
     if (this.anchor?.initial) this.initialView = true;
     if (this.anchor?.at) {
       // Start um eine Zeit: Bar-Abstand setzen und die Mitte erst platzieren, wenn das Chart eine
@@ -956,6 +993,7 @@ export class ChartController {
   /** Gestenende: Zeilengröße, Modus, Fenster, Farbreferenz (KONZEPT §7.2). */
   private evaluate(): void {
     if (!this.sym || this.items.length === 0) return;
+    this.evaluateProfile();
     const rs = this.availableR();
     // Gründe, warum kein Footprint möglich ist (nicht zoombedingt) – sichtbar in der Anzeige (A)
     const scaleMode = this.chart.priceScale('right').options().mode;
@@ -1050,6 +1088,9 @@ export class ChartController {
     if (!Number.isNaN(this.lastCenter) && center !== this.lastCenter)
       this.panDir = center > this.lastCenter ? 1 : -1;
     this.lastCenter = center;
+    // Profile: Bedarf erst am Gestenende (die Profil-Zeilengröße wird dort neu bestimmt; sonst würde
+    // während des Zoomens mit der alten Zeilengröße geladen)
+    if (!this.gestureActive) this.profile.frame();
     if (this.mode === 'footprint') this.updateFootprintWants(vis);
     else if (this.wantedFp.size > 0) {
       this.wantedFp.clear();
@@ -1382,6 +1423,28 @@ export class ChartController {
   private redraw(): void {
     this.fp.applyOptions({});
   }
+
+  /** Profil-Zeilengröße nach der Pixelhöhe der Preisskala (Gestenende, unabhängig vom Footprint-R). */
+  private evaluateProfile(): void {
+    const h = this.chart.paneSize(0).height;
+    const s = this.mode === 'footprint' ? this.fp : this.candle;
+    const pTop = s.coordinateToPrice(0);
+    const pBot = s.coordinateToPrice(h);
+    if (pTop === null || pBot === null || h <= 0 || pTop <= pBot) return;
+    this.profile.evaluate(h / ((pTop - pBot) * this.rc.priceScale));
+  }
+
+  /** Bars von [fromMs, toMs) vollständig, unveränderlich und lückenlos im aktuellen Fenster? */
+  private barsCoverFinal(fromMs: number, toMs: number): boolean {
+    if (!this.win || !this.bars) return false;
+    // nur bei an den Bars ausgerichteten Grenzen vergleichbar (z. B. offsetH 1 bei 4h nicht)
+    if ((fromMs / 1000) % this.tfSec !== 0 || (toMs / 1000) % this.tfSec !== 0) return false;
+    const c0 = chunkIndexAt(fromMs / 1000, this.tfSec);
+    const c1 = chunkIndexAt((toMs - 1) / 1000, this.tfSec);
+    return (
+      c0 >= this.win[0] && c1 <= this.win[1] && this.bars.settled(c0, c1, toMs, PROFILE_SETTLE_MS)
+    );
+  }
 }
 
 /** Start-Bar-Abstand: L3-Schwelle des Typs + 5 % (Delta 46 px, Bid×Ask 84 px). */
@@ -1439,13 +1502,7 @@ function median(a: readonly number[]): number {
   return s.length % 2 ? s[m]! : (s[m - 1]! + s[m]!) / 2;
 }
 
-/** Ganzzahl v mit d Nachkommastellen exakt als Dezimaltext (−1234, 3 → "-1.234"). */
-export function exactDecimal(v: number, d: number): string {
-  const neg = v < 0;
-  const a = String(Math.abs(v)).padStart(d + 1, '0');
-  const t = d === 0 ? a : `${a.slice(0, -d)}.${a.slice(-d)}`;
-  return neg ? `-${t}` : t;
-}
+export { exactDecimal };
 
 /** Nachkommastellen von minMove = tickRefUnits / 10^priceDecimals (z. B. 25 / 100 = 0.25 → 2). */
 export function pricePrecision(tickRefUnits: number, priceDecimals: number): number {

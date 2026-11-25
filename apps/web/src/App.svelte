@@ -3,6 +3,14 @@
   import { APP_TITLE, CHARTS_ATTRIBUTION, CHARTS_URL } from './app-info.ts';
   import { ChartController, rowLabel, type Readout } from './lib/controller.ts';
   import type { ColorMode, ColorScope, FootprintType, SymbolInfo } from './lib/types.ts';
+  import type { ProfileReadout, RangeSummary } from './lib/profile/layer.ts';
+  import {
+    parseProfileParams,
+    profileParamsQuery,
+    type ProfileMode,
+    type ProfileParams,
+    type ProfileView,
+  } from './lib/profile/model.ts';
 
   // Nur UI-Einstellungen sind reaktiv (KONZEPT §7.3); Chartdaten liegen im Controller.
   const params = new URLSearchParams(location.search);
@@ -26,6 +34,11 @@
   let symInfo = $state.raw<SymbolInfo | null>(null);
   let ro = $state.raw<Readout | null>(null);
   let error = $state('');
+  // Volume-Profile-Einstellungen (URL: pm, pv, va, oh, pr, pe, pl, pf/pt)
+  let prof = $state<ProfileParams>(parseProfileParams(params));
+  let pro = $state.raw<ProfileReadout | null>(null);
+  let summary = $state.raw<RangeSummary | null>(null);
+  let profLadder = $state.raw<number[]>([]);
 
   let el: HTMLDivElement;
   // Hover-Text: höchstens einmal je Animation-Frame gesetzt (Controller bündelt per rAF)
@@ -34,6 +47,7 @@
   let ctl: ChartController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let removeKey: (() => void) | null = null;
 
   onMount(() => {
     ctl = new ChartController(el);
@@ -41,6 +55,23 @@
       (window as unknown as { __of: ChartController }).__of = ctl;
     }
     ctl.setType(type);
+    applyProfile();
+    ctl.onProfile = () => {
+      readProfile();
+      syncUrl();
+    };
+    ctl.profile.onChange = () => {
+      summary = ctl?.profile.summary() ?? null;
+    };
+    // Esc bricht die Bereichsauswahl ab
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && ctl?.profile.selecting) {
+        ctl.profile.cancelSelect();
+        pro = ctl.profile.readout();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    removeKey = () => window.removeEventListener('keydown', onKey);
     ctl.onHover = (t) => (hover = t);
     ctl.onSymbols = () => refreshLists();
     // Start; ist die API (noch) nicht erreichbar, sichtbar melden und alle 10 s erneut versuchen
@@ -59,6 +90,8 @@
           tf = ctl!.readout().tf;
           refreshLists();
           ready = true;
+          // Bereich aus der URL erst mit bekanntem Datenbereich setzen
+          if (prof.range && !ctl!.profile.range) ctl!.profile.setRange(prof.range);
           syncUrl();
         })
         .catch((e: unknown) => {
@@ -71,6 +104,7 @@
     timer = setInterval(() => {
       if (!ctl) return;
       ro = ctl.readout();
+      pro = ctl.profile.readout();
       // Auswahl, URL und Controller konsistent halten: angezeigt wird das wirksame R
       const eff = ro.rAuto ? 'auto' : String(ro.R);
       if (ready && eff !== rMode && (ro.rAuto || rOptions.includes(ro.R))) {
@@ -83,6 +117,7 @@
   onDestroy(() => {
     if (timer) clearInterval(timer);
     if (retryTimer) clearTimeout(retryTimer);
+    removeKey?.();
     ctl?.destroy();
   });
 
@@ -94,10 +129,41 @@
     timeframes = ctl.timeframes();
     rOptions = ctl.availableR(tf);
     dataTo = ctl.dataTo();
+    profLadder = ctl.profile.ladder();
+  }
+
+  /** UI-Zustand → Profilschicht. */
+  function applyProfile(): void {
+    if (!ctl) return;
+    const p = ctl.profile;
+    p.mode = prof.mode;
+    p.view = prof.view;
+    p.va = prof.va;
+    p.offsetH = prof.offsetH;
+    p.manualR = prof.R;
+    p.extend = prof.extend;
+    p.showVa = prof.showVa;
+    if (!prof.range && p.range) p.clearRange();
+    p.changed();
+    pro = p.readout();
+    summary = p.summary();
+  }
+  /** Profilschicht → UI-Zustand (nach Bereichsauswahl im Chart). */
+  function readProfile(): void {
+    if (!ctl) return;
+    const p = ctl.profile;
+    prof = { ...prof, mode: p.mode, range: p.range };
+    pro = p.readout();
+    summary = p.summary();
+  }
+  function setProf(patch: Partial<ProfileParams>): void {
+    prof = { ...prof, ...patch };
+    applyProfile();
+    syncUrl();
   }
 
   function syncUrl(): void {
-    const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${params.has('debug') ? '&debug' : ''}`;
+    const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${profileParamsQuery(prof)}${params.has('debug') ? '&debug' : ''}`;
     history.replaceState(null, '', q);
     document.title = `${sym} ${tf} · ${APP_TITLE}`;
   }
@@ -118,6 +184,9 @@
     sym = v;
     ctl?.setSymbol(v);
     if (ctl) tf = ctl.readout().tf;
+    readProfile(); // Bereich gehört zum alten Symbol
+    prof = { ...prof, R: null };
+    if (ctl) ctl.profile.manualR = null;
     refreshLists();
     syncUrl();
   }
@@ -133,6 +202,29 @@
     syncUrl();
   }
   const label = (r: number) => (symInfo ? rowLabel(r, symInfo) : `${r} Ticks`);
+  const MODES: [ProfileMode, string][] = [
+    ['off', 'aus'],
+    ['daily', 'Tage'],
+    ['range', 'Bereich'],
+    ['both', 'Tage + Bereich'],
+  ];
+  const VIEWS: [ProfileView, string][] = [
+    ['total', 'Total'],
+    ['buysell', 'Buy/Sell'],
+    ['delta', 'Delta'],
+  ];
+  const OFFSETS = Array.from({ length: 25 }, (_, i) => i - 12);
+  function startSelect(): void {
+    if (!ctl || !ready) return;
+    if (ctl.profile.selecting) ctl.profile.cancelSelect();
+    else ctl.profile.startSelect();
+    pro = ctl.profile.readout();
+  }
+  function clearRange(): void {
+    ctl?.profile.clearRange();
+    readProfile();
+    syncUrl();
+  }
 </script>
 
 <main>
@@ -191,6 +283,87 @@
         <option value="bar">je Bar</option>
       </select>
     </label>
+    <div class="group" role="group" aria-label="Volumenprofil">
+      <select
+        aria-label="Profilmodus"
+        value={prof.mode}
+        onchange={(e) => setProf({ mode: e.currentTarget.value as ProfileMode })}
+      >
+        {#each MODES as [m, t] (m)}<option value={m}>Profil: {t}</option>{/each}
+      </select>
+      {#each VIEWS as [v, t] (v)}
+        <button
+          class:active={prof.view === v}
+          aria-pressed={prof.view === v}
+          onclick={() => setProf({ view: v })}
+        >
+          {t}
+        </button>
+      {/each}
+    </div>
+    <div class="group" role="group" aria-label="Profiloptionen">
+      <button
+        class:active={pro?.selecting}
+        aria-pressed={pro?.selecting ?? false}
+        title="Zwei Klicks: Anfang und Ende (Bar-genau, auf Minuten); Esc bricht ab"
+        onclick={startSelect}
+      >
+        Bereich wählen
+      </button>
+      {#if prof.range}<button title="Bereichsprofil entfernen" onclick={clearRange}>
+          ✕ Bereich
+        </button>{/if}
+      <button
+        class:active={prof.showVa}
+        aria-pressed={prof.showVa}
+        title="Value Area (Fläche + VAH/VAL)"
+        onclick={() => setProf({ showVa: !prof.showVa })}
+      >
+        VA
+      </button>
+      <button
+        class:active={prof.extend}
+        aria-pressed={prof.extend}
+        title="POC/VAH/VAL nach rechts verlängern, bis der Preis sie erreicht (naked)"
+        onclick={() => setProf({ extend: !prof.extend })}
+      >
+        verlängern
+      </button>
+    </div>
+    <label>
+      VA
+      <select
+        aria-label="Value-Area-Anteil"
+        value={String(prof.va)}
+        onchange={(e) => setProf({ va: Number(e.currentTarget.value) })}
+      >
+        {#each [60, 68, 70, 80, 90] as v (v)}<option value={String(v)}>{v} %</option>{/each}
+      </select>
+    </label>
+    <label>
+      Tag ab
+      <select
+        aria-label="Tagesbeginn (UTC-Offset in Stunden)"
+        value={String(prof.offsetH)}
+        onchange={(e) => setProf({ offsetH: Number(e.currentTarget.value) })}
+      >
+        {#each OFFSETS as o (o)}<option value={String(o)}>
+            {String((o + 24) % 24).padStart(2, '0')}:00 UTC
+          </option>{/each}
+      </select>
+    </label>
+    <label>
+      Profilzeile
+      <select
+        aria-label="Profil-Zeilengröße"
+        value={prof.R === null ? 'auto' : String(prof.R)}
+        onchange={(e) =>
+          setProf({ R: e.currentTarget.value === 'auto' ? null : Number(e.currentTarget.value) })}
+      >
+        <option value="auto">Auto{pro && pro.rAuto && pro.rLabel ? ` (${pro.rLabel})` : ''}</option>
+        {#each profLadder as r (r)}<option value={String(r)}>{label(r)}</option>{/each}
+      </select>
+    </label>
     {#if dataTo}<span class="datato" title="Ende der Daten (UTC)">
         Daten bis {fmtUtc(dataTo)}
       </span>{/if}
@@ -203,6 +376,22 @@
     {/if}
   </div>
 
+  {#if summary}
+    <div class="summary" data-testid="range-summary">
+      <b>Bereich</b>
+      {summary.range}
+      {#if summary.loading}<span class="hint">wird geladen …</span>
+      {:else}
+        <span>gesamt {summary.total}</span>
+        <span class="buy">Ask (Käufer) {summary.buy}</span>
+        <span class="sell">Bid (Verkäufer) {summary.sell}</span>
+        <span>Delta {summary.delta}</span>
+        <span class="poc">POC {summary.poc}</span>
+        <span>VA {summary.va}</span>
+      {/if}
+    </div>
+  {/if}
+
   <footer class="readout" data-testid="readout">
     {#if error}<span class="err">{error}</span>{/if}
     <button class="diag-toggle" aria-expanded={diagOpen} onclick={() => (diagOpen = !diagOpen)}>
@@ -214,6 +403,11 @@
         {#if ro.hint}<span class="hint">· {ro.hint}</span>{/if}
         {#if ro.notice}<span class="hint">· {ro.notice}</span>{/if}
         {#if ro.error}<span class="err">· {ro.error}</span>{/if}
+        {#if pro && pro.mode !== 'off'}
+          · Profil {pro.rLabel}{pro.rAuto ? ' (auto)' : ''}
+          {#if pro.note}<span class="hint">· {pro.note}</span>{/if}
+          {#if pro.error}<span class="err">· {pro.error}</span>{/if}
+        {:else if pro?.note}<span class="hint">· {pro.note}</span>{/if}
       </span>
     {/if}
     {#if ro && diagOpen}
@@ -238,10 +432,21 @@
       <!-- W-2: erwartete/vorübergehende Gründe ohne Footprint als normale Zeile, nicht als Banner -->
       {#if ro.notice}<span class="hint" data-k="notice">{ro.notice}</span>{/if}
       {#if ro.error}<span class="err">{ro.error}</span>{/if}
+      {#if pro}
+        <span>
+          Profil <b data-k="pmode">{pro.mode}/{pro.view}</b> · Zeile <b data-k="pR">{pro.rLabel}</b>
+          ({pro.R} Ticks, {pro.rAuto ? 'auto' : 'manuell'}) · Tage
+          <b data-k="pdays">{pro.daysDrawn}</b>
+          gezeichnet · Requests {pro.requests}
+        </span>
+        {#if pro.note}<span class="hint" data-k="pnote">{pro.note}</span>{/if}
+        {#if pro.error}<span class="err" data-k="perror">{pro.error}</span>{/if}
+      {/if}
     {/if}
     <span class="legend">
       Mengen in Basiswährung (BTC) · Delta = Ask − Bid · Bid×Ask: Bid links, Ask rechts · gelber
-      Rahmen = POC
+      Rahmen = POC · Profil: Bid (rot) links, Ask (grün) rechts; Delta grün/rot nach Vorzeichen;
+      gelbe Linie = POC, graue Linien = VAH/VAL
     </span>
     <span class="hover">{hover}</span>
     <a class="attr" href={CHARTS_URL} rel="noreferrer">{CHARTS_ATTRIBUTION}</a>
@@ -336,6 +541,26 @@
     flex-basis: 100%;
     min-height: 1.5em;
     color: #e6edf3;
+  }
+  .summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    padding: 4px 10px;
+    border-top: 1px solid #222934;
+    font:
+      12px/1.5 ui-monospace,
+      Menlo,
+      monospace;
+  }
+  .buy {
+    color: #26a69a;
+  }
+  .sell {
+    color: #ef5350;
+  }
+  .poc {
+    color: #f2c94c;
   }
   .hint {
     color: #f2c94c;
