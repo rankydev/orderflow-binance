@@ -27,6 +27,7 @@ echo "ip=$(ip -4 -o addr show dev eth0 scope global | awk '{print $4}' | cut -d/
 echo "name_clash=$(docker ps -a --format '{{.Names}}' | grep -cE '^orderflow-(db|api)$')"
 echo "nginx_zone_clash=$( (nginx -T 2>/dev/null | grep -E 'zone=orderflow_|upstream orderflow_' | grep -vc '^#') || true)"
 echo "certbot_timer=$(systemctl is-active certbot.timer)"
+echo "python3_ok=$(python3 -c 'import sys; print("yes" if sys.version_info >= (3, 7) else "no")' 2>/dev/null || echo no)"
 echo "le_accounts=$(ls /etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory 2>/dev/null | wc -l)"
 acct=$(sed -n 's/^account = //p' /etc/letsencrypt/renewal/*.conf 2>/dev/null | sort -u)
 echo "le_renewal_accounts=$(printf '%s\n' "$acct" | grep -c .)"
@@ -36,7 +37,7 @@ cat "$STATE/preflight-server.txt" >&2
 # Werte lesen, nicht als Shell-Code ausführen
 P="$STATE/preflight-server.txt"
 for k in disk_free_gb mem_avail_mb ports_busy ports_ours nginx_t docker compose ntp ip name_clash \
-         nginx_zone_clash certbot_timer le_accounts le_renewal_accounts le_renewal_account_exists; do
+         nginx_zone_clash certbot_timer python3_ok le_accounts le_renewal_accounts le_renewal_account_exists; do
   v=$(kv "$P" "$k")
   printf '%s' "$v" | grep -qE '^[A-Za-z0-9._:-]*$' || die "unerwarteter Wert für $k"
   eval "$k=\$v"
@@ -49,6 +50,7 @@ check "nginx -t" '[ "$nginx_t" = ok ]'
 check "DNS $PUBLIC_HOST → $dns = Server $ip" '[ "$dns" = "$ip" ]'
 check "Uhr synchron" '[ "$ntp" = yes ]'
 check "certbot.timer aktiv" '[ "$certbot_timer" = active ]'
+check "python3 ≥ 3.7 (Monitor/Postcheck: datetime.fromisoformat)" '[ "$python3_ok" = yes ]'
 check "Let's Encrypt: Renewal-Dateien nutzen genau 1 Produktionskonto, das existiert ($le_accounts Konten)" '[ "$le_renewal_accounts" = 1 ] && [ "$le_renewal_account_exists" = yes ]'
 check "keine Container orderflow-db/-api, keine Zonen orderflow_*" '[ "$ports_ours" -gt 0 ] || { [ "$name_clash" = 0 ] && [ "$nginx_zone_clash" = 0 ]; }'
 check "Docker ≥ 24, Compose v2+ ($docker / $compose)" '[ "${docker%%.*}" -ge 24 ]'

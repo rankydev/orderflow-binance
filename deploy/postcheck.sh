@@ -3,7 +3,8 @@
 # eigene Site antwortet. Auch nach jedem Rollback-Schritt ausführen.
 #
 #   deploy/postcheck.sh [root@host] <baseline-datei> [--neighbours-only]
-# Exit 0 = alles ok · 1 = Nachbardienste verändert oder Schnappschuss unvollständig (sofort
+# Exit 0 = alles ok · 4 = Datenbank ohne Produktionsmarker (harter Fehler) · 1 = Nachbardienste
+# verändert oder Schnappschuss unvollständig (sofort
 # handeln) · 3 = Nachbarn unverändert, aber die eigene Site noch nicht/nicht wie erwartet.
 # --neighbours-only: nur die Nachbarn prüfen (nach Schritt 2–4, bevor die Site existiert).
 set -euo pipefail
@@ -27,6 +28,17 @@ if diff <(grep -v '^info|' "$BASE") <(grep -v '^info|' "$NOW"); then
 else
   die "ABWEICHUNG bei den Nachbardiensten (siehe diff oben; $BASE ↔ $NOW)"
 fi
+# Produktionsmarker der Datenbank – auch im Modus --neighbours-only (Schritte 2 und 4 des
+# Recorder-Rollouts; Schritt 2 setzt ihn). Fehlt er: Exit 4 (harter Fehler, eigene Datenbank)
+mk=$(remote <<'EOF'
+docker exec orderflow-db psql -X -At -U of_admin -d orderflow -c "SELECT coalesce(shobj_description(oid, 'pg_database') LIKE '%orderflow:production%', false) FROM pg_database WHERE datname = 'orderflow'" </dev/null 2>/dev/null || echo error
+EOF
+)
+if [ "$mk" != t ]; then
+  warn "Datenbank ohne Produktionsmarker orderflow:production ($mk) – zuerst deploy/install-server.sh"
+  exit 4
+fi
+log "Produktionsmarker vorhanden"
 [ "$ONLY" = 1 ] && exit 0
 
 log "eigene Site"
@@ -67,6 +79,8 @@ def p(x):
 try:
     m, f = p(sys.argv[1]), p(sys.argv[2])
 except Exception:
+    print('stale'); sys.exit()
+if f.year < 2000:  # nie gestartet (FinishedAt 0001-01-01): kein bewusster Stopp
     print('stale'); sys.exit()
 now = dt.datetime.now(dt.timezone.utc)
 print('valid %.1f' % ((now - m).total_seconds() / 3600) if f <= m + dt.timedelta(seconds=30) else 'stale')

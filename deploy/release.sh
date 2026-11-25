@@ -160,7 +160,7 @@ ln -sfn "releases/$ID" "$R/current.new" && mv -Tf "$R/current.new" "$R/current"
 # Recorder (z. B. Rollback auf ein älteres Release), wird er geordnet angehalten statt in eine
 # Neustartschleife zu laufen.
 if [ "$(docker inspect -f '{{.State.Running}}' orderflow-recorder 2>/dev/null)" = true ]; then
-  if docker run --rm --entrypoint test "orderflow-api:$ID" -f apps/recorder/src/main.ts </dev/null; then
+  if docker run --rm --network none --entrypoint test "orderflow-api:$ID" -f apps/recorder/src/main.ts </dev/null; then
     say "Recorder läuft – auf $ID umstellen"
     $C --profile recorder up -d recorder </dev/null
     rst=missing

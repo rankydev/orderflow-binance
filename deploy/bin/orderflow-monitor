@@ -48,6 +48,8 @@ try:
     m, f = p(sys.argv[1]), p(sys.argv[2])
 except Exception:
     print('stale'); sys.exit()
+if f.year < 2000:  # nie gestartet (FinishedAt 0001-01-01): kein bewusster Stopp
+    print('stale'); sys.exit()
 now = dt.datetime.now(dt.timezone.utc)
 print('valid %.1f' % ((now - m).total_seconds() / 3600) if f <= m + dt.timedelta(seconds=30) else 'stale')
 PY
@@ -65,7 +67,7 @@ if [ "${sm%% *}" = valid ]; then
     reasons+=("recorder bewusst angehalten seit ${age} h (> ${STOP_MAX_H} h)")
   fi
 elif docker inspect "$RECC" >/dev/null 2>&1; then
-  [ "$sm" != stale ] || echo "info: Haltemarke des Recorders ungültig (Container lief danach weiter) – wird ignoriert"
+  [ "$sm" != stale ] || echo "info: Haltemarke des Recorders ungültig (Container lief danach weiter oder wurde nie gestartet) – wird ignoriert"
   h=$(health "$RECC")
   [ "$h" = healthy ] || reasons+=("$RECC: $h")
   r=$(docker exec "$RECC" node -e "fetch('http://127.0.0.1:7701/health').then(r=>r.json()).then(j=>{const o=[];if(j.hotCompressedChunks)o.push('hotCompressedChunks='+j.hotCompressedChunks);if(j.partialChunkAlert)o.push('partialChunkAlert '+(j.partialChunkAlertReason||''));if(j.postCommitErrors)o.push('postCommitErrors='+j.postCommitErrors);if(!j.spoolEnabled)o.push('spool disabled');console.log(o.join('; '))},e=>console.log('recorder health unreachable'))" 2>/dev/null) || r="recorder health unreachable"
@@ -74,6 +76,22 @@ elif docker inspect "$RECC" >/dev/null 2>&1; then
   # Journal, kein Alarm; eingefrorene Tage und Rückstand zeigen echte Probleme (Health „unhealthy")
   w=$(docker exec "$RECC" node -e "fetch('http://127.0.0.1:7701/health').then(r=>r.json()).then(j=>console.log(j.dbWriteErrors||0),()=>console.log('?'))" 2>/dev/null) || w='?'
   [ "$w" = 0 ] || echo "info: recorder dbWriteErrors seit Start: $w"
+fi
+# Container ganz weg (compose down / docker rm), obwohl der Recorder schon geschrieben hat (Spool
+# vorhanden): Alarm – außer mit einer Haltemarke jünger als STOP_MAX_H (Gültigkeit gegen den
+# Container ist dann nicht mehr prüfbar)
+LIVE=${OF_DATA:-/var/lib/orderflow-binance/data}/live
+if ! docker inspect "$RECC" >/dev/null 2>&1 && [ -d "$LIVE" ] && [ -n "$(ls -A "$LIVE" 2>/dev/null)" ]; then
+  if [ -f "$ROOT/recorder.stopped" ] && python3 - "$(cat "$ROOT/recorder.stopped")" "$STOP_MAX_H" <<'PY'
+import sys, datetime as dt
+m = dt.datetime.strptime(sys.argv[1].strip(), '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=dt.timezone.utc)
+sys.exit(0 if (dt.datetime.now(dt.timezone.utc) - m).total_seconds() / 3600 < float(sys.argv[2]) else 1)
+PY
+  then
+    echo "info: Recorder-Container entfernt, Haltemarke seit $(cat "$ROOT/recorder.stopped")"
+  else
+    reasons+=("recorder container missing (spool present, no recent stop marker)")
+  fi
 fi
 # Offene komprimierte Chunks unabhängig vom Recorder (sql/hot-chunks.sql; nie normal)
 hot=$(docker exec -i "$DBC" psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow < "$HOT_SQL" 2>/dev/null | sed -n 's/^hot_count|//p')
