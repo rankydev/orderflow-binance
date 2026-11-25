@@ -255,6 +255,32 @@ CONNECTION_TIMEOUT_MS/ADMIN_PORT/DIAG_HEADERS/NONFINAL_TTL_MS/MAX_CONNECTIONS/MA
   `Retry-After: 1`); 96 gemischte Anfragen über 6 Verbindungen alle 200; API-Log bei `warn` leer;
   API 151 MiB.
 
+## Web-Release 2026-11-25, 14:43 UTC (ausgeführt)
+
+Release `20261125T144233Z-0749081bfb` (Inhalt Commit 0749081: Kerzen-Schalter, TPO-Interaktion;
+API-Code identisch mit ba55a90), ausgerollt mit den Skripten aus Commit 148cedd (saubere
+Arbeitskopie) per `release.sh <ID> --allow-pending-migrations 0013,0014`: Status 0001–0012
+angewendet, 0013/0014 ausstehend und **nicht** angewendet; `schema_migrations` endet danach bei 0012. Kein `install-server.sh`, kein `--migrate`, kein nginx.
+
+- Ausfall von außen (Abfrage alle 0,6 s): 14:43:16–14:44:26, ≈ 70 s – davon ≈ 7 s 502
+  (Containerwechsel) und ≈ 63 s 503 „API startet noch (Katalog lädt)" (Katalog über 2 × 167
+  Tage auf dem VPS). Länger als die erwarteten 1–20 s; Hinweis an die API: Katalog-Start auf dem
+  VPS messen bzw. vor dem Umschalten vorwärmen (alter Container bis „Katalog geladen" laufen
+  lassen). Der Monitor-Lauf um 14:44:37 meldete deshalb einmal „orderflow-api: starting".
+- Nachher von außen: Header einschließlich CSP unverändert (Style-Hash gleich), `/api/v1/symbols`
+  unverändert (beide Symbole 2026-06-10…2026-11-24 00:00, gleiche `tileConfigVersion`), neues
+  JS-Bündel `index-Pvx73kpa.js` immutable, `index.html` no-cache; 503 nur während des Starts.
+- Browser (Chromium, öffentliche URL): `fp=0` → „Kerzen" aktiv, 0 `/footprint`-Anfragen, Kerzen
+  auch tief hineingezoomt (`R auto 2 USDT`, LOD L1); zurückgeschaltet → 2 Kacheln geladen, Zellen
+  gezeichnet. TPO: Mausrad ändert die Spaltenbreite (260 → 863 px), nach rechts verschoben
+  ≈ 667 px freier Raum rechts vom letzten Tag. Keine Konsolenfehler, keine CSP-Verstöße,
+  keine API-Fehler. Screenshots: `docs-screenshots/public-candles-only-1m.png`,
+  `docs-screenshots/public-tpo-right-space.png`.
+- Nachbarn vor/nach identisch (Postcheck voll, Exit 0); eigene Site 308/200/200/404.
+- Rücknahme: `deploy/release.sh --rollback` (zurück auf `20261125T084611Z-ba55a900e2`, das
+  Release-Verzeichnis und Image liegen noch auf dem Server), danach
+  `deploy/postcheck.sh <baseline>`.
+
 ## Transfer-Werkzeuge ab Migration 0013/0014 (lokal geprüft, noch nicht auf dem Server)
 
 - `sql/export-roles.sql` (Quelle, nur lesend) erzeugt `roles-source.sql`: Anlage/Angleichung von
