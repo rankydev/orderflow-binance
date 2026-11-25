@@ -49,6 +49,10 @@ if [ "$tables" != 0 ]; then
     say "--replace verlangt eine gestoppte API (Container orderflow-api läuft)"
     exit 1
   fi
+  if [ "$(docker ps -q -f name='^orderflow-recorder$')" != "" ]; then
+    say "--replace verlangt einen gestoppten Recorder (deploy/recorder.sh stop) – sonst schriebe er in die neue Datenbank"
+    exit 1
+  fi
   say "ersetze Datenbank $DB (DROP/CREATE)"
   psql_c -d postgres -c "DROP DATABASE $DB WITH (FORCE)" -c "CREATE DATABASE $DB OWNER $ADMIN"
 fi

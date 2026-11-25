@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Rollt ein mit build-release.sh gebautes Release auf dem VPS aus bzw. zurück.
 #
-#   deploy/release.sh [root@host] <release-id> [--migrate]   ausrollen
+#   deploy/release.sh [root@host] <release-id>               ausrollen (nichts ausstehend)
+#   deploy/release.sh [root@host] <release-id> --migrate 0013,0014,0015,0016
+#        ausrollen und genau diese ausstehenden Migrationen anwenden (andere Menge → Abbruch)
 #   deploy/release.sh [root@host] <release-id> --allow-pending-migrations 0013,0014
 #        ausrollen, obwohl genau diese Migrationen ausstehen; es wird NICHTS migriert (für ein
 #        Release, dessen API das alte Schema verträgt; nicht zusammen mit --migrate)
@@ -17,12 +19,17 @@ set -euo pipefail
 resolve_host "${1:-}"
 [ "$SHIFTED" = 1 ] && shift
 ID=
-MIGRATE=0
+MIGRATE=
 ROLLBACK=0
 ALLOW=
 while [ $# -gt 0 ]; do
   case "$1" in
-    --migrate) MIGRATE=1 ;;
+    --migrate)
+      [ $# -ge 2 ] || die "--migrate braucht die erwartete Liste, z. B. 0013,0014,0015,0016"
+      MIGRATE="$2"
+      shift
+      printf '%s' "$MIGRATE" | grep -qE '^[0-9]{4}(,[0-9]{4})*$' || die "Liste ungültig: $MIGRATE (Form 0013,0014)"
+      ;;
     --rollback) ROLLBACK=1 ;;
     --allow-pending-migrations)
       [ $# -ge 2 ] || die "--allow-pending-migrations braucht eine Liste, z. B. 0013,0014"
@@ -35,7 +42,8 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-[ -z "$ALLOW" ] || [ "$MIGRATE" = 0 ] || die "--allow-pending-migrations und --migrate schließen sich aus"
+[ -z "$ALLOW" ] || [ -z "$MIGRATE" ] || die "--allow-pending-migrations und --migrate schließen sich aus"
+[ -z "$MIGRATE" ] || [ "$ROLLBACK" = 0 ] || die "--migrate und --rollback schließen sich aus"
 [ -z "$ALLOW" ] || [ "$ROLLBACK" = 0 ] || die "--allow-pending-migrations und --rollback schließen sich aus"
 
 if [ "$ROLLBACK" = 0 ]; then
@@ -58,6 +66,25 @@ R=/opt/orderflow-binance
 C="docker compose -p orderflow-binance -f $R/compose.prod.yml --env-file $R/.env"
 say() { printf '[release %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 PREV=$(sed -n 's/^OF_RELEASE=//p' "$R/.env")
+dbq() { docker exec orderflow-db psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow -c "$1" </dev/null; }
+# Produktionsmarker (install-server.sh / post-restore.sql); ohne ihn kein Release
+marker_ok() { [ "$(dbq "SELECT coalesce(shobj_description(oid, 'pg_database') LIKE '%orderflow:production%', false) FROM pg_database WHERE datname = 'orderflow'")" = t ]; }
+# Härtung ausführen und prüfen; ab Migration 0013 muss of_recorder CONNECT auf orderflow haben
+harden_check() { # $1 = Bezeichnung (vor/nach den Migrationen)
+  local h rec
+  say "Härtung ($1): sql/harden-db.sql"
+  h=$(docker exec -i orderflow-db psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow < "$R/sql/harden-db.sql")
+  printf '%s\n' "$h" >&2
+  rec=$(dbq "SELECT count(*) FROM schema_migrations WHERE version = '0013'")
+  printf '%s\n' "$h" | grep -qx 'dbpriv|orderflow|of_api_connect=true|of_api_temp=false|of_api_create=false' \
+    && ! printf '%s\n' "$h" | grep -E '^dbpriv\|' | grep -v '^dbpriv|orderflow|' | grep -q 'connect=true' \
+    && ! printf '%s\n' "$h" | grep -q '_temp=true' \
+    && ! printf '%s\n' "$h" | grep -q '_create=true' \
+    && printf '%s\n' "$h" | grep -q '^public_connect|false|public_temp|false|' \
+    && printf '%s\n' "$h" | grep -qx 'prodmarker|true' \
+    && { [ "$rec" = 0 ] || printf '%s\n' "$h" | grep -qx 'dbpriv|orderflow|of_recorder_connect=true|of_recorder_temp=false|of_recorder_create=false'; } \
+    || { say "Härtung ($1) nicht wie erwartet – Abbruch, API bleibt auf dem bisherigen Release"; exit 1; }
+}
 cd "$R/releases"
 
 if [ "$ROLLBACK" = 1 ]; then
@@ -72,6 +99,8 @@ else
   gunzip -c api-image.tar.gz | docker load -q
   rm -f api-image.tar.gz
   cd ..
+  marker_ok || { say "Datenbank ohne Produktionsmarker – zuerst deploy/install-server.sh (setzt ihn); Abbruch"; exit 1; }
+  harden_check "vor den Migrationen"
   # Migrationsstand mit dem NEUEN Image prüfen (Migrationsdateien liegen im Image)
   # Das Skript kommt als Argument von bash -c (lib.sh remote), stdin der Gegenseite ist /dev/null.
   # Die </dev/null hier sind eine zweite Sicherung: `compose run` liest stdin und hatte, als das
@@ -87,34 +116,28 @@ else
     want=$(printf '%s' "$ALLOW" | tr ',' '\n' | sort | paste -sd, -)
     say "ausstehend: ${pending:-keine}; erlaubt (ohne Anwendung): $want"
     [ "$pending" = "$want" ] || { say "ausstehende Migrationen ≠ erlaubte Liste – Abbruch"; exit 1; }
-  elif printf '%s\n' "$st" | grep -q '^ausstehend'; then
-    if [ "$MIGRATE" != 1 ]; then say "ausstehende Migrationen – erneut mit --migrate (nach Prüfung)"; exit 1; fi
+  elif [ -n "$MIGRATE" ]; then
+    want=$(printf '%s' "$MIGRATE" | tr ',' '\n' | sort | paste -sd, -)
+    say "ausstehend: ${pending:-keine}; anzuwenden laut --migrate: $want"
+    [ "$pending" = "$want" ] || { say "ausstehende Migrationen ≠ --migrate-Liste – Abbruch"; exit 1; }
     say "Migrationen anwenden"
     OF_RELEASE=$ID $C run --rm -T ops node packages/db/src/cli.ts up </dev/null
-    # Härtung nach jeder Migration erneut (idempotent): neue Rollen/Rechte (z. B. 0013 of_recorder)
-    say "Härtung erneut (sql/harden-db.sql)"
-    h=$(docker exec -i orderflow-db psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow < "$R/sql/harden-db.sql")
-    printf '%s\n' "$h" >&2
-    { printf '%s\n' "$h" | grep -qx 'dbpriv|orderflow|of_api_connect=true|of_api_temp=false|of_api_create=false' \
-      && ! printf '%s\n' "$h" | grep -E '^dbpriv\|' | grep -v '^dbpriv|orderflow|' | grep -q 'connect=true' \
-      && ! printf '%s\n' "$h" | grep -q '_temp=true' \
-      && ! printf '%s\n' "$h" | grep -q '_create=true' \
-      && printf '%s\n' "$h" | grep -q '^public_connect|false|public_temp|false|' \
-      && printf '%s\n' "$h" | grep -qx 'prodmarker|true'; } \
-      || { say "Härtung nach den Migrationen nicht wie erwartet – API bleibt auf dem alten Release"; exit 1; }
+    # Härtung nach den Migrationen erneut (neue Rollen/Rechte, z. B. 0013 of_recorder)
+    harden_check "nach den Migrationen"
+  elif [ -n "$pending" ]; then
+    say "ausstehende Migrationen ($pending) – erneut mit --migrate $pending (nach Prüfung)"; exit 1
   fi
   say "Passwort der Rolle of_api aus api.env setzen"
   OF_RELEASE=$ID $C run --rm -T ops node apps/api/src/cli/api-role-password.ts </dev/null
   # Rolle of_recorder (ab 0013): Passwort aus recorder.env mit dem Werkzeug des Recorders
   # (e938c31, sendet nur den SCRAM-Verifier).
-  if [ -f /etc/orderflow-binance/recorder.env ] \
-     && [ "$(docker exec orderflow-db psql -X -At -U of_admin -d orderflow -c "SELECT count(*) FROM pg_roles WHERE rolname = 'of_recorder'" </dev/null)" = 1 ]; then
+  # Ab Migration 0013 (Schema) ist das Passwort Pflicht: fehlen recorder.env oder das Werkzeug → Abbruch
+  if [ "$(dbq "SELECT count(*) FROM schema_migrations WHERE version = '0013'")" = 1 ]; then
+    [ -f /etc/orderflow-binance/recorder.env ] || { say "recorder.env fehlt – zuerst deploy/install-server.sh; Abbruch"; exit 1; }
+    OF_RELEASE=$ID $C run --rm -T ops test -f apps/recorder/src/cli/recorder-role-password.ts </dev/null \
+      || { say "Release enthält recorder-role-password nicht, Schema ist ab 0013 – Abbruch"; exit 1; }
     say "Passwort der Rolle of_recorder aus recorder.env setzen"
-    if OF_RELEASE=$ID $C run --rm -T ops test -f apps/recorder/src/cli/recorder-role-password.ts </dev/null; then
-      OF_RELEASE=$ID $C run --rm -T ops node apps/recorder/src/cli/recorder-role-password.ts </dev/null
-    else
-      say "Release enthält das Werkzeug recorder-role-password nicht – Passwort von of_recorder NICHT gesetzt"
-    fi
+    OF_RELEASE=$ID $C run --rm -T ops node apps/recorder/src/cli/recorder-role-password.ts </dev/null
   fi
 fi
 
@@ -133,10 +156,26 @@ if ! $C up -d --wait --wait-timeout 120 api </dev/null; then
 fi
 ln -sfn "releases/$ID" "$R/current.new" && mv -Tf "$R/current.new" "$R/current"
 # Läuft der Recorder bereits, bekommt er dasselbe Release (startet neu: Spool + REST ab letzter ID).
-# Gestartet wird er hier nie erstmals – das ist recorder.sh start.
+# Gestartet wird er hier nie erstmals – das ist recorder.sh start. Enthält das Ziel-Image keinen
+# Recorder (z. B. Rollback auf ein älteres Release), wird er geordnet angehalten statt in eine
+# Neustartschleife zu laufen.
 if [ "$(docker inspect -f '{{.State.Running}}' orderflow-recorder 2>/dev/null)" = true ]; then
-  say "Recorder läuft – auf $ID umstellen"
-  $C --profile recorder up -d recorder </dev/null
+  if docker run --rm --entrypoint test "orderflow-api:$ID" -f apps/recorder/src/main.ts </dev/null; then
+    say "Recorder läuft – auf $ID umstellen"
+    $C --profile recorder up -d recorder </dev/null
+    rst=missing
+    for _ in $(seq 1 60); do # ≤ 10 min: Spool-Wiedergabe + REST ab der letzten ID
+      rst=$(docker inspect -f '{{.State.Health.Status}}' orderflow-recorder 2>/dev/null || echo missing)
+      [ "$rst" = healthy ] && break
+      sleep 10
+    done
+    [ "$rst" = healthy ] || { say "!!! Recorder nach dem Umstellen auf $ID nicht healthy (Status $rst) – Logs prüfen; API/Web sind umgestellt"; exit 1; }
+    say "Recorder healthy auf $ID"
+  else
+    say "!!! Release $ID enthält keinen Recorder – Recorder wird ANGEHALTEN (keine Live-Daten, bis ein Release mit Recorder läuft)"
+    $C --profile recorder stop recorder </dev/null
+    date -u +%FT%TZ > "$R/recorder.stopped"
+  fi
 fi
 say "current → $(readlink "$R/current")"
 

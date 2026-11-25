@@ -92,7 +92,8 @@ dafür umgebaut werden.
   der Server hat Node 20 für PulseBot, das Projekt braucht Node 24; ein zweites systemweites Node
   oder ein Upgrade würde pm2/PulseBot gefährden, ein SSH-Tunnel vom Mac koppelt jede Migration an
   den Mac. Das Image enthält genau die Migrationsdateien des Releases; `release.sh` prüft den Stand
-  und wendet ausstehende Migrationen nur mit `--migrate` an.
+  und wendet ausstehende Migrationen nur mit `--migrate <Liste>` an – genau diese Menge, sonst
+  Abbruch; Produktionsmarker und Härtung prüft es bei jedem Release vor und nach den Migrationen.
 - Passwort der API-Rolle: `release.sh` ruft bei jedem Release `api-role-password.ts` im
   ops-Container auf (liest `OF_API_DB_PASSWORD` aus `api.env`, idempotent).
 - Härtung (`sql/harden-db.sql`, nach dem Transfer): `REVOKE CONNECT, TEMPORARY … FROM PUBLIC`,
@@ -274,9 +275,13 @@ unless-stopped`, Health-Startphase 2,5 h (REST-Nachholen: ≈ 7 Daten-Minuten je
   Server bündelt die Schritte (`prepare`, `hot`, `repair-dry`, `repair` mit Sperre gegen parallele
   Admin-/psql-/Dump-Sitzungen, `require-zero`, `report`, `catchup-range`, `start`, `health`,
   `stop`), `deploy/recorder.sh` ruft sie vom Mac auf. Ablauf: RUNBOOK „Recorder-Rollout".
-- **Produktionsmarker:** `install-server.sh` und jeder Restore (`post-restore.sql`) setzen
+- **Produktionsmarker:** `install-server.sh` und jeder Restore setzen
   `COMMENT ON DATABASE orderflow IS 'orderflow:production'` (das Migrationswerkzeug verweigert dann
-  `reset`/`down`); Härtungsprüfung verlangt `prodmarker|true` (nur Ziel, nie die Mac-DB).
+  `reset`/`down`). Alle Restore-Wege laufen über `bin/restore-db.sh` → `sql/post-restore.sql`, auch
+  `transfer-db.sh --replace` (DROP/CREATE, danach neu gesetzt; `--replace` verlangt gestoppte API
+  und gestoppten Recorder). Hart geprüft: `transfer-db.sh` (`prodmarker|true` nach der Härtung),
+  `release.sh` (vor jedem Release, sonst Abbruch) und `postcheck.sh` (fehlt er: Fehler). Nur Ziel,
+  nie die Mac-DB.
 - **Lokal Ende-zu-Ende geprüft** (Wegwerf-Container, amd64-Image aus `git archive` + deploy-Stand):
   Schema 0012 mit offenem komprimiertem Chunk → Release-Pfad (`up 0013…0016`, Härtung OK,
   Passwörter beider Rollen) → `hot` (1) → `repair-dry` → `repair` (Sperre 10 ms) → `require-zero`

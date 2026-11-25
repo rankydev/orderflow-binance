@@ -28,10 +28,44 @@ fi
 # Recorder (nur wenn der Container existiert, d. h. einmal mit recorder-ctl.sh start angelegt):
 # läuft er nicht oder ist nicht healthy → Alarm. Aus seiner Health zusätzlich offene komprimierte
 # Chunks, Alarm zu teilweise komprimierten Chunks, Fehler nach der Finalisierung, Schreibfehler.
-if docker inspect "$RECC" >/dev/null 2>&1 && [ -f "$ROOT/recorder.stopped" ] \
-   && [ "$(docker inspect -f '{{.State.Running}}' "$RECC")" != true ]; then
-  echo "info: Recorder bewusst angehalten seit $(cat "$ROOT/recorder.stopped") (recorder.sh start hebt das auf)"
+# Haltemarke des Recorders prüfen (recorder-ctl.sh stop bzw. release.sh schreiben sie): gültig nur,
+# wenn der Container nicht läuft und spätestens 30 s nach der Marke beendet wurde (sonst lief er
+# danach noch und starb von selbst). Ausgabe: "valid <Stunden>" | "stale" | "none".
+stop_marker() { # $1 Container, $2 Markendatei
+  [ -f "$2" ] || { echo none; return; }
+  [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" != true ] || { echo stale; return; }
+  python3 - "$(cat "$2")" "$(docker inspect -f '{{.State.FinishedAt}}' "$1" 2>/dev/null)" <<'PY'
+import sys, re, datetime as dt
+def p(x):
+    # Docker liefert Nanosekunden (…:30.123456789Z); fromisoformat kann höchstens Mikrosekunden
+    m = re.match(r'^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$', x.strip())
+    if not m:
+        raise ValueError(x)
+    frac = (m.group(2) or '0')[:6].ljust(6, '0')
+    tz = '+00:00' if m.group(3) == 'Z' else m.group(3)
+    return dt.datetime.fromisoformat(m.group(1) + '.' + frac + tz)
+try:
+    m, f = p(sys.argv[1]), p(sys.argv[2])
+except Exception:
+    print('stale'); sys.exit()
+now = dt.datetime.now(dt.timezone.utc)
+print('valid %.1f' % ((now - m).total_seconds() / 3600) if f <= m + dt.timedelta(seconds=30) else 'stale')
+PY
+}
+# Bewusst angehalten: Hinweis statt Alarm – aber höchstens STOP_MAX_H Stunden (Standard 24 h; danach
+# ist ein Tag Live-Daten nur noch über die Tagesdatei zu holen und REST-Lücken > 48 h sind verloren)
+STOP_MAX_H=${OF_RECORDER_STOP_MAX_H:-24}
+sm=none
+docker inspect "$RECC" >/dev/null 2>&1 && sm=$(stop_marker "$RECC" "$ROOT/recorder.stopped")
+if [ "${sm%% *}" = valid ]; then
+  age=${sm#valid }
+  if python3 -c "import sys; sys.exit(0 if float('$age') < $STOP_MAX_H else 1)"; then
+    echo "info: Recorder bewusst angehalten seit $(cat "$ROOT/recorder.stopped") (${age} h; recorder.sh start hebt das auf)"
+  else
+    reasons+=("recorder bewusst angehalten seit ${age} h (> ${STOP_MAX_H} h)")
+  fi
 elif docker inspect "$RECC" >/dev/null 2>&1; then
+  [ "$sm" != stale ] || echo "info: Haltemarke des Recorders ungültig (Container lief danach weiter) – wird ignoriert"
   h=$(health "$RECC")
   [ "$h" = healthy ] || reasons+=("$RECC: $h")
   r=$(docker exec "$RECC" node -e "fetch('http://127.0.0.1:7701/health').then(r=>r.json()).then(j=>{const o=[];if(j.hotCompressedChunks)o.push('hotCompressedChunks='+j.hotCompressedChunks);if(j.partialChunkAlert)o.push('partialChunkAlert '+(j.partialChunkAlertReason||''));if(j.postCommitErrors)o.push('postCommitErrors='+j.postCommitErrors);if(!j.spoolEnabled)o.push('spool disabled');console.log(o.join('; '))},e=>console.log('recorder health unreachable'))" 2>/dev/null) || r="recorder health unreachable"

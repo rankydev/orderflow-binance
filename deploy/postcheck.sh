@@ -48,9 +48,34 @@ fi
 printf '%s' "$hdr" | grep -iq '^server: nginx/' && { warn "nginx-Version sichtbar"; bad=1; }
 remote <<'EOF' >&2 || bad=1
 set -euo pipefail
+# Haltemarke des Recorders prüfen (recorder-ctl.sh stop bzw. release.sh schreiben sie): gültig nur,
+# wenn der Container nicht läuft und spätestens 30 s nach der Marke beendet wurde (sonst lief er
+# danach noch und starb von selbst). Ausgabe: "valid <Stunden>" | "stale" | "none".
+stop_marker() { # $1 Container, $2 Markendatei
+  [ -f "$2" ] || { echo none; return; }
+  [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" != true ] || { echo stale; return; }
+  python3 - "$(cat "$2")" "$(docker inspect -f '{{.State.FinishedAt}}' "$1" 2>/dev/null)" <<'PY'
+import sys, re, datetime as dt
+def p(x):
+    # Docker liefert Nanosekunden (…:30.123456789Z); fromisoformat kann höchstens Mikrosekunden
+    m = re.match(r'^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$', x.strip())
+    if not m:
+        raise ValueError(x)
+    frac = (m.group(2) or '0')[:6].ljust(6, '0')
+    tz = '+00:00' if m.group(3) == 'Z' else m.group(3)
+    return dt.datetime.fromisoformat(m.group(1) + '.' + frac + tz)
+try:
+    m, f = p(sys.argv[1]), p(sys.argv[2])
+except Exception:
+    print('stale'); sys.exit()
+now = dt.datetime.now(dt.timezone.utc)
+print('valid %.1f' % ((now - m).total_seconds() / 3600) if f <= m + dt.timedelta(seconds=30) else 'stale')
+PY
+}
 docker ps --filter name='^orderflow-' --format '  {{.Names}} {{.Status}} {{.Ports}}'
-# Kein Port von uns außerhalb von 127.0.0.1
-! docker ps --filter name='^orderflow-' --format '{{.Ports}}' | tr ',' '\n' | grep -v '^ *$' | grep -vq '127.0.0.1:'
+# Kein veröffentlichter Port von uns außerhalb von 127.0.0.1 (nur Einträge mit Host-Bindung „->")
+pub=$(docker ps --filter name='^orderflow-' --format '{{.Ports}}' | tr ',' '\n' | sed 's/^ *//' | grep -- '->' || true)
+[ -z "$(printf '%s\n' "$pub" | grep -v '^127\.0\.0\.1:' | grep -v '^$' || true)" ] || { echo "  Port außerhalb 127.0.0.1: $pub"; exit 1; }
 # Erwartete eigene Container: db und api laufen; der Recorder nur, wenn er angelegt wurde – dann
 # muss er laufen und healthy sein, und er veröffentlicht keinen Port
 for c in orderflow-db orderflow-api; do
@@ -59,11 +84,18 @@ done
 if docker inspect orderflow-recorder >/dev/null 2>&1; then
   st=$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' orderflow-recorder)
   echo "  orderflow-recorder: $st"
-  [ "$st" = "running healthy" ] || [ "$st" = "exited " ] || { echo "  Recorder weder healthy noch bewusst angehalten"; exit 1; }
+  if [ "$st" != "running healthy" ]; then
+    sm=$(stop_marker orderflow-recorder /opt/orderflow-binance/recorder.stopped)
+    [ "${sm%% *}" = valid ] || { echo "  Recorder weder healthy noch gültig bewusst angehalten ($sm)"; exit 1; }
+    echo "  Recorder bewusst angehalten (Marke gültig, ${sm#valid } h)"
+  fi
   [ -z "$(docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{if $b}}{{$p}} {{end}}{{end}}' orderflow-recorder)" ] || { echo "  Recorder veröffentlicht einen Port"; exit 1; }
 fi
 # Recorder-Health/Ereignisse (7701) nur im Compose-Netz – auf dem Host lauscht niemand darauf
-! ss -ltnH | awk '{print $4}' | grep -qE ':7701$' || { echo "  Port 7701 lauscht auf dem Host"; exit 1; }
+[ -z "$(ss -ltnH 'sport = :7701')" ] || { echo "  Port 7701 lauscht auf dem Host"; exit 1; }
+# Produktionsmarker der Datenbank (install-server.sh, post-restore.sql) – fehlt er: harter Fehler
+[ "$(docker exec orderflow-db psql -X -At -U of_admin -d orderflow -c "SELECT coalesce(shobj_description(oid, 'pg_database') LIKE '%orderflow:production%', false) FROM pg_database WHERE datname = 'orderflow'" </dev/null)" = t ] \
+  || { echo "  Datenbank ohne Produktionsmarker orderflow:production"; exit 1; }
 systemctl is-active orderflow-monitor.timer >/dev/null && journalctl -u orderflow-monitor.service -n 1 --no-pager -o cat || echo "  Monitor-Timer noch nicht aktiv"
 EOF
 if [ "$bad" != 0 ]; then

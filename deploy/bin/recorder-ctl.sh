@@ -49,6 +49,14 @@ guard_no_snapshot_readers() {
   [ "$n" = 0 ] || { say "$n laufende Admin-/psql-/Dump-Sitzung(en) auf orderflow – Reparatur verweigert (nie parallel zu Transfer/Prüfbericht)"; exit 1; }
 }
 importer() { $C run --rm -T importer node apps/importer/src/main.ts "$@" </dev/null; }
+# Keine offenen komprimierten Chunks: Probelauf der Reparatur meldet 0 und hot-chunks --require-zero
+require_zero() {
+  local out
+  out=$(importer repair-open-chunks --dry-run)
+  printf '%s\n' "$out"
+  printf '%s\n' "$out" | grep -q 'repair-open-chunks: 0 Chunks gefunden' || { say "Probelauf meldet nicht 0"; exit 1; }
+  OF_HOT_SQL="$R/sql/hot-chunks.sql" OF_DB_CONTAINER="$DBC" "$R/bin/hot-chunks.sh" --require-zero
+}
 
 cmd=${1:-}
 [ $# -gt 0 ] && shift
@@ -70,12 +78,7 @@ case "$cmd" in
     guard_no_snapshot_readers
     importer repair-open-chunks --lock-timeout-ms 500
     ;;
-  require-zero)
-    out=$(importer repair-open-chunks --dry-run)
-    printf '%s\n' "$out"
-    printf '%s\n' "$out" | grep -q 'repair-open-chunks: 0 Chunks gefunden' || { say "Probelauf meldet nicht 0"; exit 1; }
-    OF_HOT_SQL="$R/sql/hot-chunks.sql" OF_DB_CONTAINER="$DBC" "$R/bin/hot-chunks.sh" --require-zero
-    ;;
+  require-zero) require_zero ;;
   report) psql_admin < "$R/sql/verify-db.sql" ;;
   catchup)
     [ $# -gt 0 ] || { say "catchup braucht Importer-Argumente"; exit 2; }
@@ -95,6 +98,9 @@ case "$cmd" in
   start)
     [ -d "$DATA/live" ] || { say "zuerst prepare"; exit 1; }
     wait_min=${1:-150}
+    printf '%s' "$wait_min" | grep -qE '^[0-9]+$' && [ "$wait_min" -ge 1 ] || { say "start [MIN]: MIN muss eine ganze Zahl ≥ 1 sein"; exit 2; }
+    say "Vorbedingung: keine offenen komprimierten Chunks"
+    require_zero
     rm -f "$R/recorder.stopped"
     $C --profile recorder up -d recorder </dev/null
     for _ in $(seq 1 $(( wait_min * 6 ))); do
@@ -115,5 +121,5 @@ case "$cmd" in
     date -u +%FT%TZ > "$R/recorder.stopped"
     say "Recorder angehalten: $(docker inspect -f '{{.State.Status}}' "$RECC" 2>/dev/null || echo fehlt)"
     ;;
-  *) sed -n '2,20p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,/^set -euo/p' "$0" | sed '$d' >&2; exit 2 ;;
 esac
