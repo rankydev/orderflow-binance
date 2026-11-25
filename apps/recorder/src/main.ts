@@ -29,8 +29,10 @@
 //    ≈ 40 s je Chunk, während der Importer-Advisory-Lock die ganze Zeit gehalten wird (ein paralleler
 //    Importer-Lauf wartet bzw. bricht mit „lock_busy" ab). Gelingt die Sperre nicht, bleibt der Chunk
 //    teilweise (lesbar, konsistent) und der nächste schreibende Lauf versucht es erneut.
-//  - Health/ingest_status: partialChunks, partialChunkOldestAgeMs (Alter seit erster Beobachtung,
-//    über Neustarts in details.partialChunkFirstSeen gehalten), partialChunkAlert/-Reason (> 24 h,
+//  - Health/ingest_status: hotCompressedChunks (offene Chunks im Columnstore – nie normal, sofort
+//    Alarm; Abhilfe: importer repair-open-chunks), partialChunks, partialChunkOldestAgeMs (Alter seit
+//    erster Beobachtung, über Neustarts in details.partialChunkFirstSeen gehalten),
+//    partialChunkAlert/-Reason (> 1 h,
 //    oder teilweise Chunks bei mehr als einem Tag Finalisierungsrückstand); postCommitErrors /
 //    lastPostCommitError {source: conversion|settle|cascade|close|other}: Tag ist final, aber danach
 //    schlug etwas fehl (Konvertierung, Randminute des Vortags, Kaskade, close-Durchlauf)
@@ -147,6 +149,7 @@ async function run(): Promise<number> {
     partial.seed(d.partialChunkFirstSeen as Record<string, unknown> | undefined);
   let partialState: PartialChunkState = {
     count: 0,
+    hotCompressed: 0,
     oldestAgeMs: 0,
     firstSeen: partial.firstSeen(), // bis zur ersten Prüfung die übernommenen Zeitpunkte erhalten
     alert: false,
@@ -156,7 +159,13 @@ async function run(): Promise<number> {
     const now = Date.now();
     const finals = [...rec.sym.values()].map((x) => x.final?.day ?? null);
     const lastFinal = finals.includes(null) ? null : Math.min(...(finals as number[]));
-    partialState = partial.update(await writer.partialChunks(), now, lastFinal, dayIndex(now));
+    partialState = partial.update(
+      await writer.partialChunks(),
+      now,
+      lastFinal,
+      dayIndex(now),
+      await writer.hotCompressedChunks(),
+    );
     if (partialState.alert)
       logLine('PARTIAL CHUNK ALERT', {
         reason: partialState.alertReason,
@@ -208,6 +217,7 @@ async function run(): Promise<number> {
       spoolPrunedDays: rec.spoolPruned.length,
       rawPrunedFiles,
       partialChunks: partialState.count,
+      hotCompressedChunks: partialState.hotCompressed,
       partialChunkOldestAgeMs: partialState.oldestAgeMs,
       partialChunkAlert: partialState.alert,
       partialChunkAlertReason: partialState.alertReason,
@@ -267,6 +277,7 @@ async function run(): Promise<number> {
           details: {
             ...x,
             partialChunks: h.partialChunks,
+            hotCompressedChunks: h.hotCompressedChunks,
             partialChunkOldestAgeMs: h.partialChunkOldestAgeMs,
             partialChunkAlert: h.partialChunkAlert,
             partialChunkAlertReason: h.partialChunkAlertReason,

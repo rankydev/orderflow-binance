@@ -117,4 +117,16 @@ describe('PartialChunkTracker (H2a)', () => {
     expect(late.alertReason).toMatch(/Finalisierung/);
     expect(new PartialChunkTracker().update([], now, today - 9, today).alert).toBe(false);
   });
+
+  it('offene Chunks im Columnstore lösen sofort Alarm aus; ein teilweiser Chunk erst nach 1 h (0015)', () => {
+    const today = parseDay('2026-11-25');
+    const now = today * DAY_MS + 10 * H;
+    const hot = new PartialChunkTracker().update([], now, today - 1, today, ['_hyper_9_29_chunk']);
+    expect(hot).toMatchObject({ alert: true, hotCompressed: 1 });
+    expect(hot.alertReason).toMatch(/offene Chunks im Columnstore.*repair-open-chunks/);
+    const t = new PartialChunkTracker();
+    expect(t.update(['c'], now, today - 1, today).alert).toBe(false);
+    expect(t.update(['c'], now + 30 * 60_000, today - 1, today).alert).toBe(false);
+    expect(t.update(['c'], now + 61 * 60_000, today - 1, today).alert).toBe(true);
+  });
 });

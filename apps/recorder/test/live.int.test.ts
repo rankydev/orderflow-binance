@@ -4,12 +4,20 @@
 // Qualitätsvergleich und identischen Digests, Zusammenspiel der Locks von Recorder und Importer.
 import { getSymbol, parseConfig, parseDay, type DbConfig } from '@orderflow/core';
 import { connect, dropAndCreateDatabase, migrateUp, type Sql } from '@orderflow/db';
-import { DryRunWriter, Importer, PostgresWriter } from '@orderflow/importer';
+import {
+  DryRunWriter,
+  HOT_MARGIN,
+  Importer,
+  PostgresWriter,
+  repairOpenChunks,
+} from '@orderflow/importer';
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { archive } from '../../importer/test/synth.ts';
 import { finaliseDay } from '../src/finalize.ts';
+import { toItem } from '../src/binance.ts';
 import { LiveWriter } from '../src/livewriter.ts';
+import { Recorder } from '../src/recorder.ts';
 import { replayDay } from '../src/replay.ts';
 
 const base = parseConfig(process.env).db;
@@ -342,6 +350,13 @@ describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5
        WHERE proc_name IN ('policy_compression', 'policy_columnstore')
          AND coalesce((config ->> 'recompress')::boolean, true)`;
     expect(odd!.n).toBe(0);
+    // 0015: Policy-Frist mindestens die Marge für offene Chunks (HOT_MARGIN = 3 Tage); die Policy
+    // vergleicht mit range_end, damit komprimiert auch sie nie einen offenen Chunk
+    const [short] = await sql`
+      SELECT count(*)::int AS n FROM timescaledb_information.jobs
+       WHERE proc_name IN ('policy_compression', 'policy_columnstore')
+         AND coalesce((config ->> 'compress_after')::interval, interval '0') < ${HOT_MARGIN}::interval`;
+    expect(short!.n).toBe(0);
   });
 
   it('of_recompress_chunk lehnt Chunks ohne Columnstore ab, bevor es sperrt (H4)', async () => {
@@ -445,5 +460,146 @@ describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5
     }
     const [d] = await sql`SELECT state FROM data_day WHERE sym_id = 1 AND day = ${H3_DAY}::date`;
     expect(d!.state).toBe('final_ok');
+  });
+});
+
+describe('Offene Chunks nie im Columnstore (Migration 0015)', () => {
+  // offene („heiße") Chunks der Projekttabellen mit Status-Bit 1 bzw. 8
+  const hotChunks = async () =>
+    sql`
+      SELECT format('%I.%I', c.chunk_schema, c.chunk_name) AS c, c.hypertable_name AS h, k.status
+        FROM timescaledb_information.chunks c
+        JOIN _timescaledb_catalog.chunk k ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
+       WHERE c.hypertable_schema = 'public' AND c.range_end > now() - interval '3 days'
+       ORDER BY 2`;
+  const compressedOrPartial = async () =>
+    (await hotChunks()).filter((c) => ((c.status as number) & 9) !== 0).map((c) => c.h as string);
+
+  // Live-Minuten zur aktuellen Uhrzeit über den echten Recorder-Pfad (Recorder → LiveWriter)
+  async function writeLiveMinutes(fromMs: number, minutes: number, firstId: number) {
+    const w = new LiveWriter(cfg);
+    await w.open();
+    const spec = BTC;
+    const day = Math.floor(fromMs / 86_400_000);
+    const rec = new Recorder({
+      symbols: ['BTCUSDT'],
+      wsUrl: 'wss://test.invalid',
+      socketFactory: () => ({
+        onopen: null,
+        onmessage: null,
+        onclose: null,
+        onerror: null,
+        close() {},
+      }),
+      rest: { aggTrades: async () => [], klines: async () => [] },
+      sink: {
+        startState: async () => ({
+          final: { day: day - 1, lastAggId: firstId - 1, carry: null, cand: null },
+          provisional: [],
+        }),
+        writeMinute: (s, d) => w.writeMinute(s, d),
+        markGap: async () => {},
+        markFrozen: async () => {},
+        writeKlineChecks: async () => {},
+      },
+      spoolDir: null,
+      log: () => {},
+      klineCheck: false,
+      autoLoops: false,
+    });
+    await rec.start();
+    const s = rec.sym.get('BTCUSDT')!;
+    const items = [];
+    let id = firstId;
+    for (let t = fromMs; t < fromMs + minutes * 60_000; t += 5_000) {
+      items.push(
+        toItem(
+          {
+            a: id,
+            p: (90_000 + (id % 7) / 10).toFixed(1),
+            q: '0.010',
+            f: id,
+            l: id,
+            T: t,
+            m: id % 2 === 0,
+          },
+          spec,
+          false,
+        ),
+      );
+      id++;
+    }
+    rec.handle(s, items, false);
+    rec.completeMinutes(s, fromMs + minutes * 60_000 + 10_000);
+    await rec.drain();
+    await rec.stop();
+    await w.close();
+    return id;
+  }
+
+  it('Live-Schreiben in alle 12 Tabellen, Policy- und Importer-Läufe: offene Chunks bleiben im Rowstore; repair-open-chunks holt komprimierte zurück', async () => {
+    const now = Date.now();
+    const from = now - (now % 60_000) - 40 * 60_000; // 40 Minuten zurück, ganze Minute
+    let id = await writeLiveMinutes(from, 5, 9_000_000_000);
+    // kline_1m bekommt live keine Zeilen (nur der Importer): eine Zeile im laufenden Chunk
+    await sql`INSERT INTO kline_1m (sym_id, ts, open_px, high_px, low_px, close_px, vol, taker_buy, trades, quote_vol_n)
+              VALUES (1, ${new Date(from)}, 1, 1, 1, 1, 1, 1, 1, 1) ON CONFLICT DO NOTHING`;
+    const tables = new Set((await hotChunks()).map((c) => c.h as string));
+    expect([...tables].sort()).toEqual(
+      [...RECORDER_WRITES.slice(0, 12)].sort(), // fp_* (8), bar_1m/1h/1d, kline_1m
+    );
+    expect(await compressedOrPartial()).toEqual([]);
+
+    // Vorfall nachstellen: offene Chunks komprimiert (wie das Messskript vom 2026-11-24)
+    for (const c of await hotChunks())
+      await sql
+        .unsafe('CALL convert_to_columnstore($1::regclass, if_not_columnstore => true)', [
+          c.c as string,
+        ])
+        .catch(() => {}); // Tabellen ohne Columnstore (bar_1h, bar_1d, fp_1d_*) lehnen ab
+    const before = (await compressedOrPartial()).sort();
+    expect(before.length).toBeGreaterThan(0);
+    const [cnt0] =
+      await sql`SELECT (SELECT count(*) FROM fp_1m) + (SELECT count(*) FROM bar_1m) AS n`;
+    const logs: string[] = [];
+    const maint = connect(cfg);
+    const rep = await repairOpenChunks(maint, { log: (m) => logs.push(m) });
+    expect(rep.map((r) => r.hypertable).sort()).toEqual(before);
+    expect(rep.every((r) => r.convertMs !== null && r.lockWaitMs !== null)).toBe(true);
+    expect(await compressedOrPartial()).toEqual([]);
+    expect(await repairOpenChunks(maint, {})).toEqual([]); // idempotent
+    await maint.end();
+    const [cnt1] =
+      await sql`SELECT (SELECT count(*) FROM fp_1m) + (SELECT count(*) FROM bar_1m) AS n`;
+    expect(cnt1!.n).toBe(cnt0!.n);
+
+    // weitere Live-Minuten: keine teilweise komprimierten Chunks
+    id = await writeLiveMinutes(from + 5 * 60_000, 5, id);
+    expect(await compressedOrPartial()).toEqual([]);
+
+    // alle Policy-Jobs: offene Chunks bleiben unkomprimiert (Policy vergleicht range_end)
+    for (const j of await sql`
+      SELECT job_id FROM timescaledb_information.jobs
+       WHERE proc_name IN ('policy_compression', 'policy_columnstore')`)
+      await sql.unsafe(`CALL run_job(${j.job_id as number})`);
+    expect(await compressedOrPartial()).toEqual([]);
+
+    // Importer: Backfill-Konvertierung „bis in die Zukunft" und close()-Durchlauf lassen sie in Ruhe
+    const wr = new PostgresWriter(cfg, BTC, { log: () => {} });
+    await wr.open();
+    await wr.convertFinishedChunks(Date.now() + 60 * 86_400_000);
+    await wr.close();
+    expect(await compressedOrPartial()).toEqual([]);
+
+    // of_recompress_chunk lehnt einen offenen Chunk ab, bevor es sperrt
+    const fp = (await hotChunks()).find((c) => c.h === 'fp_1m')!;
+    await expect(
+      sql`SELECT of_recompress_chunk(${fp.c as string}::regclass)`,
+    ).rejects.toMatchObject({
+      code: '55000',
+    });
+    // und nach der Wiederholung des Schreibens ist immer noch nichts komprimiert
+    await writeLiveMinutes(from + 10 * 60_000, 2, id);
+    expect(await compressedOrPartial()).toEqual([]);
   });
 });

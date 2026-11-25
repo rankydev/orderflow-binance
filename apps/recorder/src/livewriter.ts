@@ -254,6 +254,19 @@ export class LiveWriter {
     return rows.map((r) => r.c as string);
   }
 
+  /** Offene Chunks (range_end > now() - 3 Tage) der Projekttabellen im Columnstore (Migration 0015). */
+  async hotCompressedChunks(): Promise<string[]> {
+    const rows = await this.db`
+      SELECT format('%I.%I', c.chunk_schema, c.chunk_name) AS c
+        FROM timescaledb_information.chunks c
+        JOIN _timescaledb_catalog.chunk k
+          ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
+       WHERE c.hypertable_schema = 'public' AND (k.status & 1) <> 0
+         AND c.range_end > now() - interval '3 days'
+       ORDER BY 1`;
+    return rows.map((r) => r.c as string);
+  }
+
   async markFrozen(spec: SymbolSpec, day: number, reason: string): Promise<void> {
     const ds = formatDay(day);
     await this.db.begin(async (tx) => {
