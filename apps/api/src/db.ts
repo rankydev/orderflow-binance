@@ -9,8 +9,21 @@ import { busy, HttpError } from './errors.ts';
 export type Sql = postgres.Sql;
 export type Row = unknown[];
 
-export function createPool(cfg: ApiConfig, applicationName = 'orderflow-api'): Sql {
+export interface PoolOptions {
+  /** Eigenes statement_timeout (ms) statt cfg.statementTimeoutMs (Katalog-Pool). */
+  statementTimeoutMs?: number;
+  /** Wird für JEDE Anweisung des Pools aufgerufen (Tests: Budget des Katalogstarts). */
+  onStatement?: (text: string) => void;
+}
+
+export function createPool(
+  cfg: ApiConfig,
+  applicationName = 'orderflow-api',
+  opt: PoolOptions = {},
+): Sql {
+  const onStatement = opt.onStatement;
   return postgres({
+    ...(onStatement ? { debug: (_c: number, text: string) => onStatement(text) } : {}),
     host: cfg.db.host,
     port: cfg.db.port,
     username: cfg.db.user,
@@ -26,7 +39,7 @@ export function createPool(cfg: ApiConfig, applicationName = 'orderflow-api'): S
     onnotice: () => {},
     connection: {
       application_name: applicationName,
-      statement_timeout: cfg.statementTimeoutMs,
+      statement_timeout: opt.statementTimeoutMs ?? cfg.statementTimeoutMs,
       lock_timeout: cfg.lockTimeoutMs,
       idle_in_transaction_session_timeout: 30_000,
       default_transaction_read_only: true,

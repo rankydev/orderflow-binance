@@ -74,6 +74,64 @@ describe('RecorderEvents (SSE)', () => {
     await until(() => got.length === 3);
   }, 20_000);
 
+  it('ohne Kommentarzeilen und ohne vorab gesendete Kopfzeilen: Ereignisse kommen trotzdem an', async () => {
+    const clients = new Set<ServerResponse>();
+    let reqs = 0;
+    const srv = createServer((req, res) => {
+      reqs++;
+      // wie der Recorder heute: Kopfzeilen erst mit dem ersten Ereignis, keine Kommentare
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      clients.add(res);
+      req.on('close', () => clients.delete(res));
+    }).listen(0, '127.0.0.1');
+    await new Promise((r) => srv.once('listening', r));
+    const got: string[] = [];
+    const ev = new RecorderEvents(
+      `http://127.0.0.1:${(srv.address() as AddressInfo).port}/events`,
+      (s) => got.push(s),
+    );
+    cleanup.push(async () => {
+      await ev.stop();
+      for (const c of clients) c.destroy();
+      await new Promise((r) => srv.close(r));
+    });
+    ev.start();
+    await until(() => reqs === 1 && clients.size === 1);
+    for (const c of clients) c.write('event: minute\ndata: {"symbol":"BTCUSDT","ts":60000}\n\n');
+    await until(() => got.length === 1);
+    expect(ev.status.connected).toBe(true);
+    // Keepalive-Kommentare dazwischen stören nicht
+    for (const c of clients)
+      c.write(
+        ': keepalive\n\nevent: minute\n: mitten im Block\ndata: {"symbol":"ETHUSDT","ts":1}\n\n',
+      );
+    await until(() => got.length === 2);
+    expect(got).toEqual(['BTCUSDT', 'ETHUSDT']);
+    expect(reqs).toBe(1);
+  });
+
+  it('Server nimmt an und schließt sofort: Backoff wächst (kein Neuversuch je Sekunde)', async () => {
+    let connects = 0;
+    const srv = createServer((_req, res) => {
+      connects++;
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(': ok\n\n');
+    }).listen(0, '127.0.0.1');
+    await new Promise((r) => srv.once('listening', r));
+    const ev = new RecorderEvents(
+      `http://127.0.0.1:${(srv.address() as AddressInfo).port}/events`,
+      () => {},
+    );
+    cleanup.push(async () => {
+      await ev.stop();
+      await new Promise((r) => srv.close(r));
+    });
+    ev.start();
+    // Versuche bei 0 s, 1 s, 3 s, 7 s … – mit Rücksetzen je Annahme wären es bei 3,5 s schon 4
+    await sleep(3_500);
+    expect(connects).toBe(3);
+  }, 10_000);
+
   it('nicht erreichbar: kein Absturz, Status mit Fehler, stop() beendet sofort', async () => {
     const ev = new RecorderEvents('http://127.0.0.1:9/events', () => {});
     ev.start();

@@ -118,7 +118,10 @@ describe('Datenbankausfall', () => {
     });
     for (let i = 0; i < 5; i++) await cat.refresh();
     expect(cat.failures).toBe(5);
-    expect(logs.filter((l) => l.startsWith('warn'))).toHaveLength(1);
+    // noch nie geladen: als Fehler (API antwortet nur 503), gedrosselt auf eine Meldung
+    expect(logs.filter((l) => l.startsWith('error') || l.startsWith('warn'))).toEqual([
+      expect.stringMatching(/^error:Katalog-Start fehlgeschlagen/),
+    ]);
     down = false;
     await cat.refresh();
     expect(cat.failures).toBe(0);

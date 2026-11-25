@@ -26,7 +26,9 @@ export async function startApi(
 ): Promise<RunningApi> {
   const sql = createPool(cfg);
   // eigener Ein-Verbindungs-Pool für den Katalog: Anfragen-Bursts blockieren ihn nicht und umgekehrt
-  const catSql = createPool({ ...cfg, dbPool: 1 }, 'orderflow-api-catalog');
+  const catSql = createPool({ ...cfg, dbPool: 1 }, 'orderflow-api-catalog', {
+    statementTimeoutMs: cfg.catalogStatementTimeoutMs,
+  });
   const cache = new ResponseCache(cfg.cacheBytes);
   const limiter = new Limiter(cfg.dbPool, cfg.maxQueue, cfg.queueTimeoutMs);
   let app: ReturnType<typeof buildApp> | null = null;
@@ -35,7 +37,8 @@ export async function startApi(
     lockRetries: cfg.lockRetries,
     // Angebot der Kacheln: Quellzeilengrenze je Kachel (nicht die der Profile)
     maxSourceRows: Math.min(cfg.maxTileSourceRows, cfg.maxSourceRows),
-    refreshTimeoutMs: Math.max(10_000, 3 * cfg.statementTimeoutMs),
+    // eine Aktualisierung besteht aus mehreren Anweisungen mit eigenem Zeitlimit (Katalog-Pool)
+    refreshTimeoutMs: Math.max(10_000, 3 * cfg.catalogStatementTimeoutMs),
     log: (level, msg, obj) => app?.log[level](obj ?? {}, msg),
   });
   // Recorder-Ereignis (Minute festgeschrieben) → sofort aktualisieren statt bis zur nächsten Abfrage

@@ -4,6 +4,9 @@
 // Statistik kommen wie immer aus der Datenbank, das Ereignis ist nur der Zeitpunkt. Fällt der Feed
 // aus, bleibt die Abfrage alle pollMs (nichts geht verloren, es dauert nur bis zur nächsten Abfrage).
 
+/** Ab dieser Verbindungsdauer gilt der Feed auch ohne Ereignis als gesund (Backoff zurück auf 1 s). */
+export const HEALTHY_CONNECTION_MS = 30_000;
+
 export interface EventFeedStatus {
   url: string;
   connected: boolean;
@@ -51,8 +54,16 @@ export class RecorderEvents {
         if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
         this.status.connected = true;
         this.status.lastError = null;
-        delay = 1_000;
-        await this.consume(res.body);
+        const since = Date.now();
+        const before = this.status.events;
+        try {
+          await this.consume(res.body);
+        } finally {
+          // Backoff erst zurücksetzen, wenn die Verbindung etwas getragen hat (ein Ereignis oder
+          // ≥ 30 s offen): ein Server, der annimmt und sofort schließt, bekommt sonst 1 Versuch/s
+          if (this.status.events > before || Date.now() - since >= HEALTHY_CONNECTION_MS)
+            delay = 1_000;
+        }
         throw new Error('Feed beendet');
       } catch (e) {
         this.status.connected = false;
@@ -83,7 +94,10 @@ export class RecorderEvents {
     }
   }
 
-  /** Ein SSE-Ereignisblock; nur `event: minute` mit gültigen Daten zählt, alles andere wird ignoriert. */
+  /**
+   * Ein SSE-Ereignisblock; nur `event: minute` mit gültigen Daten zählt, alles andere wird ignoriert –
+   * auch Kommentarzeilen (`: ok`, Keepalive), auf die der Client nicht angewiesen ist.
+   */
   private dispatch(block: string): void {
     let event = 'message';
     let data = '';

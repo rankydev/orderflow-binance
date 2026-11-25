@@ -328,7 +328,11 @@ describe('Rolle of_api', () => {
 
 describe('Katalogstart: Budget unabhängig von der Zahl der Tage, nie ein Footprint-Scan', () => {
   it('Start: 2 + 4 · Symbole Abfragen, nur Bar-Tabellen; ohne Änderung danach 2; Schranken ≥ tatsächlich', async () => {
-    const sql = createPool({ ...apiCfg(), dbPool: 1 }, 'orderflow-api-catalog-test');
+    // JEDE Anweisung des Pools (auch außerhalb von ReadTx: Chunk-Liste, BEGIN/COMMIT, direkte sql-Aufrufe)
+    const all: string[] = [];
+    const sql = createPool({ ...apiCfg(), dbPool: 1 }, 'orderflow-api-catalog-test', {
+      onStatement: (t) => all.push(t),
+    });
     const texts: string[] = [];
     const orig = ReadTx.prototype.rows;
     ReadTx.prototype.rows = function (text, params) {
@@ -352,11 +356,22 @@ describe('Katalogstart: Budget unabhängig von der Zahl der Tage, nie ein Footpr
       // STATS_RUN_DAYS zusammenhängende Tage je Lauf, also unabhängig von der Zahl der Tage
       expect(STATS_RUN_DAYS).toBeGreaterThanOrEqual(366);
       expect(texts.length).toBe(2 + 4 * syms.length);
-      // kein Statement liest eine Footprint-Tabelle (≈ 2,7 GB je Symbol bei 167 Tagen, der alte Start)
-      for (const t of texts) expect(t).not.toMatch(/\bfp_\w+/);
+      // alle Anweisungen des Pools: dieselben plus je Lauf die Chunk-Liste (autocommit) und je
+      // Transaktion BEGIN/COMMIT – und keine liest eine Footprint-Tabelle (≈ 2,7 GB je Symbol bei
+      // 167 Tagen, der alte Start); die Chunk-Liste fragt nur Bar-Hypertables ab
+      const ctl = (t: string) => /^\s*(begin|commit|rollback)\b/i.test(t);
+      const work = all.filter((t) => !ctl(t));
+      expect(all.length).toBeGreaterThan(texts.length);
+      expect(work.length).toBe(texts.length + syms.length);
+      for (const t of all) expect(t).not.toMatch(/\bfp_\w+/);
+      expect(work.filter((t) => /timescaledb_information\.chunks/.test(t))).toHaveLength(
+        syms.length,
+      );
       texts.length = 0;
+      all.length = 0;
       await cat.refresh();
       expect(texts.length).toBe(2);
+      expect(all.filter((t) => !ctl(t))).toHaveLength(2);
       // Zeilen: Bars exakt, Footprint als obere Schranke; Minutenmaske = gespeicherte Minuten
       const s = syms[0]!;
       for (const [d, st] of s.stats) {
@@ -385,6 +400,49 @@ describe('Katalogstart: Budget unabhängig von der Zahl der Tage, nie ein Footpr
       ReadTx.prototype.rows = orig;
       await cat.stop();
       await sql.end();
+    }
+  });
+
+  it('Katalog-Pool mit eigenem Zeitlimit; scheiternder Start sichtbar in /health (Status-Listener)', async () => {
+    const c = apiCfg();
+    expect(c.catalogStatementTimeoutMs).toBe(30_000);
+    const cat = createPool({ ...c, dbPool: 1 }, 'orderflow-api-catalog-test', {
+      statementTimeoutMs: c.catalogStatementTimeoutMs,
+    });
+    const req = createPool({ ...c, dbPool: 1 }, 'orderflow-api-test');
+    try {
+      expect((await cat`SHOW statement_timeout`)[0]!.statement_timeout).toBe('30s');
+      expect((await req`SHOW statement_timeout`)[0]!.statement_timeout).toBe(
+        `${c.statementTimeoutMs / 1000}s`,
+      );
+    } finally {
+      await Promise.all([cat.end(), req.end()]);
+    }
+    // Start gegen eine nicht vorhandene Datenbank: läuft, antwortet 503, nennt den Grund
+    const port = await new Promise<number>((r) => {
+      const srv = createServer().listen(0, '127.0.0.1', () => {
+        const p = (srv.address() as AddressInfo).port;
+        srv.close(() => r(p));
+      });
+    });
+    const api = await start({
+      db: { ...c.db, database: `${testDb}_fehlt` },
+      adminPort: port,
+      pollMs: 60_000,
+    });
+    try {
+      expect(api.deps.catalog.ready).toBe(false);
+      expect((await get(api, '/api/v1/symbols')).res.status).toBe(503);
+      const h = await fetch(`${api.adminUrl}/health`);
+      expect(h.status).toBe(503);
+      const body = (await h.json()) as {
+        reasons: string[];
+        catalog: { failures: number; lastErrorKind: string | null };
+      };
+      expect(body.catalog.failures).toBeGreaterThanOrEqual(1);
+      expect(body.reasons.join(' ')).toMatch(/Start-Aktualisierung \d+× fehlgeschlagen/);
+    } finally {
+      await api.close();
     }
   });
 

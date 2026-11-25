@@ -32,7 +32,7 @@ Suiten anderer Pakete auf `<OF_DB_NAME>_test` sie nicht stören). Benchmark:
 
 `OF_API_HOST=127.0.0.1`, `OF_API_PORT=8780`, `OF_API_ADMIN_PORT=8781`, `OF_API_CORS_ORIGINS=loopback`
 (`*` oder Liste), `OF_API_DB_POOL=4`, `OF_API_MAX_QUEUE=64`, `OF_API_QUEUE_TIMEOUT_MS=10000`,
-`OF_API_STATEMENT_TIMEOUT_MS=5000`, `OF_API_LOCK_TIMEOUT_MS=1000`, `OF_API_LOCK_RETRIES=3`, `OF_API_CACHE_MB=200`,
+`OF_API_STATEMENT_TIMEOUT_MS=5000`, `OF_API_CATALOG_STATEMENT_TIMEOUT_MS=30000` (eigener Katalog-Pool: Statistik bis 1 Jahr bar_1m je Abfrage; ein wiederholt scheiternder Start wird als Fehler geloggt und unter `/health` mit Grund und Zahl der Versuche gemeldet), `OF_API_LOCK_TIMEOUT_MS=1000`, `OF_API_LOCK_RETRIES=3`, `OF_API_CACHE_MB=200`,
 `OF_API_NONFINAL_TTL_MS=10000`, `OF_API_POLL_MS=1000`, `OF_API_MAX_SOURCE_ROWS=1500000` (Profile, `/bars`), `OF_API_MAX_TILE_SOURCE_ROWS=300000` (Angebot und
 Auslieferung der Footprint-Kacheln), `OF_API_MAX_CELLS=60000`
 (nur Profile), `OF_API_CONNECTION_TIMEOUT_MS=30000`, `OF_API_REQUEST_TIMEOUT_MS=30000`,
@@ -47,7 +47,7 @@ antwortet mit 502. Wird nginx anders eingestellt, diesen Wert entsprechend darü
 `OF_API_RECORDER_EVENTS_URL` (Standard leer = aus): SSE-Feed des Recorders, z. B.
 `http://recorder:7701/events`; jedes `event: minute` stößt sofort eine Katalog-Aktualisierung an (sonst bis zu
 `OF_API_POLL_MS` später). Fällt der Feed aus, verbindet sich die API mit Backoff (1–30 s) neu; die Abfrage läuft
-unabhängig davon weiter. Zustand unter `/health` des Status-Listeners (`recorderEvents`).
+unabhängig davon weiter; der Backoff fällt erst nach einem empfangenen Ereignis bzw. 30 s Verbindung auf 1 s zurück. Kommentarzeilen (`: ok`, Keepalive) werden ignoriert, der Client braucht sie nicht. Zustand unter `/health` des Status-Listeners (`recorderEvents`).
 
 Startzeit (`node --env-file=.env apps/api/bench/catalog-start.ts`, nur lesend): Der Katalog liest beim Start
 `symbol`, `data_day` und je Symbol die Bar-Tabellen der ganzen Historie in einem Lauf je ≤ 366 Tage – 2 + 4 ·

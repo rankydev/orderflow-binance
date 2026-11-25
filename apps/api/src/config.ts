@@ -20,6 +20,11 @@ export interface ApiConfig {
   /** Höchste Wartezeit in der Warteschlange (ms), danach 503. */
   queueTimeoutMs: number;
   statementTimeoutMs: number;
+  /**
+   * statement_timeout des Katalog-Pools (ms, Standard 30 000): die Statistik-Abfragen lesen bis zu einem
+   * Jahr bar_1m je Symbol; auf einem kalten VPS darf das länger dauern als eine Anfrage (Standard 5 s).
+   */
+  catalogStatementTimeoutMs: number;
   lockTimeoutMs: number;
   /** Wiederholungen nach Sperr-Zeitüberschreitung (lock_not_available), mit Backoff. */
   lockRetries: number;
@@ -133,6 +138,14 @@ export function parseApiConfig(env: Env): ApiConfig {
     maxQueue: intIn(problems, env, 'OF_API_MAX_QUEUE', 64, 0, 10_000),
     queueTimeoutMs: intIn(problems, env, 'OF_API_QUEUE_TIMEOUT_MS', 10_000, 100, 120_000),
     statementTimeoutMs: intIn(problems, env, 'OF_API_STATEMENT_TIMEOUT_MS', 5_000, 100, 60_000),
+    catalogStatementTimeoutMs: intIn(
+      problems,
+      env,
+      'OF_API_CATALOG_STATEMENT_TIMEOUT_MS',
+      30_000,
+      1_000,
+      600_000,
+    ),
     lockTimeoutMs: intIn(problems, env, 'OF_API_LOCK_TIMEOUT_MS', 1_000, 10, 30_000),
     lockRetries: intIn(problems, env, 'OF_API_LOCK_RETRIES', 3, 0, 10),
     cacheBytes: intIn(problems, env, 'OF_API_CACHE_MB', 200, 0, 4096) * 1024 * 1024,

@@ -286,10 +286,14 @@ export class Catalog extends EventEmitter {
         const now = Date.now();
         if (now - this.lastWarnAt >= 60_000) {
           this.lastWarnAt = now;
-          this.opt.log('warn', 'Katalog-Aktualisierung fehlgeschlagen', {
-            err: this.lastError,
-            failures: this.failures,
-          });
+          // vor dem ersten Erfolg antwortet die API nur 503: dann als Fehler, nicht als Warnung
+          this.opt.log(
+            this.ready ? 'warn' : 'error',
+            this.ready
+              ? 'Katalog-Aktualisierung fehlgeschlagen'
+              : 'Katalog-Start fehlgeschlagen (API antwortet 503, bis er gelingt)',
+            { err: this.lastError, kind: this.lastErrorKind, failures: this.failures },
+          );
         }
       })
       .finally(() => {

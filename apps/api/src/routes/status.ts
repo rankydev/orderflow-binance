@@ -27,7 +27,19 @@ export const MAX_ISSUES = 5_000;
 function health(deps: Deps): { state: 'healthy' | 'degraded' | 'unhealthy'; reasons: string[] } {
   const reasons: string[] = [];
   const cat = deps.catalog;
-  if (!cat.ready) return { state: 'unhealthy', reasons: ['Katalog noch nicht geladen'] };
+  if (!cat.ready)
+    return {
+      state: 'unhealthy',
+      reasons: [
+        'Katalog noch nicht geladen',
+        // wiederholt scheiternder Start (z. B. Zeitlimit auf kaltem VPS) sichtbar statt stummem 503
+        ...(cat.lastError
+          ? [
+              `Start-Aktualisierung ${cat.failures}× fehlgeschlagen (${cat.lastErrorKind ?? 'other'}): ${cat.lastError}`,
+            ]
+          : []),
+      ],
+    };
   const age = Date.now() - cat.lastRefresh;
   let bad = false;
   if (age > 3 * deps.cfg.staleAfterMs) {
@@ -59,6 +71,8 @@ export function healthDetail(deps: Deps, startedAt: number, reply: FastifyReply)
       ready: cat.ready,
       ageMs: cat.lastRefresh > 0 ? Date.now() - cat.lastRefresh : null,
       lastError: cat.lastError,
+      lastErrorKind: cat.lastErrorKind,
+      failures: cat.failures,
     },
     recorderEvents: deps.events ? { ...deps.events.status } : null,
     symbols: cat.symbols().map((x) => ({
