@@ -60,7 +60,7 @@ Let's-Encrypt-Konto vorhanden, Docker-Version; legt die Baseline der Nachbarn ab
 
 ```bash
 deploy/install-server.sh
-deploy/postcheck.sh "$BASE" --neighbours-only   # Exit 0 = Nachbarn unverändert; Exit 1 = sofort Rücknahme
+deploy/postcheck.sh "$BASE" --neighbours-only   # 0 = ok; 1 = Nachbarn verändert → sofort Rücknahme; 4 = Produktionsmarker fehlt; 5 = Marker nicht prüfbar (DB läuft nicht)
 ```
 
 Ändert (nur eigene Pfade): Benutzer/Gruppe `orderflow` (10001), Verzeichnisse
@@ -71,6 +71,8 @@ Prüfung: Skript zeigt `db ok` + `timescaledb 2.31.2`.
 **Rücknahme:** `docker compose -p orderflow-binance -f /opt/orderflow-binance/compose.prod.yml --env-file /opt/orderflow-binance/.env down -v`,
 `rm -rf /opt/orderflow-binance /etc/orderflow-binance /var/lib/orderflow-binance /var/www/orderflow-acme /etc/systemd/system/orderflow-monitor.*`,
 `systemctl daemon-reload`, `userdel orderflow`, `docker image rm timescale/timescaledb:2.31.2-pg17`.
+Danach `deploy/postcheck.sh "$BASE" --uninstalled` (nur Nachbarn; bricht mit Exit 5 ab, solange
+`/opt/orderflow-binance` oder der Container `orderflow-db` noch existieren).
 
 ## Schritt 3 – Datenbank übertragen (≈ 15–25 min)
 
@@ -162,7 +164,8 @@ deploy/postcheck.sh "$BASE"
 ```
 
 Exit 0 = alles gut, 1 = Nachbarn verändert (sofort prüfen/zurücknehmen), 3 = Nachbarn unverändert,
-eigene Site nicht wie erwartet. Muss bestehen: Nachbarn identisch zur Baseline (Units ohne Neustart, genius-Container gleiche
+eigene Site nicht wie erwartet, 4 = Datenbank ohne Produktionsmarker (`install-server.sh` setzt ihn),
+5 = Marker nicht prüfbar (DB-Container fehlt oder Abfrage fehlgeschlagen). Muss bestehen: Nachbarn identisch zur Baseline (Units ohne Neustart, genius-Container gleiche
 Startzeit, pm2 ohne Neustart, Ports, Dateien, Statuscodes innen/außen, Standardserver genius),
 eigene Site 308/200/200/404, keine Diagnose-Header, keine nginx-Version, alle eigenen Ports nur
 auf 127.0.0.1. Danach im Browser `https://orderflow.rankyhub.com/` öffnen (Konsole ohne

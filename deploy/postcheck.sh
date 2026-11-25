@@ -2,18 +2,29 @@
 # Nachprüfung (nur lesend): Nachbardienste unverändert gegenüber der Preflight-Baseline, und die
 # eigene Site antwortet. Auch nach jedem Rollback-Schritt ausführen.
 #
-#   deploy/postcheck.sh [root@host] <baseline-datei> [--neighbours-only]
-# Exit 0 = alles ok · 4 = Datenbank ohne Produktionsmarker (harter Fehler) · 1 = Nachbardienste
-# verändert oder Schnappschuss unvollständig (sofort
-# handeln) · 3 = Nachbarn unverändert, aber die eigene Site noch nicht/nicht wie erwartet.
-# --neighbours-only: nur die Nachbarn prüfen (nach Schritt 2–4, bevor die Site existiert).
+#   deploy/postcheck.sh [root@host] <baseline-datei> [--neighbours-only | --uninstalled]
+# Exit 0 = alles ok · 1 = Nachbardienste verändert oder Schnappschuss unvollständig (sofort
+# handeln) · 3 = Nachbarn unverändert, aber die eigene Site nicht wie erwartet · 4 = Datenbank ohne
+# Produktionsmarker (harter Fehler) · 5 = Produktionsmarker nicht prüfbar (DB-Container fehlt oder
+# Abfrage fehlgeschlagen) bzw. „--uninstalled" angegeben, aber noch etwas installiert.
+# --neighbours-only: Nachbarn + Produktionsmarker (nach Schritt 2–4, bevor die Site existiert).
+# --uninstalled:     nach der vollständigen Rücknahme von Schritt 2 (Deinstallation): nur die
+#                    Nachbarn; prüft, dass /opt/orderflow-binance und der Container orderflow-db
+#                    wirklich fehlen (fail-closed), und lässt nur dann die Marker-Prüfung aus.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 resolve_host "${1:-}"
 [ "$SHIFTED" = 1 ] && shift
 BASE=${1:?Baseline-Datei aus preflight.sh angeben}
 ONLY=0
-[ "${2:-}" = --neighbours-only ] && ONLY=1
+UNINST=0
+for a in "${@:2}"; do
+  case "$a" in
+    --neighbours-only) ONLY=1 ;;
+    --uninstalled) UNINST=1 ONLY=1 ;;
+    *) die "unbekanntes Argument: $a" ;;
+  esac
+done
 NOW="${BASE%.txt}-after-$(date -u +%H%M%S).txt"
 
 remote < "$DEPLOY_DIR/bin/server-snapshot.sh" > "$NOW" || die "Schnappschuss fehlgeschlagen"
@@ -28,17 +39,34 @@ if diff <(grep -v '^info|' "$BASE") <(grep -v '^info|' "$NOW"); then
 else
   die "ABWEICHUNG bei den Nachbardiensten (siehe diff oben; $BASE ↔ $NOW)"
 fi
-# Produktionsmarker der Datenbank – auch im Modus --neighbours-only (Schritte 2 und 4 des
-# Recorder-Rollouts; Schritt 2 setzt ihn). Fehlt er: Exit 4 (harter Fehler, eigene Datenbank)
-mk=$(remote <<'EOF'
-docker exec orderflow-db psql -X -At -U of_admin -d orderflow -c "SELECT coalesce(shobj_description(oid, 'pg_database') LIKE '%orderflow:production%', false) FROM pg_database WHERE datname = 'orderflow'" </dev/null 2>/dev/null || echo error
+if [ "$UNINST" = 1 ]; then
+  # fail-closed: nur wenn wirklich nichts mehr installiert ist, entfällt die Marker-Prüfung
+  left=$(remote <<'EOF'
+[ -e /opt/orderflow-binance ] && echo "/opt/orderflow-binance"
+docker inspect orderflow-db >/dev/null 2>&1 && echo "container orderflow-db"
+true
 EOF
 )
-if [ "$mk" != t ]; then
-  warn "Datenbank ohne Produktionsmarker orderflow:production ($mk) – zuerst deploy/install-server.sh"
-  exit 4
+  if [ -n "$left" ]; then
+    warn "--uninstalled angegeben, aber noch vorhanden: $(printf '%s' "$left" | tr '\n' ' ')"
+    exit 5
+  fi
+  log "deinstalliert: /opt/orderflow-binance und orderflow-db fehlen – Marker-Prüfung entfällt"
+  exit 0
 fi
-log "Produktionsmarker vorhanden"
+# Produktionsmarker der Datenbank – auch im Modus --neighbours-only (Schritte 2 und 4 des
+# Recorder-Rollouts; Schritt 2 setzt ihn). t = vorhanden; f = fehlt (Exit 4); nodb/error = nicht
+# prüfbar (Exit 5)
+mk=$(remote <<'EOF'
+if ! docker inspect -f '{{.State.Running}}' orderflow-db 2>/dev/null | grep -qx true; then echo nodb; exit 0; fi
+docker exec orderflow-db psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow -c "SELECT coalesce(shobj_description(oid, 'pg_database') LIKE '%orderflow:production%', false) FROM pg_database WHERE datname = 'orderflow'" </dev/null 2>/dev/null || echo error
+EOF
+)
+case "$mk" in
+  t) log "Produktionsmarker vorhanden" ;;
+  f) warn "Datenbank ohne Produktionsmarker orderflow:production – zuerst deploy/install-server.sh"; exit 4 ;;
+  *) warn "Produktionsmarker nicht prüfbar ($mk: DB-Container fehlt/läuft nicht oder Abfrage fehlgeschlagen)"; exit 5 ;;
+esac
 [ "$ONLY" = 1 ] && exit 0
 
 log "eigene Site"
@@ -107,9 +135,7 @@ if docker inspect orderflow-recorder >/dev/null 2>&1; then
 fi
 # Recorder-Health/Ereignisse (7701) nur im Compose-Netz – auf dem Host lauscht niemand darauf
 [ -z "$(ss -ltnH 'sport = :7701')" ] || { echo "  Port 7701 lauscht auf dem Host"; exit 1; }
-# Produktionsmarker der Datenbank (install-server.sh, post-restore.sql) – fehlt er: harter Fehler
-[ "$(docker exec orderflow-db psql -X -At -U of_admin -d orderflow -c "SELECT coalesce(shobj_description(oid, 'pg_database') LIKE '%orderflow:production%', false) FROM pg_database WHERE datname = 'orderflow'" </dev/null)" = t ] \
-  || { echo "  Datenbank ohne Produktionsmarker orderflow:production"; exit 1; }
+# (Produktionsmarker: oben vor diesem Block geprüft, Exit 4/5)
 systemctl is-active orderflow-monitor.timer >/dev/null && journalctl -u orderflow-monitor.service -n 1 --no-pager -o cat || echo "  Monitor-Timer noch nicht aktiv"
 EOF
 if [ "$bad" != 0 ]; then
