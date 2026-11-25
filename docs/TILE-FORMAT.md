@@ -305,8 +305,9 @@ Umgesetzt in `apps/api` (Katalog `src/catalog.ts`, Routen `src/routes/tiles.ts`)
 ## Stats-Spalten (optional, `stats=1`)
 
 `/bars` und `/footprint` liefern mit dem Parameter `stats=1` zusätzlich diese `x.`-Spalten (Länge = `nBars`,
-gleiche Reihenfolge wie `time`; Decoder und Clients ohne Kenntnis ignorieren sie). Ohne `stats` ist jede
-Antwort byte-gleich wie bisher. `stats` ist Teil des Cache-Schlüssels und der `dataVersion`;
+gleiche Reihenfolge wie `time`; Decoder und Clients ohne Kenntnis ignorieren sie). Ohne `stats` hat jede
+Antwort dasselbe Format wie bisher; `dataVersion`/ETag ändern sich mit dieser Version einmalig für alle
+Antworten (die Eingabe des Hashes enthält jetzt den stats-Schalter), danach wieder nur mit den Daten. `stats` ist Teil des Cache-Schlüssels und der `dataVersion`;
 `tileConfigVersion` bleibt unberührt.
 
 | Spalte | Typ | Inhalt (KONZEPT §3.5; Teilbars i = Minuten bzw. Stunden der Bar, d_i = buy − sell, P_{i−1} = Σ_{k<i} d_k) |
@@ -321,6 +322,9 @@ Antwort byte-gleich wie bisher. `stats` ist Teil des Cache-Schlüssels und der `
   Teilbars der gröbsten passenden Bar-Tabelle (`bar_1m` für 1m…30m, `bar_1h` für 1h…4h, `bar_1d` für 1d); exakt.
   Belegt durch Brute-Force-Tests aus `bar_1m` für jeden Zeitrahmen (Testdatenbank) und eine unabhängige
   SQL-Rechnung auf echten Daten (`apps/api/bench/stats-check.ts`, BTC und ETH: 13 104 Bars, 0 Abweichungen).
+- **`x.trades`, zwei Fallen:** An Lückentagen kann `x.trades` einer größeren Bar die Summe der `x.trades` ihrer
+  1m-Bars übersteigen: Minuten, die in `bar_1m` fehlen (keine eigenen Trades), haben trotzdem eine Kline mit
+  Trades und zählen in die größere Bar. Und die Spalte **fehlt** (nie 0), wenn der Zeitraum zu breit ist.
 - **`x.trades` nur, wo billig:** wenn die geschätzten `kline_1m`-Zeilen des Zeitraums ≤ 100 000 sind (bei BTC:
   1m…1h-Abschnitte zu 1 000 Bars und alle Footprint-Kacheln bis ≈ 69 Tage Spanne; nicht für 2h-/4h-/1d-Abschnitte
   zu 1 000 Bars). Fehlt die Spalte, ist die Anzahl nicht geliefert (nicht 0). Mit einer Spalte `kline_trades` in
@@ -329,12 +333,26 @@ Antwort byte-gleich wie bisher. `stats` ist Teil des Cache-Schlüssels und der `
 
 ## Inkonsistente Lesestände (503, nie 500)
 
-Jede Lesetransaktion sperrt zuerst die Chunks, die sie lesen wird (leere Abfrage über alle Bereiche), und nimmt
-erst danach ihren Snapshot. Grund: `convert_to_rowstore` (Dekomprimieren vor einem Tagesersatz) ist für Leser mit
-älterem Snapshot nicht MVCC-sicher – sie sähen den Chunk leer („Bar ohne Level"). Passen Bars und Level bzw.
-Profil-Summen in einem Snapshot trotzdem nicht zusammen, wiederholt die API mit neuem Snapshot und antwortet
-danach **503 + `Retry-After: 2`** (`no-store`, nicht gecacht). Betrifft es nur unveränderliche Tage, gilt es
-zusätzlich als Datenfehler: laut protokolliert, Health `degraded`, in `/quality` unter `apiDataErrors`.
+`convert_to_rowstore` (Dekomprimieren eines Chunks vor einem Tagesersatz im Backfill) ist für Leser mit älterem
+Snapshot nicht MVCC-sicher: sie sehen den Chunk danach leer. Eine REPEATABLE-READ-Transaktion nimmt ihren
+Snapshot mit der ersten Abfrage, **vor** dem Planen, in dem Timescale die Chunks sperrt (nachgewiesen: läuft die
+Konvertierung schon, wartet der Leser und liest danach mit altem Snapshot 0 Zeilen). Daher:
+
+- Vor jeder Lesetransaktion ermittelt die API die Chunks der gelesenen Zeiträume (Katalogabfrage, autocommit)
+  und sperrt sie mit `LOCK TABLE … IN ACCESS SHARE MODE` als **erster** Anweisung der Transaktion. `LOCK` ist
+  eine Utility-Anweisung und nimmt keinen Snapshot; der Snapshot entsteht erst mit der folgenden Abfrage, also
+  nach dem Erhalt aller Sperren. Garantie: Keine Konvertierung eines gelesenen Chunks kann zwischen Snapshot und
+  Lesen committen – eine laufende wird abgewartet (bis `OF_API_LOCK_TIMEOUT_MS`, dann Wiederholung/503), eine
+  spätere wartet auf den Leser. Ein Chunk, der erst nach der Katalogabfrage entsteht, ist nicht gesperrt (neue
+  Chunks sind Rowstore; für ihn greift die Leerprüfung unten).
+- Verteidigung in der Tiefe: Bars ohne Level, Level ohne Bars, ungleiche Summen und ein **leerer** Ausschnitt,
+  obwohl der Katalog für die überdeckten Tage Minuten mit Trades kennt (erwartet ≥ 60 Minuten), gelten als
+  inkonsistent – auch für `/bars` und Profile. Die API wiederholt mit neuem Snapshot und antwortet danach
+  **503 + `Retry-After: 2`** (`no-store`, nicht gecacht). Betrifft es nur unveränderliche Tage, gilt es
+  zusätzlich als Datenfehler: laut protokolliert, Health `degraded`, in `/quality` unter `apiDataErrors`; ohne
+  Wiederholung verfällt die Meldung nach einer Stunde.
+- `stats=1` antwortet ebenso mit 503 statt mit einem Teilergebnis, wenn eine Teilbar fehlt oder nicht zur Bar
+  passt.
 
 ## Offener Entwurfspunkt für die API: Kachellänge je Zeitabschnitt (Review, nicht umgesetzt)
 

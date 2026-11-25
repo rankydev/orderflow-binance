@@ -97,8 +97,9 @@ Vielfache von 86 400 000 und `from − offsetH·3 600 000 ≥ 0`; höchstens 400
   **`dataVersion` je Tag** hängt nur von diesen UTC-Tagen und den Parametern (R, va, Offset) ab – gleich in jeder
   Anfrage, die den Tag enthält. Ein Client kann finale Tage damit dauerhaft halten, auch wenn die Antwort
   insgesamt (`final` des Umschlags) wegen eines nicht finalen Tages `false` ist.
-- `vwap` (auch beim Range-Profil): notional / (buyQ + sellQ) in price_unit, auf 6 Nachkommastellen exakt per
-  Ganzzahldivision, `null` ohne Volumen; nur zur Anzeige (exakt ist `notional`).
+- `vwap` (auch beim Range-Profil): notional / (buyQ + sellQ) in price_unit, auf 6 Nachkommastellen
+  **abgeschnitten** (Ganzzahldivision, nicht gerundet), `null` ohne Volumen; nur zur Anzeige (exakt ist
+  `notional`).
 
 ## Kennzahlen (KONZEPT §6.1, einheitlich für Bars, Profile, TPO)
 
