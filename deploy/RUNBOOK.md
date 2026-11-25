@@ -59,7 +59,7 @@ Let's-Encrypt-Konto vorhanden, Docker-Version; legt die Baseline der Nachbarn ab
 
 ```bash
 deploy/install-server.sh
-deploy/postcheck.sh "$BASE"      # Nachbarn unverändert (eigene Site existiert noch nicht → Teil 2 schlägt fehl, erwartet)
+deploy/postcheck.sh "$BASE" --neighbours-only   # Exit 0 = Nachbarn unverändert; Exit 1 = sofort Rücknahme
 ```
 
 Ändert (nur eigene Pfade): Benutzer/Gruppe `orderflow` (10001), Verzeichnisse
@@ -77,15 +77,22 @@ Prüfung: Skript zeigt `db ok` + `timescaledb 2.31.2`.
 deploy/transfer-db.sh
 ```
 
-1/7 Dump (lokal ≈ 2 s, 514 MB) · 2/7 Rolleneinstellungen + SHA256SUMS · 3/7 Prüfbericht Quelle
-(Hintergrund, ≈ 3,5 min) · 4/7 rsync + `sha256sum -c` auf dem Server · 5/7 Restore (≈ 15–30 s) +
-ANALYZE + Prüfbericht Ziel (≈ 4–6 min) · **6/7 Pflichtvergleich – bei Abweichung Abbruch mit Exit 1,
+1/7 Snapshot exportieren + Dump im Snapshot (lokal ≈ 2 s, ≈ 0,5 GB) · 2/7 Rolleneinstellungen + SHA256SUMS · 3/7 Prüfbericht Quelle
+im selben Snapshot (Hintergrund, ≈ 3,5 min; Jobs/Importe auf dem Mac stören den Vergleich nicht) · 4/7 rsync + `sha256sum -c` auf dem Server · 5/7 Restore (≈ 15–30 s) +
+ANALYZE + Prüfbericht Ziel (≈ 4–6 min; Columnstore-Policies des Ziels sind währenddessen angehalten
+und danach wieder aktiv, `jobsched|`-Zeilen vergleichen den Zustand) · **6/7 Pflichtvergleich – bei Abweichung Abbruch mit Exit 1,
 weiter erst nach Klärung** · 7/7 Härtung (`harden-db.sql`: PUBLIC ohne CONNECT/TEMP) und Löschen
 der Dumps auf beiden Seiten.
 Prüfung: Ausgabe `Prüfberichte identisch`, `digest|days=167|match=167|mismatch=0`.
 **Rücknahme / Wiederholung:** API stoppen (falls schon gestartet) und
 `deploy/transfer-db.sh --replace` (DROP/CREATE der Ziel-DB, dann alles erneut), oder Volume
-löschen: `… down -v` und Schritt 2 erneut.
+löschen: `… down -v` und Schritt 2 erneut. Danach `deploy/postcheck.sh "$BASE" --neighbours-only`.
+
+**Daten später ergänzen** (neue Tage/Symbole vom Mac, solange es auf dem VPS keinen Importer gibt):
+derzeit nur über `--replace`, also API stoppen → Ziel-DB ersetzen → Prüfbericht → API starten;
+≈ 10–15 min ohne API (die Web-Seite zeigt solange Fehler/Retry). Spätere Verbesserung ohne
+Ausfall: in eine zweite Datenbank (`orderflow_next`) restaurieren, prüfen, dann per
+`ALTER DATABASE … RENAME` tauschen (kurzer API-Neustart) oder Teilübertragung nach KONZEPT §2.3.
 
 ## Schritt 4 – Release bauen und ausrollen (Bau ≈ 3–5 min, Rollout ≈ 2 min)
 
@@ -99,7 +106,7 @@ Passwort der Rolle `of_api` aus `api.env`, `.env` → `OF_RELEASE=$ID`, `up -d -
 (scheitert der Healthcheck: automatisch zurück auf das vorige Release bzw. API gestoppt),
 Symlink `current` atomar, Rauchtest `127.0.0.1:8780/api/v1/symbols` = 200.
 **Rücknahme:** `deploy/release.sh --rollback` (vorige ID: Image + Web) bzw. beim ersten Release
-`… stop api`.
+`… stop api`. Danach `deploy/postcheck.sh "$BASE" --neighbours-only`.
 
 ## Schritt 5 – nginx und TLS (≈ 2 min)
 
@@ -107,13 +114,20 @@ Symlink `current` atomar, Rauchtest `127.0.0.1:8780/api/v1/symbols` = 200.
 deploy/nginx-setup.sh
 ```
 
-Installiert `conf.d/orderflow-binance.conf`, `snippets/orderflow-binance-headers.conf`, ACME-Webroot;
+Installiert `conf.d/orderflow-binance.conf`, `snippets/orderflow-binance-{headers,proxy}.conf`, ACME-Webroot;
 Phase 1 (nur ohne Zertifikat): Bootstrap-Site (nur Port 80, ACME) → `nginx -t` → reload →
-Probe-Datei über die öffentliche Adresse = 200 → `certbot certonly --webroot …` (vorhandenes
-Konto, Deploy-Hook nur für diese Lineage); Phase 2: endgültige Site → `nginx -t` → reload.
+Probe-Datei über die öffentliche Adresse = 200 → `certbot certonly --account <id> --webroot …`
+(das eine Produktionskonto, das die Renewal-Dateien der Nachbarn nutzen; daneben existiert ein
+Staging-Konto, ohne `--account` könnte certbot nachfragen; Deploy-Hook nur für diese Lineage); Phase 2: endgültige Site → `nginx -t` → reload.
 Schlägt `nginx -t` fehl, nimmt das Skript die eigenen Dateien zurück und lädt **nicht** neu.
 Prüfung (Skript, von innen und vom Mac): `http://` → 308, `https://` → 200,
 `/api/v1/symbols` → 200, `/api/v1/health` → 404.
+Der Symlink heißt `sites-enabled/zz-orderflow.rankyhub.com`: er sortiert immer zuletzt, unsere
+Site wird auf keinem Socket (80, [::]:80, 443, [::]:443) Standardserver; genius bleibt es überall
+(Snapshot prüft IPv4 und IPv6, mit und ohne SNI).
+Erneuerung testen – **nur** mit Namen, sonst laufen die Hooks der Nachbarn und nginx lädt neu:
+`certbot renew --dry-run --cert-name orderflow.rankyhub.com` (Staging; erzeugt ggf. kein neues
+Konto, weil das Staging-Konto existiert).
 **Rücknahme:** `deploy/nginx-setup.sh --rollback` (entfernt die eigenen Dateien, `nginx -t`,
 reload); Zertifikat ggf. `certbot delete --cert-name orderflow.rankyhub.com`.
 
@@ -124,8 +138,7 @@ deploy/install-server.sh --enable-monitor     # idempotent; schaltet orderflow-m
 ```
 
 Prüfung: letzte Journal-Zeile `orderflow healthy (…)`;
-`journalctl -u orderflow-monitor.service -f`. Totmann (healthchecks.io) erst, wenn der Nutzer
-eine Ping-URL gibt: auf dem Server `umask 077; echo 'HC_PING_URL=https://hc-ping.com/<uuid>' > /etc/orderflow-binance/healthcheck.env`.
+`journalctl -u orderflow-monitor.service -f`.
 **Rücknahme:** `systemctl disable --now orderflow-monitor.timer`.
 
 ## Schritt 7 – Abschlussprüfung (nur lesend)
@@ -134,31 +147,43 @@ eine Ping-URL gibt: auf dem Server `umask 077; echo 'HC_PING_URL=https://hc-ping
 deploy/postcheck.sh "$BASE"
 ```
 
-Muss bestehen: Nachbarn identisch zur Baseline (Units ohne Neustart, genius-Container gleiche
+Exit 0 = alles gut, 1 = Nachbarn verändert (sofort prüfen/zurücknehmen), 3 = Nachbarn unverändert,
+eigene Site nicht wie erwartet. Muss bestehen: Nachbarn identisch zur Baseline (Units ohne Neustart, genius-Container gleiche
 Startzeit, pm2 ohne Neustart, Ports, Dateien, Statuscodes innen/außen, Standardserver genius),
 eigene Site 308/200/200/404, keine Diagnose-Header, keine nginx-Version, alle eigenen Ports nur
 auf 127.0.0.1. Danach im Browser `https://orderflow.rankyhub.com/` öffnen (Konsole ohne
 CSP-Fehler, Kacheln laden, kein 429 beim Schwenken).
 
+## Nach dem Rollout – wichtig
+
+- **Niemand wird alarmiert.** Der Monitor schreibt nur ins Journal (und markiert die Unit als
+  „failed"). Der externe Totmann (healthchecks.io, E-Mail an den Nutzer, KONZEPT §2.5) ist
+  vorbereitet, aber **aus**, bis der Nutzer eine Ping-URL gibt; dann auf dem Server:
+  `umask 077; echo 'HC_PING_URL=https://hc-ping.com/<uuid>' > /etc/orderflow-binance/healthcheck.env`
+  (der nächste Timer-Lauf pingt).
+- Rate-Limit je IPv6-Adresse auf /128 (ein Client mit /64 kann es umgehen; später per `map` auf
+  /64 kürzen, falls nötig).
+- Die Daten enden am 2026-11-23; ergänzen siehe Schritt 3 („Daten später ergänzen").
+
 ## Alle zustandsändernden Befehle auf dem Server (zur Freigabe)
 
-| Schritt | Befehl(e)                                                                                                                                                                                                                                                                                                                                                                          |
-| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2       | `groupadd --system --gid 10001 orderflow`; `useradd --system --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin orderflow`                                                                                                                                                                                                                                         |
-| 2       | `install -d` `/opt/orderflow-binance{,/bin,/sql,/releases}`, `/var/www/orderflow-acme` (0755), `/etc/orderflow-binance`, `/var/lib/orderflow-binance{,/transfer}` (0700); Kopien nach `/opt/orderflow-binance/{compose.prod.yml,sql/*,bin/*}`, `.env` (`OF_RELEASE=none`); Staging `/root/.orderflow-binance-stage` (danach gelöscht)                                              |
-| 2       | Secrets erzeugen (nur wenn fehlend): `/etc/orderflow-binance/db.env`, `api.env` (0600, `openssl rand`)                                                                                                                                                                                                                                                                             |
-| 2       | `install` `/etc/systemd/system/orderflow-monitor.{service,timer}`; `systemctl daemon-reload`                                                                                                                                                                                                                                                                                       |
-| 2       | `docker compose -p orderflow-binance … pull db`; `… up -d --wait db` (legt Netz `orderflow-binance_net`, Volume `orderflow-binance_pgdata`, Container `orderflow-db` an)                                                                                                                                                                                                           |
-| 3       | `mkdir /var/lib/orderflow-binance/transfer/<dump>`; `rsync` dorthin                                                                                                                                                                                                                                                                                                                |
-| 3       | `restore-db.sh`: `psql` roles.sql + roles-source.sql (`CREATE ROLE of_api`, `ALTER ROLE of_api …`), `CREATE EXTENSION IF NOT EXISTS timescaledb`, `timescaledb_pre_restore()`, `pg_restore`, post-restore.sql (`timescaledb_post_restore()`, `GRANT CONNECT`), `vacuumdb --analyze-only`; nur bei `--replace`: `DROP DATABASE orderflow WITH (FORCE)`, `CREATE DATABASE orderflow` |
-| 3       | `psql` harden-db.sql (`REVOKE CONNECT, TEMPORARY … FROM PUBLIC`, `GRANT …` an of_admin/of_api); `rm -rf /var/lib/orderflow-binance/transfer/<dump>`                                                                                                                                                                                                                                |
-| 4       | `mkdir` + `rsync` `/opt/orderflow-binance/releases/<id>/`; `docker load`; `rm api-image.tar.gz`                                                                                                                                                                                                                                                                                    |
-| 4       | `docker compose … run --rm ops node packages/db/src/cli.ts status` (nur mit `--migrate`: `… up`); `… run --rm ops node apps/api/src/cli/api-role-password.ts` (`ALTER ROLE of_api PASSWORD …`)                                                                                                                                                                                     |
-| 4       | `.env` schreiben; `docker compose … up -d --wait api` (Container `orderflow-api`, 127.0.0.1:8780); `ln -sfn` + `mv -Tf` `/opt/orderflow-binance/current`; Aufräumen alter Releases/Images `orderflow-api:<alt>`                                                                                                                                                                    |
-| 5       | `install` `/etc/nginx/conf.d/orderflow-binance.conf`, `/etc/nginx/snippets/orderflow-binance-headers.conf`, `/etc/nginx/sites-available/orderflow.rankyhub.com` (erst Bootstrap, dann endgültig), `ln -sfn` nach `sites-enabled/`; Probe-Datei im ACME-Webroot (wieder gelöscht)                                                                                                   |
-| 5       | `nginx -t && systemctl reload nginx` (zweimal)                                                                                                                                                                                                                                                                                                                                     |
-| 5       | `certbot certonly --webroot -w /var/www/orderflow-acme -d orderflow.rankyhub.com --cert-name orderflow.rankyhub.com --non-interactive --keep-until-expiring --deploy-hook 'nginx -t && systemctl reload nginx'` (legt `/etc/letsencrypt/{live,archive,renewal}/orderflow.rankyhub.com*` an)                                                                                        |
-| 6       | `systemctl enable --now orderflow-monitor.timer`; `systemctl start orderflow-monitor.service`                                                                                                                                                                                                                                                                                      |
+| Schritt | Befehl(e)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2       | `groupadd --system --gid 10001 orderflow`; `useradd --system --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin orderflow`                                                                                                                                                                                                                                                                                                                                                  |
+| 2       | `install -d` `/opt/orderflow-binance{,/bin,/sql,/releases}`, `/var/www/orderflow-acme` (0755), `/etc/orderflow-binance`, `/var/lib/orderflow-binance{,/transfer}` (0700); Kopien nach `/opt/orderflow-binance/{compose.prod.yml,sql/*,bin/*}`, `.env` (`OF_RELEASE=none`); Staging `/root/.orderflow-binance-stage` (danach gelöscht)                                                                                                                                                       |
+| 2       | Secrets erzeugen (nur wenn fehlend): `/etc/orderflow-binance/db.env`, `api.env` (0600, `openssl rand`)                                                                                                                                                                                                                                                                                                                                                                                      |
+| 2       | `install` `/etc/systemd/system/orderflow-monitor.{service,timer}`; `systemctl daemon-reload`                                                                                                                                                                                                                                                                                                                                                                                                |
+| 2       | `docker compose -p orderflow-binance … pull db`; `… up -d --wait db` (legt Netz `orderflow-binance_net`, Volume `orderflow-binance_pgdata`, Container `orderflow-db` an)                                                                                                                                                                                                                                                                                                                    |
+| 3       | `mkdir /var/lib/orderflow-binance/transfer/<dump>`; `rsync` dorthin                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 3       | `restore-db.sh`: `psql` roles.sql + roles-source.sql (`CREATE ROLE of_api`, `ALTER ROLE of_api …`), `CREATE EXTENSION IF NOT EXISTS timescaledb`, `timescaledb_pre_restore()`, `pg_restore`, `alter_job(…, scheduled => false)` für die Policies, post-restore.sql (`timescaledb_post_restore()`, `GRANT CONNECT`), `vacuumdb --analyze-only`, nach dem Bericht `alter_job(…, scheduled => true)`; nur bei `--replace`: `DROP DATABASE orderflow WITH (FORCE)`, `CREATE DATABASE orderflow` |
+| 3       | `psql` harden-db.sql (`REVOKE CONNECT, TEMPORARY ON DATABASE orderflow/postgres/template1 FROM PUBLIC`, `GRANT …` an of_admin/of_api); `rm -rf /var/lib/orderflow-binance/transfer/<dump>`                                                                                                                                                                                                                                                                                                  |
+| 4       | `mkdir` + `rsync` `/opt/orderflow-binance/releases/<id>/`; `docker load`; `rm api-image.tar.gz`                                                                                                                                                                                                                                                                                                                                                                                             |
+| 4       | `docker compose … run --rm ops node packages/db/src/cli.ts status` (nur mit `--migrate`: `… up`); `… run --rm ops node apps/api/src/cli/api-role-password.ts` (`ALTER ROLE of_api PASSWORD …`)                                                                                                                                                                                                                                                                                              |
+| 4       | `.env` schreiben; `docker compose … up -d --wait api` (Container `orderflow-api`, 127.0.0.1:8780); `ln -sfn` + `mv -Tf` `/opt/orderflow-binance/current`; Aufräumen alter Releases/Images `orderflow-api:<alt>`                                                                                                                                                                                                                                                                             |
+| 5       | `install` `/etc/nginx/conf.d/orderflow-binance.conf`, `/etc/nginx/snippets/orderflow-binance-headers.conf`, `/etc/nginx/snippets/orderflow-binance-proxy.conf`, `/etc/nginx/sites-available/orderflow.rankyhub.com` (erst Bootstrap, dann endgültig), `ln -sfn` nach `sites-enabled/zz-orderflow.rankyhub.com`; Probe-Datei im ACME-Webroot (wieder gelöscht)                                                                                                                               |
+| 5       | `nginx -t && systemctl reload nginx` (zweimal)                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 5       | `certbot certonly --account <id aus renewal/*.conf> --webroot -w /var/www/orderflow-acme -d orderflow.rankyhub.com --cert-name orderflow.rankyhub.com --non-interactive --keep-until-expiring --deploy-hook 'nginx -t && systemctl reload nginx'` (legt `/etc/letsencrypt/{live,archive,renewal}/orderflow.rankyhub.com*` an)                                                                                                                                                               |
+| 6       | `systemctl enable --now orderflow-monitor.timer`; `systemctl start orderflow-monitor.service`                                                                                                                                                                                                                                                                                                                                                                                               |
 
 ## Risiken für die Nachbardienste und Schutz
 

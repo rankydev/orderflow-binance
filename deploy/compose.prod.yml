@@ -59,6 +59,11 @@ services:
       - work_mem=32MB
       - -c
       - maintenance_work_mem=256MB
+      # Autovacuum im 2-GB-Limit halten (sonst bis 3 × maintenance_work_mem)
+      - -c
+      - autovacuum_max_workers=2
+      - -c
+      - autovacuum_work_mem=64MB
       - -c
       - max_connections=30
       - -c
@@ -125,8 +130,14 @@ services:
       # Detail-Health nur auf Loopback im Container (nicht veröffentlicht)
       OF_API_ADMIN_PORT: '8781'
       # Diagnose-Header (X-Source, X-Rows-Estimate, Server-Timing) in Produktion aus
-      OF_API_DIAG_HEADERS: 'off'
-      OF_LOG_LEVEL: info
+      OF_API_DIAG_HEADERS: '0'
+      # Antwort-Cache nicht-finaler Antworten (Standard 10 s) und Verbindungsgrenzen der API
+      OF_API_NONFINAL_TTL_MS: '10000'
+      OF_API_MAX_CONNECTIONS: '256'
+      OF_API_MAX_QUEUE: '64'
+      # warn: keine Zeile je Anfrage im Journal (teilt SystemMaxUse=1G mit den Nachbarn); Fehler und
+      # fehlgeschlagene Anfragen loggt die API auf warn/error
+      OF_LOG_LEVEL: warn
     ports:
       - '127.0.0.1:8780:8780'
     networks: [internal]

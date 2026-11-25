@@ -56,3 +56,21 @@ confirm() {
 sha256_manifest() { # $1 = Verzeichnis → schreibt SHA256SUMS (Format von sha256sum -c)
   (cd "$1" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS)
 }
+
+# Schnappschuss (bin/server-snapshot.sh) vollständig? Fehlende Zeilen dürfen vorher/nachher nicht
+# als „gleich leer" durchgehen.
+snapshot_valid() { # $1 = Datei
+  local f=$1
+  grep -qx 'snapshot|complete' "$f" || return 1
+  [ "$(grep -c '^unit|' "$f")" -eq 6 ] || return 1
+  [ "$(grep -c '^site|' "$f")" -eq 6 ] || return 1
+  [ "$(grep -c '^site6|' "$f")" -eq 3 ] || return 1
+  [ "$(grep -c '^default|' "$f")" -eq 6 ] || return 1
+  [ "$(grep -c '^listen|' "$f")" -ge 12 ] || return 1
+  grep -q '^container|genius-live-app-1|' "$f" || return 1
+  [ "$(grep -c '^pm2|pulsebot-' "$f")" -eq 2 ] || return 1
+  ! grep -qE '^site6?\|.*\|000$' "$f"
+}
+
+# KEY=value-Zeilen lesen, ohne sie als Shell-Code auszuführen: kv <datei> <key>
+kv() { sed -n "s/^$2=//p" "$1" | head -1; }

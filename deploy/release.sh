@@ -89,7 +89,7 @@ say "current → $(readlink "$R/current")"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8780/api/v1/symbols)
 [ "$code" = 200 ] || { say "Rauchtest /api/v1/symbols: $code"; exit 1; }
-if [ -e /etc/nginx/sites-enabled/orderflow.rankyhub.com ]; then
+if [ -e /etc/nginx/sites-enabled/zz-orderflow.rankyhub.com ]; then
   for p in / /api/v1/symbols; do
     printf '[release] https://orderflow.rankyhub.com%s → %s\n' "$p" "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve orderflow.rankyhub.com:443:127.0.0.1 "https://orderflow.rankyhub.com$p")" >&2
   done

@@ -28,10 +28,19 @@ echo "name_clash=$(docker ps -a --format '{{.Names}}' | grep -cE '^orderflow-(db
 echo "nginx_zone_clash=$( (nginx -T 2>/dev/null | grep -E 'zone=orderflow_|upstream orderflow_' | grep -vc '^#') || true)"
 echo "certbot_timer=$(systemctl is-active certbot.timer)"
 echo "le_accounts=$(ls /etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory 2>/dev/null | wc -l)"
+acct=$(sed -n 's/^account = //p' /etc/letsencrypt/renewal/*.conf 2>/dev/null | sort -u)
+echo "le_renewal_accounts=$(printf '%s\n' "$acct" | grep -c .)"
+echo "le_renewal_account_exists=$([ -n "$acct" ] && [ -d "/etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory/$acct" ] && echo yes || echo no)"
 EOF
 cat "$STATE/preflight-server.txt" >&2
-# shellcheck disable=SC1091
-. "$STATE/preflight-server.txt"
+# Werte lesen, nicht als Shell-Code ausführen
+P="$STATE/preflight-server.txt"
+for k in disk_free_gb mem_avail_mb ports_busy ports_ours nginx_t docker compose ntp ip name_clash \
+         nginx_zone_clash certbot_timer le_accounts le_renewal_accounts le_renewal_account_exists; do
+  v=$(kv "$P" "$k")
+  printf '%s' "$v" | grep -qE '^[A-Za-z0-9._:-]*$' || die "unerwarteter Wert für $k"
+  eval "$k=\$v"
+done
 dns=$(dig +short A "$PUBLIC_HOST" @1.1.1.1 | tail -1)
 check "Platte ≥ 15 GB frei ($disk_free_gb GB)" '[ "$disk_free_gb" -ge 15 ]'
 check "RAM verfügbar ≥ 3500 MB ($mem_avail_mb MB; DB 2 GB + API 0,6 GB Limit)" '[ "$mem_avail_mb" -ge 3500 ]'
@@ -39,11 +48,14 @@ check "Ports 8780/8781/54320 frei oder unsere ($ports_busy belegt, $ports_ours e
 check "nginx -t" '[ "$nginx_t" = ok ]'
 check "DNS $PUBLIC_HOST → $dns = Server $ip" '[ "$dns" = "$ip" ]'
 check "Uhr synchron" '[ "$ntp" = yes ]'
-check "certbot.timer aktiv, Let'\''s-Encrypt-Konto vorhanden" '[ "$certbot_timer" = active ] && [ "$le_accounts" -ge 1 ]'
+check "certbot.timer aktiv" '[ "$certbot_timer" = active ]'
+check "Let'\''s Encrypt: Renewal-Dateien nutzen genau 1 Produktionskonto, das existiert ($le_accounts Konten)" '[ "$le_renewal_accounts" = 1 ] && [ "$le_renewal_account_exists" = yes ]'
+check "keine Container orderflow-db/-api, keine Zonen orderflow_*" '[ "$ports_ours" -gt 0 ] || { [ "$name_clash" = 0 ] && [ "$nginx_zone_clash" = 0 ]; }'
 check "Docker ≥ 24, Compose v2+ ($docker / $compose)" '[ "${docker%%.*}" -ge 24 ]'
 
 log "Schnappschuss der Nachbardienste → $BASE"
-remote < "$DEPLOY_DIR/bin/server-snapshot.sh" > "$BASE"
+remote < "$DEPLOY_DIR/bin/server-snapshot.sh" > "$BASE" || die "Schnappschuss fehlgeschlagen"
+snapshot_valid "$BASE" || die "Schnappschuss unvollständig ($BASE) – Preflight abgebrochen"
 # Außensicht vom Mac (gleiche Statuscodes erwartet wie vom Server aus)
 for u in https://genius.rankyhub.com/ https://rankyhub.com/ https://takt.rankyhub.com/; do
   printf 'external|%s|%s\n' "$u" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$u")" >> "$BASE"

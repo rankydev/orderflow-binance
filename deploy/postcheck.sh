@@ -2,15 +2,21 @@
 # Nachprüfung (nur lesend): Nachbardienste unverändert gegenüber der Preflight-Baseline, und die
 # eigene Site antwortet. Auch nach jedem Rollback-Schritt ausführen.
 #
-#   deploy/postcheck.sh [root@host] <baseline-datei>
+#   deploy/postcheck.sh [root@host] <baseline-datei> [--neighbours-only]
+# Exit 0 = alles ok · 1 = Nachbardienste verändert oder Schnappschuss unvollständig (sofort
+# handeln) · 3 = Nachbarn unverändert, aber die eigene Site noch nicht/nicht wie erwartet.
+# --neighbours-only: nur die Nachbarn prüfen (nach Schritt 2–4, bevor die Site existiert).
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 resolve_host "${1:-}"
 [ "$SHIFTED" = 1 ] && shift
 BASE=${1:?Baseline-Datei aus preflight.sh angeben}
+ONLY=0
+[ "${2:-}" = --neighbours-only ] && ONLY=1
 NOW="${BASE%.txt}-after-$(date -u +%H%M%S).txt"
 
-remote < "$DEPLOY_DIR/bin/server-snapshot.sh" > "$NOW"
+remote < "$DEPLOY_DIR/bin/server-snapshot.sh" > "$NOW" || die "Schnappschuss fehlgeschlagen"
+snapshot_valid "$NOW" || die "Schnappschuss unvollständig ($NOW)"
 for u in https://genius.rankyhub.com/ https://rankyhub.com/ https://takt.rankyhub.com/; do
   printf 'external|%s|%s\n' "$u" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$u")" >> "$NOW"
 done
@@ -19,6 +25,7 @@ if diff <(grep -v '^info|' "$BASE") <(grep -v '^info|' "$NOW"); then
 else
   die "ABWEICHUNG bei den Nachbardiensten (siehe diff oben; $BASE ↔ $NOW)"
 fi
+[ "$ONLY" = 1 ] && exit 0
 
 log "eigene Site"
 bad=0
@@ -44,5 +51,8 @@ docker ps --filter name='^orderflow-' --format '  {{.Names}} {{.Status}} {{.Port
 ! docker ps --filter name='^orderflow-' --format '{{.Ports}}' | tr ',' '\n' | grep -v '^ *$' | grep -vq '127.0.0.1:'
 systemctl is-active orderflow-monitor.timer >/dev/null && journalctl -u orderflow-monitor.service -n 1 --no-pager -o cat || echo "  Monitor-Timer noch nicht aktiv"
 EOF
-[ "$bad" = 0 ] || die "eigene Site nicht wie erwartet"
+if [ "$bad" != 0 ]; then
+  warn "eigene Site nicht wie erwartet (Nachbarn unverändert)"
+  exit 3
+fi
 log "Postcheck bestanden"

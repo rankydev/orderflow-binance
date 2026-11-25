@@ -4,8 +4,11 @@
 # nach außen. TLS wie genius/takt: certbot webroot, Zertifikat unter /etc/letsencrypt/live/<name>/.
 #
 # Bewusst NICHT gesetzt:
-#  - default_server: Standardserver bleibt der erste in sites-enabled (genius.rankyhub.com);
-#    dieser Dateiname sortiert nach „genius", ändert die Reihenfolge also nicht.
+#  - default_server: Standardserver je Socket ist der erste Server in Include-Reihenfolge; das ist
+#    auf allen vier Sockets (80, [::]:80, 443, [::]:443) genius.rankyhub.com (Survey 2026-11-25).
+#    Der Symlink heißt sites-enabled/zz-orderflow.rankyhub.com und sortiert immer als letzter.
+#    Die listen-Zeilen spiegeln die der Nachbarn (genius/takt): 80, [::]:80, 443 ssl, [::]:443 ssl;
+#    wir öffnen keinen Socket, den nicht schon ein Nachbar hat.
 #  - http2 (vom Web-Review empfohlen): in nginx 1.18 ist http2 eine Option des Listen-Sockets
 #    (0.0.0.0:443 / [::]:443) und gälte damit für ALLE Sites dort (genius, rankyhub, takt) – das
 #    wäre eine Änderung an den Nachbarn. Offen zur Entscheidung des Nutzers; Umsetzung dann:
@@ -111,6 +114,17 @@ server {
         return 404;
     }
 
+    # /api/v1/quality: ohne Server-Cache und ohne Zusammenfassen gleicher Anfragen (bis 1 100 Tage,
+    # bis 20 000 Zeilen, belegt bis 5 s einen der 4 Limiter-Plätze der API) → eigene, strenge Zone,
+    # damit eine Flut davon Kacheln/Profile nicht mit 503 verdrängt. Die Web-App nutzt es noch nicht.
+    location /api/v1/quality {
+        limit_req zone=orderflow_quality burst=5 nodelay;
+        limit_req_status 429;
+        limit_conn orderflow_conn 32;
+        limit_conn_status 429;
+        include /etc/nginx/snippets/orderflow-binance-proxy.conf;
+    }
+
     location /api/ {
         # STELLSCHRAUBE 2/2: Burst (Rate = Stellschraube 1 in conf.d/orderflow-binance.conf).
         # 30 r/s + Burst 90 ohne Verzögerung: Seitenstart (≈ 30 Anfragen) und schnelles Schwenken
@@ -121,39 +135,7 @@ server {
         limit_conn orderflow_conn 32;
         limit_conn_status 429;
 
-        proxy_pass http://orderflow_api_upstream;
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        # Überschreiben statt anhängen: vom Client gesendete X-Forwarded-For werden verworfen
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_connect_timeout 5s;
-        # API: statement_timeout 5 s, Warteschlange ≤ 10 s (dann 503), requestTimeout 30 s;
-        # nginx wartet knapp länger, damit die API-Antwort (503/408) beim Client ankommt
-        proxy_read_timeout 35s;
-        proxy_send_timeout 35s;
-        proxy_next_upstream off;
-        proxy_buffering on;
-        proxy_buffer_size 16k;
-        proxy_buffers 32 64k;
-        proxy_busy_buffers_size 128k;
-        # ETag, Cache-Control, Vary, Content-Encoding der API unverändert durchreichen (Standard);
-        # Diagnose-Header nie nach außen (die API setzt sie in Produktion ohnehin nicht,
-        # OF_API_DIAG_HEADERS aus); X-Cache bleibt (harmlos, hilft bei der Fehlersuche).
-        proxy_hide_header X-Source;
-        proxy_hide_header X-Rows-Estimate;
-        proxy_hide_header Server-Timing;
-        proxy_hide_header X-Powered-By;
-        include /etc/nginx/snippets/orderflow-binance-headers.conf;
-
-        # Von nginx selbst erzeugte Fehler (Rate-Limit, API nicht erreichbar/zu langsam) als kleines
-        # JSON ohne Versionsangabe. Antworten der API (z. B. deren 503 mit Retry-After) gehen
-        # unverändert durch (proxy_intercept_errors bleibt aus).
-        error_page 429 = @orderflow_429;
-        error_page 502 504 = @orderflow_502;
-        error_page 503 = @orderflow_503;
+        include /etc/nginx/snippets/orderflow-binance-proxy.conf;
     }
 
     location @orderflow_429 {

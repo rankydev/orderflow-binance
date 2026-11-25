@@ -9,6 +9,11 @@ SET statement_timeout = 0;
 SET timezone = 'UTC';
 SET datestyle = 'ISO, YMD';
 BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+-- Optional: im exportierten Snapshot des Dumps lesen (psql -v snapshot=<id>, transfer-db.sh), damit
+-- zwischen Dump und Bericht laufende Jobs/Importe auf der Quelle keinen Fehlalarm auslösen.
+\if :{?snapshot}
+SET TRANSACTION SNAPSHOT :'snapshot';
+\endif
 
 -- Versionen (Restore nur zwischen identischen Versionen, KONZEPT §2.3)
 SELECT 'version|postgres_major|' || current_setting('server_version_num')::int / 10000;
@@ -39,9 +44,11 @@ SELECT 'dimension|' || hypertable_name || '|' || column_name || '|' || time_inte
   FROM timescaledb_information.dimensions ORDER BY hypertable_name, dimension_number;
 
 -- Hintergrund-Jobs der Anwendung (Columnstore-Policies, IDs ≥ 1000); die Standardjobs der
--- Erweiterung (Telemetrie, Statistik-Retention) legt jede Instanz selbst an → nur info
+-- Erweiterung (Telemetrie, Statistik-Retention) legt jede Instanz selbst an → nur info.
+-- `scheduled` steht nicht hier: restore-db.sh pausiert die Jobs des Ziels während des Berichts und
+-- hängt den Zustand danach als jobsched|-Zeilen an (transfer-db.sh ebenso für die Quelle).
 SELECT 'job|' || job_id || '|' || proc_name || '|' || coalesce(hypertable_name, '-') || '|'
-       || schedule_interval || '|scheduled=' || scheduled || '|' || coalesce(config::text, '')
+       || schedule_interval || '|' || coalesce(config::text, '')
        || '|owner=' || owner
   FROM timescaledb_information.jobs WHERE job_id >= 1000 ORDER BY job_id;
 SELECT 'info|extjob|' || job_id || '|' || proc_name || '|scheduled=' || scheduled

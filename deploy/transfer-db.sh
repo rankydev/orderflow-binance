@@ -56,12 +56,32 @@ avail=$(df -BG --output=avail /var/lib | tail -1 | tr -dc 0-9)
 test -x "$1/bin/restore-db.sh"
 EOF
 
-log "1/7 pg_dump (lokal, nur lesend)"
+log "1/7 Snapshot exportieren + pg_dump (lokal, nur lesend)"
 mkdir -p "$WORK"
 chmod 777 "$WORK" # der Client-Container schreibt als UID postgres
+# Eine lesende Transaktion hält den Snapshot offen, bis Dump UND Prüfbericht der Quelle fertig sind;
+# beide lesen exakt denselben Stand (laufende Jobs/Importe auf dem Mac stören den Vergleich nicht).
+FIFO="$WORK/snapshot.fifo"
+rm -f "$FIFO" && mkfifo "$FIFO"
+docker exec -i "$SRC_CONTAINER" psql -X -At -q -v ON_ERROR_STOP=1 -U "${OF_DB_USER:-of_admin}" -d orderflow \
+  < "$FIFO" > "$WORK/snapshot.out" 2>&1 &
+HOLD_PID=$!
+exec 3> "$FIFO"
+release_snapshot() { exec 3>&- 2>/dev/null || true; wait "$HOLD_PID" 2>/dev/null || true; rm -f "$FIFO"; }
+trap release_snapshot EXIT
+printf 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSELECT pg_export_snapshot();\n' >&3
+SNAP=
+for _ in $(seq 1 30); do
+  SNAP=$(head -1 "$WORK/snapshot.out" 2>/dev/null || true)
+  [ -n "$SNAP" ] && break
+  sleep 1
+done
+printf '%s' "$SNAP" | grep -qE '^[0-9A-F]+-[0-9A-F]+-[0-9]+$' || die "Snapshot-Export fehlgeschlagen: $SNAP"
+log "Snapshot $SNAP"
 t0=$(date +%s)
 docker run --rm --network "$NET" -e PGPASSWORD -v "$WORK:/dump" "$IMAGE" \
-  pg_dump -h "$SRC_CONTAINER" -U "${OF_DB_USER:-of_admin}" -d orderflow -Fd -j 4 -Z zstd:3 -f /dump/db 2> "$WORK/pg_dump.log" \
+  pg_dump -h "$SRC_CONTAINER" -U "${OF_DB_USER:-of_admin}" -d orderflow --snapshot="$SNAP" \
+  -Fd -j 4 -Z zstd:3 -f /dump/db 2> "$WORK/pg_dump.log" \
   || { cat "$WORK/pg_dump.log" >&2; die "pg_dump fehlgeschlagen"; }
 log "pg_dump: $(( $(date +%s) - t0 )) s, $(du -sh "$WORK/db" | cut -f1)"
 
@@ -71,8 +91,8 @@ src_psql -c "SELECT s FROM (SELECT 0 AS o, 'ALTER ROLE of_api RESET ALL;' AS s U
     FROM pg_roles, unnest(rolconfig) c WHERE rolname = 'of_api') x ORDER BY o, s" > "$WORK/db/roles-source.sql"
 sha256_manifest "$WORK/db"
 
-log "3/7 Prüfbericht der Quelle (Hintergrund, ≈ 3–4 min)"
-src_psql < "$DEPLOY_DIR/sql/verify-db.sql" > "$WORK/report-source.txt" 2> "$WORK/report-source.err" &
+log "3/7 Prüfbericht der Quelle im selben Snapshot (Hintergrund, ≈ 3–4 min)"
+src_psql -v snapshot="$SNAP" < "$DEPLOY_DIR/sql/verify-db.sql" > "$WORK/report-source.txt" 2> "$WORK/report-source.err" &
 SRC_PID=$!
 
 log "4/7 Upload + Prüfsummen auf dem Server"
@@ -96,6 +116,10 @@ set -euo pipefail
 EOF
 
 wait "$SRC_PID" || { cat "$WORK/report-source.err" >&2; die "Prüfbericht der Quelle fehlgeschlagen"; }
+release_snapshot
+trap - EXIT
+# Planungszustand der Anwendungs-Jobs (wie restore-db.sh am Ende für das Ziel)
+src_psql -c "SELECT 'jobsched|' || job_id || '|' || scheduled FROM timescaledb_information.jobs WHERE job_id >= 1000 ORDER BY job_id" >> "$WORK/report-source.txt"
 
 log "6/7 Vergleich Quelle ↔ Ziel (Pflicht)"
 if ! diff <(grep -v '^info|' "$WORK/report-source.txt") <(grep -v '^info|' "$WORK/report-target.txt") > "$WORK/report.diff"; then
@@ -106,10 +130,17 @@ grep -E '^(digest|data_day\||info\|db_size)' "$WORK/report-target.txt" >&2
 log "Prüfberichte identisch: Transfer bestanden"
 
 log "7/7 Härtung + Aufräumen"
-remote "$SRV_ROOT" <<'EOF'
+remote "$SRV_ROOT" <<'EOF' > "$WORK/harden.txt"
 set -euo pipefail
 docker exec -i orderflow-db psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow < "$1/sql/harden-db.sql"
 EOF
+cat "$WORK/harden.txt" >&2
+# Erwartet: of_api nur in orderflow verbindbar, nirgends TEMP; PUBLIC ohne CONNECT/TEMP
+grep -qx 'dbpriv|orderflow|of_api_connect=true|of_api_temp=false' "$WORK/harden.txt" \
+  && ! grep -E '^dbpriv\|' "$WORK/harden.txt" | grep -v '^dbpriv|orderflow|' | grep -q 'connect=true' \
+  && ! grep -q 'of_api_temp=true' "$WORK/harden.txt" \
+  && grep -q '^public_connect|false|public_temp|false|' "$WORK/harden.txt" \
+  || die "Härtung nicht wie erwartet (siehe oben)"
 if [ "$KEEP" = 0 ]; then
   remote "$REMOTE_DIR" <<'EOF'
 set -euo pipefail

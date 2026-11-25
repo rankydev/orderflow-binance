@@ -73,7 +73,9 @@ dafür umgebaut werden.
   `shared_buffers` + Cache. Mit P3 (Recorder, PulseBot/mongod gestoppt) auf 2,5 GB / 640 MB gemäß
   KONZEPT §2.4 anheben.
 - Einstellungen: `shared_buffers=512MB`, `effective_cache_size=1280MB`, `work_mem=32MB` (die Rolle
-  `of_api` bekommt per Migration 16 MB), `maintenance_work_mem=256MB`, `max_connections=30`,
+  `of_api` bekommt per Migration 0010 16 MB), `maintenance_work_mem=256MB`,
+  `autovacuum_max_workers=2` + `autovacuum_work_mem=64MB` (sonst bis 3 × 256 MB im 2-GB-Limit),
+  `max_connections=30`,
   `max_parallel_workers_per_gather=1`, `max_parallel_workers=2`, `max_worker_processes=10`,
   `timescaledb.max_background_workers=4`, `timescaledb.telemetry_level=off` (+ `NO_TS_TUNE`,
   damit `timescaledb-tune` nichts in `postgresql.conf` schreibt), `random_page_cost=1.1`,
@@ -150,9 +152,11 @@ und API einen Vertrag teilen). Rollback = `release.sh --rollback` (vorige ID, Im
 
 ### nginx
 
-Eine neue Site-Datei `sites-available/orderflow.rankyhub.com` (+ Symlink), Zonen in
-`conf.d/orderflow-binance.conf` (nur `limit_req_zone`/`limit_conn_zone`, kein server-Block),
-Header in `snippets/orderflow-binance-headers.conf`. Keine vorhandene Datei wird verändert.
+Eine neue Site-Datei `sites-available/orderflow.rankyhub.com` (Symlink
+`sites-enabled/zz-orderflow.rankyhub.com`), Zonen in `conf.d/orderflow-binance.conf` (nur
+`limit_req_zone`/`limit_conn_zone`, kein server-Block), Header in
+`snippets/orderflow-binance-headers.conf`, gemeinsame `/api/`-Proxy-Einstellungen in
+`snippets/orderflow-binance-proxy.conf`. Keine vorhandene Datei wird verändert.
 
 - Statisch: `/assets/*` `public, max-age=31536000, immutable`; `/index.html` und SPA-Fallback
   `no-cache`; versteckte Dateien 404; nur GET/HEAD/OPTIONS (sonst 405); Auslieferung an der
@@ -161,7 +165,10 @@ Header in `snippets/orderflow-binance-headers.conf`. Keine vorhandene Datei wird
   (überschrieben, nicht angehängt)/`X-Forwarded-Proto`, Timeouts connect 5 s, read/send 35 s;
   ETag/Cache-Control/Content-Encoding der API unverändert, **kein** nginx-Cache;
   `X-Source`, `X-Rows-Estimate`, `Server-Timing` werden zusätzlich ausgeblendet;
-  `/api/v1/health` → 404.
+  `/api/v1/health` → 404 (die API liefert dort nur noch `{status}`, gesperrt bleibt es trotzdem).
+- `/api/v1/quality` eigene Zone `orderflow_quality` (1 r/s, Burst 5 je IP): ohne Server-Cache und
+  Zusammenfassen belegt eine Anfrage bis 5 s einen der 4 Limiter-Plätze der API; die Web-App ruft
+  es noch nicht auf.
 - Rate-Limit je IP: `rate=30r/s` (conf.d, Stellschraube 1) + `burst=90 nodelay` (Site,
   Stellschraube 2), `limit_conn 32`, Status 429; nginx-eigene 429/502/503/504 als kleines JSON mit
   `Retry-After`, ohne Versionsangabe (`server_tokens off` für diesen Server, global nicht gesetzt).
@@ -178,7 +185,14 @@ Header in `snippets/orderflow-binance-headers.conf`. Keine vorhandene Datei wird
   würde genius/rankyhub/takt mit umstellen – Entscheidung des Nutzers.
 - TLS wie genius/takt: certbot **webroot** mit dem vorhandenen Konto; Deploy-Hook (nginx -t +
   reload) nur in der eigenen Renewal-Datei; Erneuerung über den vorhandenen `certbot.timer`.
-- Kein `default_server`; der Dateiname sortiert nach genius, der Standardserver bleibt genius.
+- Kein `default_server`. Standardserver je Socket ist der erste in Include-Reihenfolge; genius
+  lauscht auf allen vier Sockets (80, [::]:80, 443, [::]:443, Survey 2026-11-25) und bleibt
+  überall Standard. Der Symlink `zz-orderflow.rankyhub.com` sortiert zusätzlich immer zuletzt,
+  unsere listen-Zeilen spiegeln die der Nachbarn (kein neuer Socket). Lokal mit Stub-Nachbarn
+  (identische listen-Zeilen) für IPv4 und IPv6 geprüft: unbekannter Host → genius.
+- Let's Encrypt: zwei Konten (Produktion + Staging); alle drei Renewal-Dateien nutzen dasselbe
+  Produktionskonto → `certonly --account <id>` (aus den Renewal-Dateien gelesen). Erneuerung
+  testen nur mit `certbot renew --dry-run --cert-name orderflow.rankyhub.com`.
 - Lokal geprüft: `nginx -t` mit `nginx:1.18.0` (Server-Version) für Site und Bootstrap-Site;
   Funktionstest gegen API-Image + wiederhergestellte DB (Redirect 308, Header, Cache-Control,
   ETag/304-Durchreichung, gzip der API mit starkem ETag, Health 404, POST 405, Rate-Limit).
@@ -199,22 +213,28 @@ Auf dem Server ist fast nichts zu sichern: die Daten sind aus dem Mac jederzeit 
 setzen). Kein Backup-Job in dieser Stufe. Das ändert sich mit dem Live-Recorder (P3): dann entstehen
 Daten nur auf dem VPS (Spool, provisorische Minuten) und brauchen eine eigene Sicherung.
 
-## Offen / nach dem API-Review zu prüfen
+## Abgleich mit dem Stand der Anwendung (2026-11-25, nach den API-Fixes)
 
-- API in Arbeit (Review-Fixes): Pfad/Port des Status-Listeners (`127.0.0.1:8781/health`, in
-  `compose.prod.yml` und `bin/orderflow-monitor`), Namen der Variablen
-  (`OF_API_KEEPALIVE_TIMEOUT_MS`, `…_REQUEST_TIMEOUT_MS`, `…_CONNECTION_TIMEOUT_MS`,
-  `…_ADMIN_PORT`, `…_DIAG_HEADERS`), ob `/api/v1/health` im öffentlichen Router bleibt,
-  `api-role-password.ts` (SCRAM-Verifier statt Klartext; Aufruf bleibt gleich?).
-- Neue Migration (work_mem 16 MB für `of_api`, Rechte-Entzug): Rolleneinstellungen sind
-  clusterweit und **nicht im Dump** – `transfer-db.sh` überträgt sie deshalb aus der Quelle
-  (`roles-source.sql`), der Prüfbericht vergleicht sie. Migration vor dem Dump auf dem Mac anwenden.
-- `harden-db.sql` an die vom API-Autor im README dokumentierten Anweisungen angleichen.
-- CSP: der Wert im Snippet entspricht dem im README-Abschnitt Web dokumentierten (Stand
-  2026-11-25) – vor dem Rollout erneut vergleichen. Rate-Limit nach gemessenen Raten nachstellen.
-- Restore-Test, zweiter Lauf: der Pflichtvergleich meldete `grant|of_api|select=16` (Quelle) gegen
-  `20` (Ziel) – auf der Mac-DB waren zwischen Dump und Prüfbericht SELECT-Rechte auf 4 Tabellen
-  entzogen worden (laufende Arbeit an 0010, außerhalb dieses Auftrags). Der Vergleich erkennt also
-  Änderungen an der Quelle während des Transfers; beim echten Transfer die Mac-DB ruhig halten.
+- API-Variablen in `compose.prod.yml` gegen `apps/api/src/config.ts`/`apps/api/README.md` geprüft:
+  `OF_API_HOST/PORT/CORS_ORIGINS/DB_POOL/CACHE_MB/KEEPALIVE_TIMEOUT_MS/REQUEST_TIMEOUT_MS/
+CONNECTION_TIMEOUT_MS/ADMIN_PORT/DIAG_HEADERS/NONFINAL_TTL_MS/MAX_CONNECTIONS/MAX_QUEUE`,
+  `OF_LOG_LEVEL=warn` (keine Zeile je Anfrage im gemeinsamen Journal). Status-Listener bindet
+  immer 127.0.0.1:8781 im Container → Healthcheck per `node -e fetch` im Container.
+- `api-role-password.ts` (berechnet jetzt den SCRAM-Verifier im Client): Aufruf unverändert.
+- Migration 0010 (`work_mem=16MB`, kein SELECT auf `raw_file`, `raw_day`, `schema_migrations`,
+  `verify_run`): Tabellenrechte kommen mit dem Dump, die Rolleneinstellung über
+  `roles-source.sql`; der Prüfbericht vergleicht beides (`grant|of_api|tables=20|select=16`).
+- `harden-db.sql` = Anweisungen aus `apps/api/README.md` („Rechte auf Datenbankebene"), inkl.
+  `postgres`/`template1`; `transfer-db.sh` prüft das Ergebnis.
+- CSP im Snippet = Wert im README-Abschnitt Web.
+- Cache: finale Kacheln `max-age=604800` u. a. kommen unverändert von der API; nginx setzt keine
+  API-Cache-Header und cacht nicht.
+
+## Offen
+
 - HTTP/2 (betrifft alle Sites auf 443) – Entscheidung des Nutzers.
-- Healthchecks.io-URL – vom Nutzer.
+- Healthchecks.io-URL – vom Nutzer; bis dahin alarmiert niemand.
+- Rate-Limit nach den gemessenen Raten des Web-Autors nachstellen (Stellschrauben 1/2).
+- Pflichtvergleich: Quellbericht und Dump lesen denselben exportierten Snapshot; auf dem Ziel sind
+  die Policies während des Berichts angehalten (ein früherer Lauf hatte eine echte Änderung an der
+  Mac-DB zwischen Dump und Bericht als Abweichung gemeldet – der Vergleich greift).

@@ -3,7 +3,9 @@
 # Fasst AUSSCHLIESSLICH eigene Dateien an:
 #   /etc/nginx/conf.d/orderflow-binance.conf            (limit_req_zone/limit_conn_zone)
 #   /etc/nginx/snippets/orderflow-binance-headers.conf  (Sicherheits-Header)
-#   /etc/nginx/sites-available/orderflow.rankyhub.com + Symlink in sites-enabled
+#   /etc/nginx/snippets/orderflow-binance-proxy.conf    (gemeinsame /api/-Proxy-Einstellungen)
+#   /etc/nginx/sites-available/orderflow.rankyhub.com + Symlink sites-enabled/zz-orderflow.rankyhub.com
+#   (Präfix zz-: sortiert immer als letzte Site → nie Standardserver eines vorhandenen Sockets)
 #   /var/www/orderflow-acme, Zertifikat orderflow.rankyhub.com (certbot webroot, wie genius/takt)
 # Vor jedem Reload `nginx -t`; schlägt der Test fehl, werden die eigenen Dateien zurückgenommen
 # und nginx nicht neu geladen (die Nachbar-Sites bleiben unverändert).
@@ -19,8 +21,10 @@ MODE=${1:-setup}
 if [ "$MODE" = --rollback ]; then
   remote <<'EOF'
 set -euo pipefail
-rm -f /etc/nginx/sites-enabled/orderflow.rankyhub.com /etc/nginx/sites-available/orderflow.rankyhub.com \
-      /etc/nginx/conf.d/orderflow-binance.conf /etc/nginx/snippets/orderflow-binance-headers.conf
+rm -f /etc/nginx/sites-enabled/zz-orderflow.rankyhub.com /etc/nginx/sites-enabled/orderflow.rankyhub.com \
+      /etc/nginx/sites-available/orderflow.rankyhub.com \
+      /etc/nginx/conf.d/orderflow-binance.conf /etc/nginx/snippets/orderflow-binance-headers.conf \
+      /etc/nginx/snippets/orderflow-binance-proxy.conf
 nginx -t && systemctl reload nginx
 echo "orderflow-nginx-Dateien entfernt (Zertifikat bleibt; löschen: certbot delete --cert-name orderflow.rankyhub.com)"
 EOF
@@ -47,7 +51,7 @@ remote "$STAGE" <<'EOF'
 set -euo pipefail
 S=$1
 SITE=/etc/nginx/sites-available/orderflow.rankyhub.com
-LINK=/etc/nginx/sites-enabled/orderflow.rankyhub.com
+LINK=/etc/nginx/sites-enabled/zz-orderflow.rankyhub.com
 CERT=/etc/letsencrypt/live/orderflow.rankyhub.com/fullchain.pem
 say() { printf '[nginx %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 # Namenskonflikte: unsere Zonen/Upstreams dürfen nirgends sonst definiert sein
@@ -56,20 +60,21 @@ if nginx -T 2>/dev/null | grep -E 'zone=orderflow_|upstream orderflow_' | grep -
   say "Namen orderflow_* bereits vergeben – Abbruch"; exit 1
 fi
 backup=$(mktemp -d)
-for f in "$SITE" /etc/nginx/conf.d/orderflow-binance.conf /etc/nginx/snippets/orderflow-binance-headers.conf; do
+for f in "$SITE" /etc/nginx/conf.d/orderflow-binance.conf /etc/nginx/snippets/orderflow-binance-headers.conf /etc/nginx/snippets/orderflow-binance-proxy.conf; do
   [ -e "$f" ] && cp -a "$f" "$backup/$(basename "$f")"
 done
 had_link=0; [ -L "$LINK" ] && had_link=1
 undo() {
   say "nginx -t fehlgeschlagen – eigene Dateien zurück auf vorher, KEIN Reload"
-  rm -f "$SITE" /etc/nginx/conf.d/orderflow-binance.conf /etc/nginx/snippets/orderflow-binance-headers.conf
+  rm -f "$SITE" /etc/nginx/conf.d/orderflow-binance.conf /etc/nginx/snippets/orderflow-binance-headers.conf \
+        /etc/nginx/snippets/orderflow-binance-proxy.conf
   [ "$had_link" = 1 ] || rm -f "$LINK"
   for f in "$backup"/*; do
     [ -e "$f" ] || continue
     case "$(basename "$f")" in
       orderflow.rankyhub.com) cp -a "$f" "$SITE" ;;
       orderflow-binance.conf) cp -a "$f" /etc/nginx/conf.d/ ;;
-      orderflow-binance-headers.conf) cp -a "$f" /etc/nginx/snippets/ ;;
+      orderflow-binance-headers.conf | orderflow-binance-proxy.conf) cp -a "$f" /etc/nginx/snippets/ ;;
     esac
   done
   nginx -t || true
@@ -77,6 +82,7 @@ undo() {
 }
 install -m 644 "$S/orderflow-binance-http.conf" /etc/nginx/conf.d/orderflow-binance.conf
 install -m 644 "$S/orderflow-binance-headers.conf" /etc/nginx/snippets/orderflow-binance-headers.conf
+install -m 644 "$S/orderflow-binance-proxy.conf" /etc/nginx/snippets/orderflow-binance-proxy.conf
 install -d -m 755 /var/www/orderflow-acme
 
 if [ ! -f "$CERT" ]; then
@@ -92,9 +98,14 @@ if [ ! -f "$CERT" ]; then
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://orderflow.rankyhub.com/.well-known/acme-challenge/$probe")
   rm -f "/var/www/orderflow-acme/.well-known/acme-challenge/$probe"
   [ "$code" = 200 ] || { say "Challenge-Pfad liefert $code statt 200"; exit 1; }
-  # Vorhandenes Let's-Encrypt-Konto des Servers (keine neue Registrierung, keine neuen AGB);
+  # Vorhandenes Let's-Encrypt-Konto des Servers (keine neue Registrierung, keine neuen AGB): das
+  # Konto, das die Renewal-Dateien der Nachbarn nutzen – ausdrücklich per --account (mit mehreren
+  # Konten fragte certbot sonst nach und brach mit --non-interactive ab).
+  acct=$(sed -n 's/^account = //p' /etc/letsencrypt/renewal/*.conf | sort -u)
+  [ "$(printf '%s\n' "$acct" | grep -c .)" = 1 ] || { say "Renewal-Dateien nutzen nicht genau ein Konto: $acct"; exit 1; }
+  [ -d "/etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory/$acct" ] || { say "Konto $acct fehlt"; exit 1; }
   # deploy-hook nur für diese Lineage (steht in renewal/orderflow.rankyhub.com.conf)
-  certbot certonly --webroot -w /var/www/orderflow-acme -d orderflow.rankyhub.com \
+  certbot certonly --account "$acct" --webroot -w /var/www/orderflow-acme -d orderflow.rankyhub.com \
     --cert-name orderflow.rankyhub.com --non-interactive --keep-until-expiring \
     --deploy-hook 'nginx -t && systemctl reload nginx'
 fi
