@@ -123,6 +123,31 @@ export class LiveWriter {
       ON CONFLICT (sym_id) DO NOTHING`;
   }
 
+  /**
+   * Symbolzeile sicherstellen und die Einheiten mit dem Code vergleichen (Review S2, wie
+   * PostgresWriter.open). Ohne Zeile schlüge das erste Minutenschreiben mit 23503 fehl und der Tag
+   * würde nach fünf Versuchen eingefroren; bei abweichenden Einheiten wären alle Preise falsch.
+   */
+  async checkSymbol(spec: SymbolSpec): Promise<void> {
+    await this.ensureSymbol(spec);
+    const [row] = await this.db`
+      SELECT name, price_unit::text AS pu, price_decimals, tick_ref_units, qty_unit::text AS qu, qty_decimals
+        FROM symbol WHERE sym_id = ${spec.symId}`;
+    if (
+      !row ||
+      row.name !== spec.name ||
+      row.pu !== unitString(spec.priceDecimals) ||
+      row.price_decimals !== spec.priceDecimals ||
+      row.tick_ref_units !== spec.tickRefUnits ||
+      row.qu !== unitString(spec.qtyDecimals) ||
+      row.qty_decimals !== spec.qtyDecimals
+    ) {
+      throw new Error(
+        `Tabelle symbol (sym_id ${spec.symId}) passt nicht zu den Einheiten im Code für ${spec.name}: ${JSON.stringify(row)}`,
+      );
+    }
+  }
+
   /** Letzter finaler Tag des Symbols (Startpunkt der Kette) und provisorische Tage danach. */
   async startState(spec: SymbolSpec): Promise<{
     final: StoredFinal | null;

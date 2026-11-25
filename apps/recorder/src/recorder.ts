@@ -106,7 +106,15 @@ export interface SymbolState {
   wsLastMsg: number;
   /** Uhrzeit minus Ereigniszeit E der letzten Stream-Nachricht (Uhrversatz + Latenz). */
   eventLagMs: number | null;
+  /** Fortlaufend fehlschlagendes Nachholen (Review S1): gleicher Fehler an derselben fromId. */
+  restFail: { fromId: number | null; key: string; count: number; since: number } | null;
+  /** gesetzt, solange das Nachholen dauerhaft scheitert (Health/Alarm); null sonst */
+  restAlert: string | null;
 }
+
+/** Ab so vielen gleichen Fehlern an derselben fromId oder so lange gilt das Nachholen als gestört. */
+export const REST_ALERT_FAILURES = 12;
+export const REST_ALERT_MS = 15 * 60_000;
 
 export class Recorder {
   readonly o: Required<Omit<RecorderOptions, 'onMinuteCommitted' | 'spoolDir'>> &
@@ -161,6 +169,8 @@ export class Recorder {
         unwritten: 0,
         wsLastMsg: 0,
         eventLagMs: null,
+        restFail: null,
+        restAlert: null,
       };
       this.sym.set(name, s);
       for (const p of st.provisional) {
@@ -393,13 +403,43 @@ export class Recorder {
   /** Lücken per REST schließen (fromId = erwartet), Seite für Seite, im Gewichtsbudget. */
   async catchUpLoop(s: SymbolState): Promise<void> {
     while (!this.stopped) {
-      try {
-        const moved = await this.catchUpOnce(s);
-        if (!moved) await new Promise((r) => setTimeout(r, 250));
-      } catch (e) {
-        this.o.log('rest error', { symbol: s.spec.name, error: String(e) });
-        await new Promise((r) => setTimeout(r, 5000));
+      const r = await this.catchUpStep(s);
+      if (r === 'error') await new Promise((x) => setTimeout(x, 5000));
+      else if (r === 'idle') await new Promise((x) => setTimeout(x, 250));
+    }
+  }
+
+  /**
+   * Ein Nachhol-Schritt mit Fehlerbuchführung (Review S1): jeder Fehler außer -4166 wird weiter
+   * versucht (Aufgeben kostete Daten), aber derselbe Fehler an derselben fromId zählt; ab
+   * REST_ALERT_FAILURES Versuchen oder REST_ALERT_MS setzt er restAlert (Health), bis ein Schritt
+   * wieder gelingt.
+   */
+  async catchUpStep(s: SymbolState): Promise<'moved' | 'idle' | 'error'> {
+    try {
+      const moved = await this.catchUpOnce(s);
+      if (s.restFail || s.restAlert) {
+        if (s.restAlert) this.o.log('rest catch-up recovered', { symbol: s.spec.name });
+        s.restFail = null;
+        s.restAlert = null;
       }
+      return moved ? 'moved' : 'idle';
+    } catch (e) {
+      const now = this.o.now();
+      const code = (e as { code?: unknown }).code;
+      const key = `${String(code ?? '')} ${e instanceof Error ? e.message : String(e)}`.trim();
+      const from = s.feed.expected;
+      if (s.restFail && s.restFail.fromId === from && s.restFail.key === key) s.restFail.count++;
+      else s.restFail = { fromId: from, key, count: 1, since: now };
+      this.o.log('rest error', { symbol: s.spec.name, error: String(e), count: s.restFail.count });
+      if (
+        !s.restAlert &&
+        (s.restFail.count >= REST_ALERT_FAILURES || now - s.restFail.since >= REST_ALERT_MS)
+      ) {
+        s.restAlert = `REST catch-up failing persistently: ${key} (fromId ${String(from)}, ${s.restFail.count}×)`;
+        this.o.log('REST CATCH-UP ALERT', { symbol: s.spec.name, reason: s.restAlert });
+      }
+      return 'error';
     }
   }
 

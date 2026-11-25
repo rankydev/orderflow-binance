@@ -23,7 +23,13 @@ import {
   type RawAgg,
   type RestSource,
 } from '../src/binance.ts';
-import { isTransientDbError, Recorder, type LiveSink } from '../src/recorder.ts';
+import {
+  isTransientDbError,
+  Recorder,
+  REST_ALERT_FAILURES,
+  REST_ALERT_MS,
+  type LiveSink,
+} from '../src/recorder.ts';
 import {
   assertRawPrunable,
   pruneRaw,
@@ -280,6 +286,77 @@ describe('Erster Start mit letztem finalem Tag außerhalb des REST-Fensters (Rev
     expect(f.gaps).toEqual([]);
     expect(s.gapsAbandoned).toBe(0);
     expect(s.feed.expected).toBe(101);
+    await f.rec.stop();
+  });
+
+  it('dauerhaft gleicher Fehler an derselben fromId: Alarm nach N Versuchen bzw. 15 min, nie Aufgeben; Erfolg hebt ihn auf (S1)', async () => {
+    let now = D0 + 505 * MINUTE_MS;
+    let broken = true;
+    const f = make({
+      final: { day: DAY - 1, lastAggId: 7999 },
+      rest: {
+        ...rest,
+        aggTrades: async (sym, fromId, limit) => {
+          if (broken) throw new RestError(400, -1121, 'Invalid symbol.');
+          return rest.aggTrades(sym, fromId, limit);
+        },
+      },
+      now: () => now,
+    });
+    await f.rec.start();
+    const s = f.rec.sym.get('BTCUSDT')!;
+    f.rec.handle(
+      s,
+      rows(500, 3, 9000).map((r) => toItem(r, BTC, false)),
+      true,
+    );
+    for (let i = 1; i < REST_ALERT_FAILURES; i++) {
+      expect(await f.rec.catchUpStep(s)).toBe('error');
+      now += 5000;
+    }
+    expect(s.restAlert).toBeNull(); // noch unter der Grenze
+    expect(await f.rec.catchUpStep(s)).toBe('error');
+    expect(s.restAlert).toMatch(
+      /REST catch-up failing persistently: -1121 Invalid symbol\..*fromId 8000/,
+    );
+    // nie aufgegeben: nichts eingefroren, keine Lücke, Erwartung unverändert
+    expect(f.frozen).toEqual([]);
+    expect(f.gaps).toEqual([]);
+    expect(s.feed.expected).toBe(8000);
+    // Erfolg hebt den Alarm auf
+    broken = false;
+    expect(await f.rec.catchUpStep(s)).toBe('moved');
+    expect(s.restAlert).toBeNull();
+    expect(s.restFail).toBeNull();
+    await f.rec.stop();
+  });
+
+  it('Alarm auch nach 15 min bei wenigen Versuchen (S1)', async () => {
+    let now = D0 + 505 * MINUTE_MS;
+    const f = make({
+      final: { day: DAY - 1, lastAggId: 7999 },
+      rest: {
+        ...rest,
+        aggTrades: async () => {
+          throw new RestError(502, undefined, 'Bad Gateway');
+        },
+      },
+      now: () => now,
+    });
+    await f.rec.start();
+    const s = f.rec.sym.get('BTCUSDT')!;
+    f.rec.handle(
+      s,
+      rows(500, 3, 9000).map((r) => toItem(r, BTC, false)),
+      true,
+    );
+    await f.rec.catchUpStep(s);
+    now += REST_ALERT_MS - 1;
+    await f.rec.catchUpStep(s);
+    expect(s.restAlert).toBeNull();
+    now += 1;
+    await f.rec.catchUpStep(s);
+    expect(s.restAlert).toMatch(/Bad Gateway/);
     await f.rec.stop();
   });
 

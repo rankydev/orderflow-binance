@@ -155,6 +155,15 @@ async function run(): Promise<number> {
       );
     }
   }
+  // Review S2: Symbolzeilen sicherstellen und Einheiten prüfen, bevor geschrieben wird
+  for (const name of cfg.symbols) {
+    try {
+      await writer.checkSymbol(getSymbol(name));
+    } catch (e) {
+      await writer.close();
+      throw e;
+    }
+  }
   // Review H2a – Start-Prüfung: offene Chunks im Columnstore (dürfen seit 0015 nie vorkommen).
   // Der Recorder startet trotzdem, meldet aber sofort Alarm und bleibt unhealthy, bis
   // `importer repair-open-chunks` gelaufen ist: Live-Daten jenseits des REST-Fensters (48 h) wären
@@ -253,6 +262,7 @@ async function run(): Promise<number> {
           spoolLagMs: s.spool?.oldestUnflushed ? now - s.spool.oldestUnflushed : 0,
           eventLagMs: s.eventLagMs,
           frozenDays: rec.frozenDays(s),
+          restCatchUpAlert: s.restAlert,
           lastFinalisedDay: lastFinalised[name] ?? null,
         },
       ]),
@@ -266,7 +276,8 @@ async function run(): Promise<number> {
         free >= cfg.minFreeBytes &&
         rec.stream?.connected === true &&
         rec.spoolEnabled &&
-        partialState.hotCompressed === 0,
+        partialState.hotCompressed === 0 &&
+        [...rec.sym.values()].every((x) => x.restAlert === null),
       spoolEnabled: rec.spoolEnabled,
       spoolPrunedDays: rec.spoolPruned.length,
       rawPrunedFiles,

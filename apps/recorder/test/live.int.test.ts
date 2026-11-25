@@ -241,6 +241,29 @@ describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5
     });
   });
 
+  it('checkSymbol legt eine fehlende Symbolzeile unter der Recorder-Rolle an und verweigert abweichende Einheiten (S2)', async () => {
+    const ETH = getSymbol('ETHUSDT');
+    await sql`DELETE FROM symbol WHERE sym_id = ${ETH.symId}
+                AND NOT EXISTS (SELECT 1 FROM data_day WHERE sym_id = ${ETH.symId})`;
+    const w = new LiveWriter(roleCfg);
+    await w.open();
+    try {
+      await w.checkSymbol(ETH); // fehlt → angelegt
+      const [r] = await sql`SELECT name FROM symbol WHERE sym_id = ${ETH.symId}`;
+      expect(r!.name).toBe('ETHUSDT');
+      await w.checkSymbol(ETH); // vorhanden und passend
+      const [orig] = await sql`SELECT tick_ref_units FROM symbol WHERE sym_id = ${ETH.symId}`;
+      await sql`UPDATE symbol SET tick_ref_units = tick_ref_units + 1 WHERE sym_id = ${ETH.symId}`;
+      try {
+        await expect(w.checkSymbol(ETH)).rejects.toThrow(/passt nicht zu den Einheiten.*ETHUSDT/);
+      } finally {
+        await sql`UPDATE symbol SET tick_ref_units = ${orig!.tick_ref_units as number} WHERE sym_id = ${ETH.symId}`;
+      }
+    } finally {
+      await w.close();
+    }
+  });
+
   it('erkennt erhöhte Rechte der Sitzung unabhängig von OF_DB_USER (Admin verweigert, Recorder-Rolle nicht)', async () => {
     const adm = new LiveWriter(cfg);
     await adm.open();
