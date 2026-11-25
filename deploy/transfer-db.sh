@@ -67,7 +67,7 @@ docker exec -i "$SRC_CONTAINER" psql -X -At -q -v ON_ERROR_STOP=1 -U "${OF_DB_US
   < "$FIFO" > "$WORK/snapshot.out" 2>&1 &
 HOLD_PID=$!
 exec 3> "$FIFO"
-release_snapshot() { exec 3>&- 2>/dev/null || true; wait "$HOLD_PID" 2>/dev/null || true; rm -f "$FIFO"; }
+release_snapshot() { { exec 3>&-; } 2>/dev/null || true; wait "$HOLD_PID" 2>/dev/null || true; rm -f "$FIFO"; }
 trap release_snapshot EXIT
 printf 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSELECT pg_export_snapshot();\n' >&3
 SNAP=
