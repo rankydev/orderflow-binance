@@ -5,14 +5,18 @@ import { formatDay } from '@orderflow/core';
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { guardedRead, requireSymbol, type Deps } from '../context.ts';
 import { badRequest } from '../errors.ts';
-import { acceptsGzip, etagOfBody, makeResponse, send } from '../http.ts';
+import { makeResponse } from '../http.ts';
+import { serveVersioned } from '../respond.ts';
+import { qualityVersion } from '../versions.ts';
 import { DAY_MS, MAX_TIME_MS, Params, SYMBOL_RE } from '../params.ts';
 import { coveredDays } from '../plan.ts';
 import { queryIssues, queryQualityDays } from '../queries.ts';
 
 export const QUALITY_SCHEMA = 1;
-export const MAX_QUALITY_DAYS = 1_100;
-export const MAX_ISSUES = 20_000;
+/** Höchstens so viele Tage je Anfrage (eine Anfrage hält den Limiter-Platz nur kurz). */
+export const MAX_QUALITY_DAYS = 400;
+/** Höchstens so viele Issue-Minuten je Antwort; weitere Seiten über issuesFrom = issuesNext. */
+export const MAX_ISSUES = 5_000;
 
 /** Gründe, warum die API nicht gesund ist (leer = gesund). */
 function healthReasons(deps: Deps): string[] {
@@ -20,7 +24,7 @@ function healthReasons(deps: Deps): string[] {
   const cat = deps.catalog;
   const age = cat.lastRefresh > 0 ? Date.now() - cat.lastRefresh : null;
   if (!cat.ready) reasons.push('Katalog noch nicht geladen');
-  else if (age! > Math.max(30_000, deps.cfg.pollMs * 10))
+  else if (age! > deps.cfg.staleAfterMs)
     reasons.push(`Katalog seit ${Math.round(age! / 1000)} s nicht aktualisiert`);
   if (cat.lastError) reasons.push(`Datenbank: ${cat.lastError}`);
   return reasons;
@@ -65,38 +69,48 @@ export function registerStatusRoutes(app: FastifyInstance, deps: Deps): void {
     const from = p.int('from', 0, MAX_TIME_MS);
     const to = p.int('to', 0, MAX_TIME_MS);
     const withShift = p.int('shift', 0, 1, 0) === 1;
+    const issuesFrom = p.int('issuesFrom', 0, MAX_TIME_MS, 0);
     p.done();
     const s = requireSymbol(deps, symName);
     if (to <= from) throw badRequest('to muss größer als from sein');
     const [d0, d1] = coveredDays(from, to);
     if (d1 - d0 + 1 > MAX_QUALITY_DAYS) throw badRequest(`höchstens ${MAX_QUALITY_DAYS} Tage`);
-    const { days, issues } = await guardedRead(deps, req.ctx, async (tx) => ({
-      days: await queryQualityDays(tx, s.symId, d0, d1),
-      issues: await queryIssues(tx, s.symId, d0 * DAY_MS, (d1 + 1) * DAY_MS, withShift, MAX_ISSUES),
-    }));
-    const truncated = issues.length > MAX_ISSUES;
-    const body = Buffer.from(
-      JSON.stringify({
-        schema: QUALITY_SCHEMA,
-        kind: 'quality',
-        sym: s.name,
-        from: d0 * DAY_MS,
-        to: (d1 + 1) * DAY_MS,
-        days: days.map((d) => ({ ...d, day: formatDay(d.day), from: d.day * DAY_MS })),
-        issues: truncated ? issues.slice(0, MAX_ISSUES) : issues,
-        issuesIncludeShift: withShift,
-        issuesTruncated: truncated,
-      }),
-    );
-    // Qualitätsangaben können sich ohne neue Datenversion ändern (z. B. deep_check) → nie immutable.
-    const r = await makeResponse(
-      body,
-      'application/json',
-      etagOfBody(body),
-      false,
-      acceptsGzip(req),
-    );
-    return send(req, reply, r);
+    const parts = ['quality', s.name, withShift ? 1 : 0, issuesFrom];
+    const fpNow = (d: number) => s.days.get(d)?.quality;
+    // Qualität ist nie final (kann sich ändern, solange ein Tag nicht neu importiert wird): Browser
+    // no-cache, Server-Cache höchstens nonFinalTtlMs, Schlüssel = Fingerabdruck aller Qualitätsfelder.
+    const pre = { dataVersion: qualityVersion(parts, d0, d1, fpNow), final: false };
+    const key = `quality|${parts.join('|')}|${d0}|${d1}`;
+    return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
+      const lo = Math.max(d0 * DAY_MS, issuesFrom);
+      const { days, issues } = await guardedRead(deps, ctx, async (tx) => ({
+        days: await queryQualityDays(tx, s.symId, d0, d1),
+        issues: await queryIssues(tx, s.symId, lo, (d1 + 1) * DAY_MS, withShift, MAX_ISSUES),
+      }));
+      const fps = new Map(days.map((d) => [d.day, d.fp]));
+      const version = qualityVersion(parts, d0, d1, (d) => fps.get(d));
+      if (version !== pre.dataVersion) void deps.catalog.refresh();
+      const body = Buffer.from(
+        JSON.stringify({
+          schema: QUALITY_SCHEMA,
+          kind: 'quality',
+          sym: s.name,
+          from: d0 * DAY_MS,
+          to: (d1 + 1) * DAY_MS,
+          days: days.map(({ fp: _fp, ...d }) => ({
+            ...d,
+            day: formatDay(d.day),
+            from: d.day * DAY_MS,
+          })),
+          issues: issues.issues,
+          issuesIncludeShift: withShift,
+          issuesFrom: lo,
+          issuesNext: issues.next,
+          issuesTruncated: issues.next !== null,
+        }),
+      );
+      return makeResponse(body, 'application/json', version, false, true);
+    });
   });
 
   // Öffentliche Liveness ohne Interna (Review W3); Details nur auf dem Status-Listener.

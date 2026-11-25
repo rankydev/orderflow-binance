@@ -23,7 +23,7 @@ import {
   type Timeframe,
 } from '@orderflow/core';
 import { int, readTx, type ReadTx, type Sql } from './db.ts';
-import { tsLit } from './queries.ts';
+import { QUALITY_FP_SQL, tsLit } from './queries.ts';
 import { BAR_TABLES, barTableFor, FP_TABLE_NAMES, type BarTable, type RowsOn } from './plan.ts';
 import { DAY_MS, SYMBOL_RE } from './params.ts';
 
@@ -31,7 +31,7 @@ import { DAY_MS, SYMBOL_RE } from './params.ts';
 export const TILE_MAX_R = 10_000;
 export const TILE_LADDER: readonly number[] = ladder(TILE_MAX_R);
 /** Erhöhen, wenn sich der Inhalt von Kacheln bei gleichem Datenstand ändert (trennt alle Caches). */
-export const TILE_BUILD_VERSION = 1;
+export const TILE_BUILD_VERSION = 2;
 export const TIMEFRAME_LIST = Object.keys(TIMEFRAMES) as Timeframe[];
 
 /** Nominale Zeilen/Tag (KONZEPT §3.6, BTC), nur falls noch keine Statistik vorliegt. */
@@ -53,6 +53,8 @@ export interface DayInfo {
   immutable: boolean;
   /** Tag hat (oder hatte vor einem laufenden Ersatz) gespeicherte Daten. */
   hasData: boolean;
+  /** Fingerabdruck der Qualitätsfelder (QUALITY_FP_SQL) für /quality. */
+  quality: string;
 }
 
 interface DayStats {
@@ -218,7 +220,7 @@ export class Catalog extends EventEmitter {
     );
     const dayRows = await tx.rows(
       `SELECT sym_id, (day - DATE '1970-01-01')::int, state, version, immutable,
-              state_before_import IS NOT NULL
+              state_before_import IS NOT NULL, ${QUALITY_FP_SQL}
          FROM data_day ORDER BY sym_id, day`,
     );
     const out = new Map<string, SymbolState>();
@@ -253,7 +255,14 @@ export class Catalog extends EventEmitter {
       const day = int(r[1]);
       // Ein neu angelegter Tag im Zustand importing hat noch keine Daten; ein Ersatz schon.
       const hasData = state !== 'importing' || r[5] === true;
-      s.days.set(day, { day, state, version: int(r[3]), immutable: r[4] === true, hasData });
+      s.days.set(day, {
+        day,
+        state,
+        version: int(r[3]),
+        immutable: r[4] === true,
+        hasData,
+        quality: String(r[6]),
+      });
     }
     for (const s of out.values()) {
       for (const d of s.stats.keys()) if (!s.days.get(d)?.hasData) s.stats.delete(d);
@@ -355,14 +364,39 @@ function rowsPerDay(s: SymbolState): { avg: Record<string, number>; max: Record<
   return { avg, max };
 }
 
+/** Quantil der Tagesmaxima, aus dem n und das Angebot entstehen (P95; TILE-FORMAT.md). */
+export const TILE_DAY_QUANTILE = 0.95;
+
 /**
- * Kachellänge je (tf, R) nach TILE-FORMAT.md (Maximum über die gesamte Historie, Zuschlag 1,5,
- * angeboten nur bei 32 · m ≤ 60 000) und zusätzlich nur, wenn eine Kachel die Quellzeilengrenze
- * sicher einhält (größte Tageszeilenzahl der Quelle × Kachelspanne ≤ maxSourceRows) – sonst
- * bekäme der Client für eine angebotene Kombination ein 422.
+ * Referenzwert der Zeilen je Bar für (tf, Leiterindex i): das P95 der Tagesmaxima, genauer der
+ * (⌊N/20⌋ + 1)-größte Wert unter N Referenztagen (bei N < 20 also das Maximum). Referenztage sind die
+ * unveränderlichen Tage; gibt es keine, alle Tage mit Statistik. Nicht finale Tage (laufender Tag,
+ * provisorische Live-Minuten ab P2) bleiben außen vor, damit sich `tiles` nicht im Tagesverlauf
+ * ändert; ihre Kacheln schützt der Zell-Wächter beim Ausliefern (422 je Kachel).
+ */
+export function referenceRows(
+  s: Pick<SymbolState, 'stats' | 'days'>,
+  tf: Timeframe,
+  i: number,
+): number {
+  const all = [...s.stats.entries()];
+  let ref = all.filter(([d]) => s.days.get(d)?.immutable === true);
+  if (ref.length === 0) ref = all;
+  const v = ref.map(([, st]) => st.maxRows.get(tf)?.[i] ?? 0).sort((a, b) => b - a);
+  if (v.length === 0) return 0;
+  return v[Math.floor((1 - TILE_DAY_QUANTILE) * v.length + 1e-9)]!;
+}
+
+/**
+ * Kachellänge je (tf, R) nach TILE-FORMAT.md: m = ceil(1,5 · P95 der Tagesmaxima der Zeilen je Bar),
+ * n = clamp(2^floor(log2(30 000 / m)), 32, 1024), angeboten nur bei 32 · m ≤ 60 000 und wenn eine
+ * Kachel die Quellzeilengrenze sicher einhält (größte Tageszeilenzahl der Quelle + Bar-Tabelle,
+ * über alle Tage, × Kachelspanne ≤ maxSourceRows) – sonst bekäme der Client für eine angebotene
+ * Kombination ein 422. Kacheln, die trotzdem über 60 000 Zellen kommen (Ausreißer-Tage oberhalb des
+ * P95, nicht finale Tage), lehnt der Wächter in routes/tiles.ts einzeln mit 422 ab.
  */
 export function computeTiles(
-  s: Pick<SymbolState, 'tickRefUnits' | 'tickUnits' | 'stats'>,
+  s: Pick<SymbolState, 'tickRefUnits' | 'tickUnits' | 'stats' | 'days'>,
   maxSourceRows: number,
 ): { tiles: Record<string, Record<string, number>>; src: Map<string, FpTableName> } {
   const { avg, max } = rowsPerDay(s as SymbolState);
@@ -373,10 +407,9 @@ export function computeTiles(
     const m: Record<string, number> = {};
     TILE_LADDER.forEach((R, i) => {
       if (R * s.tickRefUnits < s.tickUnits) return;
-      let maxRows = 0;
-      for (const st of s.stats.values()) maxRows = Math.max(maxRows, st.maxRows.get(tf)?.[i] ?? 0);
-      if (maxRows === 0) return;
-      const n = tileBarsForMax(maxRows);
+      const rows = referenceRows(s, tf, i);
+      if (rows === 0) return;
+      const n = tileBarsForMax(rows);
       if (n === null) return;
       const table = chooseFpSource(tfSec / 60, R, avg as Record<FpTableName, number>);
       const spanDays = (n * tfSec) / 86_400;
@@ -390,6 +423,19 @@ export function computeTiles(
     if (Object.keys(m).length > 0) tiles[tf] = m;
   }
   return { tiles, src };
+}
+
+/** Nächstgröbere angebotene Zeilengröße für tf (Vorschlag bei 422 einer Kachel); null = keine. */
+export function coarserOffered(
+  tiles: Record<string, Record<string, number>>,
+  tf: string,
+  R: number,
+): number | null {
+  const rs = Object.keys(tiles[tf] ?? {})
+    .map(Number)
+    .filter((r) => r > R)
+    .sort((a, b) => a - b);
+  return rs[0] ?? null;
 }
 
 /** tileConfigVersion: Hash über die Kachelkonfiguration (undurchsichtige Ganzzahl in 1…2^47). */

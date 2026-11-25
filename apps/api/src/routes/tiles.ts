@@ -8,8 +8,8 @@ import {
   type TileMeta,
 } from '@orderflow/core';
 import type { FastifyInstance } from 'fastify';
-import { rowsOnFor, type SymbolState } from '../catalog.ts';
-import { guardedRead, requireSymbol, type Deps } from '../context.ts';
+import { coarserOffered, rowsOnFor, type SymbolState } from '../catalog.ts';
+import { assertFresh, guardedRead, requireSymbol, type Deps } from '../context.ts';
 import { serveVersioned } from '../respond.ts';
 import { badRequest, HttpError, unprocessable } from '../errors.ts';
 import { etagOfBody, makeResponse, send, acceptsGzip } from '../http.ts';
@@ -96,7 +96,7 @@ function baseMeta(s: SymbolState, tf: string, tfSec: number) {
 export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
   app.get('/api/v1/symbols', async (req, reply) => {
     new Params(req.query).done();
-    if (!deps.catalog.ready) throw new HttpError(503, 'API startet noch (Katalog lädt)', {}, 1);
+    assertFresh(deps);
     const body = Buffer.from(symbolsBody(deps.catalog.symbols()));
     const r = await makeResponse(
       body,
@@ -212,17 +212,27 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
       });
       const ver = versionOf(parts, d0, d1, (d) => days.get(d));
       if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
-      // Kacheln folgen der Grenze aus TILE-FORMAT.md (60 000), nicht OF_API_MAX_CELLS (nur Profile)
+      // Zell-Wächter (TILE-FORMAT.md): eine Kachel über 60 000 Zellen wird nie ausgeliefert, sondern
+      // einzeln mit 422 abgelehnt (Ausreißer oberhalb des P95 bzw. nicht finaler Tag). Kein 500, keine
+      // Neuberechnung der Konfiguration (die bleibt stabil), die Ablehnung wird wie eine Antwort gecacht.
       if (levels.row.length > TILE_MAX_CELLS) {
-        // Zwischen Import und Neuberechnung möglich (TILE-FORMAT.md): neu berechnen, dann 409.
-        await deps.catalog.refresh();
-        const now = deps.catalog.symbol(s.name);
-        if (now && now.tileConfigVersion !== cfgV) {
-          throw new HttpError(409, 'Kachelkonfiguration wurde neu berechnet', {
-            tileConfigVersion: now.tileConfigVersion,
-          });
-        }
-        throw new HttpError(500, `Kachel mit ${levels.row.length} Zellen über der harten Grenze`);
+        const body = Buffer.from(
+          JSON.stringify({
+            error: `Kachel mit ${levels.row.length} Zellen über ${TILE_MAX_CELLS}; gröberes R wählen`,
+            reason: 'tile_cells_exceeded',
+            cells: levels.row.length,
+            limit: TILE_MAX_CELLS,
+            suggestR: coarserOffered(s.tiles, tf, R),
+          }),
+        );
+        return {
+          body,
+          gzip: null,
+          type: 'application/json',
+          etag: ver.dataVersion,
+          final: ver.final,
+          status: 422,
+        };
       }
       const meta: TileMeta = {
         ...baseMeta(s, tf, tfSec),

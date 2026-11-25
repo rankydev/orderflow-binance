@@ -54,6 +54,11 @@ export interface ApiConfig {
   adminPort: number;
   /** Diagnose-Header X-Source, X-Rows-Estimate, Server-Timing (Standard aus). */
   diagHeaders: boolean;
+  /**
+   * Schlägt die Katalog-Aktualisierung länger als diese Zeit (ms) fehl, antworten die Datenendpunkte
+   * mit 503 statt mit 304/Cache-Treffern auf einem womöglich veralteten Versionsstand.
+   */
+  staleAfterMs: number;
 }
 
 const intIn = (
@@ -132,6 +137,7 @@ export function parseApiConfig(env: Env): ApiConfig {
     maxConnections: intIn(problems, env, 'OF_API_MAX_CONNECTIONS', 1_024, 1, 1e6),
     adminPort: intIn(problems, env, 'OF_API_ADMIN_PORT', 8781, 0, 65535),
     diagHeaders: /^(1|true|on)$/i.test(env.OF_API_DIAG_HEADERS?.trim() ?? ''),
+    staleAfterMs: intIn(problems, env, 'OF_API_STALE_AFTER_MS', 30_000, 1_000, 3_600_000),
   };
   if (cfg.adminPort !== 0 && cfg.adminPort === cfg.port)
     problems.push('OF_API_ADMIN_PORT muss sich von OF_API_PORT unterscheiden');

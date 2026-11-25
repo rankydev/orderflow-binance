@@ -44,8 +44,19 @@ export function newCtx(): ReqCtx {
   };
 }
 
+/**
+ * Versionsstand frisch genug? Fällt die Katalog-Aktualisierung länger als staleAfterMs aus, wären
+ * 304 und Cache-Treffer auf einem womöglich veralteten Stand möglich → 503 (Retry-After 5).
+ */
+export function assertFresh(deps: Deps): void {
+  const c = deps.catalog;
+  if (!c.ready) throw new HttpError(503, 'API startet noch (Katalog lädt)', {}, 1);
+  if (c.lastError !== null && Date.now() - c.lastRefresh > deps.cfg.staleAfterMs)
+    throw new HttpError(503, 'Datenstand nicht aktuell (Datenbank nicht erreichbar)', {}, 5);
+}
+
 export function requireSymbol(deps: Deps, name: string): SymbolState {
-  if (!deps.catalog.ready) throw new HttpError(503, 'API startet noch (Katalog lädt)', {}, 1);
+  assertFresh(deps);
   const s = deps.catalog.symbol(name);
   if (!s) throw notFound(`unbekanntes Symbol ${name}`);
   return s;

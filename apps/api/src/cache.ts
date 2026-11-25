@@ -14,32 +14,56 @@ export interface CachedResponse {
   final: boolean;
   /** Ablaufzeit (ms, Date.now()) für nicht finale Einträge; null = nur LRU. */
   expiresAt?: number | null;
+  /**
+   * HTTP-Status, falls nicht 200: gecachte Ablehnung (422 einer Ausreißer-Kachel). Wird ohne ETag
+   * und mit `no-store` ausgeliefert; der Schlüssel enthält trotzdem die dataVersion.
+   */
+  status?: number;
 }
 
 export class ResponseCache {
-  private readonly map = new Map<string, CachedResponse>();
-  private bytes = 0;
+  /** Finale Einträge (LRU) und nicht finale (eigene LRU, mit Ablaufzeit und Byte-Anteil). */
+  private readonly fin = new Map<string, CachedResponse>();
+  private readonly tmp = new Map<string, CachedResponse>();
+  private finBytes = 0;
+  private tmpBytes = 0;
+  private lastSweep = 0;
   readonly maxBytes: number;
+  /** Höchstanteil nicht finaler Einträge am Cache (Review: sie verdrängen nie die finalen). */
+  readonly nonFinalShare: number;
   hits = 0;
   misses = 0;
 
-  constructor(maxBytes: number) {
+  constructor(maxBytes: number, nonFinalShare = 0.25) {
     this.maxBytes = maxBytes;
+    this.nonFinalShare = nonFinalShare;
   }
 
   private static size(e: CachedResponse): number {
     return e.body.length + (e.gzip?.length ?? 0) + 128;
   }
 
+  private static expired(e: CachedResponse, now: number): boolean {
+    return e.expiresAt != null && e.expiresAt <= now;
+  }
+
+  private drop(m: Map<string, CachedResponse>, key: string, e: CachedResponse): void {
+    m.delete(key);
+    if (m === this.fin) this.finBytes -= ResponseCache.size(e);
+    else this.tmpBytes -= ResponseCache.size(e);
+  }
+
   get(key: string): CachedResponse | undefined {
-    const e = this.map.get(key);
-    if (e && e.expiresAt != null && e.expiresAt <= Date.now()) {
-      this.map.delete(key);
-      this.bytes -= ResponseCache.size(e);
-    } else if (e) {
+    for (const m of [this.fin, this.tmp]) {
+      const e = m.get(key);
+      if (!e) continue;
+      if (ResponseCache.expired(e, Date.now())) {
+        this.drop(m, key, e);
+        break;
+      }
       // LRU: ans Ende verschieben
-      this.map.delete(key);
-      this.map.set(key, e);
+      m.delete(key);
+      m.set(key, e);
       this.hits++;
       return e;
     }
@@ -49,30 +73,63 @@ export class ResponseCache {
 
   /** Nur für Tests/Diagnose. */
   has(key: string): boolean {
-    return this.map.has(key);
+    return this.fin.has(key) || this.tmp.has(key);
+  }
+
+  /** Entfernt abgelaufene nicht finale Einträge (höchstens einmal je Sekunde vollständig). */
+  sweep(now = Date.now(), force = false): void {
+    if (!force && now - this.lastSweep < 1_000) return;
+    this.lastSweep = now;
+    for (const [k, v] of this.tmp) if (ResponseCache.expired(v, now)) this.drop(this.tmp, k, v);
   }
 
   set(key: string, e: CachedResponse): void {
     const sz = ResponseCache.size(e);
     if (sz > this.maxBytes / 4) return; // einzelne Riesenantworten verdrängen nicht den ganzen Cache
-    const old = this.map.get(key);
-    if (old) {
-      this.bytes -= ResponseCache.size(old);
-      this.map.delete(key);
+    for (const m of [this.fin, this.tmp]) {
+      const old = m.get(key);
+      if (old) this.drop(m, key, old);
     }
-    this.map.set(key, e);
-    this.bytes += sz;
-    for (const [k, v] of this.map) {
-      if (this.bytes <= this.maxBytes) break;
-      this.map.delete(k);
-      this.bytes -= ResponseCache.size(v);
+    this.sweep();
+    const temporary = e.expiresAt != null;
+    if (temporary) {
+      if (sz > this.maxBytes * this.nonFinalShare) return;
+      this.tmp.set(key, e);
+      this.tmpBytes += sz;
+      // Anteil begrenzen: älteste nicht finale zuerst
+      for (const [k, v] of this.tmp) {
+        if (this.tmpBytes <= this.maxBytes * this.nonFinalShare) break;
+        this.drop(this.tmp, k, v);
+      }
+    } else {
+      this.fin.set(key, e);
+      this.finBytes += sz;
+    }
+    // Gesamtgrenze: erst nicht finale, dann finale verdrängen
+    for (const [k, v] of this.tmp) {
+      if (this.finBytes + this.tmpBytes <= this.maxBytes) break;
+      this.drop(this.tmp, k, v);
+    }
+    for (const [k, v] of this.fin) {
+      if (this.finBytes + this.tmpBytes <= this.maxBytes) break;
+      this.drop(this.fin, k, v);
     }
   }
 
-  stats(): { entries: number; bytes: number; maxBytes: number; hits: number; misses: number } {
+  stats(): {
+    entries: number;
+    bytes: number;
+    nonFinalEntries: number;
+    nonFinalBytes: number;
+    maxBytes: number;
+    hits: number;
+    misses: number;
+  } {
     return {
-      entries: this.map.size,
-      bytes: this.bytes,
+      entries: this.fin.size + this.tmp.size,
+      bytes: this.finBytes + this.tmpBytes,
+      nonFinalEntries: this.tmp.size,
+      nonFinalBytes: this.tmpBytes,
       maxBytes: this.maxBytes,
       hits: this.hits,
       misses: this.misses,

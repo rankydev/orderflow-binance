@@ -57,6 +57,11 @@ export function matchesEtag(req: FastifyRequest, etag: string): boolean {
 
 /** Sendet eine Antwort mit ETag/304, Cache-Control und gzip. */
 export function send(req: FastifyRequest, reply: FastifyReply, r: CachedResponse): FastifyReply {
+  if (r.status !== undefined && r.status !== 200) {
+    // gecachte Ablehnung: kein ETag/304, nie im Browser cachen
+    req.ctx.bytes = r.body.length;
+    return reply.code(r.status).header('Cache-Control', 'no-store').type(r.type).send(r.body);
+  }
   reply.header('ETag', `"${r.etag}"`);
   reply.header('Cache-Control', cacheControl(r.final));
   reply.header('Vary', 'Accept-Encoding, Origin');

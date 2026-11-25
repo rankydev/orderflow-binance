@@ -272,7 +272,18 @@ export async function queryProfileBars(
     }));
 }
 
+/**
+ * Fingerabdruck aller Qualitätsfelder eines Tages (data_day), die /quality ausliefert. Derselbe
+ * Ausdruck im Katalog (für 304/Cache vor der Abfrage) und im Snapshot der Antwort: so werden auch
+ * Änderungen ohne Versionssprung (deep_check, Zähler) erkannt.
+ */
+export const QUALITY_FP_SQL = `md5(ROW(state, version, immutable, source, stale, edge_pending,
+  edge_first_pending, edge_last_pending, deep_check, rows, min_exact, min_shift, min_mismatch,
+  min_missing, min_gap)::text)`;
+
 export interface QualityDayRow {
+  /** Fingerabdruck (QUALITY_FP_SQL); nur intern, nicht Teil der Antwort. */
+  fp: string;
   day: number;
   state: string;
   version: number;
@@ -305,12 +316,13 @@ export async function queryQualityDays(
   const rows = await tx.rows(
     `SELECT (day - DATE '1970-01-01')::int, state, version, immutable, source, stale, edge_pending,
             edge_first_pending, edge_last_pending, deep_check, rows,
-            min_exact, min_shift, min_mismatch, min_missing, min_gap
+            min_exact, min_shift, min_mismatch, min_missing, min_gap, ${QUALITY_FP_SQL}
        FROM data_day WHERE sym_id = $1 AND day >= ${dateLit(d0)} AND day <= ${dateLit(d1)}
       ORDER BY day`,
     [symId],
   );
   return rows.map((r) => ({
+    fp: String(r[16]),
     day: int(r[0]),
     state: String(r[1]),
     version: int(r[2]),
@@ -339,6 +351,10 @@ export interface IssueRow {
   dB: number | null;
 }
 
+/**
+ * Issue-Minuten ab `from` (inklusive) bis `to`, höchstens `limit`; eine Seite endet immer an einer
+ * Minutengrenze (alle Arten einer Minute gemeinsam), `next` = erste ausgelassene Minute oder null.
+ */
 export async function queryIssues(
   tx: ReadTx,
   symId: number,
@@ -346,18 +362,22 @@ export async function queryIssues(
   to: number,
   withShift: boolean,
   limit: number,
-): Promise<IssueRow[]> {
+): Promise<{ issues: IssueRow[]; next: number | null }> {
+  // höchstens 4 Arten je Minute → limit + 4 Zeilen genügen, um die Seitengrenze zu erkennen
   const rows = await tx.rows(
     `SELECT (extract(epoch from ts)::int8 * 1000), kind, d_q, d_b FROM data_minute_issue
       WHERE sym_id = $1 AND ts >= ${tsLit(from)} AND ts < ${tsLit(to)}
         ${withShift ? '' : "AND kind <> 'shift'"}
-      ORDER BY ts, kind LIMIT ${Math.trunc(limit) + 1}`,
+      ORDER BY ts, kind LIMIT ${Math.trunc(limit) + 4}`,
     [symId],
   );
-  return rows.map((r) => ({
+  const all = rows.map((r) => ({
     ts: int(r[0]),
     kind: String(r[1]),
     dQ: intOrNull(r[2]),
     dB: intOrNull(r[3]),
   }));
+  if (all.length <= limit) return { issues: all, next: null };
+  const next = all[limit]!.ts;
+  return { issues: all.slice(0, limit).filter((x) => x.ts < next), next };
 }

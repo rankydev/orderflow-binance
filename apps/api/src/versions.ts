@@ -35,3 +35,19 @@ export function versionOf(
   }
   return { dataVersion: h.digest('base64url').slice(0, 27), final };
 }
+
+/**
+ * Version einer /quality-Antwort: Hash über die Parameter und die Qualitäts-Fingerabdrücke der
+ * überdeckten Tage (fehlende Tage als „-"). Nie final.
+ */
+export function qualityVersion(
+  parts: (string | number)[],
+  d0: number,
+  d1: number,
+  fp: (day: number) => string | null | undefined,
+): string {
+  const h = createHash('sha256');
+  h.update(`q${RESPONSE_BUILD_VERSION}|${parts.join('|')}|${d0}..${d1}|`);
+  for (let d = d0; d <= d1; d++) h.update(`${fp(d) ?? '-'},`);
+  return h.digest('base64url').slice(0, 27);
+}
