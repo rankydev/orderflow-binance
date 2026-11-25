@@ -319,13 +319,39 @@ export class PostgresWriter implements DayWriter {
         `WARNUNG: Chunk ${o.c as string} hat unbekannte Status-Bits ${o.status as number}`,
       );
     }
-    for (const c of chunks) {
-      await this.db.unsafe(
-        'CALL convert_to_columnstore($1::regclass, if_not_columnstore => true, recompress => true)',
-        [c.c as string],
-      );
-    }
+    for (const c of chunks) await this.convertChunk(c.c as string);
     return chunks.length;
+  }
+
+  /**
+   * Chunk in den Columnstore wandeln (auch teilweise komprimierte nachverdichten) – unter einer
+   * vorher genommenen ACCESS-EXCLUSIVE-Sperre. Die Nachverdichtung eines teilweise komprimierten
+   * Chunks wartet in 2.31 von sich aus NICHT auf Leser (gemessen) und ist für ältere Snapshots nicht
+   * MVCC-sicher (ein REPEATABLE-READ-Leser sah den Chunk trotz eigener Sperre leer); mit der Sperre
+   * wartet sie, bis laufende Leser fertig sind, und neue Leser warten auf sie.
+   */
+  private async recompressPartial(from: Date, to: Date): Promise<number> {
+    const chunks = await this.db`
+      SELECT format('%I.%I', c.chunk_schema, c.chunk_name) AS c
+        FROM timescaledb_information.chunks c
+        JOIN _timescaledb_catalog.chunk k
+          ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
+       WHERE c.hypertable_schema = 'public' AND c.hypertable_name = ANY(${[...DIGEST_TABLES]}::text[])
+         AND c.range_start < ${to} AND c.range_end > ${from}
+         AND (k.status & 8) <> 0 AND (k.status & 4) = 0 AND NOT k.osm_chunk
+       ORDER BY c.hypertable_name, c.range_start`;
+    for (const c of chunks) await this.convertChunk(c.c as string);
+    return chunks.length;
+  }
+
+  private async convertChunk(chunk: string): Promise<void> {
+    await this.db.begin(async (tx) => {
+      await tx.unsafe(`LOCK TABLE ${chunk} IN ACCESS EXCLUSIVE MODE`);
+      await tx.unsafe(
+        'CALL convert_to_columnstore($1::regclass, if_not_columnstore => true, recompress => true)',
+        [chunk],
+      );
+    });
   }
 
   async close(): Promise<void> {
@@ -596,13 +622,13 @@ export class PostgresWriter implements DayWriter {
     // Konvertierungsfehler werden nur gemeldet; die Policy bzw. der nächste Backfill holt sie nach.
     this.writtenUntil = Math.max(this.writtenUntil, (data.day + 1) * DAY_MS);
     try {
-      for (const c of reconvert) {
-        await this.db.unsafe(
-          'CALL convert_to_columnstore($1::regclass, if_not_columnstore => true)',
-          [c],
-        );
-      }
+      for (const c of reconvert) await this.convertChunk(c);
       if (this.opt.backfill) await this.convertFinishedChunks(this.writtenUntil);
+      // Online (direktes DML auf einem Columnstore-Chunk): der Chunk ist danach teilweise
+      // komprimiert (Status-Bit 8). Sonst verdichtet ihn später die Policy nach – und die nimmt
+      // keine Sperre, ein Leser mit älterem Snapshot (auch mit LOCK TABLE … ACCESS SHARE) sähe ihn
+      // dann leer. Daher hier sofort unter ACCESS EXCLUSIVE nachverdichten (wartet auf Leser).
+      else await this.recompressPartial(from, to);
     } catch (e) {
       this.opt.log?.(
         `WARNUNG: Columnstore-Konvertierung nach ${dayStr} fehlgeschlagen (Daten sind geschrieben): ${e instanceof Error ? e.message : String(e)}`,

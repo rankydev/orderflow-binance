@@ -524,6 +524,39 @@ describe('Leser während des Schreibens (Konsistenz je Snapshot)', () => {
     let stop = false;
     let reads = 0;
     const problems: unknown[] = [];
+    // Tag zuerst einmal schreiben: der RR-Leser bestimmt seine Chunkliste vor dem Snapshot; ein
+    // erst danach angelegter Chunk wäre nicht gesperrt (Neuanlage ist kein Ersatz, siehe Bericht)
+    await run(new PostgresWriter(cfg, BTC), '2026-09-16', '2026-09-16', false);
+    // zweiter Leser wie die API: REPEATABLE READ mit mehreren Anweisungen, vorher LOCK TABLE auf alle
+    // Chunks des Tages (ohne diese Sperre könnte ein älterer Snapshot einen konvertierten Chunk leer sehen)
+    const rr = connect(cfg);
+    let rrReads = 0;
+    const rrLoop = (async () => {
+      while (!stop) {
+        // Chunkliste VOR der Transaktion bestimmen: die erste Anfrage einer REPEATABLE-READ-
+        // Transaktion legt den Snapshot fest – er muss nach dem LOCK entstehen
+        const chunks = await rr`
+          SELECT format('%I.%I', chunk_schema, chunk_name) AS c FROM timescaledb_information.chunks
+           WHERE hypertable_schema = 'public' AND range_start < '2026-09-17' AND range_end > '2026-09-16'
+             AND hypertable_name IN ('bar_1m', 'fp_1m', 'fp_1m_b10')`;
+        await rr.begin('isolation level repeatable read read only', async (tx) => {
+          if (chunks.length) {
+            await tx.unsafe(
+              `LOCK TABLE ${chunks.map((c) => c.c as string).join(', ')} IN ACCESS SHARE MODE`,
+            );
+          }
+          const [b] =
+            await tx`SELECT count(*)::int AS n FROM bar_1m WHERE ts >= '2026-09-16' AND ts < '2026-09-17'`;
+          const [f] =
+            await tx`SELECT count(DISTINCT ts)::int AS n FROM fp_1m WHERE ts >= '2026-09-16' AND ts < '2026-09-17'`;
+          const [g] =
+            await tx`SELECT count(DISTINCT ts)::int AS n FROM fp_1m_b10 WHERE ts >= '2026-09-16' AND ts < '2026-09-17'`;
+          rrReads++;
+          if (b!.n !== f!.n || f!.n !== g!.n)
+            problems.push({ rr: true, b: b!.n, f: f!.n, g: g!.n });
+        });
+      }
+    })();
     const loop = (async () => {
       while (!stop) {
         const r = await check();
@@ -556,8 +589,63 @@ describe('Leser während des Schreibens (Konsistenz je Snapshot)', () => {
     }
     stop = true;
     await loop;
+    await rrLoop;
     await reader.end();
+    await rr.end();
     expect(reads).toBeGreaterThan(10);
+    expect(rrReads).toBeGreaterThan(3);
+    if (problems.length) console.log('PROBLEMS', JSON.stringify(problems));
     expect(problems).toEqual([]);
+  });
+});
+
+describe('Re-Import eines historischen Tages ohne --backfill (Review W6)', () => {
+  it('direktes DML macht Chunks teilweise komprimiert; der Importer verdichtet sie sofort unter Sperre nach, die Policy könnte es auch (2.31)', async () => {
+    // Tag schreiben und alles bis 2026-10-01 komprimieren
+    await run(new PostgresWriter(cfg, BTC), '2026-09-08', '2026-09-08', false);
+    const w = new PostgresWriter(cfg, BTC);
+    await w.open();
+    await w.convertFinishedChunks(Date.UTC(2026, 9, 1));
+    await w.close();
+    const status = async () =>
+      (
+        await sql`
+        SELECT k.status FROM timescaledb_information.chunks c
+          JOIN _timescaledb_catalog.chunk k ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
+         WHERE c.hypertable_name = 'fp_1m' AND c.range_start = '2026-09-08 00:00:00+00'`
+      )[0]!.status as number;
+    expect(await status()).toBe(1);
+    const t0 = performance.now();
+    const [s] = await new Importer({
+      dataDir,
+      spec: BTC,
+      firstDay: parseDay('2026-09-08'),
+      lastDay: parseDay('2026-09-08'),
+      prefer: 'monthly',
+      neighbours: false,
+      writer: await opened(new PostgresWriter(cfg, BTC)),
+      importerVersion: 'int-test',
+      sidecar: false,
+      log: () => {},
+      force: true,
+    }).run();
+    await lastOpened?.close();
+    const ms = performance.now() - t0;
+    expect(s!.dbDigest).toBe(s!.digest);
+    // Der Importer hat die nach direktem DML teilweise komprimierten Chunks des Tages gleich unter
+    // ACCESS EXCLUSIVE nachverdichtet (die Policy täte es ohne Sperre, s. u.).
+    expect(await status()).toBe(1);
+    console.log(
+      `W6: Re-Import 2026-09-08 ohne --backfill inkl. Nachverdichtung ${Math.round(ms)} ms`,
+    );
+    // Belegen, dass auch die Policy teilweise komprimierte Chunks nachverdichtet: Chunk per DML
+    // teilweise machen (No-op-Update auf eine Zeile) und den Policy-Job laufen lassen.
+    await sql`UPDATE fp_1m SET buy_q = buy_q WHERE sym_id = ${BTC.symId} AND ts = '2026-09-08 12:00:00+00'`;
+    expect(await status()).toBe(9);
+    const [job] = await sql`
+      SELECT job_id FROM timescaledb_information.jobs WHERE proc_name = 'policy_compression' AND hypertable_name = 'fp_1m'`;
+    await sql.unsafe(`CALL run_job(${job!.job_id as number})`);
+    expect(await status()).toBe(1); // die Policy komprimiert teilweise komprimierte Chunks nach
+    expect(ms).toBeGreaterThan(0);
   });
 });
