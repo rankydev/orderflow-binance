@@ -121,6 +121,13 @@ Probe-Datei über die öffentliche Adresse = 200 → `certbot certonly --account
 (das eine Produktionskonto, das die Renewal-Dateien der Nachbarn nutzen; daneben existiert ein
 Staging-Konto, ohne `--account` könnte certbot nachfragen; Deploy-Hook nur für diese Lineage); Phase 2: endgültige Site → `nginx -t` → reload.
 Schlägt `nginx -t` fehl, nimmt das Skript die eigenen Dateien zurück und lädt **nicht** neu.
+Liefert die Challenge-Probe (bis 15 Versuche à ≤ 3 s, verlangt wird der Inhalt der Probe-Datei,
+nicht nur Status 200) nicht das Erwartete, bricht das Skript **vor certbot** ab (keine
+fehlgeschlagene Let's-Encrypt-Validierung): die Bootstrap-Site (nur Port 80/ACME, alles andere 404)
+bleibt aktiv, `conf.d`/Snippets bleiben installiert, Staging- und Backup-Verzeichnis werden
+gelöscht. Danach Ursache klären und das Skript erneut starten (idempotent) oder mit
+`deploy/nginx-setup.sh --rollback` alles Eigene entfernen; `--rollback` bricht mit Exit 1 ab,
+wenn `nginx -t` danach fehlschlägt, und lädt dann nicht neu.
 Prüfung (Skript, von innen und vom Mac): `http://` → 308, `https://` → 200,
 `/api/v1/symbols` → 200, `/api/v1/health` → 404.
 Der Symlink heißt `sites-enabled/zz-orderflow.rankyhub.com`: er sortiert immer zuletzt, unsere

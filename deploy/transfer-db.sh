@@ -45,7 +45,10 @@ export PGPASSWORD="$OF_DB_PASSWORD"
 [ "${OF_DB_NAME:-orderflow}" = orderflow ] || die "Quelle muss die DB orderflow sein (OF_DB_NAME=$OF_DB_NAME)"
 NET=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "$SRC_CONTAINER" | head -1)
 [ -n "$NET" ] || die "Quell-Container $SRC_CONTAINER läuft nicht"
+# src_psql liest stdin (für < datei); src_psql_c nur mit -c und ohne stdin (sonst läse docker exec -i
+# die Eingabe des Skripts)
 src_psql() { docker exec -i "$SRC_CONTAINER" psql -X -At -v ON_ERROR_STOP=1 -U "${OF_DB_USER:-of_admin}" -d orderflow "$@"; }
+src_psql_c() { src_psql "$@" </dev/null; }
 
 log "Ziel $DEPLOY_HOST, Dump $NAME"
 remote "$SRV_ROOT" <<'EOF'
@@ -86,7 +89,7 @@ docker run --rm --network "$NET" -e PGPASSWORD -v "$WORK:/dump" "$IMAGE" \
 log "pg_dump: $(( $(date +%s) - t0 )) s, $(du -sh "$WORK/db" | cut -f1)"
 
 log "2/7 Rolleneinstellungen + Prüfsummen"
-src_psql -c "SELECT s FROM (SELECT 0 AS o, 'ALTER ROLE of_api RESET ALL;' AS s UNION ALL
+src_psql_c -c "SELECT s FROM (SELECT 0 AS o, 'ALTER ROLE of_api RESET ALL;' AS s UNION ALL
   SELECT 1, format('ALTER ROLE of_api SET %s = %L;', split_part(c, '=', 1), substr(c, strpos(c, '=') + 1))
     FROM pg_roles, unnest(rolconfig) c WHERE rolname = 'of_api') x ORDER BY o, s" > "$WORK/db/roles-source.sql"
 sha256_manifest "$WORK/db"
@@ -114,7 +117,7 @@ wait "$SRC_PID" || { cat "$WORK/report-source.err" >&2; die "Prüfbericht der Qu
 release_snapshot
 trap - EXIT
 # Planungszustand der Anwendungs-Jobs (wie restore-db.sh am Ende für das Ziel)
-src_psql -c "SELECT 'jobsched|' || job_id || '|' || scheduled FROM timescaledb_information.jobs WHERE job_id >= 1000 ORDER BY job_id" >> "$WORK/report-source.txt"
+src_psql_c -c "SELECT 'jobsched|' || job_id || '|' || scheduled FROM timescaledb_information.jobs WHERE job_id >= 1000 ORDER BY job_id" >> "$WORK/report-source.txt"
 
 log "5/7 Restore auf dem Server (Ziel muss leer sein${REPLACE:+, --replace})"
 remote "$SRV_ROOT" "/transfer/$NAME" "$REPLACE" <<'EOF' > "$WORK/report-target.txt"

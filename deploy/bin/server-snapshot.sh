@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Nur lesender Schnappschuss der Nachbardienste auf dem VPS (per `remote` von preflight.sh und
-# postcheck.sh über stdin ausgeführt, nie installiert). Ausgabe: stabile Zeilen „schlüssel|wert";
+# Nur lesender Schnappschuss der Nachbardienste auf dem VPS (von preflight.sh und postcheck.sh per
+# `remote` als Argument von bash -c ausgeführt, stdin der Gegenseite /dev/null; nie installiert). Ausgabe: stabile Zeilen „schlüssel|wert";
 # vor und nach dem Rollout identisch, solange nichts an den Nachbarn verändert/neu gestartet wurde.
 # Zeilen mit Präfix „info|" sind informativ (dürfen sich ändern).
 set -uo pipefail

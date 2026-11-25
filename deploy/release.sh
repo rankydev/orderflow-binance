@@ -60,8 +60,9 @@ else
   rm -f api-image.tar.gz
   cd ..
   # Migrationsstand mit dem NEUEN Image prüfen (Migrationsdateien liegen im Image)
-  # </dev/null überall: dieses Skript kommt per stdin (bash -s); `compose run` läse sonst den Rest
-  # des Skripts als Eingabe des Containers und die folgenden Befehle liefen nie (so geschehen)
+  # Das Skript kommt als Argument von bash -c (lib.sh remote), stdin der Gegenseite ist /dev/null.
+  # Die </dev/null hier sind eine zweite Sicherung: `compose run` liest stdin und hatte, als das
+  # Skript noch über stdin kam, dessen Rest verschluckt (beim Rollout so geschehen).
   st=$(OF_RELEASE=$ID $C run --rm -T ops node packages/db/src/cli.ts status </dev/null)
   printf '%s\n' "$st" >&2
   if printf '%s\n' "$st" | grep -q '^ausstehend'; then

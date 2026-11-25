@@ -38,8 +38,9 @@ resolve_host() {
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=8)
 
-# Befehl(e) auf dem Server per bash ausführen; Skripttext von stdin, Argumente als $1…
-# Beispiel: remote <<'EOF' … EOF     bzw.  remote_args a b <<'EOF' … EOF
+# Befehl(e) auf dem Server per bash ausführen: den Skripttext liest remote() lokal von stdin und
+# übergibt ihn als Argument von `bash -c` (Argumente als $1…); stdin der Gegenseite ist /dev/null.
+# Beispiel: remote a b <<'EOF' … EOF
 remote() {
   # Skript als Argument (bash -c), nicht als stdin: ein Befehl im Skript, der stdin liest (z. B.
   # `docker compose run`), würde sonst den Rest des Skripts verschlucken (beim Rollout passiert).

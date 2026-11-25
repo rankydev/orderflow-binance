@@ -25,7 +25,8 @@ rm -f /etc/nginx/sites-enabled/zz-orderflow.rankyhub.com /etc/nginx/sites-enable
       /etc/nginx/sites-available/orderflow.rankyhub.com \
       /etc/nginx/conf.d/orderflow-binance.conf /etc/nginx/snippets/orderflow-binance-headers.conf \
       /etc/nginx/snippets/orderflow-binance-proxy.conf
-nginx -t && systemctl reload nginx
+nginx -t || { echo "nginx -t fehlgeschlagen – KEIN Reload; Konfiguration prüfen" >&2; exit 1; }
+systemctl reload nginx
 echo "orderflow-nginx-Dateien entfernt (Zertifikat bleibt; löschen: certbot delete --cert-name orderflow.rankyhub.com)"
 EOF
   exit 0
@@ -103,16 +104,25 @@ if [ ! -f "$CERT" ]; then
   # Challenge-Pfad vorab prüfen (über die öffentliche Adresse, wie Let's Encrypt)
   install -d -m 755 /var/www/orderflow-acme/.well-known/acme-challenge
   probe=probe-$(openssl rand -hex 8)
-  echo ok > "/var/www/orderflow-acme/.well-known/acme-challenge/$probe"
-  # nach dem Reload übernehmen die neuen Worker erst nach kurzer Zeit → bis 15 s wiederholen
-  code=000
+  token=$(openssl rand -hex 16)
+  printf %s "$token" > "/var/www/orderflow-acme/.well-known/acme-challenge/$probe" # ohne Zeilenende
+  # Nach dem Reload übernehmen die neuen Worker erst nach kurzer Zeit: bis 15 Versuche à höchstens
+  # 3 s + 1 s Pause (≤ 60 s). Verlangt wird der Inhalt der Probe-Datei, nicht nur Status 200, damit
+  # kein anderer Server-Block durchrutscht (jede fehlgeschlagene LE-Validierung zählt gegen das Limit).
+  code=000 got=
   for _ in $(seq 1 15); do
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://orderflow.rankyhub.com/.well-known/acme-challenge/$probe")
-    [ "$code" = 200 ] && break
+    got=$(curl -s --max-time 3 -w '\n%{http_code}' "http://orderflow.rankyhub.com/.well-known/acme-challenge/$probe" || true)
+    code=${got##*$'\n'}
+    [ "$code" = 200 ] && [ "${got%$'\n'*}" = "$token" ] && break
     sleep 1
   done
   rm -f "/var/www/orderflow-acme/.well-known/acme-challenge/$probe"
-  [ "$code" = 200 ] || { say "Challenge-Pfad liefert $code statt 200"; exit 1; }
+  if [ "$code" != 200 ] || [ "${got%$'\n'*}" != "$token" ]; then
+    say "Challenge-Pfad liefert $code bzw. nicht die Probe-Datei – Abbruch vor certbot"
+    say "Zustand: Bootstrap-Site (nur Port 80/ACME) bleibt aktiv; zurücknehmen mit nginx-setup.sh --rollback"
+    rm -rf -- "$S" "$backup"
+    exit 1
+  fi
   # deploy-hook nur für diese Lineage (steht in renewal/orderflow.rankyhub.com.conf)
   certbot certonly --account "$acct" --webroot -w /var/www/orderflow-acme -d orderflow.rankyhub.com \
     --cert-name orderflow.rankyhub.com --non-interactive --keep-until-expiring \
