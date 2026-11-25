@@ -3,6 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   clampScroll,
+  fitPriceRange,
   floorPriceRange,
   normalizeWheel,
   pinchStep,
@@ -187,5 +188,22 @@ describe('Folgeprüfung c47aef6: Gründe ohne Footprint, Ratio-Sperre', () => {
   it('High/Low Ratio nur mit Footprint', () => {
     expect(ratioAllowed(true)).toBe(false);
     expect(ratioAllowed(false)).toBe(true);
+  });
+});
+
+describe('Folgeprüfung 63f7ccb: Einpassen mit Unterkante ≥ 0', () => {
+  it('niedrig notiertes Instrument: Rand reicht unter 0 → nach oben geschoben, Spanne bleibt', () => {
+    // Tief 3, Hoch 100 Einheiten, Tick 10: Rand 0,06 × 97 + 10 = 15,82 > Tief
+    const [t, b] = fitPriceRange(3, 100, 10);
+    expect(b).toBe(0);
+    expect(t).toBeCloseTo(100 + 15.82 + (15.82 - 3), 9);
+    expect(t - b).toBeCloseTo(97 + 2 * 15.82, 9);
+    // weiteres Verschieben/Zoomen springt nicht: der Bereich ist schon ≥ 0
+    expect(floorPriceRange(t, b)).toEqual([t, b]);
+  });
+  it('normal notiert: Rand symmetrisch, unverändert', () => {
+    const [t, b] = fitPriceRange(5_000_000, 6_000_000, 10);
+    expect(t).toBeCloseTo(6_060_010, 6);
+    expect(b).toBeCloseTo(4_939_990, 6);
   });
 });

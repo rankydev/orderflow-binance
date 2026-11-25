@@ -32,6 +32,7 @@ import type { SymbolInfo } from '../types.ts';
 import { GestureTracker } from '../gesture.ts';
 import {
   clampScroll,
+  fitPriceRange,
   floorPriceRange,
   normalizeWheel,
   pinchStep,
@@ -756,10 +757,8 @@ export class TpoView {
       }
     }
     if (lo === Infinity) return;
-    const m = (hi - lo) * 0.06 + s.tickRefUnits;
     this.dataSpan = hi - lo;
-    this.pTop = hi + m;
-    this.pBot = lo - m;
+    [this.pTop, this.pBot] = fitPriceRange(lo, hi, s.tickRefUnits);
     this.fitted = true;
     this.fitOffset = this.host.offsetH();
     this.autoR = null;

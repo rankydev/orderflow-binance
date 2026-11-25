@@ -132,3 +132,12 @@ export function pinchStep(
   const d1 = Math.abs(a1.x - b1.x);
   return { f: d0 >= 10 && d1 >= 10 ? d1 / d0 : 1, x: (a1.x + b1.x) / 2 };
 }
+
+/**
+ * Preisbereich zum Einpassen (fit/Doppelklick): Datenbereich plus 6 % Rand und ein Tick, Unterkante ≥ 0
+ * (sonst springt der Bereich beim ersten Verschieben/Zoomen nach oben).
+ */
+export function fitPriceRange(lo: number, hi: number, tickUnits: number): [number, number] {
+  const m = (hi - lo) * 0.06 + tickUnits;
+  return floorPriceRange(hi + m, lo - m);
+}
