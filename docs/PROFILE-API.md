@@ -127,9 +127,11 @@ Tagesgrenzen, alle Quelltabellen, Offsets 0/+3/−7, Notional > 2^53).
 ## Caching
 
 `final = true` nur, wenn jeder überdeckte UTC-Tag existiert und `data_day.immutable` ist; dann
-`Cache-Control: public, max-age=31536000, immutable` und `ETag: "<dataVersion>"`, sonst `no-cache` (+ ETag, 304
-möglich). `dataVersion` = Hash über die Versionen der überdeckten Tage und die Parameter. Finale Antworten liegen
-vorkomprimiert im Server-Cache.
+`Cache-Control: public, max-age=604800` (eine Woche, ohne `immutable`, danach Revalidierung per ETag) und
+`ETag: "<dataVersion>"`, sonst `no-cache` (+ ETag). `dataVersion` = Hash über die Versionen der überdeckten Tage
+und die Parameter. Die API beantwortet ein passendes `If-None-Match` mit 304, ohne die Datenbank zu fragen; im
+Server-Cache liegen finale Antworten bis zur Verdrängung, nicht finale höchstens 10 s
+(`OF_API_NONFINAL_TTL_MS`), jeweils unter ihrer `dataVersion`.
 
 ## Antwortgröße und Format (Begründung JSON)
 
@@ -168,5 +170,12 @@ ohne Decoder. Gemessen (BTC, echte Daten, 2026-11-24): Oktober bei R = 100 (≈ 
 ## Fehler
 
 `400` ungültige Parameter, `404` unbekanntes Symbol/Pfad, `422` Grenzen (mit `suggestR`), `503` Überlast,
-Sperre durch einen laufenden Import oder Abfragezeitlimit (mit `Retry-After`, wiederholbar). Wie bei den Kacheln
-sind 400/404/422 für diese URL endgültig.
+Sperre durch einen laufenden Import, Abfragezeitlimit oder Datenbank nicht erreichbar (mit `Retry-After`,
+wiederholbar).
+
+400 und 404 sind für diese URL endgültig. **422 gilt nur für den aktuellen Datenstand:** die Schätzung der
+Quellzeilen und der Preisbereich wachsen mit neuen Tagen bzw. ändern sich mit Neuimporten. Ein Client übernimmt
+`suggestR` (oder wählt ein gröberes R) und fragt dieselbe URL frühestens nach einem neuen `/symbols`-Stand
+(geändertes `dataTo`) erneut. Umgekehrt ist ein leeres Profil (200, `rowLo = null`) für einen Zeitraum ohne
+Trades kein Endzustand: liegt der Zeitraum nicht vollständig in finalen Tagen (`final = false`), kann ein späterer
+Import oder Backfill ihn füllen; der Client fragt dann wie bei jeder nicht finalen Antwort erneut.

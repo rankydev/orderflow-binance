@@ -168,8 +168,9 @@ wiederholt, `Retry-After` (Sekunden oder HTTP-Datum) wird beachtet. Kacheln mit 
 höchstens 60 s, danach fragt er neu (bis die Live-Invalidierung aus §5.4 in P2 kommt). ETag/304 sind erlaubt, werden
 aber vom Client nicht vorausgesetzt.
 
-**Cache-Header:** finale Kacheln (`final = true`) `Cache-Control: public, max-age=31536000, immutable` und
-`ETag: "<dataVersion>"`; nicht finale `Cache-Control: no-cache` (+ ETag, 304 erlaubt). `/symbols`: `no-cache`.
+**Cache-Header:** finale Kacheln (`final = true`) `Cache-Control: public, max-age=604800` (eine Woche, **ohne**
+`immutable`; Review W5, siehe „Festlegungen der API") und `ETag: "<dataVersion>"`; nicht finale
+`Cache-Control: no-cache` (+ ETag, 304 erlaubt). `/symbols`: `no-cache`.
 
 **CORS:** Liegt die API auf einem anderen Ursprung als die Seite (`VITE_API_BASE`), muss sie für den Seiten-Ursprung
 `Access-Control-Allow-Origin` setzen (nur GET, keine Credentials, keine besonderen Header). Gleicher Ursprung über
@@ -223,12 +224,27 @@ Umgesetzt in `apps/api` (Katalog `src/catalog.ts`, Routen `src/routes/tiles.ts`)
 - **503 + `Retry-After`** (wiederholbar): Überlast (Gleichzeitigkeitslimit/Warteschlange), Sperre durch einen
   laufenden Import nach begrenzter Wiederholung (`lock_timeout`), Abfragezeitlimit, Datenbank nicht erreichbar.
 - **CORS**: Standard erlaubt nur Loopback-Ursprünge (`http://127.0.0.1|localhost|[::1]:<port>`, Entwicklung mit
-  zweitem Vite-Server); im Betrieb `OF_API_CORS_ORIGINS` (Liste oder `*`). Exponiert `ETag`, `Retry-After`,
-  `X-Cache`, `X-Source`. Diagnose-Header: `X-Cache` (hit/miss), `X-Source` (Quelltabelle), `X-Rows-Estimate`
-  (geschätzte Quellzeilen), `Server-Timing`.
-- Nach einem Neuimport eines bereits finalen Tages ändert sich `dataVersion`, nicht aber die Kachel-URL: Browser-
-  Caches mit `immutable` behalten die alte Kachel, bis sich `cfg` ändert oder die Live-Invalidierung (§5.4, P2)
-  kommt. Der Server-Cache ist davon nicht betroffen (Schlüssel enthält die `dataVersion`).
+  zweitem Vite-Server); im Betrieb `OF_API_CORS_ORIGINS` (Liste oder `*`) – oder gleicher Ursprung hinter nginx,
+  dann ist kein CORS nötig. Exponiert `ETag`, `Retry-After`, `X-Cache`. Jede Antwort trägt
+  `X-Content-Type-Options: nosniff` und `X-Cache` (`hit`, `miss`, `shared` = an eine laufende gleiche Berechnung
+  angehängt, `revalidated` = 304). Diagnose-Header `X-Source` (Quelltabelle), `X-Rows-Estimate` (geschätzte
+  Quellzeilen) und `Server-Timing` nur mit `OF_API_DIAG_HEADERS=1` (Standard aus: sie verraten Tabellennamen und
+  DB-Zeiten).
+- **Browser-Cache (Review W5):** finale Antworten `Cache-Control: public, max-age=604800` – eine Woche, nicht
+  `immutable`. Danach revalidiert der Browser mit `If-None-Match`; stimmt die `dataVersion` noch, antwortet die
+  API mit 304 ohne Datenabfrage. Ein Neuimport eines bereits finalen Tages (neue Binance-Datei, Historien-
+  reparatur) ändert die `dataVersion`, nicht die URL; er ist damit nach höchstens einer Woche sichtbar (sofort mit
+  der Live-Invalidierung aus §5.4 in P2 oder einem Datenzähler in der URL).
+- **Server-Cache und Revalidierung (Review W1):** Die API prüft `If-None-Match` gegen die `dataVersion` aus ihrer
+  Tagesversionstabelle (≤ 1 s alt), **bevor** sie die Datenbank fragt: Treffer → 304 ohne Datenabfrage und ohne
+  Platz im Gleichzeitigkeitslimit. Auch nicht finale Antworten liegen im Server-Cache, unter ihrer `dataVersion`
+  (fehlende Tage gehen als „-" ein) und höchstens `OF_API_NONFINAL_TTL_MS` (Standard 10 s) lang; gleichzeitige
+  gleiche Anfragen teilen eine Berechnung. Der Browser bekommt für nicht finale Antworten weiterhin `no-cache`.
+- **Bestätigt für den Web-Client:** (1) `tileConfigVersion` bleibt eine sichere Ganzzahl (Hash < 2^47, derzeit
+  14 Stellen); (2) eine Footprint-Kachel und `/bars` über denselben Zeitraum mit derselben Datenlage enthalten
+  identische Bars mit identischem `buyQ + sellQ` je Bar (eine Funktion, ein Snapshot je Antwort); (3) `/bars`
+  gibt im Header exakt das angefragte `from`/`to` zurück, auch wenn `to` hinter `dataTo` liegt (der Abschnitt
+  enthält dann nur Bars < `dataTo`).
 
 ## Offener Entwurfspunkt für die API: Kachellänge je Zeitabschnitt (Review, nicht umgesetzt)
 
