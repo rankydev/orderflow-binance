@@ -1,9 +1,9 @@
 // Wartung: offene („heiße") Chunks aus dem Columnstore zurück in den Rowstore (Migration 0015).
 //
 //   node --env-file-if-exists=.env apps/importer/src/main.ts repair-open-chunks [--dry-run]
-//        [--lock-timeout-ms 2000] [--attempts 30]
+//        [--lock-timeout-ms 500] [--attempts 30] [--ignore-open-transactions]
 //
-// Ein Chunk, der noch Schreibzugriffe bekommen kann (range_end > now() - HOT_MARGIN), gehört nicht
+// Ein Chunk, der noch Schreibzugriffe bekommen kann (range_end > now() - of_hot_margin()), gehört nicht
 // in den Columnstore: Live-Minuten machen ihn sonst dauerhaft teilweise komprimiert. Bis 0015 konnte
 // ein manueller Komplett-Konvertierungslauf (2026-11-24, Messskript) offene Chunks komprimieren,
 // und der Backfill hielt sie danach komprimiert. Dieses Kommando macht das rückgängig:
@@ -13,11 +13,16 @@
 //    Leser warten auf uns.
 //  - idempotent: nur Chunks mit Status-Bit 1 (komprimiert) und offenem Zeitraum; ein zweiter Lauf
 //    findet nichts mehr.
+//  - Sperre je Versuch höchstens 500 ms (unter der lock_timeout der API von 1 s: API-Leser hinter
+//    unserer wartenden Sperre laufen nicht in ihre Zeitüberschreitung).
+//  - bricht ab, solange auf der Datenbank eine andere Transaktion offen ist, die vor dem Lauf
+//    begann (Review W1): ein REPEATABLE-READ-Leser ohne Chunk-Sperren (Prüfbericht verify-db.sql,
+//    Dump-Probelauf) sähe den umgewandelten Chunk sonst leer und schlüge laut fehl. Überschreibbar
+//    mit --ignore-open-transactions, wenn die offenen Transaktionen bekannt harmlos sind.
 //  - als Eigentümer (of_admin) ausführen; der Recorder sollte dabei gestoppt sein (nicht nötig für
 //    die Korrektheit, aber seine Schreibzugriffe verlängern die Sperrwartezeit nicht unnötig).
 import type { Sql } from '@orderflow/db';
 import { DIGEST_TABLES } from '@orderflow/core';
-import { HOT_MARGIN } from './writer/postgres.ts';
 
 export interface RepairResult {
   chunk: string;
@@ -41,7 +46,7 @@ export async function openColumnstoreChunks(
         ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
      WHERE c.hypertable_schema = 'public' AND c.hypertable_name = ANY(${[...DIGEST_TABLES]}::text[])
        AND (k.status & 1) <> 0 AND (k.status & 4) = 0 AND NOT k.osm_chunk
-       AND c.range_end > now() - ${HOT_MARGIN}::interval
+       AND c.range_end > now() - of_hot_margin()
      ORDER BY c.hypertable_name, c.range_start`;
   return rows.map((r) => ({
     chunk: r.c as string,
@@ -51,19 +56,67 @@ export async function openColumnstoreChunks(
   }));
 }
 
+/** Andere offene Transaktionen auf dieser Datenbank, die vor jetzt begannen (W1). */
+export async function otherOpenTransactions(
+  sql: Sql,
+): Promise<{ pid: number; user: string; app: string; since: string; db: string }[]> {
+  const rows = await sql`
+    SELECT pid, usename AS u, application_name AS a, xact_start::text AS s, datname AS d
+      FROM pg_stat_activity
+     WHERE datname = current_database() AND pid <> pg_backend_pid()
+       AND backend_type = 'client backend' AND xact_start IS NOT NULL
+       AND xact_start < statement_timestamp()
+     ORDER BY xact_start`;
+  return rows.map((r) => ({
+    pid: r.pid as number,
+    user: r.u as string,
+    app: r.a as string,
+    since: r.s as string,
+    db: r.d as string,
+  }));
+}
+
+/**
+ * Nur auf Test-Datenbanken (Review H2c): Skripte unter scripts/ oder bench/, die Chunks
+ * konvertieren, rufen dies vorher auf. Der Vorfall vom 2026-11-24 war ein solches Skript gegen
+ * die Entwicklungsdatenbank.
+ */
+export const TEST_DB_PATTERN = /_(test|probe)(_[a-z0-9_]+)?$/;
+export async function assertTestDatabase(sql: Sql): Promise<string> {
+  const [r] = await sql`SELECT current_database() AS d`;
+  const db = r!.d as string;
+  if (!TEST_DB_PATTERN.test(db))
+    throw new Error(
+      `Chunk-Konvertierung nur auf Test-Datenbanken (Muster ${TEST_DB_PATTERN}), nicht auf "${db}"`,
+    );
+  return db;
+}
+
 export async function repairOpenChunks(
   sql: Sql,
   o: {
     dryRun?: boolean;
     lockTimeoutMs?: number | undefined;
     attempts?: number | undefined;
+    ignoreOpenTransactions?: boolean;
     log?: (s: string) => void;
   },
 ): Promise<RepairResult[]> {
   const out: RepairResult[] = [];
-  const timeout = Math.max(1, Math.trunc(o.lockTimeoutMs ?? 2000));
+  const timeout = Math.max(1, Math.trunc(o.lockTimeoutMs ?? 500));
   const attempts = o.attempts ?? 30;
-  for (const c of await openColumnstoreChunks(sql)) {
+  const chunks = await openColumnstoreChunks(sql);
+  if (!o.dryRun && chunks.length > 0 && !o.ignoreOpenTransactions) {
+    const open = await otherOpenTransactions(sql);
+    if (open.length > 0)
+      throw new Error(
+        `repair-open-chunks: ${open.length} andere offene Transaktion(en) auf ${open[0]!.db}, älter als dieser Lauf ` +
+          `(${open.map((t) => `pid ${t.pid} ${t.app || t.user} seit ${t.since}`).join('; ')}). ` +
+          'Ein REPEATABLE-READ-Leser ohne Chunk-Sperren (Prüfbericht, Dump) sähe umgewandelte Chunks leer. ' +
+          'Abwarten oder, wenn harmlos, mit --ignore-open-transactions erneut starten.',
+      );
+  }
+  for (const c of chunks) {
     if (o.dryRun) {
       out.push({ ...c, lockWaitMs: null, convertMs: null });
       o.log?.(

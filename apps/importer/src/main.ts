@@ -44,7 +44,7 @@ export const USAGE = `Verwendung:
                   [--dry-run | --db] [--prefer auto|daily|monthly] [--no-neighbours]
                   [--out ergebnis.jsonl] [--resume] [--sidecar | --sidecar-dir DIR] [--data-dir DIR] [--quiet]
   importer download --symbol BTCUSDT --kind aggTrades|klines (--day YYYY-MM-DD | --from … --to …)
-  importer repair-open-chunks [--dry-run] [--lock-timeout-ms 2000] [--attempts 30]`;
+  importer repair-open-chunks [--dry-run] [--lock-timeout-ms 500] [--attempts 30] [--ignore-open-transactions]`;
 
 export class UsageError extends Error {}
 
@@ -297,6 +297,7 @@ async function runRepairOpenChunks(argv: string[]): Promise<number> {
       'dry-run': { type: 'boolean' },
       'lock-timeout-ms': { type: 'string' },
       attempts: { type: 'string' },
+      'ignore-open-transactions': { type: 'boolean' },
     },
     strict: true,
   });
@@ -309,6 +310,7 @@ async function runRepairOpenChunks(argv: string[]): Promise<number> {
       dryRun: !!v['dry-run'],
       lockTimeoutMs: v['lock-timeout-ms'] ? Number(v['lock-timeout-ms']) : undefined,
       attempts: v.attempts ? Number(v.attempts) : undefined,
+      ignoreOpenTransactions: !!v['ignore-open-transactions'],
       log: (s) => console.log(s),
     });
     const held = res.reduce((m, r) => Math.max(m, r.convertMs ?? 0), 0);
