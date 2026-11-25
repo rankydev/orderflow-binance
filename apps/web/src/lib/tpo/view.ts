@@ -31,6 +31,13 @@ import { RequestQueue, type Want } from '../request-queue.ts';
 import type { SymbolInfo } from '../types.ts';
 import { GestureTracker } from '../gesture.ts';
 import {
+  clampScroll,
+  priceAxisDrag,
+  wheelIntent,
+  wheelZoomFactor,
+  zoomColumnsAt,
+} from './interaction.ts';
+import {
   blockShade,
   chooseSourceTf,
   computeTpo,
@@ -151,6 +158,7 @@ export class TpoView {
   private frameReq = 0;
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private drag: { x: number; y: number } | null = null;
+  private axisDrag = false;
   private hoverPos: { x: number; y: number } | null = null;
   private hoverReq = 0;
   private readonly ro: ResizeObserver;
@@ -239,6 +247,9 @@ export class TpoView {
       this.listeners.push(() => this.canvas.removeEventListener(ev, f as EventListener));
     };
     on('pointerdown', (e) => {
+      const r = this.canvas.getBoundingClientRect();
+      // Ziehen auf der Preisachse (rechts) skaliert den Preis, in der Fläche wird verschoben
+      this.axisDrag = e.clientX - r.left > this.plotW();
       this.drag = { x: e.clientX, y: e.clientY };
       this.tracker.pointerDown();
       this.canvas.setPointerCapture(e.pointerId);
@@ -255,7 +266,10 @@ export class TpoView {
         const dy = e.clientY - this.drag.y;
         this.drag = { x: e.clientX, y: e.clientY };
         this.tracker.pointerMove(e.buttons);
-        this.pan(dx, dy);
+        if (this.axisDrag) {
+          [this.pTop, this.pBot] = priceAxisDrag(this.pTop, this.pBot, dy);
+          this.schedule();
+        } else this.pan(dx, dy);
         return;
       }
       const r = this.canvas.getBoundingClientRect();
@@ -276,6 +290,14 @@ export class TpoView {
     const blur = () => up();
     window.addEventListener('blur', blur);
     this.listeners.push(() => window.removeEventListener('blur', blur));
+    // Doppelklick auf die Preisachse: Preisbereich neu einpassen (wie „Auto-Skala" der Chart-Seite)
+    on('dblclick', (e) => {
+      const r = this.canvas.getBoundingClientRect();
+      if (e.clientX - r.left > this.plotW()) {
+        this.fitted = false;
+        this.fit();
+      }
+    });
     on('pointerleave', () => {
       this.hoverPos = null;
       this.onHover?.('');
@@ -285,10 +307,12 @@ export class TpoView {
       (e) => {
         e.preventDefault();
         const r = this.canvas.getBoundingClientRect();
-        if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
-          const d = e.shiftKey ? e.deltaY : e.deltaX;
-          this.zoomColumns(Math.exp(-d * 0.002), e.clientX - r.left);
-        } else this.zoomPrice(Math.exp(e.deltaY * 0.002), e.clientY - r.top);
+        // wie die Chart-Seite: Rad/Pinch zoomt die Zeitachse (Spaltenbreite) um den Zeiger, waagrechtes
+        // Scrollen (Touchpad, Shift) verschiebt die Tage
+        if (wheelIntent(e) === 'pan') {
+          const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+          this.pan(-d, 0);
+        } else this.zoomColumns(wheelZoomFactor(e.deltaY, e.ctrlKey), e.clientX - r.left);
         this.tracker.wheel();
       },
       false,
@@ -330,8 +354,12 @@ export class TpoView {
     const b = this.dayBounds();
     if (!b) return;
     const d = Math.min(b[1], Math.max(b[0], tpoDayOf(tMs, this.host.offsetH())));
-    const max = Math.max(0, (b[1] - b[0]) * this.colW);
-    this.scrollPx = Math.min(max, Math.max(0, (b[1] - d + 0.5) * this.colW - this.plotW() / 2));
+    this.scrollPx = clampScroll(
+      (b[1] - d + 0.5) * this.colW - this.plotW() / 2,
+      b[1] - b[0] + 1,
+      this.colW,
+      this.plotW(),
+    );
     this.fitted = false;
     this.evaluate();
   }
@@ -418,8 +446,8 @@ export class TpoView {
   private pan(dx: number, dy: number): void {
     const b = this.dayBounds();
     if (!b) return;
-    const max = Math.max(0, (b[1] - b[0]) * this.colW);
-    this.scrollPx = Math.min(max, Math.max(0, this.scrollPx + dx));
+    // freier Raum rechts nach dem letzten Tag wie auf der Chart-Seite (scrollBounds)
+    this.scrollPx = clampScroll(this.scrollPx + dx, b[1] - b[0] + 1, this.colW, this.plotW());
     const upp = (this.pTop - this.pBot) / this.plotH();
     this.pTop += dy * upp;
     this.pBot += dy * upp;
@@ -435,14 +463,11 @@ export class TpoView {
 
   /** Spaltenbreite ändern, verankert an der Zeigerposition x (CSS-px, Standard: rechter Rand). */
   zoomColumns(f: number, xCss = this.plotW()): void {
-    const old = this.colW;
-    this.colW = Math.min(1600, Math.max(60, this.colW * f));
-    // Abstand des Ankers vom rechten Rand in „Tagen" bleibt gleich: (pw − x + scroll) / colW
-    const pw = this.plotW();
-    const daysFromRight = (pw - xCss + this.scrollPx) / old;
     const b = this.dayBounds();
-    const max = b ? Math.max(0, (b[1] - b[0]) * this.colW) : 0;
-    this.scrollPx = Math.min(max, Math.max(0, daysFromRight * this.colW - (pw - xCss)));
+    const n = b ? b[1] - b[0] + 1 : 1;
+    const z = zoomColumnsAt(this.colW, this.scrollPx, f, xCss, this.plotW(), n);
+    this.colW = z.colW;
+    this.scrollPx = z.scrollPx;
     this.schedule();
   }
 

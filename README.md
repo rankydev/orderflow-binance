@@ -118,7 +118,8 @@ für den Zellbudget-Test). Kachelformat: [`docs/TILE-FORMAT.md`](docs/TILE-FORMA
 TILE-FORMAT.md, „Offen für die Live-Phase"). Messung (T11) im Browser:
 `PLAYWRIGHT_CORE=<pfad zu playwright-core> node apps/web/perf/measure.ts` bei laufendem Dev-Server.
 
-**Footprint komplett + Stats-Grid (P4, §6.1/§6.2):** Typen Delta (Standard), Bid×Ask, Volume (b + s) und Δ + Vol
+**Footprint komplett + Stats-Grid (P4, §6.1/§6.2):** „Kerzen" schaltet den Footprint ganz aus (OHLC-Kerzen in jeder
+Zoomstufe, keine Kachel-Anfragen, URL `fp=0`; Volumenprofil und Stats bleiben). Typen Delta (Standard), Bid×Ask, Volume (b + s) und Δ + Vol
 (Delta links, Volumen rechts); „Balken" = Profilmodus (Balken je Zeile ∝ Wert / Maximum im Bar) statt Box. Marken:
 POC (Standard an), Δ-POC (größtes |Delta|, Rahmen türkis/orange nach Vorzeichen), Bar-VA (VA-% wie beim Profil,
 Paarverfahren des Kerns), Imbalance (Standard aus; diagonal, Faktor 300 %, Mindestdifferenz, „Gegenseite 0 zählt",
@@ -146,8 +147,9 @@ POC, TPO ↑/↓, IB, Poor High/Low, fehlende Blöcke). Speicher: höchstens 20 
 Zeilengröße wird angehoben, mit Hinweis) und 3 Mio. vorbereitete Zellen (LRU, sichtbare Tage ± 1 bleiben); unter
 1,5 px Zeilenhöhe nur die Profilform je Pixelzeile. In der TPO-Ansicht ruht der Chart (keine Anfragen). Quelle: die Bars des gröbsten
 angebotenen Zeitrahmens, der Blockgröße, Initial Balance und Tagesgrenze teilt (30-min-Blöcke: 30m-Bars), je Tag eine
-Anfrage, nur sichtbare Tage ± 1. Ziehen verschiebt Tage und Preis, Mausrad zoomt den Preis, Shift + Mausrad die
-Spaltenbreite. URL: `view=tpo`, `tb=<min>`, `tib=<min>`, `ts=1` (Split), `tvp=0` (ohne Volumenprofil), `tr=<Ticks>`.
+Anfrage, nur sichtbare Tage ± 1. Bedienung wie die Chart-Seite: Ziehen verschiebt (auch über den letzten Tag hinaus nach rechts), Mausrad/Pinch
+zoomt die Spaltenbreite um den Zeiger, waagrechtes Scrollen/Shift verschiebt, Ziehen auf der Preisachse skaliert
+den Preis, Doppelklick dort passt ihn neu ein. URL: `view=tpo`, `tb=<min>`, `tib=<min>`, `ts=1` (Split), `tvp=0` (ohne Volumenprofil), `tr=<Ticks>`.
 
 **Volumenprofil + Delta** (Vertrag: [`docs/PROFILE-API.md`](docs/PROFILE-API.md)): standardmäßig je sichtbarem Tag
 ein Profil ab dem Tagesbeginn nach rechts, unter Kerzen/Footprint gezeichnet (Pane-Primitive, kein DOM-Overlay).

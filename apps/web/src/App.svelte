@@ -390,6 +390,14 @@
         {/each}
       </div>
       <div class="group" role="group" aria-label="Footprint-Typ">
+        <button
+          class:active={!fpo.footprint}
+          aria-pressed={!fpo.footprint}
+          title="Nur OHLC-Kerzen in jeder Zoomstufe (Footprint aus, keine Kachel-Anfragen); Profil und Stats bleiben"
+          onclick={() => setFp({ footprint: !fpo.footprint })}
+        >
+          Kerzen
+        </button>
         {#each TYPES as [t, l] (t)}
           <button class:active={type === t} aria-pressed={type === t} onclick={() => chooseType(t)}>
             {l}

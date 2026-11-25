@@ -94,6 +94,8 @@ export type Mode = 'footprint' | 'candle';
 export const MAX_VISIBLE_TILES = 24;
 /** K1: Abstand der Abschnittsanforderungen während einer Geste. */
 export const CHUNK_REQUEST_THROTTLE_MS = 250;
+/** Hinweis, wenn der Footprint per Schalter aus ist (normale Zeile, kein Banner). */
+export const FOOTPRINT_OFF_NOTE = 'Footprint aus – nur Kerzen';
 /** Profil-Querprüfung mit vorläufigen Bar-Abschnitten erst für Tage, die so lange vor dem Laden endeten. */
 export const PROFILE_SETTLE_MS = 86_400_000;
 
@@ -154,6 +156,8 @@ export class ChartController {
   readonly statsCtx = new StatsContext();
   /** Bars werden mit `stats=1` geladen (seit das Grid in dieser Sitzung eingeschaltet wurde). */
   private barsStats = false;
+  /** Footprint ausgeschaltet („nur Kerzen") */
+  private footprintOff = false;
   /** Profil-Grenzen aus /symbols (limits.profile) */
   private profileLimits: { maxRows: number; maxR: number; maxRangeDays: number } | null = null;
   private statsSeries: ISeriesApi<'Custom', Time, StatsItem | WhitespaceData<Time>> | null = null;
@@ -654,6 +658,15 @@ export class ChartController {
    */
   setFootprintOptions(o: FootprintOptions, vaPct: number): void {
     const rc = this.rc;
+    // „nur Kerzen": Footprint ganz aus – keine Kacheln, Kerzen in jeder Zoomstufe; Profil und Stats bleiben
+    if (o.footprint === this.footprintOff) {
+      this.footprintOff = !o.footprint;
+      if (this.footprintOff) {
+        this.fpQueue.cancelAll();
+        this.wantedFp.clear();
+      }
+      this.evaluate();
+    }
     rc.mode = o.mode;
     rc.showPoc = o.poc;
     rc.showDeltaPoc = o.deltaPoc;
@@ -1184,8 +1197,9 @@ export class ChartController {
     const rs = this.availableR();
     // Gründe, warum kein Footprint möglich ist (nicht zoombedingt) – sichtbar in der Anzeige (A)
     const scaleMode = this.chart.priceScale('right').options().mode;
-    this.noFootprint =
-      rs.length === 0
+    this.noFootprint = this.footprintOff
+      ? FOOTPRINT_OFF_NOTE
+      : rs.length === 0
         ? `kein Footprint für ${this.tf} (keine Zeilengröße angeboten)`
         : scaleMode !== PriceScaleMode.Normal
           ? 'Preisskala nicht linear – nur Kerzen'

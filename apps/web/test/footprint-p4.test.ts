@@ -224,6 +224,7 @@ describe('URL-Zustand Footprint/Stats', () => {
       'type=deltavol&fm=profile&poc=0&dpoc=1&bva=1&imb=1&imbr=250&imbd=500&imbz=1&imbh=1&imbs=4&sg=1&sgr=delta,cvd,trades';
     const o = parseFootprintParams(new URLSearchParams(q));
     expect(o).toEqual({
+      footprint: true,
       type: 'deltavol',
       mode: 'profile',
       poc: false,

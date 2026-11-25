@@ -5,6 +5,8 @@ import { STAT_ROWS, STATS_DEFAULT_ROWS, type StatRow } from './stats-grid.ts';
 import type { FootprintMode, FootprintType } from './types.ts';
 
 export interface FootprintOptions {
+  /** false = Footprint aus, nur OHLC-Kerzen in jeder Zoomstufe (URL fp=0) */
+  footprint: boolean;
   type: FootprintType;
   mode: FootprintMode;
   poc: boolean;
@@ -18,6 +20,7 @@ export interface FootprintOptions {
 
 /** Voreinstellung (eine Konstante; Änderung = eine Zeile). */
 export const FOOTPRINT_DEFAULTS: FootprintOptions = {
+  footprint: true,
   type: 'delta',
   mode: 'box',
   poc: true,
@@ -32,7 +35,7 @@ export const FOOTPRINT_DEFAULTS: FootprintOptions = {
 const TYPES: readonly FootprintType[] = ['delta', 'bidask', 'volume', 'deltavol'];
 
 /**
- * URL: type, fm=profile, poc=0, dpoc=1, bva=1, imb=1, imbr=<%>, imbd=<Lots>, imbz=1, imbh=1, imbs=<n>,
+ * URL: fp=0 (nur Kerzen), type, fm=profile, poc=0, dpoc=1, bva=1, imb=1, imbr=<%>, imbd=<Lots>, imbz=1, imbh=1, imbs=<n>,
  * sg=1, sgr=<Zeilen, kommagetrennt>. Ungültiges → Standard.
  */
 export function parseFootprintParams(q: URLSearchParams): FootprintOptions {
@@ -48,6 +51,7 @@ export function parseFootprintParams(q: URLSearchParams): FootprintOptions {
     .split(',')
     .filter((r): r is StatRow => STAT_ROWS.some((x) => x.id === r));
   return {
+    footprint: q.get('fp') !== '0',
     type: t && TYPES.includes(t) ? t : d.type,
     mode: q.get('fm') === 'profile' ? 'profile' : d.mode,
     poc: q.get('poc') === null ? d.poc : q.get('poc') !== '0',
@@ -70,6 +74,7 @@ export function parseFootprintParams(q: URLSearchParams): FootprintOptions {
 export function footprintParamsQuery(o: FootprintOptions): string {
   const d = FOOTPRINT_DEFAULTS;
   let q = '';
+  if (!o.footprint) q += '&fp=0';
   if (o.mode !== d.mode) q += `&fm=${o.mode}`;
   if (o.poc !== d.poc) q += `&poc=${o.poc ? 1 : 0}`;
   if (o.deltaPoc !== d.deltaPoc) q += `&dpoc=${o.deltaPoc ? 1 : 0}`;
