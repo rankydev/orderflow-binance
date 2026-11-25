@@ -22,8 +22,14 @@ import {
   type RawAgg,
   type RestSource,
 } from '../src/binance.ts';
-import { Recorder, type LiveSink } from '../src/recorder.ts';
-import { pruneRaw, readSpoolDay, SpoolWriter } from '../src/spool.ts';
+import { isTransientDbError, Recorder, type LiveSink } from '../src/recorder.ts';
+import {
+  assertRawPrunable,
+  pruneRaw,
+  RAW_CACHE_MARKER,
+  readSpoolDay,
+  SpoolWriter,
+} from '../src/spool.ts';
 import type { SocketLike } from '../src/ws.ts';
 
 const BTC = getSymbol('BTCUSDT');
@@ -359,8 +365,23 @@ describe('Abnahme 7: Plattenwächter und Aufbewahrung (W3)', () => {
       writeFileSync(join(agg, `BTCUSDT-aggTrades-${d}.zip`), 'x');
       writeFileSync(join(agg, `BTCUSDT-aggTrades-${d}.zip.CHECKSUM`), 'x');
     }
+    // ohne Marker-Datei (z. B. versehentlich gesetztes OF_RAW_KEEP_DAYS auf dem Mac): nichts löschen
+    expect(() => pruneRaw(data, 'BTCUSDT', DAY - 14, () => true)).toThrow(RAW_CACHE_MARKER);
+    expect(existsSync(join(agg, 'BTCUSDT-aggTrades-2026-11-01.zip'))).toBe(true);
+    writeFileSync(join(data, 'raw/binance-vision', RAW_CACHE_MARKER), '');
     const gone = pruneRaw(data, 'BTCUSDT', DAY - 14, (d) => d <= DAY - 1);
     expect(gone).toHaveLength(2);
     expect(existsSync(join(agg, 'BTCUSDT-aggTrades-2026-11-20.zip'))).toBe(true);
+    // Import-Archiv (enthält Monatsdateien): auch mit Marker nie
+    mkdirSync(join(data, 'raw/binance-vision/futures/um/monthly'), { recursive: true });
+    expect(() => assertRawPrunable(data)).toThrow(/Import-Archiv/);
+  });
+
+  it('statement_timeout (57014) zählt als dauerhafter Fehler, Verbindungsfehler als vorübergehend', () => {
+    expect(isTransientDbError({ code: '57014' })).toBe(false);
+    expect(isTransientDbError({ code: '57P01' })).toBe(true);
+    expect(isTransientDbError({ code: '55P03' })).toBe(true);
+    expect(isTransientDbError({ code: 'ECONNREFUSED' })).toBe(true);
+    expect(isTransientDbError({ code: '23514' })).toBe(false);
   });
 });

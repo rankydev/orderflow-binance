@@ -250,12 +250,34 @@ export function freeBytes(dir: string): number {
  * das Mac-Archiv ist die Quelle der Wahrheit). Löscht daily aggTrades- und 1m-Kline-Dateien samt
  * .CHECKSUM eines Symbols, deren Tag vor `oldestKeep` liegt und für den `isFinal(day)` gilt.
  */
+/**
+ * Marker-Datei, die ein Rohdaten-Verzeichnis als Cache des Recorders ausweist (vom Betrieb angelegt,
+ * VPS-Runbook). Ohne sie löscht pruneRaw nichts: ein versehentlich gesetztes OF_RAW_KEEP_DAYS auf dem
+ * Mac darf nie die Tagesdateien des Import-Archivs löschen.
+ */
+export const RAW_CACHE_MARKER = '.of-recorder-raw-cache';
+
+/** Wirft, wenn `dataDir` nicht als löschbarer Recorder-Cache ausgewiesen ist (oder ein Archiv ist). */
+export function assertRawPrunable(dataDir: string): void {
+  const root = join(dataDir, 'raw/binance-vision');
+  if (!existsSync(join(root, RAW_CACHE_MARKER)))
+    throw new Error(
+      `OF_RAW_KEEP_DAYS > 0, aber ${root} trägt keine Marker-Datei ${RAW_CACHE_MARKER}: Rohdaten werden nur in einem ausdrücklich als Recorder-Cache markierten Verzeichnis gelöscht`,
+    );
+  // Monatsdateien gibt es nur im Import-Archiv (der Recorder lädt Tagesdateien)
+  if (existsSync(join(root, 'futures/um/monthly')))
+    throw new Error(
+      `OF_RAW_KEEP_DAYS > 0, aber ${root} enthält Monatsdateien – das ist das Import-Archiv, kein Recorder-Cache`,
+    );
+}
+
 export function pruneRaw(
   dataDir: string,
   symbol: string,
   oldestKeep: number,
   isFinal: (day: number) => boolean,
 ): string[] {
+  assertRawPrunable(dataDir);
   const out: string[] = [];
   const dirs = [
     join(dataDir, 'raw/binance-vision/futures/um/daily/aggTrades', symbol),

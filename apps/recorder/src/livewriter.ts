@@ -245,7 +245,7 @@ export class LiveWriter {
         VALUES (${spec.symId}, ${ds}::date, 'provisional', 'live', 1, ${reason})
         ON CONFLICT (sym_id, day) DO UPDATE SET live_frozen = EXCLUDED.live_frozen,
                version = data_day.version + 1
-         WHERE data_day.state NOT IN ('final_ok', 'final_bad')`;
+         WHERE data_day.state = 'provisional'`; // nie in importing/final (Review W2)
     });
   }
 

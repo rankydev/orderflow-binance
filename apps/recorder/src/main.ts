@@ -7,7 +7,9 @@
 //   OF_SPOOL_KEEP_DAYS       Spool-Tage behalten, gezählt ab heute, unabhängig von der Finalisierung (Standard 7)
 //   OF_SPOOL_MIN_FREE_GB     darunter: Spoolen gestoppt (DB-Schreiben läuft weiter), Health unhealthy (Standard 5)
 //   OF_RAW_KEEP_DAYS         >0: geladene Tagesdateien finaler Tage älter als so viele Tage löschen
-//                            (VPS 14, §2.3; Mac 0 = nie, dort ist das Archiv die Quelle der Wahrheit)
+//                            (VPS 14, §2.3; Mac 0 = nie, dort ist das Archiv die Quelle der Wahrheit).
+//                            Verlangt die Marker-Datei <OF_DATA_DIR>/raw/binance-vision/.of-recorder-raw-cache
+//                            und keine Monatsdateien dort; sonst startet der Recorder nicht.
 //   OF_REST_WEIGHT_PER_MIN   eigenes REST-Gewichtsbudget (Standard 1200 = 50 % von 2400, §4.2)
 //   OF_BINANCE_WS_BASE / OF_BINANCE_REST_BASE   Endpunkte (Standard Binance USDⓈ-M, /market)
 //   OF_RECORDER_HTTP_PORT    lokaler Health-/Ereignis-Port auf 127.0.0.1 (Standard 7701, 0 = aus)
@@ -32,7 +34,7 @@ import { finaliseDay, nextAttempt } from './finalize.ts';
 import { LiveWriter } from './livewriter.ts';
 import { Recorder } from './recorder.ts';
 import { replayDay } from './replay.ts';
-import { freeBytes, pruneRaw } from './spool.ts';
+import { assertRawPrunable, freeBytes, pruneRaw } from './spool.ts';
 import type { SocketLike } from './ws.ts';
 
 type Env = Record<string, string | undefined>;
@@ -95,6 +97,7 @@ export function sdNotify(state: string): void {
 
 async function run(): Promise<number> {
   const cfg = recorderConfig(process.env);
+  if (cfg.rawKeepDays > 0) assertRawPrunable(cfg.dataDir); // vor dem Start, nicht erst nach Tagen
   const db = parseConfig(process.env).db;
   const writer = new LiveWriter(db, (s) => logLine(s));
   await writer.open();

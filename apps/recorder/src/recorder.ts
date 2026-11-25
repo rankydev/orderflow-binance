@@ -70,6 +70,10 @@ export const MAX_GAP_MS = 3 * DAY_MS;
  */
 export function isTransientDbError(e: unknown): boolean {
   const code = String((e as { code?: unknown })?.code ?? '');
+  // 57014 (statement_timeout): eine Minute, die das Limit immer überschreitet, würde sonst ewig
+  // wiederholt und blockierte die Warteschlange – zählt als dauerhafter Fehler (nach N Versuchen
+  // eingefroren); ein einmaliger Lastspitzen-Timeout ist nach dem nächsten Versuch erledigt.
+  if (code === '57014') return false;
   if (/^(08|53|57|40)/.test(code) || code === '55P03') return true;
   if (/^(CONNECTION_|CONNECT_TIMEOUT|ECONN|ETIMEDOUT|EPIPE|ENOTFOUND|EHOSTUNREACH)/.test(code))
     return true;
