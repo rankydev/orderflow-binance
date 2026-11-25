@@ -2,6 +2,7 @@
 export { downloadFile } from './download.ts';
 export { absPath, isPresent, relPath, type FileRef } from './files.ts';
 export { IMPORTER_VERSION } from './main.ts';
+export { openColumnstoreChunks, repairOpenChunks } from './maintenance.ts';
 export {
   Importer,
   klineRef,
@@ -11,7 +12,7 @@ export {
 } from './pipeline.ts';
 export { readAggTrades, readKlineDay } from './readers.ts';
 export { DryRunWriter } from './writer/dryrun.ts';
-export { IMPORTER_LOCK_KEY, PostgresWriter, safeNumber } from './writer/postgres.ts';
+export { HOT_MARGIN, IMPORTER_LOCK_KEY, PostgresWriter, safeNumber } from './writer/postgres.ts';
 export type { DayWriter, StoredDay } from './writer/types.ts';
 export { streamSingleEntry, textBlocks } from './zip.ts';
 export { verifyFile } from './files.ts';

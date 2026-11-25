@@ -197,6 +197,14 @@ export interface PostgresWriterOptions {
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Marge für offene („heiße") Chunks (Migration 0015): komprimiert bzw. nachverdichtet wird ein Chunk
+ * erst, wenn range_end <= now() - HOT_MARGIN. Deckt Live-Minuten, die Finalisierung von d-1 samt
+ * Randminute von d-2 und eine um einen Tag verspätete Tagesdatei ab; gleich compress_after der
+ * Policies. Wird in SQL ausgewertet (Uhr der Datenbank).
+ */
+export const HOT_MARGIN = '3 days';
 const pgCode = (e: unknown): string => String((e as { code?: unknown })?.code ?? '');
 
 export class PostgresWriter implements DayWriter {
@@ -325,6 +333,7 @@ export class PostgresWriter implements DayWriter {
           ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
        WHERE c.hypertable_schema = 'public' AND c.hypertable_name = ANY(${[...DIGEST_TABLES]}::text[])
          AND h.compression_enabled AND c.range_end <= ${new Date(untilMs)}
+         AND c.range_end <= now() - ${HOT_MARGIN}::interval -- offene Chunks nie (Migration 0015)
          -- nur Chunks mit unkomprimierten Zeilen: nicht komprimiert, oder teilweise (Status-Bit 8
          -- nach DML auf einem Columnstore-Chunk, in 2.31 auf orderflow_test geprüft; is_compressed
          -- bleibt dabei true). Bereits vollständig komprimierte Chunks nicht erneut anfassen.
@@ -361,6 +370,7 @@ export class PostgresWriter implements DayWriter {
          AND (${to ?? null}::timestamptz IS NULL OR c.range_start < ${to ?? null})
          AND (${from ?? null}::timestamptz IS NULL OR c.range_end > ${from ?? null})
          AND (k.status & 8) <> 0 AND (k.status & 4) = 0 AND NOT k.osm_chunk
+         AND c.range_end <= now() - ${HOT_MARGIN}::interval -- offene Chunks nie (Migration 0015)
        ORDER BY c.hypertable_name, c.range_start`;
     let deferred = 0;
     for (const c of chunks) if (!(await this.convertChunk(c.c as string))) deferred++;
@@ -506,6 +516,17 @@ export class PostgresWriter implements DayWriter {
    * mehrere Tabellen Lesesperren in anderer Reihenfolge nimmt → Deadlock (im DB-Test beobachtet).
    * Einzeln gibt es keinen Zyklus; die Daten ändern sich dabei nicht.
    */
+  /** Teilmenge der Chunks, deren Zeitraum samt Marge HOT_MARGIN vorbei ist. */
+  private async coldOnly(chunks: string[]): Promise<string[]> {
+    if (chunks.length === 0) return [];
+    const rows = await this.db`
+      SELECT format('%I.%I', chunk_schema, chunk_name) AS c FROM timescaledb_information.chunks
+       WHERE format('%I.%I', chunk_schema, chunk_name) = ANY(${chunks}::text[])
+         AND range_end <= now() - ${HOT_MARGIN}::interval`;
+    const cold = new Set(rows.map((r) => r.c as string));
+    return chunks.filter((c) => cold.has(c));
+  }
+
   private async rowstoreDay(from: Date, to: Date): Promise<string[]> {
     const tables = [...DIGEST_TABLES];
     const chunks = await this.db`
@@ -677,7 +698,8 @@ export class PostgresWriter implements DayWriter {
     // Sperr-Zeitüberschreitungen bei der Konvertierung holt close() bzw. der nächste Lauf nach.
     this.writtenUntil = Math.max(this.writtenUntil, (data.day + 1) * DAY_MS);
     try {
-      for (const c of reconvert) await this.convertChunk(c);
+      // nur kalte Chunks zurück in den Columnstore; ein offener bleibt im Rowstore (Migration 0015)
+      for (const c of await this.coldOnly(reconvert)) await this.convertChunk(c);
       if (this.opt.backfill) await this.convertFinishedChunks(this.writtenUntil);
       // Online (direktes DML auf einem Columnstore-Chunk): der Chunk ist danach teilweise
       // komprimiert (Status-Bit 8). Die Policy verdichtet ihn seit Migration 0014 nicht mehr nach

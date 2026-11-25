@@ -16,7 +16,9 @@ import {
 } from '@orderflow/core';
 import { appendFileSync, readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
+import { connect } from '@orderflow/db';
 import { downloadFile } from './download.ts';
+import { repairOpenChunks } from './maintenance.ts';
 import type { FileRef } from './files.ts';
 import { Importer, type DaySummary, type Prefer } from './pipeline.ts';
 import { DryRunWriter } from './writer/dryrun.ts';
@@ -41,7 +43,8 @@ export const USAGE = `Verwendung:
   importer import --symbol BTCUSDT (--day YYYY-MM-DD | --from YYYY-MM-DD --to YYYY-MM-DD | --month YYYY-MM)
                   [--dry-run | --db] [--prefer auto|daily|monthly] [--no-neighbours]
                   [--out ergebnis.jsonl] [--resume] [--sidecar | --sidecar-dir DIR] [--data-dir DIR] [--quiet]
-  importer download --symbol BTCUSDT --kind aggTrades|klines (--day YYYY-MM-DD | --from … --to …)`;
+  importer download --symbol BTCUSDT --kind aggTrades|klines (--day YYYY-MM-DD | --from … --to …)
+  importer repair-open-chunks [--dry-run] [--lock-timeout-ms 2000] [--attempts 30]`;
 
 export class UsageError extends Error {}
 
@@ -286,11 +289,44 @@ async function runDownload(argv: string[]): Promise<number> {
   return 0;
 }
 
+/** Offene Chunks aus dem Columnstore zurückholen (Migration 0015, siehe maintenance.ts). */
+async function runRepairOpenChunks(argv: string[]): Promise<number> {
+  const { values: v } = parseArgs({
+    args: argv,
+    options: {
+      'dry-run': { type: 'boolean' },
+      'lock-timeout-ms': { type: 'string' },
+      attempts: { type: 'string' },
+    },
+    strict: true,
+  });
+  const sql = connect(parseConfig(process.env).db, undefined, {
+    applicationName: 'orderflow-repair-open-chunks',
+  });
+  try {
+    const t0 = performance.now();
+    const res = await repairOpenChunks(sql, {
+      dryRun: !!v['dry-run'],
+      lockTimeoutMs: v['lock-timeout-ms'] ? Number(v['lock-timeout-ms']) : undefined,
+      attempts: v.attempts ? Number(v.attempts) : undefined,
+      log: (s) => console.log(s),
+    });
+    const held = res.reduce((m, r) => Math.max(m, r.convertMs ?? 0), 0);
+    console.log(
+      `repair-open-chunks: ${res.length} Chunks ${v['dry-run'] ? 'gefunden (dry-run)' : 'in den Rowstore gewandelt'}, längste Sperre ${held} ms, gesamt ${Math.round(performance.now() - t0)} ms`,
+    );
+    return 0;
+  } finally {
+    await sql.end();
+  }
+}
+
 export async function main(argv: string[]): Promise<number> {
   const [cmd, ...rest] = argv;
   try {
     if (cmd === 'import') return await runImport(rest);
     if (cmd === 'download') return await runDownload(rest);
+    if (cmd === 'repair-open-chunks') return await runRepairOpenChunks(rest);
     console.error(USAGE);
     return 2;
   } catch (e) {
