@@ -107,6 +107,11 @@ Upload, `sha256sum -c`, `docker load`, Migrationsstand (nach Schritt 3: nichts a
 Passwort der Rolle `of_api` aus `api.env`, `.env` → `OF_RELEASE=$ID`, `up -d --wait api`
 (scheitert der Healthcheck: automatisch zurück auf das vorige Release bzw. API gestoppt),
 Symlink `current` atomar, Rauchtest `127.0.0.1:8780/api/v1/symbols` = 200.
+Enthält ein Release Migrationen, die (noch) nicht angewendet werden sollen, und verträgt seine API
+das alte Schema (vorher am Code prüfen), dann ausdrücklich
+`deploy/release.sh "$ID" --allow-pending-migrations 0013,0014`: es wird nichts migriert, und das
+Release bricht ab, wenn die ausstehenden Migrationen nicht genau der Liste entsprechen (nicht
+zusammen mit `--migrate`).
 **Rücknahme:** `deploy/release.sh --rollback` (vorige ID: Image + Web) bzw. beim ersten Release
 `… stop api`. Danach `deploy/postcheck.sh "$BASE" --neighbours-only`.
 

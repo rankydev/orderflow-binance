@@ -2,6 +2,9 @@
 # Rollt ein mit build-release.sh gebautes Release auf dem VPS aus bzw. zurück.
 #
 #   deploy/release.sh [root@host] <release-id> [--migrate]   ausrollen
+#   deploy/release.sh [root@host] <release-id> --allow-pending-migrations 0013,0014
+#        ausrollen, obwohl genau diese Migrationen ausstehen; es wird NICHTS migriert (für ein
+#        Release, dessen API das alte Schema verträgt; nicht zusammen mit --migrate)
 #   deploy/release.sh [root@host] --rollback                  auf das vorige Release zurück
 #
 # Ablauf: Upload nach /opt/orderflow-binance/releases/<id>/ → sha256sum -c → docker load →
@@ -16,14 +19,23 @@ resolve_host "${1:-}"
 ID=
 MIGRATE=0
 ROLLBACK=0
-for a in "$@"; do
-  case "$a" in
+ALLOW=
+while [ $# -gt 0 ]; do
+  case "$1" in
     --migrate) MIGRATE=1 ;;
     --rollback) ROLLBACK=1 ;;
-    -*) die "unbekanntes Argument: $a" ;;
-    *) ID="$a" ;;
+    --allow-pending-migrations)
+      [ $# -ge 2 ] || die "--allow-pending-migrations braucht eine Liste, z. B. 0013,0014"
+      ALLOW="$2"
+      shift
+      printf '%s' "$ALLOW" | grep -qE '^[0-9]{4}(,[0-9]{4})*$' || die "Liste ungültig: $ALLOW (Form 0013,0014)"
+      ;;
+    -*) die "unbekanntes Argument: $1" ;;
+    *) ID="$1" ;;
   esac
+  shift
 done
+[ -z "$ALLOW" ] || [ "$MIGRATE" = 0 ] || die "--allow-pending-migrations und --migrate schließen sich aus"
 
 if [ "$ROLLBACK" = 0 ]; then
   [ -n "$ID" ] || die "Release-ID fehlt (Ausgabe von deploy/build-release.sh)"
@@ -38,9 +50,9 @@ EOF
   rsync -a --partial -e "ssh ${SSH_OPTS[*]}" "$SRC/" "$DEPLOY_HOST:$SRV_ROOT/releases/$ID/"
 fi
 
-remote "$ID" "$MIGRATE" "$ROLLBACK" <<'EOF'
+remote "$ID" "$MIGRATE" "$ROLLBACK" "$ALLOW" <<'EOF'
 set -euo pipefail
-ID=$1 MIGRATE=$2 ROLLBACK=$3
+ID=$1 MIGRATE=$2 ROLLBACK=$3 ALLOW=$4
 R=/opt/orderflow-binance
 C="docker compose -p orderflow-binance -f $R/compose.prod.yml --env-file $R/.env"
 say() { printf '[release %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -65,7 +77,12 @@ else
   # Skript noch über stdin kam, dessen Rest verschluckt (beim Rollout so geschehen).
   st=$(OF_RELEASE=$ID $C run --rm -T ops node packages/db/src/cli.ts status </dev/null)
   printf '%s\n' "$st" >&2
-  if printf '%s\n' "$st" | grep -q '^ausstehend'; then
+  pending=$(printf '%s\n' "$st" | sed -n 's/^ausstehend *\([0-9]\{4\}\)_.*/\1/p' | sort | paste -sd, -)
+  if [ -n "$ALLOW" ]; then
+    want=$(printf '%s' "$ALLOW" | tr ',' '\n' | sort | paste -sd, -)
+    say "ausstehend: ${pending:-keine}; erlaubt (ohne Anwendung): $want"
+    [ "$pending" = "$want" ] || { say "ausstehende Migrationen ≠ erlaubte Liste – Abbruch"; exit 1; }
+  elif printf '%s\n' "$st" | grep -q '^ausstehend'; then
     if [ "$MIGRATE" != 1 ]; then say "ausstehende Migrationen – erneut mit --migrate (nach Prüfung)"; exit 1; fi
     say "Migrationen anwenden"
     OF_RELEASE=$ID $C run --rm -T ops node packages/db/src/cli.ts up </dev/null
