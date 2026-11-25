@@ -1,0 +1,20 @@
+# Ausschlüsse für den Build von deploy/api.Dockerfile (BuildKit liest <Dockerfile>.dockerignore).
+# Allowlist: alles ausschließen, nur das Nötige zulassen – .env, data/, Dumps gelangen nie ins Image.
+*
+!package.json
+!package-lock.json
+!.npmrc
+!packages/core/package.json
+!packages/core/src/**
+!packages/db/package.json
+!packages/db/src/**
+!packages/db/migrations/**
+!apps/api/package.json
+!apps/api/src/**
+!apps/importer/package.json
+!apps/importer/src/**
+!apps/recorder/package.json
+!apps/web/package.json
+**/*.test.ts
+**/.env
+**/.env.*

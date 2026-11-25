@@ -1,0 +1,12 @@
+[Unit]
+Description=orderflow-binance: Health- und Plattenprüfung (Journal; optional healthchecks.io)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/orderflow-binance/bin/orderflow-monitor
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=60
+# Kein Secret hier; die optionale Ping-URL liest das Skript aus /etc/orderflow-binance/healthcheck.env

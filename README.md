@@ -135,6 +135,17 @@ fp_1m + alle Rollups aus KONZEPT §3.6, bar_1m/1h/1d, Kline-Abgleich §4.6 mit �
 `--prefer auto|daily|monthly` wählt die aggTrades-Quelle; `--no-neighbours` liest keine Nachbartage (Randminuten
 bleiben `edge_pending`); `--sidecar`/`--sidecar-dir` schreibt das Manifest-Sidecar. Exit-Code 3 bei `final_bad`.
 
+## Deployment (VPS)
+
+Produktion unter `https://orderflow.rankyhub.com` (öffentlich, ohne Login): Dateien und Skripte in
+[`deploy/`](deploy/), Entscheidungen und Server-Bestandsaufnahme in
+[`deploy/README.md`](deploy/README.md), Ablauf mit Prüfungen und Rücknahme je Schritt in
+[`deploy/RUNBOOK.md`](deploy/RUNBOOK.md). Kurz: DB und API als Docker-Compose-Projekt
+`orderflow-binance` (nur `127.0.0.1`), Historie per `pg_dump`/`pg_restore` vom Mac übertragen und
+gegen einen Prüfbericht verglichen (`deploy/transfer-db.sh`), Releases auf dem Mac gebaut
+(`deploy/build-release.sh`, `deploy/release.sh`), eigene nginx-Site (`deploy/nginx-setup.sh`).
+Ziel-Host nur in `deploy/.env.deploy` (git-ignoriert), Secrets nur auf dem Server.
+
 ## Konfiguration
 
 Nur über Umgebungsvariablen (`.env`, nie im Repo; Vorlage `.env.example`): `OF_DB_HOST`, `OF_DB_PORT` (Standard 54320), `OF_DB_USER`, `OF_DB_PASSWORD` (Pflicht), `OF_DB_NAME`, `OF_DATA_DIR`, `OF_LOG_LEVEL`. Das Parsen und Validieren liegt rein in `packages/core/src/config.ts`; die Einstiegspunkte laden `.env` per `node --env-file-if-exists=.env`.

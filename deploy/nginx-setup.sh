@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# nginx-Site orderflow.rankyhub.com einrichten (nach install-server, transfer-db und release).
+# Fasst AUSSCHLIESSLICH eigene Dateien an:
+#   /etc/nginx/conf.d/orderflow-binance.conf            (limit_req_zone/limit_conn_zone)
+#   /etc/nginx/snippets/orderflow-binance-headers.conf  (Sicherheits-Header)
+#   /etc/nginx/sites-available/orderflow.rankyhub.com + Symlink in sites-enabled
+#   /var/www/orderflow-acme, Zertifikat orderflow.rankyhub.com (certbot webroot, wie genius/takt)
+# Vor jedem Reload `nginx -t`; schlägt der Test fehl, werden die eigenen Dateien zurückgenommen
+# und nginx nicht neu geladen (die Nachbar-Sites bleiben unverändert).
+#
+#   deploy/nginx-setup.sh [root@host]             einrichten (idempotent)
+#   deploy/nginx-setup.sh [root@host] --rollback  eigene nginx-Dateien entfernen, nginx neu laden
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+resolve_host "${1:-}"
+[ "$SHIFTED" = 1 ] && shift
+MODE=${1:-setup}
+
+if [ "$MODE" = --rollback ]; then
+  remote <<'EOF'
+set -euo pipefail
+rm -f /etc/nginx/sites-enabled/orderflow.rankyhub.com /etc/nginx/sites-available/orderflow.rankyhub.com \
+      /etc/nginx/conf.d/orderflow-binance.conf /etc/nginx/snippets/orderflow-binance-headers.conf
+nginx -t && systemctl reload nginx
+echo "orderflow-nginx-Dateien entfernt (Zertifikat bleibt; löschen: certbot delete --cert-name orderflow.rankyhub.com)"
+EOF
+  exit 0
+fi
+
+# DNS: öffentlicher Resolver muss die Server-Adresse liefern
+want=$(remote <<'EOF'
+ip -4 -o addr show dev eth0 scope global | awk '{print $4}' | cut -d/ -f1 | head -1
+EOF
+)
+got=$(dig +short A "$PUBLIC_HOST" @1.1.1.1 | tail -1)
+[ -n "$want" ] && [ "$got" = "$want" ] || die "DNS $PUBLIC_HOST → '$got', Server hat '$want'"
+log "DNS ok"
+
+STAGE=/root/.orderflow-binance-nginx
+remote "$STAGE" <<'EOF'
+set -euo pipefail
+rm -rf -- "$1" && mkdir -p -m 700 "$1"
+EOF
+rsync -a -e "ssh ${SSH_OPTS[*]}" "$DEPLOY_DIR/nginx/" "$DEPLOY_HOST:$STAGE/"
+
+remote "$STAGE" <<'EOF'
+set -euo pipefail
+S=$1
+SITE=/etc/nginx/sites-available/orderflow.rankyhub.com
+LINK=/etc/nginx/sites-enabled/orderflow.rankyhub.com
+CERT=/etc/letsencrypt/live/orderflow.rankyhub.com/fullchain.pem
+say() { printf '[nginx %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+# Namenskonflikte: unsere Zonen/Upstreams dürfen nirgends sonst definiert sein
+if nginx -T 2>/dev/null | grep -E 'zone=orderflow_|upstream orderflow_' | grep -v '^#' | grep -q . \
+   && ! [ -e /etc/nginx/conf.d/orderflow-binance.conf ]; then
+  say "Namen orderflow_* bereits vergeben – Abbruch"; exit 1
+fi
+backup=$(mktemp -d)
+for f in "$SITE" /etc/nginx/conf.d/orderflow-binance.conf /etc/nginx/snippets/orderflow-binance-headers.conf; do
+  [ -e "$f" ] && cp -a "$f" "$backup/$(basename "$f")"
+done
+had_link=0; [ -L "$LINK" ] && had_link=1
+undo() {
+  say "nginx -t fehlgeschlagen – eigene Dateien zurück auf vorher, KEIN Reload"
+  rm -f "$SITE" /etc/nginx/conf.d/orderflow-binance.conf /etc/nginx/snippets/orderflow-binance-headers.conf
+  [ "$had_link" = 1 ] || rm -f "$LINK"
+  for f in "$backup"/*; do
+    [ -e "$f" ] || continue
+    case "$(basename "$f")" in
+      orderflow.rankyhub.com) cp -a "$f" "$SITE" ;;
+      orderflow-binance.conf) cp -a "$f" /etc/nginx/conf.d/ ;;
+      orderflow-binance-headers.conf) cp -a "$f" /etc/nginx/snippets/ ;;
+    esac
+  done
+  nginx -t || true
+  exit 1
+}
+install -m 644 "$S/orderflow-binance-http.conf" /etc/nginx/conf.d/orderflow-binance.conf
+install -m 644 "$S/orderflow-binance-headers.conf" /etc/nginx/snippets/orderflow-binance-headers.conf
+install -d -m 755 /var/www/orderflow-acme
+
+if [ ! -f "$CERT" ]; then
+  say "Phase 1: nur Port 80 (ACME), Zertifikat holen"
+  install -m 644 "$S/orderflow.rankyhub.com.bootstrap" "$SITE"
+  ln -sfn "$SITE" "$LINK"
+  nginx -t || undo
+  systemctl reload nginx
+  # Challenge-Pfad vorab prüfen (über die öffentliche Adresse, wie Let's Encrypt)
+  install -d -m 755 /var/www/orderflow-acme/.well-known/acme-challenge
+  probe=probe-$(openssl rand -hex 8)
+  echo ok > "/var/www/orderflow-acme/.well-known/acme-challenge/$probe"
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://orderflow.rankyhub.com/.well-known/acme-challenge/$probe")
+  rm -f "/var/www/orderflow-acme/.well-known/acme-challenge/$probe"
+  [ "$code" = 200 ] || { say "Challenge-Pfad liefert $code statt 200"; exit 1; }
+  # Vorhandenes Let's-Encrypt-Konto des Servers (keine neue Registrierung, keine neuen AGB);
+  # deploy-hook nur für diese Lineage (steht in renewal/orderflow.rankyhub.com.conf)
+  certbot certonly --webroot -w /var/www/orderflow-acme -d orderflow.rankyhub.com \
+    --cert-name orderflow.rankyhub.com --non-interactive --keep-until-expiring \
+    --deploy-hook 'nginx -t && systemctl reload nginx'
+fi
+
+say "Phase 2: endgültige Site (80 → 308, 443 mit App und /api/)"
+install -m 644 "$S/orderflow.rankyhub.com" "$SITE"
+ln -sfn "$SITE" "$LINK"
+nginx -t || undo
+systemctl reload nginx
+rm -rf -- "$S" "$backup"
+sleep 1
+for u in http://orderflow.rankyhub.com/ https://orderflow.rankyhub.com/ https://orderflow.rankyhub.com/api/v1/symbols https://orderflow.rankyhub.com/api/v1/health; do
+  printf '[nginx] %s → %s\n' "$u" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$u")" >&2
+done
+EOF
+log "Prüfung von außen (Mac):"
+for u in "http://$PUBLIC_HOST/" "https://$PUBLIC_HOST/" "https://$PUBLIC_HOST/api/v1/symbols" "https://$PUBLIC_HOST/api/v1/health"; do
+  printf '  %s → %s\n' "$u" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$u")" >&2
+done
+log "erwartet: 308, 200, 200, 404"

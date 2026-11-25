@@ -1,0 +1,19 @@
+# Ziel (nur vorübergehend, Runbook Schritt „TLS"): /etc/nginx/sites-available/orderflow.rankyhub.com
+# Nur Port 80 mit der ACME-Challenge, damit certbot (webroot, wie genius/takt) das erste Zertifikat
+# holen kann; danach durch das endgültige Site-File ersetzt.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name orderflow.rankyhub.com;
+
+    access_log off;
+    error_log /var/log/nginx/orderflow-error.log warn;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/orderflow-acme;
+        default_type text/plain;
+    }
+    location / {
+        return 404;
+    }
+}

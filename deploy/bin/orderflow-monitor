@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Minimales Monitoring (systemd-Timer orderflow-monitor.timer, alle 5 min): schreibt eine Zeile in
+# das Journal und endet mit Exit 1, wenn etwas nicht stimmt (Unit „failed" → systemctl --failed).
+#   journalctl -u orderflow-monitor.service
+# Externer Totmann (KONZEPT §2.5, healthchecks.io) vorbereitet, aber AUS: aktiv erst, wenn
+# /etc/orderflow-binance/healthcheck.env mit HC_PING_URL=https://hc-ping.com/<uuid> existiert
+# (root, 0600; die URL kommt vom Nutzer). Dann Ping nur bei „healthy", sonst /fail mit Gründen.
+set -uo pipefail
+reasons=()
+
+health() { docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$1" 2>/dev/null || echo missing; }
+for c in orderflow-db orderflow-api; do
+  h=$(health "$c")
+  [ "$h" = healthy ] || reasons+=("$c: $h")
+done
+# Detail-Health der API (Loopback-Listener im Container; PRÜFEN nach API-Review: Port/Pfad)
+if ! docker exec orderflow-api node -e "fetch('http://127.0.0.1:8781/health').then(r=>process.exit(r.status===200?0:1),()=>process.exit(1))" 2>/dev/null; then
+  reasons+=("api health != 200")
+fi
+# Öffentlicher Weg über nginx (lokal aufgelöst)
+code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve orderflow.rankyhub.com:443:127.0.0.1 https://orderflow.rankyhub.com/api/v1/symbols)
+[ "$code" = 200 ] || reasons+=("nginx /api/v1/symbols: $code")
+# Platte (KONZEPT §2.5: ≥ 10 GB frei) und Speicher
+free_gb=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+[ "$free_gb" -ge 10 ] || reasons+=("disk free ${free_gb} GB < 10 GB")
+mem_mb=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+[ "$mem_mb" -ge 500 ] || reasons+=("MemAvailable ${mem_mb} MB < 500 MB")
+# Uhr
+[ "$(timedatectl show -p NTPSynchronized --value)" = yes ] || reasons+=("clock not NTP-synchronized")
+
+if [ ${#reasons[@]} -eq 0 ]; then
+  status=healthy
+  echo "orderflow healthy (disk ${free_gb} GB free, mem ${mem_mb} MB available)"
+else
+  status=unhealthy
+  msg=$(IFS='; '; echo "${reasons[*]}")
+  echo "orderflow UNHEALTHY: $msg"
+fi
+
+if [ -r /etc/orderflow-binance/healthcheck.env ]; then
+  # shellcheck disable=SC1091
+  . /etc/orderflow-binance/healthcheck.env
+  if [ -n "${HC_PING_URL:-}" ]; then
+    if [ "$status" = healthy ]; then
+      curl -fsS -m 10 --retry 3 -o /dev/null "$HC_PING_URL" || echo "healthchecks ping failed"
+    else
+      curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "$msg" "$HC_PING_URL/fail" || echo "healthchecks fail-ping failed"
+    fi
+  fi
+fi
+[ "$status" = healthy ]
