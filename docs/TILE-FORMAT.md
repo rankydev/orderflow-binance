@@ -83,32 +83,53 @@ unbekannte Namen sind ein Fehler. Inkompatible Änderungen erhöhen `format`.
   `tileConfigVersion` (Fixtures: 3); die Fixture-API tut das bereits (der Client braucht n, um Kachelindizes zu
   berechnen). **Nur angebotene Kombinationen** stehen in `tiles`; der Client fordert keine anderen an.
 
-## Kachellänge (Abweichung von KONZEPT §5.3, Nutzerentscheid 2026-11-24)
+## Kachellänge (Abweichung von KONZEPT §5.3; Nutzerentscheide 2026-11-24 und 2026-11-25)
 
 §5.3 leitet n aus dem **Median** der Zeilen je Bar ab. Gemessen (BTCUSDT 2026-11-20…22) ergab das Kacheln bis
-107 000 Zellen und 22 Kacheln über der harten Grenze. Neu (`tileBarsForMax` in `packages/core/src/tile/timeframes.ts`):
+107 000 Zellen. Die erste Ersatzregel (Maximum über die ganze Historie) entfernte wegen eines einzigen echten
+Ausreißers (2026-08-19 15:27, 1m-Kerze 67 859 → 70 450 USDT) die Zeilengrößen unter 5 USDT für alle Zeiträume.
+Seit 2026-11-25 gilt (Interimsregel; die bessere Lösung bleibt der offene Entwurfspunkt am Ende):
 
 ```
-w       = R · tick_ref_units
-maxRows = max über ALLE gespeicherten Bars des Symbols und tf von  floor(high/w) − floor(low/w) + 1
-m       = ceil(1,5 · maxRows)                 (Sicherheitszuschlag TILE_ROWS_MARGIN)
-n       = clamp(2^floor(log2(30 000 / m)), 32, 1024)
-angeboten nur, wenn 32 · m ≤ 60 000           (sonst fehlt R für diesen tf in tiles[tf])
+w        = R · tick_ref_units
+rows(d)  = max über die Bars des tf am UTC-Tag d von  floor(high/w) − floor(low/w) + 1
+Ref      = P95 von rows(d) über die Referenztage = der (⌊N/20⌋ + 1)-größte Wert unter N Tagen
+           (N < 20: das Maximum). Referenztage: alle unveränderlichen Tage (data_day.immutable);
+           gibt es keinen, alle Tage mit Daten.
+m        = ceil(1,5 · Ref)                      (Sicherheitszuschlag TILE_ROWS_MARGIN)
+n        = clamp(2^floor(log2(30 000 / m)), 32, 1024)
+angeboten nur, wenn 32 · m ≤ 60 000 und (größte Tageszeilenzahl der Quelltabelle + Bar-Tabelle,
+           über alle Tage) × Kachelspanne in Tagen ≤ 1,5 Mio. (Quellzeilengrenze, §1.4)
 ```
 
-- **Referenzzeitraum:** die gesamte gespeicherte Historie des Symbols (nicht die letzten N Tage). Grund: ein
-  Kurzzeitraum unterschätzt; gemessen max. Zeilen je 1m-Bar bei R = 5 an den drei Fixture-Tagen 1 110 / 1 755 /
-  1 017 – n aus Tag 1 allein hätte an Tag 2 bei R = 50 und n = 256 Kacheln mit 45 056 Zellen ergeben.
-- **Neuberechnung:** nach jedem Import eines Tages (billig: maxRows je (tf, R) als laufendes Maximum aus `bar_*`).
-  Ändert sich ein n, wird `tileConfigVersion` um 1 erhöht. Da `cfg` Teil der Kachel-URL ist, sind alle Caches
-  (Browser, nginx, Server-LRU) für die neue Konfiguration automatisch getrennt; alte Einträge laufen aus.
-- **Garantie:** Zellen je Kachel ≤ n · m ≤ 30 000 (bei n = 32: ≤ 60 000), solange kein neuer Bar mehr als 1,5 × das
-  Referenzmaximum an Zeilen hat; ein solcher Tag löst beim Import die Neuberechnung aus (neues n, neue Version).
-- **Falls eine Kachel trotzdem die harte Grenze überschreitet** (z. B. zwischen Import und Neuberechnung): Der
-  Server erhöht `tileConfigVersion` (neu berechnetes n) und antwortet auf die alte `cfg` mit **409** + JSON
-  `{error}`. Der Client lädt daraufhin **einmal** `/symbols` neu und fährt mit der neuen Konfiguration fort;
-  ändert sich dabei nichts, zeigt er dauerhaft „Server-Stand passt nicht zur Seite – Seite und Server neu laden".
-  Kein 422 für diesen Fall (422 zeigt der Client für den Rest der Sitzung als Kerzen).
+- **Garantie:** **Jede ausgelieferte Kachel hat ≤ 60 000 Zellen.** Der Server zählt die Zellen jeder Kachel
+  (Ergebnis der Abfrage) und liefert eine Kachel darüber nie aus, sondern antwortet für **diese eine Kachel** mit
+  **422** und `{ "error", "reason": "tile_cells_exceeded", "cells", "limit": 60000, "suggestR" }` (`suggestR` =
+  nächstgröbere angebotene Zeilengröße dieses tf oder `null`), `Cache-Control: no-store`, ohne ETag. Die
+  Ablehnung ist nie ein 500, löst keine Neuberechnung der Konfiguration und kein 409 aus; `tiles` und
+  `tileConfigVersion` bleiben unverändert. Betroffen sein können nur Kacheln über Tagen oberhalb des P95 und
+  über nicht finalen Tagen. Richtwert ohne Ausreißer: Zellen ≤ n · m ≤ 30 000 (bei n = 32: ≤ 60 000).
+- **Gemessen (BTCUSDT, 167 Tage, exakte Zählung über die gesamte Historie, `apps/api/bench/tile-cells.ts`):**
+  für alle 78 angebotenen (tf, R) 0 Kacheln über 30 000 und 0 über 60 000; größte Kachel 14 614 Zellen (1d,
+  R = 50). Neu angeboten gegenüber der Maximum-Regel: 1m R = 10 und 20, 3m/5m/15m/30m R = 20, 1d R = 50; für
+  viele bestehende (tf, R) ist n doppelt so groß.
+- **Stabilität:** Nicht finale Tage (der laufende Tag, ab P2 provisorische Live-Minuten) zählen nicht, damit sich
+  `tiles` nicht im Tagesverlauf ändert. Ein zusätzlicher oder neu importierter Referenztag verschiebt `Ref`
+  höchstens um einen Rang (zum benachbarten Wert der sortierten Tagesmaxima, oder um N/20 einen Rang weiter);
+  `tiles` und damit `tileConfigVersion` können sich also höchstens einmal je Import bzw. je Tag ändern, der
+  unveränderlich wird, nie im Wechsel innerhalb eines Tages. Die Regel ist deterministisch (gleiche Daten →
+  gleiche Version, auch nach Neustart).
+- **Neuberechnung:** nach jeder Änderung einer Tagesversion (Statistik je Tag aus `bar_*`, im Speicher). Ändert
+  sich ein n oder das Angebot, ändert sich `tileConfigVersion`; da `cfg` Teil der Kachel-URL ist, sind alle Caches
+  für die neue Konfiguration getrennt.
+- **Veraltete `cfg`:** **409** + `{ error, tileConfigVersion }`; der Client lädt einmal `/symbols` neu.
+- **Was der Client bei einem 422 einer einzelnen Kachel tun soll (Empfehlung für den Web-Autor):** Heute markiert
+  der Client die Kachel als abgelehnt, zeichnet dort Kerzen und fragt nach 5 min erneut – das ist korrekt und
+  bleibt zulässig. Besser: bei `reason = "tile_cells_exceeded"` und `suggestR ≠ null` für **diesen Zeitraum**
+  die Kachel mit `suggestR` laden (eigene Kachelindizes, da n je R verschieden ist: Kacheln von `suggestR`, die
+  den Zeitraum der abgelehnten Kachel überdecken) und dort mit gröberen Zeilen zeichnen, mit einem Hinweis
+  („Zeilengröße hier vergröbert"); das globale R und Auto-R bleiben unverändert; die Ablehnung erst nach
+  REJECT_TTL erneut versuchen. Eine 422 ohne `reason` (Kombination nicht angeboten) bleibt endgültig.
 
 Mit den Fixtures (Zuschlag 1,5): 0 Kacheln über 30 000, 0 abgelehnt; feinste angebotene Zeilen 1m: R = 10 Ticks.
 
@@ -198,12 +219,12 @@ Umgesetzt in `apps/api` (Katalog `src/catalog.ts`, Routen `src/routes/tiles.ts`)
   Menge der angebotenen (tf, R) ändert, ist nach einem Neustart und auf einer zweiten Instanz mit denselben Daten
   gleich und wird **nur auf Gleichheit** geprüft (nicht „+1", nicht monoton). Kein Schreibzugriff nötig: das
   Maximum der Zeilen je Bar wird je UTC-Tag aus `bar_*` berechnet und mit `data_day.version` als Schlüssel im
-  Speicher gehalten (Bars ≤ 1d überqueren keine Tagesgrenze, das Maximum über die Tage ist also exakt); ändert
-  sich eine Tagesversion, wird nur dieser Tag neu berechnet (Abfrageintervall 1 s).
+  Speicher gehalten (Bars ≤ 1d überqueren keine Tagesgrenze); ändert sich eine Tagesversion, wird nur dieser Tag
+  neu berechnet.
 - **Angeboten** wird (tf, R) für alle Zeitrahmen aus KONZEPT §5.2 (1m … 1d) und R auf der Leiter bis
-  10 000 Ticks mit `R · tickRefUnits ≥ tickUnits`, wenn die Zellregel oben gilt **und** eine Kachel die
-  Quellzeilengrenze (1,5 Mio., §1.4) sicher einhält: (größte Tageszeilenzahl der gewählten Quelltabelle +
-  Bar-Tabelle) × Kachelspanne in Tagen ≤ 1,5 Mio. Damit gibt es für eine angebotene Kombination nie ein 422.
+  10 000 Ticks mit `R · tickRefUnits ≥ tickUnits`, nach der Regel im Abschnitt „Kachellänge" (P95 der
+  Tagesmaxima, Zellregel, Quellzeilengrenze). Für eine angebotene Kombination gibt es nie ein 422 wegen der
+  Quellzeilen; ein 422 mit `reason = "tile_cells_exceeded"` betrifft nur die einzelne Ausreißer-Kachel.
 - **`cfg` ist Pflicht** (fehlt → 400). Die 409-Antwort trägt die aktuelle Version:
   `{ "error": …, "tileConfigVersion": <aktuell> }`.
 - **`final`** (Kacheln, Bar-Abschnitte, Profile) gilt genau dann, wenn jeder überdeckte UTC-Tag eine
@@ -236,10 +257,20 @@ Umgesetzt in `apps/api` (Katalog `src/catalog.ts`, Routen `src/routes/tiles.ts`)
   reparatur) ändert die `dataVersion`, nicht die URL; er ist damit nach höchstens einer Woche sichtbar (sofort mit
   der Live-Invalidierung aus §5.4 in P2 oder einem Datenzähler in der URL).
 - **Server-Cache und Revalidierung (Review W1):** Die API prüft `If-None-Match` gegen die `dataVersion` aus ihrer
-  Tagesversionstabelle (≤ 1 s alt), **bevor** sie die Datenbank fragt: Treffer → 304 ohne Datenabfrage und ohne
-  Platz im Gleichzeitigkeitslimit. Auch nicht finale Antworten liegen im Server-Cache, unter ihrer `dataVersion`
-  (fehlende Tage gehen als „-" ein) und höchstens `OF_API_NONFINAL_TTL_MS` (Standard 10 s) lang; gleichzeitige
-  gleiche Anfragen teilen eine Berechnung. Der Browser bekommt für nicht finale Antworten weiterhin `no-cache`.
+  Tagesversionstabelle (Katalog), **bevor** sie die Datenbank fragt: Treffer → 304 ohne Datenabfrage und ohne
+  Platz im Gleichzeitigkeitslimit. Fehler (400/404/409/422) werden vorher entschieden; ein `If-None-Match`
+  ändert sie nie in ein 304. Auch nicht finale Antworten liegen im Server-Cache, unter ihrer `dataVersion`
+  (fehlende Tage gehen als „-" ein), höchstens `OF_API_NONFINAL_TTL_MS` (Standard 10 s) lang und höchstens mit
+  25 % der Cache-Größe (sie verdrängen keine finalen Einträge; abgelaufene werden beim Einfügen weggeräumt);
+  gleichzeitige gleiche Anfragen teilen eine Berechnung. Der Browser bekommt für nicht finale Antworten weiterhin
+  `no-cache`.
+- **Aktualität von 304 und Cache-Treffern:** Der Katalog liest `data_day` alle `OF_API_POLL_MS` (Standard 1 s).
+  Bei gesundem Katalog ist ein Versionswechsel daher spätestens nach `OF_API_POLL_MS` + Dauer einer
+  Aktualisierung sichtbar (warm einige ms; nach einem Import zusätzlich die Neuberechnung der Statistik des
+  geänderten Tages, ≈ 0,1 s; beim Start ≈ 1 s für 167 Tage). Schlägt die Aktualisierung fehl (Datenbank weg),
+  antworten 304 und Cache-Treffer höchstens `OF_API_STALE_AFTER_MS` (Standard 30 s) lang auf dem letzten
+  bekannten Stand; danach antworten alle Datenendpunkte und `/symbols` mit **503** + `Retry-After: 5`, bis eine
+  Aktualisierung wieder gelingt. Eine berechnete Antwort trägt immer die `dataVersion` ihres eigenen Snapshots.
 - **Bestätigt für den Web-Client:** (1) `tileConfigVersion` bleibt eine sichere Ganzzahl (Hash < 2^47, derzeit
   14 Stellen); (2) eine Footprint-Kachel und `/bars` über denselben Zeitraum mit derselben Datenlage enthalten
   identische Bars mit identischem `buyQ + sellQ` je Bar (eine Funktion, ein Snapshot je Antwort); (3) `/bars`

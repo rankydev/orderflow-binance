@@ -12,7 +12,7 @@ form `{error}`, `Retry-After`, CORS, `ETag`/304) wie in [`TILE-FORMAT.md`](TILE-
 |---|---|---|
 | `GET /api/v1/profile` | `sym`, `from`, `to`, `R`, `va`? | ein Profil über `[from, to)` |
 | `GET /api/v1/profiles/daily` | `sym`, `from`, `to`, `R`, `offsetH`?, `va`? | ein Profil je Tag in `[from, to)` |
-| `GET /api/v1/quality` | `sym`, `from`, `to`, `shift`? | Zustand und Qualität je UTC-Tag, Issue-Minuten |
+| `GET /api/v1/quality` | `sym`, `from`, `to`, `shift`?, `issuesFrom`? | Zustand und Qualität je UTC-Tag, Issue-Minuten |
 
 Parameter (strikt geprüft; unbekannte, doppelte oder leere Parameter → 400; Zahlen nur in kanonischer
 Dezimalform):
@@ -155,15 +155,21 @@ ohne Decoder. Gemessen (BTC, echte Daten, 2026-11-24): Oktober bei R = 100 (≈ 
 }
 ```
 
-- `from`/`to` der Antwort sind auf ganze UTC-Tage erweitert (alle Tage, die die Anfrage berührt; ≤ 1 100).
+- `from`/`to` der Antwort sind auf ganze UTC-Tage erweitert (alle Tage, die die Anfrage berührt; **≤ 400** je
+  Anfrage, sonst 400).
 - `days`: nur Tage mit `data_day`-Zeile; ein fehlender Tag hat keine Daten (Lücke). `state` ∈ provisional,
   importing, provisional_import_failed, final_ok, final_bad; `immutable` wie oben; `minutes` sind die Zähler des
   Kline-Abgleichs (§4.6, `null` vor dem ersten Abgleich).
 - `issues`: Minuten mit `kind` ∈ mismatch, missing, gap (und shift mit `shift=1`), aufsteigend nach `ts`;
-  `dQ`/`dB` = Abweichung Volumen/Taker-Buy gegen die Kline in Lots. Höchstens 20 000 Einträge
-  (`issuesTruncated`).
-- Immer `Cache-Control: no-cache` (Tiefenprüfung und Annotationen können sich ohne neue Datenversion ändern),
-  `ETag` = Hash der Antwort.
+  `dQ`/`dB` = Abweichung Volumen/Taker-Buy gegen die Kline in Lots. **Höchstens 5 000 Einträge je Antwort**,
+  geschnitten an einer Minutengrenze. Weitere Seiten: Parameter `issuesFrom=<issuesNext>` (ms; Issues mit
+  `ts ≥ issuesFrom`); `issuesNext` ist die erste ausgelassene Minute oder `null`, `issuesTruncated` =
+  `issuesNext ≠ null`, `issuesFrom` in der Antwort ist der tatsächlich verwendete Beginn.
+- Immer `Cache-Control: no-cache`. `ETag` = Hash über die Parameter und einen Fingerabdruck **aller**
+  ausgelieferten Qualitätsfelder je Tag (Zustand, Version, Quelle, Flags, `deep_check`, Zähler) – so ändert sich
+  die ETag auch ohne neue Datenversion (z. B. nach einer Tiefenprüfung). Wie bei den Kacheln: 304 ohne
+  Datenabfrage, Server-Cache höchstens `OF_API_NONFINAL_TTL_MS` (10 s) lang, gleiche gleichzeitige Anfragen
+  teilen eine Abfrage.
 - Farbband nach §4.9: grün `final_ok`; gelb `provisional`, `provisional_import_failed`, `importing`,
   `edgePending`/`stale`; rot `final_bad` oder `minutes.gap > 0`.
 

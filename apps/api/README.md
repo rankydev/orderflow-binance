@@ -35,7 +35,8 @@ Tests: `npm test` (Unit), `npm run test:db` (Integration gegen `<OF_DB_NAME>_tes
 `OF_API_NONFINAL_TTL_MS=10000`, `OF_API_POLL_MS=1000`, `OF_API_MAX_SOURCE_ROWS=1500000`, `OF_API_MAX_CELLS=60000`
 (nur Profile), `OF_API_CONNECTION_TIMEOUT_MS=30000`, `OF_API_REQUEST_TIMEOUT_MS=30000`,
 `OF_API_KEEPALIVE_TIMEOUT_MS=65000`, `OF_API_MAX_REQUESTS_PER_SOCKET=1000`, `OF_API_MAX_CONNECTIONS=1024`,
-`OF_API_DIAG_HEADERS=0` (1 = `X-Source`, `X-Rows-Estimate`, `Server-Timing`).
+`OF_API_DIAG_HEADERS=0` (1 = `X-Source`, `X-Rows-Estimate`, `Server-Timing`), `OF_API_STALE_AFTER_MS=30000`
+(Katalog länger ausgefallen → 503 statt 304/Cache-Treffer auf altem Stand).
 
 `OF_API_KEEPALIVE_TIMEOUT_MS` liegt bewusst **über** dem `keepalive_timeout` des nginx-`upstream`-Blocks (Standard
 60 s): schließt die API eine Leerlaufverbindung früher als nginx, kann nginx sie gerade wiederverwenden und
@@ -78,3 +79,18 @@ Rolle (`of_importer`, KONZEPT §2.4), braucht diese `GRANT CONNECT, TEMPORARY ON
 Passwort der API-Rolle setzen: `npm run role:password -w @orderflow/api` (aus `OF_API_DB_PASSWORD`, als Admin-Rolle
 verbunden). Das Werkzeug berechnet den SCRAM-SHA-256-Verifier im Client; der Server sieht den Klartext nie, auch
 nicht im Log bei `log_statement` oder in einer Fehlermeldung.
+
+## Neue Tabellen und die API-Rolle (für Migrationsautoren)
+
+Migration 0009 vergibt **Standardrechte**: jede Tabelle, die eine spätere Migration (als Migrationsrolle) im
+Schema `public` anlegt, ist automatisch für `of_api` lesbar. Wer eine Tabelle anlegt, entscheidet bewusst:
+
+- Die API soll sie lesen → in `API_READABLE` in `apps/api/test/api.int.test.ts` eintragen.
+- Die API soll sie nicht lesen (Betriebs-, Manifest- oder Rohdaten) → in derselben Migration
+  `REVOKE SELECT ON <tabelle> FROM of_api;` (wie 0010 für `raw_file`, `raw_day`, `schema_migrations`,
+  `verify_run`).
+
+Der Integrationstest „of_api liest genau die freigegebenen Tabellen" schlägt fehl, solange eine neue Tabelle in
+keiner der beiden Listen steht. Die Integrationstests selbst laufen mit einer eigenen Rolle `of_api_test`, die in
+der Testdatenbank genau die Rechte und Rolleneinstellungen von `of_api` gespiegelt bekommt; sie ändern nie das
+Passwort der clusterweiten Rolle `of_api`.
