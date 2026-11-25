@@ -262,14 +262,25 @@ CONNECTION_TIMEOUT_MS/ADMIN_PORT/DIAG_HEADERS/NONFINAL_TTL_MS/MAX_CONNECTIONS/MA
   Mac existiert `of_recorder` schon, auch wenn `orderflow` noch bei 0012 ist), deren
   Rolleneinstellungen und die Datenbankrechte von `of_api`, `of_recorder` und PUBLIC auf
   `orderflow` (pg_dump ohne `--create` sichert sie nicht). Keine Passwörter. Bricht ab, wenn eine
-  Anwendungsrolle auf der Quelle erhöhte Rechte hat.
+  Anwendungsrolle auf der Quelle erhöhte Attribute oder (auch mittelbar) eine Mitgliedschaft in
+  einer `pg_*`-Rolle, in `of_admin` oder einer Superuser-Rolle hat, und bei Listen-Einstellungen
+  (`search_path`, `temp_tablespaces`, `*_preload_libraries`), die sich nicht verlustfrei als
+  `SET name = 'wert'` übertragen ließen. Rolleneinstellungen je Datenbank werden nicht exportiert
+  (fallen als `dbsetting|` auf).
 - `verify-db.sql` vergleicht für beide Rollen: Attribute und Einstellungen, Datenbank-/Schemarechte
   (inkl. TEMPORARY), Tabellenrechte je Art samt Liste der beschreibbaren Tabellen, ausführbare
   Projektfunktionen und je Projektfunktion Eigentümer, SECURITY DEFINER, `search_path` und ACL
-  (`of_recompress_chunk` aus 0014), Default-ACLs; Policy-Konfiguration (`recompress: false`) steht
+  (`of_recompress_chunk` aus 0014) samt MD5 der Funktionsdefinition, Default-ACLs (sortiert, mit
+  Schema), Rollenmitgliedschaften (`member|`); Policy-Konfiguration (`recompress: false`) steht
   in den `job|`-Zeilen.
 - `harden-db.sql`: `of_recorder` behält nur sein ausdrückliches CONNECT (aus 0013 bzw. vom
-  Transfer), nie TEMPORARY; die Härtungsprüfung gilt für beide Rollen.
+  Transfer), nie TEMPORARY; die Härtungsprüfung gilt für beide Rollen und verlangt auch, dass
+  keine von beiden CREATE auf einer Datenbank hat.
+- Gegenproben (Wegwerf-Container, Quelle aus den Migrationen 0001–0014): Export bricht ab bei
+  `GRANT pg_write_all_data TO of_api`, bei mittelbarer Mitgliedschaft in `of_admin` und bei
+  `search_path` an der Rolle; eine geänderte Funktionsdefinition erscheint als abweichende
+  `function|`-Zeile; `GRANT CREATE ON DATABASE` an `of_api` lässt die Härtungsprüfung scheitern.
+  Eigene Parameter mit Punkt (`of.test = 'x, y'`) kommen unverändert an.
 - Trockenläufe (Wegwerf-Container, 2-GB-Limit):
   - A, Quelle Mac-DB bei 0012 (`of_recorder` existiert clusterweit ohne Rechte): Berichte identisch
     (396 Zeilen), Härtung OK, `of_recorder` ohne CONNECT.

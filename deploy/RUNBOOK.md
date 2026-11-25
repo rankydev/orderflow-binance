@@ -170,8 +170,14 @@ Der Server wurde am 2026-11-25 bei Migration 0012 übertragen; es gibt dort **ke
 ops-Container als `of_admin` an:
 
 - `CREATE ROLE of_recorder` steht in der Migration unter `IF NOT EXISTS` – kein Konflikt mit
-  `roles.sql`/`roles-source.sql` (die legen `of_recorder` nur an, wenn die Quelle eines Transfers
-  sie schon hatte; dann ist 0013 auf dem Server bereits angewendet und nichts ausstehend).
+  `roles-source.sql`. Achtung: Rollen gelten clusterweit, und auf dem Mac existiert `of_recorder`
+  bereits, auch solange `orderflow` noch bei 0012 war. Ein Transfer legt die Rolle dann auf dem
+  Server mit LOGIN, aber ohne CONNECT, ohne Passwort und ohne Tabellenrechte an – harmlos (sie kann
+  sich nicht anmelden); die Migration ergänzt später Rechte und CONNECT.
+- `transfer-db.sh --replace`, wenn die Quell-Cluster die Rolle **nicht** hat, der Server aber
+  schon: der Pflichtvergleich bricht laut ab (`role|of_recorder`-Zeile nur auf dem Ziel); dann
+  die Lage klären (Rolle auf dem Server bewusst löschen oder auf der Quelle anlegen), nicht
+  übergehen.
 - `GRANT CONNECT ON DATABASE orderflow TO of_recorder` aus der Migration ist nach der Härtung
   nötig und ausreichend (PUBLIC hat kein CONNECT mehr); TEMPORARY bekommt die Rolle nicht.
   Danach `harden-db.sql` erneut ausführen (idempotent; prüft beide Rollen):

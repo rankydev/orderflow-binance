@@ -11,11 +11,30 @@
 \set ON_ERROR_STOP on
 \set QUIET on
 \pset footer off
+-- Rolleneinstellungen je Datenbank (ALTER ROLE … IN DATABASE …) werden NICHT exportiert; eine
+-- solche Abweichung fällt im Prüfbericht als dbsetting|-Zeile auf.
 DO $$
 BEGIN
-  IF EXISTS (SELECT FROM pg_roles WHERE rolname IN ('of_api', 'of_recorder')
-               AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)) THEN
-    RAISE EXCEPTION 'Anwendungsrolle mit erhöhten Rechten auf der Quelle – Transfer abgebrochen';
+  -- Erhöhte Attribute oder (auch mittelbare) Mitgliedschaft in einer vordefinierten pg_*-Rolle,
+  -- in of_admin oder in einer Superuser-Rolle → Abbruch
+  IF EXISTS (
+    SELECT FROM pg_roles r
+     WHERE r.rolname IN ('of_api', 'of_recorder')
+       AND (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls
+            OR EXISTS (SELECT FROM pg_roles g
+                        WHERE g.oid <> r.oid
+                          AND (g.rolname LIKE 'pg\_%' OR g.rolname = 'of_admin' OR g.rolsuper)
+                          AND pg_has_role(r.oid, g.oid, 'MEMBER')))) THEN
+    RAISE EXCEPTION 'Anwendungsrolle mit erhöhten Rechten oder Mitgliedschaften auf der Quelle – Transfer abgebrochen';
+  END IF;
+  -- Listen-Einstellungen (search_path, temp_tablespaces, *_preload_libraries) ließen sich mit
+  -- SET name = 'wert' nicht verlustfrei übertragen → ablehnen statt verfälschen
+  IF EXISTS (
+    SELECT FROM pg_roles r, unnest(r.rolconfig) c
+     WHERE r.rolname IN ('of_api', 'of_recorder')
+       AND lower(split_part(c, '=', 1)) IN ('search_path', 'temp_tablespaces',
+                                             'session_preload_libraries', 'local_preload_libraries')) THEN
+    RAISE EXCEPTION 'Listen-Einstellung an einer Anwendungsrolle – nicht automatisch übertragbar, Transfer abgebrochen';
   END IF;
 END
 $$;
@@ -35,7 +54,10 @@ SELECT s FROM (
   SELECT r.rolname, 2, format('ALTER ROLE %I RESET ALL;', r.rolname)
     FROM pg_roles r WHERE r.rolname IN ('of_api', 'of_recorder')
   UNION ALL
-  SELECT r.rolname, 3, format('ALTER ROLE %I SET %s = %L;', r.rolname, split_part(c, '=', 1),
+  SELECT r.rolname, 3, format('ALTER ROLE %I SET %s = %L;', r.rolname,
+                              -- Name je Teil gequotet (eigene Parameter wie timescaledb.x)
+                              array_to_string(ARRAY(SELECT quote_ident(x)
+                                                      FROM unnest(string_to_array(split_part(c, '=', 1), '.')) x), '.'),
                               substr(c, strpos(c, '=') + 1))
     FROM pg_roles r, unnest(r.rolconfig) c WHERE r.rolname IN ('of_api', 'of_recorder')
   UNION ALL

@@ -139,11 +139,12 @@ docker exec -i orderflow-db psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderf
 EOF
 cat "$WORK/harden.txt" >&2
 # Erwartet: keine Anwendungsrolle (of_api, of_recorder) außerhalb von orderflow verbindbar, nirgends
-# TEMP; of_api verbindet sich mit orderflow; PUBLIC ohne CONNECT/TEMP. of_recorder hat CONNECT auf
+# TEMP und kein CREATE auf einer Datenbank; of_api verbindet sich mit orderflow; PUBLIC ohne CONNECT/TEMP. of_recorder hat CONNECT auf
 # orderflow genau dann, wenn die Quelle es hatte (Migration 0013) – das prüft schon datacl| im Bericht.
-grep -qx 'dbpriv|orderflow|of_api_connect=true|of_api_temp=false' "$WORK/harden.txt" \
+grep -qx 'dbpriv|orderflow|of_api_connect=true|of_api_temp=false|of_api_create=false' "$WORK/harden.txt" \
   && ! grep -E '^dbpriv\|' "$WORK/harden.txt" | grep -v '^dbpriv|orderflow|' | grep -q 'connect=true' \
   && ! grep -q '_temp=true' "$WORK/harden.txt" \
+  && ! grep -q '_create=true' "$WORK/harden.txt" \
   && grep -q '^public_connect|false|public_temp|false|' "$WORK/harden.txt" \
   || die "Härtung nicht wie erwartet (siehe oben)"
 if [ "$KEEP" = 0 ]; then

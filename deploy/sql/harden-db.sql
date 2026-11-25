@@ -19,10 +19,11 @@ $$;
 -- Wartungsdatenbanken: keine Verbindung für Anwendungsrollen (CREATE DATABASE als Superuser geht weiter)
 REVOKE CONNECT, TEMPORARY ON DATABASE postgres FROM PUBLIC;
 REVOKE CONNECT, TEMPORARY ON DATABASE template1 FROM PUBLIC;
--- Kontrolle: of_api darf sich nur mit orderflow verbinden und nirgends TEMP anlegen
+-- Kontrolle: of_api/of_recorder nur mit orderflow verbindbar, nirgends TEMP oder CREATE
 SELECT 'dbpriv|' || d.datname || '|' || r.rolname || '_connect='
        || has_database_privilege(r.oid, d.datname, 'CONNECT')
        || '|' || r.rolname || '_temp=' || has_database_privilege(r.oid, d.datname, 'TEMPORARY')
+       || '|' || r.rolname || '_create=' || has_database_privilege(r.oid, d.datname, 'CREATE')
   FROM pg_database d CROSS JOIN pg_roles r
  WHERE d.datallowconn AND r.rolname IN ('of_api', 'of_recorder')
  ORDER BY d.datname, r.rolname;

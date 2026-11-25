@@ -129,15 +129,24 @@ SELECT 'grant_exec|' || r.rolname || '|' || coalesce(string_agg(p.oid::regproced
    AND has_function_privilege(r.oid, p.oid, 'EXECUTE')
  GROUP BY r.rolname ORDER BY r.rolname;
 SELECT 'function|' || p.oid::regprocedure::text || '|owner=' || pg_get_userbyid(p.proowner)
+       || '|body=' || CASE WHEN p.prokind IN ('f', 'p') THEN md5(pg_get_functiondef(p.oid)) ELSE md5(p.prosrc) END
        || '|secdef=' || p.prosecdef || '|config=' || coalesce(array_to_string(p.proconfig, ','), '')
        || '|acl=' || coalesce(array_to_string(ARRAY(SELECT unnest(p.proacl)::text ORDER BY 1), ','), 'default')
   FROM pg_proc p JOIN pg_namespace s ON s.oid = p.pronamespace
  WHERE s.nspname = 'public'
    AND NOT EXISTS (SELECT FROM pg_depend dp WHERE dp.classid = 'pg_proc'::regclass AND dp.objid = p.oid AND dp.deptype = 'e')
  ORDER BY 1;
-SELECT 'default_acl|' || pg_get_userbyid(defaclrole) || '|' || defaclobjtype::text || '|'
-       || array_to_string(defaclacl, ',')
+SELECT 'default_acl|' || pg_get_userbyid(defaclrole) || '|'
+       || CASE WHEN defaclnamespace = 0 THEN '*' ELSE defaclnamespace::regnamespace::text END || '|'
+       || defaclobjtype::text || '|'
+       || array_to_string(ARRAY(SELECT unnest(defaclacl)::text ORDER BY 1), ',')
   FROM pg_default_acl ORDER BY 1;
+-- Rollenmitgliedschaften der Anwendungsrollen (direkt), sortiert
+SELECT 'member|' || r.rolname || '|'
+       || coalesce((SELECT string_agg(g.rolname, ',' ORDER BY g.rolname)
+                      FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
+                     WHERE m.member = r.oid), '')
+  FROM pg_roles r WHERE r.rolname IN ('of_api', 'of_recorder') ORDER BY r.rolname;
 -- Datenbankrechte und -einstellungen (pg_dump ohne --create sichert sie nicht → post-restore.sql;
 -- timescaledb.restoring=on hieße: timescaledb_post_restore() fehlt)
 SELECT 'datacl|' || coalesce(array_to_string(ARRAY(SELECT unnest(datacl)::text ORDER BY 1), ','), 'default')
