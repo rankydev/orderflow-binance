@@ -15,8 +15,8 @@
 //    findet nichts mehr.
 //  - Sperre je Versuch höchstens 500 ms (unter der lock_timeout der API von 1 s: API-Leser hinter
 //    unserer wartenden Sperre laufen nicht in ihre Zeitüberschreitung).
-//  - bricht ab (vor jedem Chunk geprüft), solange auf der Datenbank eine andere Transaktion länger
-//    als 5 s offen ist (Review W1; kurze API-Lesezugriffe zählen nicht): ein REPEATABLE-READ-Leser ohne Chunk-Sperren (Prüfbericht verify-db.sql,
+//  - bricht ab (vor jedem Chunk geprüft), solange auf der Datenbank eine andere Transaktion offen ist
+//    (Review W1; ausgenommen nur API/Recorder-Transaktionen jünger als 5 s): ein REPEATABLE-READ-Leser ohne Chunk-Sperren (Prüfbericht verify-db.sql,
 //    Dump-Probelauf) sähe den umgewandelten Chunk sonst leer und schlüge laut fehl. Überschreibbar
 //    mit --ignore-open-transactions, wenn die offenen Transaktionen bekannt harmlos sind.
 //  - als Eigentümer (of_admin) ausführen; der Recorder sollte dabei gestoppt sein (nicht nötig für
@@ -57,21 +57,25 @@ export async function openColumnstoreChunks(
 }
 
 /**
- * Andere offene Transaktionen auf dieser Datenbank, die länger als `minAgeMs` laufen (W1). Kurze
- * Transaktionen (API-Lesezugriffe, Katalog-Abfragen: Millisekunden, und sie sperren ihre Chunks vor
- * dem Snapshot) zählen nicht; ein Prüfbericht oder Dump läuft Sekunden bis Minuten.
+ * Andere offene Transaktionen auf dieser Datenbank, die die Reparatur gefährden (W1). Ausgenommen
+ * sind nur die bekannten kurzlebigen Anwendungen (API-Lesezugriffe und Katalog-Abfrage, Recorder-
+ * Schreibvorgänge: Millisekunden; die API sperrt ihre Chunks vor dem Snapshot), solange sie jünger
+ * als `shortMaxAgeMs` sind. Jede andere offene Transaktion zählt unabhängig vom Alter – auch ein
+ * gerade begonnener REPEATABLE-READ-Leser (Prüfbericht, Dump), der den Chunk noch nicht gelesen hat.
  */
-export const OPEN_TX_MIN_AGE_MS = 5000;
+export const SHORT_LIVED_APPS = ['orderflow-api', 'orderflow-api-catalog', 'orderflow-recorder'];
+export const SHORT_LIVED_MAX_AGE_MS = 5000;
 export async function otherOpenTransactions(
   sql: Sql,
-  minAgeMs = OPEN_TX_MIN_AGE_MS,
+  shortMaxAgeMs = SHORT_LIVED_MAX_AGE_MS,
 ): Promise<{ pid: number; user: string; app: string; since: string; db: string }[]> {
   const rows = await sql`
     SELECT pid, usename AS u, application_name AS a, xact_start::text AS s, datname AS d
       FROM pg_stat_activity
      WHERE datname = current_database() AND pid <> pg_backend_pid()
        AND backend_type = 'client backend' AND xact_start IS NOT NULL
-       AND xact_start < statement_timestamp() - make_interval(secs => ${minAgeMs / 1000})
+       AND NOT (application_name = ANY(${SHORT_LIVED_APPS}::text[])
+                AND xact_start >= statement_timestamp() - make_interval(secs => ${shortMaxAgeMs / 1000}))
      ORDER BY xact_start`;
   return rows.map((r) => ({
     pid: r.pid as number,
@@ -105,8 +109,8 @@ export async function repairOpenChunks(
     lockTimeoutMs?: number | undefined;
     attempts?: number | undefined;
     ignoreOpenTransactions?: boolean;
-    /** Ab diesem Alter zählt eine andere Transaktion als lang (Standard 5 s). */
-    openTxMinAgeMs?: number;
+    /** Ab diesem Alter zählt auch eine Transaktion der kurzlebigen Anwendungen (Standard 5 s). */
+    shortLivedMaxAgeMs?: number;
     log?: (s: string) => void;
   },
 ): Promise<RepairResult[]> {
@@ -117,10 +121,10 @@ export async function repairOpenChunks(
   // vor jedem Chunk prüfen: ein langer Leser kann auch zwischen zwei Chunks beginnen
   const checkOpen = async () => {
     if (o.ignoreOpenTransactions) return;
-    const open = await otherOpenTransactions(sql, o.openTxMinAgeMs ?? OPEN_TX_MIN_AGE_MS);
+    const open = await otherOpenTransactions(sql, o.shortLivedMaxAgeMs ?? SHORT_LIVED_MAX_AGE_MS);
     if (open.length > 0)
       throw new Error(
-        `repair-open-chunks: ${open.length} andere Transaktion(en) auf ${open[0]!.db} länger als ${(o.openTxMinAgeMs ?? OPEN_TX_MIN_AGE_MS) / 1000} s offen ` +
+        `repair-open-chunks: ${open.length} andere offene Transaktion(en) auf ${open[0]!.db} ` +
           `(${open.map((t) => `pid ${t.pid} ${t.app || t.user} seit ${t.since}`).join('; ')}). ` +
           'Ein REPEATABLE-READ-Leser ohne Chunk-Sperren (Prüfbericht, Dump) sähe umgewandelte Chunks leer. ' +
           'Abwarten oder, wenn harmlos, mit --ignore-open-transactions erneut starten.',
