@@ -23,7 +23,7 @@ beforeAll(async () => {
   await dropAndCreateDatabase(cfg);
   sql = connect(cfg);
   await migrateUp(sql);
-  dir = archive({ dailyDays: ['2026-09-10', '2026-09-14'] });
+  dir = archive({ dailyDays: ['2026-09-10', '2026-09-14', '2026-09-15'] });
 });
 afterAll(async () => {
   await sql?.end();
@@ -137,6 +137,7 @@ const RECORDER_WRITES = [
 ];
 const RECORDER_READS_ONLY = ['symbol', 'schema_migrations', 'verify_run'];
 const ROLE_DAY = '2026-09-14';
+const H3_DAY = '2026-09-15';
 
 describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5)', () => {
   // Test-Login-Rolle als Mitglied von of_recorder: gleiche Rechte, kein Eigentum – of_recorder selbst
@@ -322,14 +323,109 @@ describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5
     }
   });
 
-  it('Migration 0014: keine Projekt-Policy verdichtet teilweise komprimierte Chunks nach', async () => {
-    const jobs = await sql`
-      SELECT hypertable_name, config FROM timescaledb_information.jobs
-       WHERE proc_name IN ('policy_compression', 'policy_columnstore') AND hypertable_schema = 'public'`;
-    expect(jobs.length).toBeGreaterThan(0);
-    for (const j of jobs)
-      expect((j.config as { recompress?: boolean }).recompress, j.hypertable_name as string).toBe(
-        false,
-      );
+  it('jede Columnstore-Policy eines Projekt-Hypertables hat recompress=false (H2: auch künftige Migrationen)', async () => {
+    const rows = await sql`
+      SELECT h.hypertable_name AS t, j.job_id, j.config
+        FROM timescaledb_information.hypertables h
+        LEFT JOIN timescaledb_information.jobs j
+          ON j.hypertable_schema = h.hypertable_schema AND j.hypertable_name = h.hypertable_name
+         AND j.proc_name IN ('policy_compression', 'policy_columnstore')
+       WHERE h.hypertable_schema = 'public' AND h.compression_enabled`;
+    expect(rows.length).toBeGreaterThan(0);
+    for (const r of rows) {
+      expect(r.job_id, `${r.t as string}: Columnstore ohne Policy`).not.toBeNull();
+      expect((r.config as { recompress?: boolean }).recompress, r.t as string).toBe(false);
+    }
+    // und keine Policy auf einem Hypertable ohne Columnstore / außerhalb von public
+    const [odd] = await sql`
+      SELECT count(*)::int AS n FROM timescaledb_information.jobs
+       WHERE proc_name IN ('policy_compression', 'policy_columnstore')
+         AND coalesce((config ->> 'recompress')::boolean, true)`;
+    expect(odd!.n).toBe(0);
+  });
+
+  it('of_recompress_chunk lehnt Chunks ohne Columnstore ab, bevor es sperrt (H4)', async () => {
+    const [ch] = await sql`
+      SELECT format('%I.%I', chunk_schema, chunk_name) AS c FROM timescaledb_information.chunks
+       WHERE hypertable_name = 'bar_1h' ORDER BY range_start LIMIT 1`;
+    expect(ch).toBeDefined();
+    const holder = connect(cfg);
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let held!: () => void;
+    const isHeld = new Promise<void>((r) => (held = r));
+    const holding = holder.begin(async (tx) => {
+      await tx.unsafe(`LOCK TABLE ${ch!.c as string} IN ACCESS SHARE MODE`);
+      held();
+      await released;
+    });
+    await isHeld;
+    try {
+      // Sperrte die Funktion zuerst, käme hier 55P03 (lock_timeout) statt 42501
+      await expect(
+        rsql.begin(async (tx) => {
+          await tx`SET LOCAL lock_timeout = '200ms'`;
+          await tx`SELECT of_recompress_chunk(${ch!.c as string}::regclass)`;
+        }),
+      ).rejects.toMatchObject({ code: '42501' });
+    } finally {
+      release();
+      await holding;
+      await holder.end();
+    }
+  });
+
+  it('teilweise komprimierte Chunks sind unter der Recorder-Rolle sichtbar (H2)', async () => {
+    const lw = new LiveWriter(roleCfg);
+    await lw.open();
+    try {
+      expect(await lw.partialChunks()).toEqual([]);
+      await sql`UPDATE fp_1m SET buy_q = buy_q WHERE sym_id = 1 AND ts = ${ROLE_DAY}::date + interval '12 hours'`;
+      const p = await lw.partialChunks();
+      expect(p).toHaveLength(1);
+      await rsql`SELECT of_recompress_chunk(${p[0]!}::regclass)`;
+      expect(await lw.partialChunks()).toEqual([]);
+    } finally {
+      await lw.close();
+    }
+  });
+
+  it('Konvertierungsfehler nach dem Festschreiben: Tag ist final, finaliseDay meldet ihn getrennt (H3)', async () => {
+    const day = parseDay(H3_DAY);
+    expect(
+      (await replayDay({ dataDir: dir, symbol: 'BTCUSDT', day, db: cfg, log: () => {} })).equal,
+    ).toBe(true);
+    const chunks = await sql`
+      SELECT format('%I.%I', c.chunk_schema, c.chunk_name) AS c
+        FROM timescaledb_information.chunks c
+        JOIN timescaledb_information.hypertables h USING (hypertable_schema, hypertable_name)
+       WHERE h.compression_enabled AND c.hypertable_schema = 'public'
+         AND c.range_start < ${H3_DAY}::date + 1 AND c.range_end > ${H3_DAY}::date`;
+    for (const c of chunks)
+      await sql.unsafe('CALL convert_to_columnstore($1::regclass, if_not_columnstore => true)', [
+        c.c as string,
+      ]);
+    // Konvertierungsrecht entziehen (wie eine fehlende Migration 0014): Fehler nach dem Commit
+    await sql`REVOKE EXECUTE ON FUNCTION of_recompress_chunk(regclass) FROM of_recorder`;
+    try {
+      const res = await finaliseDay({
+        dataDir: dir,
+        cfg: roleCfg,
+        spec: BTC,
+        day,
+        sql: rsql,
+        log: () => {},
+      });
+      expect(res).toMatchObject({
+        quality: { identical: 1440 },
+        conversionError: expect.stringMatching(
+          /permission denied for function of_recompress_chunk/,
+        ),
+      });
+    } finally {
+      await sql`GRANT EXECUTE ON FUNCTION of_recompress_chunk(regclass) TO of_recorder`;
+    }
+    const [d] = await sql`SELECT state FROM data_day WHERE sym_id = 1 AND day = ${H3_DAY}::date`;
+    expect(d!.state).toBe('final_ok');
   });
 });

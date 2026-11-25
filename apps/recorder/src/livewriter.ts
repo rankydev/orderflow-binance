@@ -236,6 +236,18 @@ export class LiveWriter {
   }
 
   /** Grund, warum ein Tag nicht weiter live geschrieben wird (data_day.live_frozen; nur provisorische Tage). */
+  /** Teilweise komprimierte Chunks (Status-Bit 8) der Projekttabellen (Review H2). */
+  async partialChunks(): Promise<string[]> {
+    const rows = await this.db`
+      SELECT format('%I.%I', c.chunk_schema, c.chunk_name) AS c
+        FROM timescaledb_information.chunks c
+        JOIN _timescaledb_catalog.chunk k
+          ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
+       WHERE c.hypertable_schema = 'public' AND (k.status & 8) <> 0
+       ORDER BY 1`;
+    return rows.map((r) => r.c as string);
+  }
+
   async markFrozen(spec: SymbolSpec, day: number, reason: string): Promise<void> {
     const ds = formatDay(day);
     await this.db.begin(async (tx) => {

@@ -24,6 +24,15 @@
 //  - Ruhiger Markt: nur dann entscheidet die lokale Uhr den Minutenabschluss (nach einer REST-Probe);
 //    die Uhr muss per NTP stimmen. Health zeigt eventLagMs (Uhr − Ereigniszeit E der letzten
 //    Nachricht); dauerhaft > 3 000 ms → Uhr prüfen.
+//  - Nachverdichtung bei der Finalisierung (Importer, Review W3): je teilweise komprimiertem Chunk
+//    bis zu 10 Sperrversuche à 500 ms mit Pausen 1, 2, 3, 4, 5, 5, 5, 5, 5 s → schlimmstenfalls
+//    ≈ 40 s je Chunk, während der Importer-Advisory-Lock die ganze Zeit gehalten wird (ein paralleler
+//    Importer-Lauf wartet bzw. bricht mit „lock_busy" ab). Gelingt die Sperre nicht, bleibt der Chunk
+//    teilweise (lesbar, konsistent) und der nächste schreibende Lauf versucht es erneut.
+//  - Health/ingest_status: partialChunks und partialChunkOldestAgeMs (teilweise komprimierte Chunks,
+//    Alter seit erster Beobachtung durch diesen Prozess) – Alarm, wenn > 24 h; finaliseConversion-
+//    Errors / lastFinaliseConversionError: Tag ist final, aber die Konvertierung danach schlug fehl
+//    (z. B. fehlende Migration 0014 oder Rechte) – nie normal, immer prüfen.
 import { DAY_MS, dayIndex, formatDay, getSymbol, parseConfig, parseDay } from '@orderflow/core';
 import { execFile } from 'node:child_process';
 import { createServer, type ServerResponse } from 'node:http';
@@ -123,6 +132,30 @@ async function run(): Promise<number> {
   await rec.start();
   let lastFinalised: Record<string, string | null> = {};
   let rawPrunedFiles = 0;
+  // Review H3: Fehler nach dem Festschreiben eines finalen Tages (Columnstore-Konvertierung)
+  let finaliseConversionErrors = 0;
+  let lastFinaliseConversionError: string | null = null;
+  // Review H2: teilweise komprimierte Chunks der Projekttabellen (Status-Bit 8). Seit Migration 0014
+  // verdichtet nur ein schreibender Importer-Lauf sie (unter Sperre) nach; ein lange bestehender
+  // teilweiser Chunk ist lesbar, aber ein Zeichen, dass das Nachverdichten nicht gelingt.
+  // Alter = seit der Recorder ihn zuerst gesehen hat (der Katalog führt keinen Zeitpunkt).
+  const partialSeen = new Map<string, number>();
+  let partialChunks = { count: 0, oldestAgeMs: 0 };
+  const checkPartialChunks = async () => {
+    const rows = await writer.partialChunks();
+    const now = Date.now();
+    const cur = new Set(rows);
+    for (const k of partialSeen.keys()) if (!cur.has(k)) partialSeen.delete(k);
+    for (const c of cur) if (!partialSeen.has(c)) partialSeen.set(c, now);
+    const oldest = Math.min(now, ...partialSeen.values());
+    partialChunks = { count: cur.size, oldestAgeMs: now - oldest };
+  };
+  const partialTimer = setInterval(() => {
+    checkPartialChunks().catch((e: unknown) =>
+      logLine('partial chunk check failed', { error: String(e) }),
+    );
+  }, 5 * 60_000);
+  void checkPartialChunks().catch(() => {});
   const attempts = new Map<string, number>();
   const health = () => {
     const now = Date.now();
@@ -161,6 +194,10 @@ async function run(): Promise<number> {
       spoolEnabled: rec.spoolEnabled,
       spoolPrunedDays: rec.spoolPruned.length,
       rawPrunedFiles,
+      partialChunks: partialChunks.count,
+      partialChunkOldestAgeMs: partialChunks.oldestAgeMs,
+      finaliseConversionErrors,
+      lastFinaliseConversionError,
       wsConnected: rec.stream?.connected ?? false,
       wsReconnects: rec.stream?.reconnects ?? 0,
       wsRotations: rec.stream?.rotations ?? 0,
@@ -212,7 +249,12 @@ async function run(): Promise<number> {
           spool_lag_ms: x.spoolLagMs,
           last_committed_minute: s.lastCommittedMinute ? new Date(s.lastCommittedMinute) : null,
           last_finalised_day: lastFinalised[name] ?? null,
-          details: x,
+          details: {
+            ...x,
+            partialChunks: h.partialChunks,
+            partialChunkOldestAgeMs: h.partialChunkOldestAgeMs,
+            finaliseConversionErrors: h.finaliseConversionErrors,
+          },
         })
         .catch((e: unknown) => logLine('status write failed', { error: String(e) }));
     }
@@ -253,6 +295,16 @@ async function run(): Promise<number> {
             logLine('finalise later', { symbol: name, day: formatDay(d), reason: r });
             break;
           }
+          if (r !== 'done' && r.conversionError) {
+            // Tag ist final (zählt für die Schleife), aber die Konvertierung schlug fehl: laut melden
+            finaliseConversionErrors++;
+            lastFinaliseConversionError = `${name} ${formatDay(d)}: ${r.conversionError}`;
+            logLine('FINALISE CONVERSION ERROR (day is final)', {
+              symbol: name,
+              day: formatDay(d),
+              error: r.conversionError,
+            });
+          }
           const st = await writer.startState(s.spec);
           if (st.final) rec.markFinal(name, st.final);
           lastFinalised = { ...lastFinalised, [name]: formatDay(d) };
@@ -288,6 +340,7 @@ async function run(): Promise<number> {
   clearInterval(status);
   clearInterval(statsLog);
   clearInterval(fin);
+  clearInterval(partialTimer);
   await rec.stop();
   server?.close();
   for (const c of clients) c.end();

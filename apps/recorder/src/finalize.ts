@@ -130,7 +130,12 @@ export interface FinaliseOptions {
  */
 export async function finaliseDay(
   o: FinaliseOptions,
-): Promise<'done' | 'not_available' | 'lock_busy' | { quality: QualityResult | null }> {
+): Promise<
+  | 'done'
+  | 'not_available'
+  | 'lock_busy'
+  | { quality: QualityResult | null; conversionError?: string }
+> {
   const ds = formatDay(o.day);
   const refs: FileRef[] = [
     { kind: 'aggTrades', origin: 'daily', symbol: o.spec.name, period: ds },
@@ -152,7 +157,35 @@ export async function finaliseDay(
     throw e;
   }
   let quality: QualityResult | null = null;
+  const versionOf = async () =>
+    ((
+      await o.sql`SELECT state, version FROM data_day WHERE sym_id = ${o.spec.symId} AND day = ${ds}::date`
+    )[0] ?? null) as { state: string; version: number } | null;
+  const before = await versionOf();
+  let err: unknown = null;
   try {
+    await runImport();
+  } catch (e) {
+    err = e;
+  }
+  try {
+    await writer.close();
+  } catch (e) {
+    err ??= e; // den ersten Fehler melden
+  }
+  if (err !== null) {
+    const e = err;
+    // Review H3: ein Fehler NACH dem Festschreiben (Columnstore-Konvertierung, close-Durchlauf)
+    // lässt einen finalen Tag zurück. Der gilt für die Schleife als finalisiert; der Fehler wird
+    // getrennt gemeldet, statt alle Folgetage provisorisch hängen zu lassen.
+    const after = await versionOf();
+    const final = after?.state === 'final_ok' || after?.state === 'final_bad';
+    if (!final || (before !== null && after!.version <= before.version)) throw e;
+    return { quality, conversionError: e instanceof Error ? e.message : String(e) };
+  }
+  return { quality };
+
+  async function runImport(): Promise<void> {
     await new Importer({
       dataDir: o.dataDir,
       spec: o.spec,
@@ -180,10 +213,7 @@ export async function finaliseDay(
         );
       },
     }).run();
-  } finally {
-    await writer.close();
   }
-  return { quality };
 }
 
 /** Nächster Versuchszeitpunkt: ab 06:00 UTC des Folgetags, dann alle `everyMs`. */
