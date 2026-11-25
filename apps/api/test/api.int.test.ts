@@ -27,6 +27,7 @@ import {
 } from '@orderflow/core';
 import { connect, dropAndCreateDatabase, migrateUp, type Sql } from '@orderflow/db';
 import { randomBytes } from 'node:crypto';
+import { createConnection, createServer, type AddressInfo, type Socket } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { checkSymbolsResponse } from '../../web/src/lib/api.ts';
@@ -34,6 +35,7 @@ import { BarStore } from '../../web/src/lib/bar-store.ts';
 import { FootprintStore } from '../../web/src/lib/footprint-store.ts';
 import { parseApiConfig, type ApiConfig } from '../src/config.ts';
 import { createPool, readTx } from '../src/db.ts';
+import { alterRolePasswordSql } from '../src/scram.ts';
 import { startApi, type RunningApi } from '../src/main.ts';
 import { FP_TABLE_NAMES } from '../src/plan.ts';
 import { queryLevels } from '../src/queries.ts';
@@ -70,7 +72,8 @@ function apiCfg(over: Partial<ApiConfig> = {}): ApiConfig {
     OF_API_DB_USER: 'of_api',
     OF_API_DB_PASSWORD: apiPassword,
   });
-  return { ...c, port: 0, pollMs: 100, ...over };
+  // Tests prüfen Quelle und Schätzung über die Diagnose-Header; Status-Listener nur wo nötig
+  return { ...c, port: 0, pollMs: 100, adminPort: 0, diagHeaders: true, ...over };
 }
 
 async function start(over: Partial<ApiConfig> = {}): Promise<RunningApi> {
@@ -164,7 +167,8 @@ beforeAll(async () => {
   admin = connect(adminCfg);
   await migrateUp(admin);
   // Rolle ist clusterweit: dasselbe Passwort wie die lokale .env (sonst ein zufälliges, z. B. in CI)
-  await admin.unsafe(`ALTER ROLE of_api PASSWORD '${apiPassword.replace(/'/g, "''")}'`);
+  // nur der SCRAM-Verifier geht an den Server (W4a); jede API-Verbindung unten beweist, dass er gilt
+  await admin.unsafe(alterRolePasswordSql('of_api', apiPassword));
   data = generate();
   await seed(admin, data);
 }, 120_000);
@@ -183,6 +187,11 @@ describe('Rolle of_api', () => {
       await expect(sql.begin('read write', (tx) => tx`DELETE FROM data_day`)).rejects.toThrow(
         /permission/,
       );
+      // Migration 0010 (W4b/W4d): work_mem 16 MB, kein Zugriff auf Manifest/Verwaltung
+      const [wm] = await sql`SHOW work_mem`;
+      expect(wm!.work_mem).toBe('16MB');
+      for (const t of ['raw_file', 'raw_day', 'schema_migrations', 'verify_run'])
+        await expect(sql.unsafe(`SELECT 1 FROM ${t} LIMIT 1`), t).rejects.toThrow(/permission/);
     } finally {
       await sql.end();
     }
@@ -256,7 +265,7 @@ describe('Endpunkte gegen den Web-Client', () => {
         // final nur, wenn jeder überdeckte UTC-Tag existiert und unveränderlich ist
         expect(dec.header.final).toBe(expFinal(from, to));
         expect(res.headers.get('cache-control')).toBe(
-          expFinal(from, to) ? 'public, max-age=31536000, immutable' : 'no-cache',
+          expFinal(from, to) ? 'public, max-age=604800' : 'no-cache',
         );
         const ref = refBars(tfSec, from, to);
         expect(dec.header.nBars).toBe(ref.length);
@@ -456,7 +465,7 @@ describe('Endpunkte gegen den Web-Client', () => {
       const allImmutable = expFinal(from, to);
       expect(body.final).toBe(allImmutable);
       expect(res.headers.get('cache-control')).toBe(
-        allImmutable ? 'public, max-age=31536000, immutable' : 'no-cache',
+        allImmutable ? 'public, max-age=604800' : 'no-cache',
       );
     }
   }, 120_000);
@@ -573,13 +582,121 @@ describe('Endpunkte gegen den Web-Client', () => {
     expect(no.res.headers.get('access-control-allow-origin')).toBeNull();
   });
 
-  it('/health nur lokal ohne Proxy-Header', async () => {
-    expect((await get(api, '/api/v1/health')).res.status).toBe(200);
-    expect(
-      (await get(api, '/api/v1/health', { headers: { 'X-Forwarded-For': '1.2.3.4' } })).res.status,
-    ).toBe(404);
+  it('öffentliche /health ohne Interna, auch lokal und hinter einem Proxy (W3)', async () => {
+    for (const headers of [{}, { 'X-Forwarded-For': '1.2.3.4' }, { 'X-Real-IP': '1.2.3.4' }]) {
+      const r = await get(api, '/api/v1/health', { headers });
+      expect(r.res.status).toBe(200);
+      expect(r.json()).toEqual({ status: 'ok' });
+      expect(r.res.headers.get('cache-control')).toBe('no-store');
+    }
+  });
+
+  it('nosniff an jeder Antwort', async () => {
+    for (const u of [
+      '/api/v1/symbols',
+      '/api/v1/nope',
+      `/api/v1/bars?sym=BTCUSDT&tf=1m&from=0&to=60000`,
+    ])
+      expect((await get(api, u)).res.headers.get('x-content-type-options')).toBe('nosniff');
   });
 });
+
+describe('Betriebsschutz: Status-Listener, Diagnose-Header, CORS-Liste, Zeitgrenzen', () => {
+  it('ausführliche Health nur auf dem Loopback-Status-Listener (W3)', async () => {
+    const port = await freePort();
+    const api = await start({ adminPort: port, host: '127.0.0.1' });
+    try {
+      expect(api.adminUrl).toBe(`http://127.0.0.1:${port}`);
+      const r = await fetch(`${api.adminUrl}/health`);
+      const j = (await r.json()) as Record<string, unknown>;
+      expect(j.status).toBe('healthy');
+      expect(j).toHaveProperty('memory');
+      expect(j).toHaveProperty('cache');
+      // der öffentliche Port kennt den Detailpfad nicht
+      expect((await get(api, '/health')).res.status).toBe(404);
+    } finally {
+      await api.close();
+    }
+  });
+
+  it('Diagnose-Header standardmäßig aus', async () => {
+    const api = await start({ diagHeaders: false });
+    try {
+      const r = await get(
+        api,
+        `/api/v1/profile?sym=BTCUSDT&from=${dataFrom}&to=${dataFrom + DAY_MS}&R=100`,
+      );
+      expect(r.res.status).toBe(200);
+      for (const h of ['x-source', 'x-rows-estimate', 'server-timing'])
+        expect(r.res.headers.get(h), h).toBeNull();
+      const c = await get(api, '/api/v1/symbols', { headers: { Origin: 'http://127.0.0.1:5174' } });
+      expect(c.res.headers.get('access-control-expose-headers')).toBe('ETag, Retry-After, X-Cache');
+    } finally {
+      await api.close();
+    }
+  });
+
+  it('CORS mit konfigurierter Liste: nur exakte Ursprünge, Loopback nicht mehr', async () => {
+    const api = await start({ cors: ['https://of.example'] });
+    try {
+      const ok = await get(api, '/api/v1/symbols', { headers: { Origin: 'https://of.example' } });
+      expect(ok.res.headers.get('access-control-allow-origin')).toBe('https://of.example');
+      for (const o of [
+        'http://127.0.0.1:5174',
+        'https://of.example:8443',
+        'https://evil.example',
+      ]) {
+        const r = await get(api, '/api/v1/symbols', { headers: { Origin: o } });
+        expect(r.res.headers.get('access-control-allow-origin'), o).toBeNull();
+      }
+    } finally {
+      await api.close();
+    }
+  });
+
+  it('Zeitgrenzen (W2): Leerlauf-Socket und tröpfelnde Kopfzeilen werden geschlossen', async () => {
+    const api = await start({ connectionTimeoutMs: 300, requestTimeoutMs: 600 });
+    try {
+      const { port } = new URL(api.url);
+      // Leerlauf: nichts senden
+      const idle = await socketLife(Number(port), () => {});
+      expect(idle).toBeLessThan(2_000);
+      // Slow-Loris: alle 100 ms ein Kopfzeilen-Byte (hält den Socket aktiv, nie fertig)
+      const loris = await socketLife(Number(port), (sock) => {
+        sock.write('GET /api/v1/symbols HTTP/1.1\r\nHost: x\r\nX-A: ');
+        const t = setInterval(() => sock.write('a'), 100);
+        sock.on('close', () => clearInterval(t));
+      });
+      expect(loris).toBeLessThan(3_000);
+    } finally {
+      await api.close();
+    }
+  });
+});
+
+/** Öffnet eine TCP-Verbindung, führt `use` aus und misst die Zeit bis zum Schließen durch den Server. */
+function socketLife(port: number, use: (s: Socket) => void): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const sock = createConnection({ host: '127.0.0.1', port }, () => use(sock));
+    sock.on('error', () => {});
+    sock.on('close', () => resolve(Date.now() - t0));
+    setTimeout(() => {
+      sock.destroy();
+      reject(new Error('Server hat den Socket nicht geschlossen'));
+    }, 10_000).unref();
+  });
+}
+
+function freePort(): Promise<number> {
+  return new Promise((resolve) => {
+    const srv = createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const p = (srv.address() as AddressInfo).port;
+      srv.close(() => resolve(p));
+    });
+  });
+}
 
 describe('Grenzen (422 mit Vorschlag)', () => {
   let api: RunningApi;
@@ -653,7 +770,7 @@ describe('Versionen, Unveränderlichkeit, Cache', () => {
     expect(a.res.status).toBe(200);
     const h = decodeTile(a.buf).header;
     expect(h.final).toBe(true);
-    expect(a.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    expect(a.res.headers.get('cache-control')).toBe('public, max-age=604800');
     expect(a.res.headers.get('etag')).toBe(`"${h.dataVersion}"`);
     expect(a.res.headers.get('x-cache')).toBe('miss');
     const b = await get(api, url, { headers: { 'Accept-Encoding': 'gzip' } });
@@ -677,7 +794,8 @@ describe('Versionen, Unveränderlichkeit, Cache', () => {
     const b = await get(api, url);
     expect(decodeTile(b.buf).header.final).toBe(false);
     expect(b.res.headers.get('cache-control')).toBe('no-cache');
-    expect((await get(api, url)).res.headers.get('x-cache')).toBe('miss');
+    // W1: auch nicht finale Antworten kommen aus dem Server-Cache (kurz, unter der dataVersion)
+    expect((await get(api, url)).res.headers.get('x-cache')).toBe('hit');
     await admin`UPDATE data_day SET edge_pending = false WHERE sym_id = ${SYM_ID} AND day = ${new Date(day * DAY_MS).toISOString().slice(0, 10)}::date`;
     await waitCatalog();
   });
@@ -720,13 +838,13 @@ describe('Sperren, Abbruch, Überlast', () => {
   });
   afterAll(async () => locker?.end());
   /** Hält eine exklusive Sperre auf fp_1m, bis release() gerufen wird. */
-  async function holdLock(): Promise<() => Promise<void>> {
+  async function holdLock(tables = ['fp_1m']): Promise<() => Promise<void>> {
     let release!: () => void;
     const released = new Promise<void>((r) => (release = r));
     let locked!: () => void;
     const isLocked = new Promise<void>((r) => (locked = r));
     const done = locker.begin(async (tx) => {
-      await tx`LOCK TABLE fp_1m IN ACCESS EXCLUSIVE MODE`;
+      for (const t of tables) await tx.unsafe(`LOCK TABLE ${t} IN ACCESS EXCLUSIVE MODE`);
       locked();
       await released;
     });
@@ -797,6 +915,89 @@ describe('Sperren, Abbruch, Überlast', () => {
       await release();
       expect((await first).res.status).toBe(200);
     } finally {
+      await api.close();
+    }
+  });
+  // nicht final (überdeckt den provisorischen Tag), liest fp_1m
+  const openUrl = (k: number) =>
+    `/api/v1/profile?sym=BTCUSDT&from=${PROVISIONAL_DAY * DAY_MS + k * MINUTE_MS}&to=${PROVISIONAL_DAY * DAY_MS + (k + 30) * MINUTE_MS}&R=5`;
+
+  it('W1: nicht finale Antwort aus dem Cache und 304 ohne Datenabfrage (Tabellen gesperrt)', async () => {
+    const api = await start({ lockTimeoutMs: 20_000 });
+    try {
+      const a = await get(api, openUrl(1));
+      expect(a.res.status).toBe(200);
+      expect(a.json().final).toBe(false);
+      expect(a.res.headers.get('cache-control')).toBe('no-cache');
+      const etag = a.res.headers.get('etag')!;
+      const release = await holdLock(['fp_1m', 'bar_1m', 'data_day']);
+      try {
+        const t0 = Date.now();
+        const r304 = await get(api, openUrl(1), { headers: { 'If-None-Match': etag } });
+        expect(r304.res.status).toBe(304);
+        expect(r304.res.headers.get('etag')).toBe(etag);
+        expect(r304.res.headers.get('x-cache')).toBe('revalidated');
+        const hit = await get(api, openUrl(1));
+        expect(hit.res.status).toBe(200);
+        expect(hit.res.headers.get('x-cache')).toBe('hit');
+        expect(Date.now() - t0).toBeLessThan(1_000);
+        expect(await waiting()).toBe(0); // keine API-Sitzung wartet auf die Sperren
+      } finally {
+        await release();
+      }
+    } finally {
+      await api.close();
+    }
+  });
+
+  it('W1: Ansturm gleicher Anfragen → eine Datenabfrage, alle 200 (Pool 1, keine Warteschlange)', async () => {
+    const api = await start({ dbPool: 1, maxQueue: 0, lockTimeoutMs: 20_000 });
+    const release = await holdLock();
+    try {
+      const all = Array.from({ length: 50 }, () => get(api, openUrl(2)));
+      for (let i = 0; i < 50 && (await waiting()) === 0; i++) await sleep(50);
+      expect(await waiting()).toBe(1);
+      await release();
+      const res = await Promise.all(all);
+      expect(res.map((r) => r.res.status)).toEqual(Array(50).fill(200));
+      const kinds = res.map((r) => r.res.headers.get('x-cache'));
+      expect(kinds.filter((k) => k === 'miss')).toHaveLength(1);
+      expect(kinds.filter((k) => k === 'shared')).toHaveLength(49);
+    } finally {
+      await release().catch(() => {});
+      await api.close();
+    }
+  });
+
+  it('W1: nicht finale Einträge laufen nach nonFinalTtlMs ab', async () => {
+    const api = await start({ nonFinalTtlMs: 300 });
+    try {
+      expect((await get(api, openUrl(3))).res.headers.get('x-cache')).toBe('miss');
+      expect((await get(api, openUrl(3))).res.headers.get('x-cache')).toBe('hit');
+      await sleep(400);
+      expect((await get(api, openUrl(3))).res.headers.get('x-cache')).toBe('miss');
+    } finally {
+      await api.close();
+    }
+  });
+
+  it('Verbindungsabbruch durch die Datenbank (57P01) → 503 + Retry-After, danach wieder 200', async () => {
+    const api = await start({ lockTimeoutMs: 20_000 });
+    const release = await holdLock();
+    try {
+      const p = get(api, profileUrl(6));
+      for (let i = 0; i < 50 && (await waiting()) === 0; i++) await sleep(50);
+      expect(await waiting()).toBe(1);
+      await admin`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+                   WHERE datname = ${testDb} AND application_name = 'orderflow-api'
+                     AND wait_event_type = 'Lock'`;
+      const r = await p;
+      expect(r.res.status).toBe(503);
+      expect(r.res.headers.get('retry-after')).toBe('5');
+      await release();
+      expect((await get(api, profileUrl(6))).res.status).toBe(200);
+    } finally {
+      await release().catch(() => {});
       await api.close();
     }
   });
