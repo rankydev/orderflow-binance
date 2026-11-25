@@ -2,7 +2,7 @@
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
-import { EventHub } from '../src/events.ts';
+import { EventHub, SSE_MAX_BUFFER } from '../src/events.ts';
 
 describe('EventHub (/events)', () => {
   it('antwortet sofort mit Kopfzeilen und `: ok`, sendet Keepalive und Minuten', async () => {
@@ -122,15 +122,24 @@ describe('EventHub: echter Server, Client liest nicht (S4)', () => {
     sock.pause(); // liest nie: Kernel- und Prozesspuffer laufen voll
     try {
       while (hub.size === 0) await new Promise((r) => setTimeout(r, 5));
+      // Puffergröße der einen Antwort bei jedem Schritt beobachten (writableLength enthält auf
+      // Node 24 auch den Socket-Puffer); getrennt werden muss sie knapp über 1 MB
+      let maxBuffered = 0;
+      const res = [...(hub as unknown as { clients: Set<{ writableLength: number }> }).clients][0]!;
       let sent = 0;
-      while (hub.dropped === 0 && sent < 500_000) {
+      while (hub.dropped === 0 && sent < 2_000_000) {
         for (let i = 0; i < 2000; i++) hub.minute('BTCUSDT', 1_795_600_000_000 + sent++);
+        maxBuffered = Math.max(maxBuffered, res.writableLength);
         await new Promise((r) => setImmediate(r));
       }
       expect(hub.dropped).toBe(1);
       expect(hub.size).toBe(0);
-      // getrennt, bevor der Puffer weit über die Grenze wuchs (~65 Byte je Ereignis)
-      expect(sent * 65).toBeLessThan(64 * 1024 * 1024);
+      // der Puffer lief wirklich voll (Trennung wegen Gegendruck, nicht aus anderem Grund) und war
+      // beim letzten Blick vor der Trennung nicht über der Grenze plus einem Schub (≈ 130 kB)
+      expect(maxBuffered).toBeGreaterThan(SSE_MAX_BUFFER / 2);
+      expect(maxBuffered).toBeLessThan(SSE_MAX_BUFFER + 256 * 1024);
+      // ohne Grenze wären alle gesendeten Ereignisse im Prozess gepuffert worden
+      expect(sent).toBeLessThan(2_000_000);
     } finally {
       sock.destroy();
       hub.close();

@@ -129,7 +129,16 @@ export class LiveWriter {
    * würde nach fünf Versuchen eingefroren; bei abweichenden Einheiten wären alle Preise falsch.
    */
   async checkSymbol(spec: SymbolSpec): Promise<void> {
-    await this.ensureSymbol(spec);
+    try {
+      await this.ensureSymbol(spec);
+    } catch (e) {
+      if (String((e as { code?: unknown }).code) !== '23505') throw e;
+      const [o] = await this.db`SELECT sym_id FROM symbol WHERE name = ${spec.name}`;
+      throw new Error(
+        `Tabelle symbol: ${spec.name} hat sym_id ${String(o?.sym_id)}, der Code erwartet ${spec.symId}`,
+        { cause: e },
+      );
+    }
     const [row] = await this.db`
       SELECT name, price_unit::text AS pu, price_decimals, tick_ref_units, qty_unit::text AS qu, qty_decimals
         FROM symbol WHERE sym_id = ${spec.symId}`;

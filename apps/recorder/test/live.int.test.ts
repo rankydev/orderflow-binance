@@ -259,6 +259,10 @@ describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, Review K1, W2, W4, W5
       } finally {
         await sql`UPDATE symbol SET tick_ref_units = ${orig!.tick_ref_units as number} WHERE sym_id = ${ETH.symId}`;
       }
+      // gleicher Name unter anderer sym_id: lesbare Meldung statt 23505
+      await expect(w.checkSymbol({ ...ETH, symId: 77 })).rejects.toThrow(
+        /ETHUSDT hat sym_id 2, der Code erwartet 77/,
+      );
     } finally {
       await w.close();
     }

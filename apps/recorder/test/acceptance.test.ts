@@ -331,6 +331,75 @@ describe('Erster Start mit letztem finalem Tag außerhalb des REST-Fensters (Rev
     await f.rec.stop();
   });
 
+  it('wechselnde Fehler an derselben fromId zählen zusammen: 12 Versuche (S1a)', async () => {
+    let now = D0 + 505 * MINUTE_MS;
+    let n = 0;
+    const errs = [
+      () => Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+      () => new Error('The operation was aborted due to timeout'),
+      () => new RestError(502, undefined, 'Bad Gateway'),
+    ];
+    const f = make({
+      final: { day: DAY - 1, lastAggId: 7999 },
+      rest: {
+        ...rest,
+        aggTrades: async () => {
+          throw errs[n++ % errs.length]!();
+        },
+      },
+      now: () => now,
+    });
+    await f.rec.start();
+    const s = f.rec.sym.get('BTCUSDT')!;
+    f.rec.handle(
+      s,
+      rows(500, 3, 9000).map((r) => toItem(r, BTC, false)),
+      true,
+    );
+    for (let i = 1; i < REST_ALERT_FAILURES; i++) {
+      await f.rec.catchUpStep(s);
+      now += 5000;
+    }
+    expect(s.restAlert).toBeNull();
+    await f.rec.catchUpStep(s); // 12. Fehler (ein 502)
+    expect(s.restAlert).toMatch(/Bad Gateway.*fromId 8000, 12×/); // nur der letzte Fehler im Text
+    await f.rec.stop();
+  });
+
+  it('wechselnde Fehler an derselben fromId: 15 min ab dem ersten Fehler (S1a)', async () => {
+    let now = D0 + 505 * MINUTE_MS;
+    let n = 0;
+    const f = make({
+      final: { day: DAY - 1, lastAggId: 7999 },
+      rest: {
+        ...rest,
+        aggTrades: async () => {
+          throw n++ % 2 ? new RestError(502, undefined, 'Bad Gateway') : new Error('fetch failed');
+        },
+      },
+      now: () => now,
+    });
+    await f.rec.start();
+    const s = f.rec.sym.get('BTCUSDT')!;
+    f.rec.handle(
+      s,
+      rows(500, 3, 9000).map((r) => toItem(r, BTC, false)),
+      true,
+    );
+    const t0 = now;
+    await f.rec.catchUpStep(s);
+    now = t0 + REST_ALERT_MS / 2;
+    await f.rec.catchUpStep(s);
+    now = t0 + REST_ALERT_MS - 1;
+    await f.rec.catchUpStep(s);
+    expect(s.restAlert).toBeNull();
+    expect(s.restFail!.since).toBe(t0);
+    now = t0 + REST_ALERT_MS;
+    await f.rec.catchUpStep(s);
+    expect(s.restAlert).toMatch(/Bad Gateway.*fromId 8000, 4×/);
+    await f.rec.stop();
+  });
+
   it('Alarm auch nach 15 min bei wenigen Versuchen (S1)', async () => {
     let now = D0 + 505 * MINUTE_MS;
     const f = make({
