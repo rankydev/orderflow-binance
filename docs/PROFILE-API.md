@@ -73,16 +73,32 @@ Gleicher Umschlag mit `"kind": "profiles/daily"` und `"offsetH"`, statt `profile
 
 ```json
 "days": [ { "day": "2026-11-05", "from": 1793836800000, "to": 1793923200000, "final": true,
-            "rowLo": …, "buy": […], "sell": […], "poc": …, "vah": …, "val": …, "deltaPoc": …,
-            "buyQ": …, "sellQ": …, "notional": "…", "low": …, "high": … } ]
+            "dataVersion": "…", "rowLo": …, "buy": […], "sell": […], "poc": …, "vah": …, "val": …,
+            "deltaPoc": …, "buyQ": …, "sellQ": …, "notional": "…", "vwap": 61234.567891,
+            "low": …, "high": … } ],
+"emptyDays": [],
+"missingDays": ["2026-06-08", "2026-06-09"]
 ```
+
+**Regeln für `from`/`to`/`offsetH`:** `offsetH` ganzzahlig in −23…23 (praktisch reichen −11…+12); `from` und `to`
+sind Tagesgrenzen mit diesem Offset, d. h. `(from − offsetH·3 600 000)` und `(to − offsetH·3 600 000)` sind
+Vielfache von 86 400 000 und `from − offsetH·3 600 000 ≥ 0`; höchstens 400 Tage; sonst 400.
 
 - Tag d überdeckt `[d·86 400 000 + offsetH·3 600 000, (d+1)·86 400 000 + offsetH·3 600 000)`; `day` ist das
   **UTC-Datum von d**. Beispiel `offsetH = −7`: `"day": "2026-11-05"` reicht von 2026-11-04 17:00 bis
   2026-11-05 17:00 UTC (Sitzung wird nach dem Tag benannt, in dem sie endet); `offsetH = +2`: 2026-11-05 02:00
   bis 2026-11-06 02:00.
-- Nur Tage mit Trades, aufsteigend; ein Tag ohne Trades fehlt.
+- **Maßgeblich sind `from`/`to`** jedes Tages; `day` ist nur die Bezeichnung (bei `offsetH ≠ 0` deckt sich der
+  Zeitraum nicht mit dem UTC-Datum).
+- `days`: nur Tage mit Trades, aufsteigend. Die übrigen Tage des Bereichs stehen in **`emptyDays`** (Daten
+  gespeichert, aber keine Trades – ein echtes leeres Profil) oder **`missingDays`** (keine gespeicherten Daten:
+  Lücke, Zukunft, vor dem Datenbeginn – kann sich durch Import/Backfill füllen).
 - `final` je Tag: alle UTC-Tage, die der Tag überdeckt (bei Offset ≠ 0 zwei), sind unveränderlich.
+  **`dataVersion` je Tag** hängt nur von diesen UTC-Tagen und den Parametern (R, va, Offset) ab – gleich in jeder
+  Anfrage, die den Tag enthält. Ein Client kann finale Tage damit dauerhaft halten, auch wenn die Antwort
+  insgesamt (`final` des Umschlags) wegen eines nicht finalen Tages `false` ist.
+- `vwap` (auch beim Range-Profil): notional / (buyQ + sellQ) in price_unit, auf 6 Nachkommastellen exakt per
+  Ganzzahldivision, `null` ohne Volumen; nur zur Anzeige (exakt ist `notional`).
 
 ## Kennzahlen (KONZEPT §6.1, einheitlich für Bars, Profile, TPO)
 
@@ -115,10 +131,17 @@ Tagesgrenzen, alle Quelltabellen, Offsets 0/+3/−7, Notional > 2^53).
 ## Grenzen (KONZEPT §1.4, §5.1)
 
 - **Quellzeilen ≤ 1,5 Mio.**, geschätzt **vor** der Ausführung aus einer Statistik je (Tabelle, UTC-Tag)
-  (Zeilen des Tages × überdeckter Anteil). Darüber **422** `{ "error": …, "suggestR": <R> | null }` mit der
-  kleinsten Leiterstufe > R, die unter der Grenze liegt.
+  (Zeilen des Tages × überdeckter Anteil). Darüber **422**
+  `{ "error", "reason": "profile_source_rows", "rowsEstimate", "limit", "suggestR": <R> | null }` mit der
+  kleinsten Leiterstufe > R, die unter der Grenze liegt. Die Schätzung ist etwa proportional zur Länge des
+  Zeitraums: ein Zeitraum ≈ `limit / rowsEstimate` × so lang passt bei gleichem R.
 - **Zeilen ≤ 60 000** (Range: Zeilenzahl; Tagesprofile: Summe über alle Tage), bestimmt aus dem Preisbereich der
-  Bar-Tabellen vor der Level-Abfrage. Darüber ebenfalls **422** + `suggestR`.
+  Bar-Tabellen vor der Level-Abfrage. Darüber **422**
+  `{ "error", "reason": "profile_rows", "rows", "limit", "suggestR" }` (ein kürzerer Zeitraum hilft nur, wenn
+  er den Preisbereich verkleinert).
+- Alle Grenzen stehen maschinenlesbar in `/symbols` unter `limits` (`profile.maxRows`, `profile.maxSourceRows`,
+  `profile.maxR`, `profile.maxRangeDays`, `profile.maxDailyDays`, `profile.offsetH`, `profile.va`; außerdem
+  `tiles`, `bars`, `quality`). R liegt auf der Leiter {1, 2, 5}·10^k mit `R · tickRefUnits ≥ tickUnits`.
 - Richtwerte BTC: R ∈ {1, 2, 5} liest `fp_1m` (≈ 0,45–0,9 Mio. Zeilen je Tag) → ein bis zwei Tage; R = 10…50
   liest `fp_1h_b10` → einige Monate; R ≥ 100 auf ganzen Tagen `fp_1d_b100` → Jahre. Für ein Auto-R (§6.3:
   ≈ 120 Zeilen Range, ≈ 60 je Tag) aus `low`/`high` eines vorhandenen Profils oder der Bars wählen und bei 422
@@ -172,6 +195,9 @@ ohne Decoder. Gemessen (BTC, echte Daten, 2026-11-24): Oktober bei R = 100 (≈ 
   Import-Transaktion entstehen, die auch `data_day` (Version, Zähler) ändert (heute der Fall). Wie bei den Kacheln: 304 ohne
   Datenabfrage, Server-Cache höchstens `OF_API_NONFINAL_TTL_MS` (10 s) lang, gleiche gleichzeitige Anfragen
   teilen eine Abfrage.
+- `apiDataErrors`: Datenfehler, die die API seit ihrem Start auf unveränderlichen Tagen dieses Bereichs gefunden
+  hat (Bars ohne Level, Summen ungleich; die betroffene Anfrage wurde mit 503 beantwortet):
+  `[{ at, message, from, to }]`. Normal leer.
 - Farbband nach §4.9: grün `final_ok`; gelb `provisional`, `provisional_import_failed`, `importing`,
   `edgePending`/`stale`; rot `final_bad` oder `minutes.gap > 0`.
 

@@ -302,6 +302,40 @@ Umgesetzt in `apps/api` (Katalog `src/catalog.ts`, Routen `src/routes/tiles.ts`)
   gibt im Header exakt das angefragte `from`/`to` zurück, auch wenn `to` hinter `dataTo` liegt (der Abschnitt
   enthält dann nur Bars < `dataTo`).
 
+## Stats-Spalten (optional, `stats=1`)
+
+`/bars` und `/footprint` liefern mit dem Parameter `stats=1` zusätzlich diese `x.`-Spalten (Länge = `nBars`,
+gleiche Reihenfolge wie `time`; Decoder und Clients ohne Kenntnis ignorieren sie). Ohne `stats` ist jede
+Antwort byte-gleich wie bisher. `stats` ist Teil des Cache-Schlüssels und der `dataVersion`;
+`tileConfigVersion` bleibt unberührt.
+
+| Spalte | Typ | Inhalt (KONZEPT §3.5; Teilbars i = Minuten bzw. Stunden der Bar, d_i = buy − sell, P_{i−1} = Σ_{k<i} d_k) |
+|---|---|---|
+| `x.maxDelta` | f64 Lots | max_i (P_{i−1} + run_max_i) – höchstes laufendes Delta in der Bar |
+| `x.minDelta` | f64 Lots | min_i (P_{i−1} + run_min_i) |
+| `x.cotHigh` | f64 Lots | DeepCharts „COT High": Delta seit die Bar ihr **Low** gebildet hat: j = **erste** Teilbar mit low_j = Bar-Low, d_from_low_j + Σ_{i>j} d_i |
+| `x.cotLow` | f64 Lots | „COT Low": dasselbe mit dem **High** (j = erste Teilbar mit high_j = Bar-High, d_from_high) |
+| `x.trades` | i32 | Σ `kline_1m.trades` der Minuten der Bar (Binance-Zählung, nicht aggTrades) |
+
+- Berechnet mit `composeBars` aus `@orderflow/core` (derselbe Code wie im Importer für `bar_1h`/`bar_1d`) aus den
+  Teilbars der gröbsten passenden Bar-Tabelle (`bar_1m` für 1m…30m, `bar_1h` für 1h…4h, `bar_1d` für 1d); exakt.
+  Belegt durch Brute-Force-Tests aus `bar_1m` für jeden Zeitrahmen (Testdatenbank) und eine unabhängige
+  SQL-Rechnung auf echten Daten (`apps/api/bench/stats-check.ts`, BTC und ETH: 13 104 Bars, 0 Abweichungen).
+- **`x.trades` nur, wo billig:** wenn die geschätzten `kline_1m`-Zeilen des Zeitraums ≤ 100 000 sind (bei BTC:
+  1m…1h-Abschnitte zu 1 000 Bars und alle Footprint-Kacheln bis ≈ 69 Tage Spanne; nicht für 2h-/4h-/1d-Abschnitte
+  zu 1 000 Bars). Fehlt die Spalte, ist die Anzahl nicht geliefert (nicht 0). Mit einer Spalte `kline_trades` in
+  `bar_1m`/`bar_1h`/`bar_1d` (Importer) wäre sie überall billig.
+- Größe: +36 B je Bar (4 × f64 + i32); bei Footprint-Kacheln gegenüber den Leveln (28 B je Level) gering.
+
+## Inkonsistente Lesestände (503, nie 500)
+
+Jede Lesetransaktion sperrt zuerst die Chunks, die sie lesen wird (leere Abfrage über alle Bereiche), und nimmt
+erst danach ihren Snapshot. Grund: `convert_to_rowstore` (Dekomprimieren vor einem Tagesersatz) ist für Leser mit
+älterem Snapshot nicht MVCC-sicher – sie sähen den Chunk leer („Bar ohne Level"). Passen Bars und Level bzw.
+Profil-Summen in einem Snapshot trotzdem nicht zusammen, wiederholt die API mit neuem Snapshot und antwortet
+danach **503 + `Retry-After: 2`** (`no-store`, nicht gecacht). Betrifft es nur unveränderliche Tage, gilt es
+zusätzlich als Datenfehler: laut protokolliert, Health `degraded`, in `/quality` unter `apiDataErrors`.
+
 ## Offener Entwurfspunkt für die API: Kachellänge je Zeitabschnitt (Review, nicht umgesetzt)
 
 **Stand der API:** Die Statistik liegt bereits je UTC-Tag vor (`DayStats` in `apps/api/src/catalog.ts`); eine
