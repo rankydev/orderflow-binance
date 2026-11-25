@@ -51,7 +51,7 @@
           sym,
           tf,
           rMode === 'auto' ? 'auto' : Number(rMode),
-          Number.isFinite(atParam) && atParam > 0 ? atParam : undefined,
+          params.has('at') ? atParam : undefined, // Prüfung/Klemmung in parseAt
         )
         .then(() => {
           error = '';

@@ -99,6 +99,18 @@ Die Seite übernimmt Symbole, Zeitrahmen und Datenstand („Daten bis …") aus 
 5 min neu. URL-Zustand: `?sym=&tf=&type=&r=&at=<Unix-Sekunden>` (at = Ansicht um diese Zeit). Die Diagnosezeile ist in
 Produktion eingeklappt („▸ Diagnose"), `&debug` öffnet sie und stellt `window.__of` bereit.
 
+Content-Security-Policy für die Seite (nginx, `add_header … always;`), im Browser geprüft (Laden, Pannen, Zoomen,
+Hover, tf-/Typwechsel, Diagnosezeile: keine Verletzung; der Hash gehört zum `<style>`-Element, das
+lightweight-charts 5.3.0 für sein Logo einfügt – bei einem Update der Bibliothek neu bestimmen):
+
+```
+Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self' 'sha256-3pRED1tOXas1FXFoPb9TGCjmYe9XQsmO9OV23khV2nY='; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'
+```
+
+Anfragelast je Tab (gemessen gegen die Fixture-API, 90-Tage-Datensatz): Seitenstart ≈ 9–11 Anfragen in ≈ 1 s
+(Symbole, Bar-Abschnitte, 2–3 Kacheln); 10 s schnelles Pannen 3–13 Anfragen, Spitze 2/s (auch herausgezoomt).
+Höchstens 4 parallel (Client). `limit_req` 10 r/s mit Burst 40 je IP reicht mit großer Reserve.
+
 Die Dev-Middleware (`apps/web/dev/fixture-api.ts`) bedient `/api/v1/symbols|bars|footprint` in der URL-Form der
 künftigen API; mit `VITE_API_BASE=<url>` spricht das Frontend stattdessen die echte API an. Symbole: `BTCUSDT`
 (echt), `BTCUSDT-SYN90` (90 Tage, 30× wiederholte echte Tage, nur Performance), `STRESS-FLAT` (Seitwärtsdaten

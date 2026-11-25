@@ -528,7 +528,8 @@ describe('RequestQueue (§5.4 + Review W2)', () => {
     await tick();
     console.error = err;
     expect(q.stats.decodeErrors).toBe(1);
-    expect(q.lastError).toContain('kaputt');
+    expect(q.lastError).toBe('d: Antwort unbrauchbar'); // Anzeige ohne Rohtext
+    expect(q.lastError).not.toContain('kaputt');
     expect(rejected).toEqual([['d', 0]]);
     advance(10 * PARK_MS);
     q.setWanted(want(['d']), all(['d']));

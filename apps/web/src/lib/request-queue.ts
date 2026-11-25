@@ -60,6 +60,8 @@ export class RequestQueue {
   };
   /** Letzter Verarbeitungsfehler (für die Anzeige). */
   lastError = '';
+  /** Kurzbezeichnung eines Schlüssels für die Anzeige (ohne Serverrohtext). */
+  label: (key: string) => string = (key) => key;
 
   private readonly onLoaded: (key: string, buf: ArrayBuffer) => void;
   private readonly onRejected: (key: string, status: number, error?: unknown) => void;
@@ -182,7 +184,7 @@ export class RequestQueue {
           if (ac.signal.aborted) return;
           this.failures.delete(w.key);
           this.stats.completed++;
-          if (this.lastError.startsWith(`${w.key}:`)) this.lastError = '';
+          if (this.lastError.startsWith(`${this.label(w.key)}:`)) this.lastError = '';
           // Erst austragen, dann melden: der Verbraucher darf im Rückruf neuen Bedarf setzen.
           // Aus dem Bedarf nehmen: geladen ist geladen, bis der Verbraucher neu fragt (keine Schleife).
           release();
@@ -191,8 +193,9 @@ export class RequestQueue {
             this.onLoaded(w.key, buf);
           } catch (e) {
             this.stats.decodeErrors++;
-            this.lastError = `${w.key}: ${e instanceof Error ? e.message : String(e)}`;
-            console.error('Kachel unbrauchbar', this.lastError);
+            // Anzeige kurz; Details nur in die Konsole
+            this.lastError = `${this.label(w.key)}: Antwort unbrauchbar`;
+            console.error('Antwort unbrauchbar', w.key, e);
             this.failures.set(w.key, { attempts: 1, retryAt: Infinity, final: true });
             this.onRejected(w.key, 0, e);
           }
@@ -202,7 +205,7 @@ export class RequestQueue {
           this.onRejected(w.key, res.status);
         } else {
           // sichtbar machen (A): wiederholte Serverfehler dürfen nicht still bleiben
-          this.lastError = `${w.key}: HTTP ${res.status} – neuer Versuch folgt`;
+          this.lastError = `${this.label(w.key)}: HTTP ${res.status} – neuer Versuch folgt`;
           this.fail(w.key, retryAfterMs(res.headers.get('Retry-After')));
         }
       })

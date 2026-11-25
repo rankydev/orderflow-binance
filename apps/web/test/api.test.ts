@@ -1,9 +1,12 @@
 // A: der Client erkennt einen unverträglichen Server-Stand an /symbols (statt still Kerzen zu zeichnen).
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  ApiClient,
   checkSymbolsResponse,
   IncompatibleServerError,
+  NoDataError,
   SUPPORTED_SYMBOLS_SCHEMA,
+  timeoutSignal,
 } from '../src/lib/api.ts';
 
 const good = () => ({
@@ -47,5 +50,35 @@ describe('checkSymbolsResponse', () => {
   it('Fehlerklasse trägt eine verständliche Meldung', () => {
     const e = new IncompatibleServerError(['schema undefined ≠ 2']);
     expect(e.message).toMatch(/Server-Stand passt nicht zur Seite/);
+  });
+});
+
+describe('Produktion: Fehlertexte, leere Daten, Zeitgrenze', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it('HTTP-Fehler: Anzeige nur mit Status, kein Antworttext (nginx-Seite)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      async () => new Response('<html>nginx/1.24.0 Too Many Requests</html>', { status: 429 }),
+    );
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await expect(new ApiClient('').symbols()).rejects.toThrow(/^symbols: HTTP 429$/);
+    warn.mockRestore();
+  });
+  it('leere Symbolliste → „Noch keine Daten vorhanden" (kein Versionsbanner)', async () => {
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ schema: 2, symbols: [] })));
+    await expect(new ApiClient('').symbols()).rejects.toBeInstanceOf(NoDataError);
+    await expect(new ApiClient('').symbols()).rejects.toThrow('Noch keine Daten vorhanden');
+  });
+  it('timeoutSignal funktioniert auch ohne AbortSignal.timeout (ältere Browser)', async () => {
+    const orig = AbortSignal.timeout;
+    (AbortSignal as unknown as { timeout?: unknown }).timeout = undefined;
+    try {
+      const s = timeoutSignal(5);
+      expect(s.aborted).toBe(false);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(s.aborted).toBe(true);
+    } finally {
+      AbortSignal.timeout = orig;
+    }
   });
 });

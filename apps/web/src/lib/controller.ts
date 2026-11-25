@@ -20,7 +20,7 @@ import {
   type Time,
   type WhitespaceData,
 } from 'lightweight-charts';
-import { ApiClient, SERVER_MISMATCH } from './api.ts';
+import { ApiClient, IncompatibleServerError, SERVER_MISMATCH, timeoutSignal } from './api.ts';
 import { GestureTracker } from './gesture.ts';
 import { MismatchRecovery, REFETCH_TIMEOUT_MS, RETRY_MS, tileConfigChanged } from './mismatch.ts';
 import {
@@ -219,10 +219,12 @@ export class ChartController {
       (key, buf) => this.onBarChunk(key, buf),
       (key) => this.onBarRejected(key),
     );
+    this.barQueue.label = (k) => `Bars ${tileLabel(k)}`;
     this.fpQueue = new RequestQueue(
       (key, buf) => this.onFpTile(key, buf),
       (key, status, err) => this.onFpRejected(key, status, err),
     );
+    this.fpQueue.label = (k) => `Kachel ${tileLabel(k)}`;
 
     this.chart.timeScale().subscribeVisibleLogicalRangeChange(this.onRangeChange);
     // Hover-Anzeige (W10): exakte Werte der Zelle unter dem Zeiger, als DOM-Text, höchstens einmal
@@ -356,7 +358,7 @@ export class ChartController {
     }
     let r;
     try {
-      r = await this.api.symbols(AbortSignal.timeout(REFETCH_TIMEOUT_MS * 3));
+      r = await this.api.symbols(timeoutSignal(REFETCH_TIMEOUT_MS * 3));
     } catch (e) {
       this.blocked = e instanceof Error ? e.message : String(e);
       throw e;
@@ -369,7 +371,8 @@ export class ChartController {
     const tfs = offeredTimeframes(s);
     const tf0 = tfs.includes(tf) ? tf : (tfs.find((x) => x === '1m') ?? tfs[0] ?? '1m');
     let anchor: Anchor | null = null;
-    if (atSec !== undefined && atSec * 1000 >= s.dataFrom && atSec * 1000 < s.dataTo) {
+    atSec = parseAt(atSec, s.dataFrom, s.dataTo);
+    if (atSec !== undefined) {
       const paneW = this.chart.paneSize(0).width || 1200;
       anchor = {
         centerSec: atSec,
@@ -442,7 +445,7 @@ export class ChartController {
       this.cancelSymbolsRefresh = null;
       if (this.destroyed) return;
       this.api
-        .symbols(AbortSignal.timeout(REFETCH_TIMEOUT_MS))
+        .symbols(timeoutSignal(REFETCH_TIMEOUT_MS))
         .then((r) => {
           if (this.destroyed) return;
           const s = r.symbols.find((x) => x.name === this.sym.name);
@@ -454,7 +457,12 @@ export class ChartController {
           }
           this.onSymbols?.();
         })
-        .catch(() => {})
+        .catch((e: unknown) => {
+          // 5: neuere API nach einem Deployment → sichtbar „Seite neu laden"; Netzfehler still (nächster
+          // Versuch in SYMBOLS_REFRESH_MS)
+          if (!this.destroyed && e instanceof IncompatibleServerError)
+            this.blocked = SERVER_MISMATCH;
+        })
         .finally(() => this.scheduleSymbolsRefresh());
     }, SYMBOLS_REFRESH_MS);
     this.cancelSymbolsRefresh = () => clearTimeout(id);
@@ -1214,7 +1222,8 @@ export class ChartController {
         if (diff) {
           const n = (this.crossFails.get(key) ?? 0) + 1;
           this.crossFails.set(key, n);
-          this.fpQueue.lastError = `Kachel ${key}: ${diff}`;
+          console.warn(`Kachel ${key}: ${diff}`);
+          this.fpQueue.lastError = `Kachel ${tileLabel(key)}: passt nicht zu /bars`;
           if (n === 1) {
             // b: Abschnitte neu laden; die Kachel erst wieder anfordern, wenn die neuen Abschnitte im
             // Fenster sind (sonst prüfte sie gegen die alten Items und zählte als zweite Abweichung)
@@ -1267,7 +1276,7 @@ export class ChartController {
     if (act !== 'refetch') return;
     const before = this.sym;
     this.api
-      .symbols(AbortSignal.timeout(REFETCH_TIMEOUT_MS)) // d: nie ewig „refetching"
+      .symbols(timeoutSignal(REFETCH_TIMEOUT_MS)) // d: nie ewig „refetching"
       .then((r) => {
         if (this.destroyed) return;
         const s = r.symbols.find((x) => x.name === before.name);
@@ -1481,4 +1490,29 @@ export function compareTileWithBars(
     j++;
     n++;
   }
+}
+
+/** Kurzform eines Anfrageschlüssels für die Anzeige: "BTCUSDT|1m|20#29219" → "1m R20 #29219". */
+export function tileLabel(key: string): string {
+  const [series = '', k = ''] = key.split('#');
+  const [, tf = '', R] = series.split('|');
+  return R ? `${tf} R${R} #${k}` : `${tf} #${k}`;
+}
+
+/**
+ * 6: URL-Parameter at → Sekunden im Datenbereich. Werte > 1e11 gelten als Millisekunden; plausible
+ * Zeiten (2001…2286) werden in [dataFrom, dataTo) geklemmt, alles andere ignoriert.
+ */
+export function parseAt(
+  raw: number | undefined,
+  dataFromMs: number,
+  dataToMs: number,
+): number | undefined {
+  if (raw === undefined || !Number.isFinite(raw) || raw <= 0) return undefined;
+  const sec = raw > 1e11 ? Math.floor(raw / 1000) : Math.floor(raw);
+  if (sec < 1e9 || sec >= 1e10) return undefined;
+  const lo = Math.ceil(dataFromMs / 1000);
+  const hi = Math.floor(dataToMs / 1000) - 1;
+  if (hi < lo) return undefined;
+  return Math.min(hi, Math.max(lo, sec));
 }

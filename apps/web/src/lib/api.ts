@@ -16,7 +16,7 @@ export function checkSymbolsResponse(x: unknown): string[] {
   if (typeof x !== 'object' || x === null) return ['Antwort ist kein Objekt'];
   if (o.schema !== SUPPORTED_SYMBOLS_SCHEMA)
     p.push(`schema ${String(o.schema)} ≠ ${SUPPORTED_SYMBOLS_SCHEMA}`);
-  if (!Array.isArray(o.symbols) || o.symbols.length === 0) return [...p, 'keine Symbole'];
+  if (!Array.isArray(o.symbols) || o.symbols.length === 0) return [...p, NO_SYMBOLS];
   for (const s of o.symbols) {
     const name = typeof s?.name === 'string' ? s.name : '?';
     for (const k of [
@@ -43,6 +43,26 @@ export function checkSymbolsResponse(x: unknown): string[] {
     }
   }
   return p;
+}
+
+const NO_SYMBOLS = 'keine Symbole';
+
+/** API erreichbar, aber noch keine Daten (leere Symbolliste) – kein Versionsproblem. */
+export class NoDataError extends Error {
+  constructor() {
+    super('Noch keine Daten vorhanden');
+    this.name = 'NoDataError';
+  }
+}
+
+/**
+ * AbortSignal mit Zeitgrenze; AbortSignal.timeout fehlt in älteren Browsern (Safari < 16, Chrome < 103).
+ */
+export function timeoutSignal(ms: number): AbortSignal {
+  if (typeof AbortSignal.timeout === 'function') return AbortSignal.timeout(ms);
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), ms);
+  return ac.signal;
 }
 
 export class IncompatibleServerError extends Error {
@@ -75,9 +95,16 @@ export class ApiClient {
 
   async symbols(signal?: AbortSignal): Promise<SymbolsResponse> {
     const res = await fetch(this.symbolsUrl(), signal ? { signal } : {});
-    if (!res.ok) throw new Error(`symbols: HTTP ${res.status} ${await res.text()}`);
+    if (!res.ok) {
+      // Nur der Status ist für die Anzeige; den (gekürzten) Text nur in die Konsole – hinter nginx wäre
+      // es eine HTML-Fehlerseite mit Serverdetails
+      const body = await res.text().catch(() => '');
+      console.warn(`symbols: HTTP ${res.status}`, body.slice(0, 200));
+      throw new Error(`symbols: HTTP ${res.status}`);
+    }
     const body: unknown = await res.json();
     const problems = checkSymbolsResponse(body);
+    if (problems.length === 1 && problems[0] === NO_SYMBOLS) throw new NoDataError();
     if (problems.length > 0) throw new IncompatibleServerError(problems);
     return body as SymbolsResponse;
   }

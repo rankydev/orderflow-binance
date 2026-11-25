@@ -14,7 +14,9 @@ import {
   compareTileWithBars,
   countItemsIn,
   exactDecimal,
+  parseAt,
   pricePrecision,
+  tileLabel,
 } from '../src/lib/controller.ts';
 import type { BarItem } from '../src/lib/types.ts';
 
@@ -209,5 +211,29 @@ describe('Review b: zurückgestellte Kachel erst nach neu geladenen Abschnitten 
     expect(chunksReadyInWindow([3, 4], has, [0, 3])).toBe(false); // Fenster noch ohne Abschnitt 4
     expect(chunksReadyInWindow([3, 4], has, null)).toBe(false);
     expect(chunksReadyInWindow([3, 4], has, [2, 6])).toBe(true);
+  });
+});
+
+describe('6: URL-Parameter at', () => {
+  const from = 1_781_049_600_000; // 2026-06-10
+  const to = 1_795_478_400_000; // 2026-11-24
+  it('Sekunden im Bereich unverändert, Millisekunden erkannt', () => {
+    expect(parseAt(1_793_060_100, from, to)).toBe(1_793_060_100);
+    expect(parseAt(1_793_060_100_000, from, to)).toBe(1_793_060_100);
+  });
+  it('plausible Zeiten außerhalb werden in den Datenbereich geklemmt', () => {
+    expect(parseAt(1_700_000_000, from, to)).toBe(from / 1000);
+    expect(parseAt(1_900_000_000, from, to)).toBe(to / 1000 - 1);
+  });
+  it('Unsinn wird ignoriert', () => {
+    expect(parseAt(undefined, from, to)).toBeUndefined();
+    expect(parseAt(Number.NaN, from, to)).toBeUndefined();
+    expect(parseAt(0, from, to)).toBeUndefined();
+    expect(parseAt(12345, from, to)).toBeUndefined();
+    expect(parseAt(5e10, from, to)).toBeUndefined();
+  });
+  it('Kurzbezeichnung von Anfrageschlüsseln ohne Symbol-Interna', () => {
+    expect(tileLabel('BTCUSDT|1m|20#29219')).toBe('1m R20 #29219');
+    expect(tileLabel('BTCUSDT|5m#12')).toBe('5m #12');
   });
 });
