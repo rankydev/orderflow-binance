@@ -270,6 +270,33 @@ describe('computeTiles (TILE-FORMAT.md Kachellänge)', () => {
     expect(referenceRows(history(3, 900, { 2: 90_000 }, 0), '1m', 0)).toBe(90_001);
   });
 
+  it('ein schwerer nicht finaler Tag ändert weder n noch das Angebot (Quellzeilen nur aus Referenztagen)', () => {
+    const calm = history(30, 900, {}, 30);
+    const heavy = history(31, 900, {}, 30) as unknown as {
+      stats: Map<number, { rows: Map<string, number> }>;
+    };
+    // laufender Tag mit zehnfacher Zeilenzahl in allen Quelltabellen
+    const st = heavy.stats.get(30)!;
+    for (const [t, r] of st.rows) st.rows.set(t, r * 10);
+    expect(computeTiles(heavy as never, 300_000).tiles).toEqual(computeTiles(calm, 300_000).tiles);
+  });
+
+  it('refStats: ein Tag im Neuimport bleibt Referenztag (gleiche Daten → gleiche cfg)', () => {
+    const h = history(30, 900, { 3: 5_000 }, 30) as unknown as {
+      stats: Map<number, never>;
+      days: Map<number, { immutable: boolean }>;
+      refStats?: Map<number, never>;
+    };
+    h.refStats = new Map(h.stats);
+    const before = configVersion(computeTiles(h as never, 300_000).tiles);
+    // alle Tage gleichzeitig im Neuimport (immutable false): Referenz bleibt die alte Statistik
+    for (const d of h.days.values()) d.immutable = false;
+    expect(configVersion(computeTiles(h as never, 300_000).tiles)).toBe(before);
+    // ohne refStats würde der Wechsel durchschlagen (Kontrolle)
+    const without = { ...h, refStats: undefined, days: new Map([[3, { immutable: true }]]) };
+    expect(configVersion(computeTiles(without as never, 300_000).tiles)).not.toBe(before);
+  });
+
   it('Stabilität: ein zusätzlicher Tag verschiebt den Referenzwert höchstens um einen Rang', () => {
     // 59 Tage mit absteigenden Spannen; Referenz ist der 3.-größte Wert (⌊59/20⌋ + 1)
     const sp: Record<number, number> = {};

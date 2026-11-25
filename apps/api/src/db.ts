@@ -157,10 +157,10 @@ export async function readTx<T>(
           if (opt.signal.aborted) throw new HttpError(499, 'Client hat abgebrochen');
           continue;
         }
-        throw busy('Daten werden gerade ersetzt (Sperre), bitte gleich erneut', 2);
+        throw busy('Daten werden gerade ersetzt (Sperre), bitte gleich erneut', 2, 'lock');
       }
-      if (code === '57014') throw busy('Abfrage zu langsam (statement_timeout)', 2);
-      if (isConnectionLoss(code)) throw busy('Datenbank nicht erreichbar', 5);
+      if (code === '57014') throw busy('Abfrage zu langsam (statement_timeout)', 2, 'timeout');
+      if (isConnectionLoss(code)) throw busy('Datenbank nicht erreichbar', 5, 'connection');
       throw e;
     }
   }

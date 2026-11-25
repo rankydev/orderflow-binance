@@ -34,6 +34,7 @@ export async function startApi(
     lockRetries: cfg.lockRetries,
     // Angebot der Kacheln: Quellzeilengrenze je Kachel (nicht die der Profile)
     maxSourceRows: Math.min(cfg.maxTileSourceRows, cfg.maxSourceRows),
+    refreshTimeoutMs: Math.max(10_000, 3 * cfg.statementTimeoutMs),
     log: (level, msg, obj) => app?.log[level](obj ?? {}, msg),
   });
   const deps: Deps = { cfg, sql, catalog, cache, limiter };

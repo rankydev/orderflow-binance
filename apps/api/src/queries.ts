@@ -276,6 +276,11 @@ export async function queryProfileBars(
  * Fingerabdruck aller Qualitätsfelder eines Tages (data_day), die /quality ausliefert. Derselbe
  * Ausdruck im Katalog (für 304/Cache vor der Abfrage) und im Snapshot der Antwort: so werden auch
  * Änderungen ohne Versionssprung (deep_check, Zähler) erkannt.
+ *
+ * Abhängigkeit: data_minute_issue (die Issue-Minuten) ist nicht im Fingerabdruck. Das ist nur richtig,
+ * weil der Importer Issue-Zeilen ausschließlich in der Import-Transaktion schreibt, die zugleich
+ * data_day.version und die Minutenzähler setzt. Schreibt künftig ein anderer Weg Issues (Recorder,
+ * Annotationen), muss er data_day mitändern oder dieser Ausdruck um eine Issue-Prüfsumme wachsen.
  */
 export const QUALITY_FP_SQL = `md5(ROW(state, version, immutable, source, stale, edge_pending,
   edge_first_pending, edge_last_pending, deep_check, rows, min_exact, min_shift, min_mismatch,

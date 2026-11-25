@@ -71,6 +71,12 @@ export class ResponseCache {
     return undefined;
   }
 
+  /** Eintrag ohne LRU-Bewegung und ohne Statistik (abgelaufene gelten als fehlend). */
+  peek(key: string): CachedResponse | undefined {
+    const e = this.fin.get(key) ?? this.tmp.get(key);
+    return e && !ResponseCache.expired(e, Date.now()) ? e : undefined;
+  }
+
   /** Nur für Tests/Diagnose. */
   has(key: string): boolean {
     return this.fin.has(key) || this.tmp.has(key);

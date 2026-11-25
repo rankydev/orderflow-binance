@@ -45,14 +45,31 @@ export function newCtx(): ReqCtx {
 }
 
 /**
- * Versionsstand frisch genug? Fällt die Katalog-Aktualisierung länger als staleAfterMs aus, wären
- * 304 und Cache-Treffer auf einem womöglich veralteten Stand möglich → 503 (Retry-After 5).
+ * Versionsstand frisch genug? 304 und Cache-Treffer beruhen auf der Tagesversionstabelle des Katalogs.
+ * Unbrauchbar ist sie, wenn die Aktualisierung länger als staleAfterMs an Verbindungsverlust scheitert
+ * oder seit 3 · staleAfterMs gar nicht mehr abschließt (hängende Verbindung) → 503 + Retry-After 5
+ * und sofort ein (gebündelter) neuer Versuch. Scheitert sie an Sperren eines laufenden Imports, bleibt
+ * der letzte Stand gültig (Daten ändern sich erst mit dem Commit) – nur Health meldet „degraded".
  */
 export function assertFresh(deps: Deps): void {
   const c = deps.catalog;
   if (!c.ready) throw new HttpError(503, 'API startet noch (Katalog lädt)', {}, 1);
-  if (c.lastError !== null && Date.now() - c.lastRefresh > deps.cfg.staleAfterMs)
-    throw new HttpError(503, 'Datenstand nicht aktuell (Datenbank nicht erreichbar)', {}, 5);
+  const age = Date.now() - c.lastRefresh;
+  const lost =
+    c.lastError !== null && c.lastErrorKind === 'connection' && age > deps.cfg.staleAfterMs;
+  const hung = age > 3 * deps.cfg.staleAfterMs;
+  if (lost || hung) {
+    void c.refresh();
+    throw new HttpError(
+      503,
+      hung && !lost
+        ? 'Datenstand nicht aktuell (Katalog-Aktualisierung hängt)'
+        : 'Datenstand nicht aktuell (Datenbank nicht erreichbar)',
+      {},
+      5,
+      'connection',
+    );
+  }
 }
 
 export function requireSymbol(deps: Deps, name: string): SymbolState {

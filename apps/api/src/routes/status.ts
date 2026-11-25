@@ -19,25 +19,38 @@ export const MAX_QUALITY_DAYS = 400;
 export const MAX_ISSUES = 5_000;
 
 /** Gründe, warum die API nicht gesund ist (leer = gesund). */
-function healthReasons(deps: Deps): string[] {
+/**
+ * Gesundheit: unhealthy (503), wenn der Katalog fehlt, die Datenbank nicht erreichbar ist oder die
+ * Aktualisierung hängt; degraded (200), wenn sie nur an Sperren/Zeitlimits eines laufenden Imports
+ * scheitert (der letzte Stand bleibt gültig, die API bedient weiter).
+ */
+function health(deps: Deps): { state: 'healthy' | 'degraded' | 'unhealthy'; reasons: string[] } {
   const reasons: string[] = [];
   const cat = deps.catalog;
-  const age = cat.lastRefresh > 0 ? Date.now() - cat.lastRefresh : null;
-  if (!cat.ready) reasons.push('Katalog noch nicht geladen');
-  else if (age! > deps.cfg.staleAfterMs)
-    reasons.push(`Katalog seit ${Math.round(age! / 1000)} s nicht aktualisiert`);
-  if (cat.lastError) reasons.push(`Datenbank: ${cat.lastError}`);
-  return reasons;
+  if (!cat.ready) return { state: 'unhealthy', reasons: ['Katalog noch nicht geladen'] };
+  const age = Date.now() - cat.lastRefresh;
+  let bad = false;
+  if (age > 3 * deps.cfg.staleAfterMs) {
+    bad = true;
+    reasons.push(`Katalog seit ${Math.round(age / 1000)} s nicht aktualisiert`);
+  }
+  if (cat.lastError) {
+    reasons.push(`Datenbank (${cat.lastErrorKind ?? 'other'}): ${cat.lastError}`);
+    if (cat.lastErrorKind === 'connection' || cat.lastErrorKind === 'other') {
+      if (age > deps.cfg.staleAfterMs) bad = true;
+    }
+  }
+  return { state: bad ? 'unhealthy' : reasons.length > 0 ? 'degraded' : 'healthy', reasons };
 }
 
 /** Ausführliche Health-Antwort – nur auf dem Loopback-Status-Listener (buildAdminApp). */
 export function healthDetail(deps: Deps, startedAt: number, reply: FastifyReply): FastifyReply {
-  const reasons = healthReasons(deps);
+  const { state, reasons } = health(deps);
   const cat = deps.catalog;
   const mem = process.memoryUsage();
   reply.header('Cache-Control', 'no-store');
-  return reply.code(reasons.length === 0 ? 200 : 503).send({
-    status: reasons.length === 0 ? 'healthy' : 'unhealthy',
+  return reply.code(state === 'unhealthy' ? 503 : 200).send({
+    status: state,
     reasons,
     uptimeS: Math.round((Date.now() - startedAt) / 1000),
     catalog: {
@@ -116,8 +129,10 @@ export function registerStatusRoutes(app: FastifyInstance, deps: Deps): void {
   // Öffentliche Liveness ohne Interna (Review W3); Details nur auf dem Status-Listener.
   app.get('/api/v1/health', async (req, reply) => {
     new Params(req.query).done();
-    const ok = healthReasons(deps).length === 0;
+    const { state } = health(deps);
     reply.header('Cache-Control', 'no-store');
-    return reply.code(ok ? 200 : 503).send({ status: ok ? 'ok' : 'unavailable' });
+    return reply.code(state === 'unhealthy' ? 503 : 200).send({
+      status: state === 'healthy' ? 'ok' : state === 'degraded' ? 'degraded' : 'unavailable',
+    });
   });
 }

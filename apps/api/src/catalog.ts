@@ -57,7 +57,7 @@ export interface DayInfo {
   quality: string;
 }
 
-interface DayStats {
+export interface DayStats {
   version: number;
   /** je tf: größte Zeilenzahl eines Bars je Leiterstufe (Index wie TILE_LADDER) */
   maxRows: Map<Timeframe, Int32Array>;
@@ -74,6 +74,12 @@ export interface SymbolState {
   tickUnits: number;
   days: Map<number, DayInfo>;
   stats: Map<number, DayStats>;
+  /**
+   * Letzte Statistik je Tag aus der Zeit, als er unveränderlich war (Referenztage der Kachelregel).
+   * Bleibt während eines Neuimports (immutable kurz false, Folgetag stale) bestehen, bis die neue
+   * Statistik vorliegt; so ändert ein Neuimport mit gleichen Daten `tiles` nie (Review Pass 3).
+   */
+  refStats: Map<number, DayStats>;
   dataFrom: number;
   dataTo: number;
   tiles: Record<string, Record<string, number>>;
@@ -87,6 +93,8 @@ export interface CatalogOptions {
   lockRetries: number;
   /** Quellzeilengrenze je Kachel für das Angebot (cfg.maxTileSourceRows). */
   maxSourceRows: number;
+  /** Zeitlimit einer Aktualisierung (ms); danach gilt sie als Verbindungsverlust. */
+  refreshTimeoutMs?: number;
   log: (level: 'info' | 'warn' | 'error', msg: string, obj?: Record<string, unknown>) => void;
 }
 
@@ -110,6 +118,8 @@ export class Catalog extends EventEmitter {
   lastError: string | null = null;
   /** Fehlschläge in Folge (Backoff, gedrosselte Warnung). */
   failures = 0;
+  /** Art des letzten Fehlers: nur 'connection' (und Hänger) machen den Versionsstand unbrauchbar. */
+  lastErrorKind: 'connection' | 'lock' | 'timeout' | 'other' | null = null;
   private lastWarnAt = -Infinity;
 
   constructor(sql: Sql, opt: CatalogOptions) {
@@ -159,7 +169,21 @@ export class Catalog extends EventEmitter {
   /** Aktualisiert jetzt (eine laufende Aktualisierung wird abgewartet, nicht verdoppelt). */
   refresh(): Promise<void> {
     if (this.running) return this.running;
-    this.running = this.doRefresh()
+    // eigenes Zeitlimit: eine hängende Verbindung (schwarzes Loch) setzt sonst nie lastError
+    let timer: NodeJS.Timeout | undefined;
+    const limit = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            Object.assign(new Error('Katalog-Aktualisierung hängt (Zeitlimit)'), {
+              kind: 'connection',
+            }),
+          ),
+        this.opt.refreshTimeoutMs ?? 30_000,
+      );
+      timer.unref();
+    });
+    this.running = Promise.race([this.doRefresh(), limit])
       .then(() => {
         this.lastRefresh = Date.now();
         if (this.failures > 0)
@@ -168,11 +192,14 @@ export class Catalog extends EventEmitter {
           });
         this.failures = 0;
         this.lastError = null;
+        this.lastErrorKind = null;
       })
       .catch((e: unknown) => {
         if (this.stopped) return;
         this.failures++;
         this.lastError = e instanceof Error ? e.message : String(e);
+        const k = (e as { kind?: unknown }).kind;
+        this.lastErrorKind = k === 'connection' || k === 'lock' || k === 'timeout' ? k : 'other';
         // gedrosselt: erste Meldung sofort, danach höchstens eine je 60 s (keine Log-Flut)
         const now = Date.now();
         if (now - this.lastWarnAt >= 60_000) {
@@ -184,6 +211,7 @@ export class Catalog extends EventEmitter {
         }
       })
       .finally(() => {
+        clearTimeout(timer);
         this.running = null;
       });
     return this.running;
@@ -240,6 +268,7 @@ export class Catalog extends EventEmitter {
         tickUnits: r[5] === null ? tickRef : int(r[5]),
         days: new Map(),
         stats: old ? new Map(old.stats) : new Map(),
+        refStats: old ? new Map(old.refStats) : new Map(),
         dataFrom: 0,
         dataTo: 0,
         tiles: {},
@@ -271,6 +300,11 @@ export class Catalog extends EventEmitter {
         .filter((i) => i.hasData && s.stats.get(i.day)?.version !== i.version)
         .map((i) => i.day);
       for (const [a, b] of runs(todo, 31)) await this.computeStats(tx, s, a, b);
+      for (const d of s.refStats.keys()) if (!s.days.get(d)?.hasData) s.refStats.delete(d);
+      for (const [d, st] of s.stats) {
+        const info = s.days.get(d);
+        if (info?.immutable && st.version === info.version) s.refStats.set(d, st);
+      }
       finalize(s, this.opt.maxSourceRows);
     }
     return out;
@@ -348,11 +382,26 @@ export function rowsOnFor(s: SymbolState): RowsOn {
 }
 
 /** Durchschnitt und Maximum der Zeilen/Tag je Tabelle (Tage mit Daten). */
-function rowsPerDay(s: SymbolState): { avg: Record<string, number>; max: Record<string, number> } {
+type RefInput = Pick<SymbolState, 'stats' | 'days'> & Partial<Pick<SymbolState, 'refStats'>>;
+
+/**
+ * Referenztage der Kachelregel: die zuletzt unveränderlichen Statistiken (refStats). Ohne sie (nur in
+ * Unit-Tests) die heute unveränderlichen Tage; gibt es keinen, alle Tage mit Statistik.
+ */
+export function referenceStats(s: RefInput): DayStats[] {
+  if (s.refStats && s.refStats.size > 0) return [...s.refStats.values()];
+  const all = [...s.stats.entries()];
+  const ref = all.filter(([d]) => s.days.get(d)?.immutable === true);
+  return (ref.length > 0 ? ref : all).map(([, st]) => st);
+}
+
+function rowsPerDay(s: RefInput): { avg: Record<string, number>; max: Record<string, number> } {
   const sum: Record<string, number> = {};
   const max: Record<string, number> = {};
   let n = 0;
-  for (const st of s.stats.values()) {
+  // Nur Referenztage: ein schwerer laufender Tag ändert das Angebot nicht im Tagesverlauf; die Prüfung
+  // je Anfrage (routes/tiles.ts) deckt ihn ab.
+  for (const st of referenceStats(s)) {
     n++;
     for (const [t, r] of st.rows) {
       sum[t] = (sum[t] ?? 0) + r;
@@ -375,15 +424,10 @@ export const TILE_DAY_QUANTILE = 0.95;
  * provisorische Live-Minuten ab P2) bleiben außen vor, damit sich `tiles` nicht im Tagesverlauf
  * ändert; ihre Kacheln schützt der Zell-Wächter beim Ausliefern (422 je Kachel).
  */
-export function referenceRows(
-  s: Pick<SymbolState, 'stats' | 'days'>,
-  tf: Timeframe,
-  i: number,
-): number {
-  const all = [...s.stats.entries()];
-  let ref = all.filter(([d]) => s.days.get(d)?.immutable === true);
-  if (ref.length === 0) ref = all;
-  const v = ref.map(([, st]) => st.maxRows.get(tf)?.[i] ?? 0).sort((a, b) => b - a);
+export function referenceRows(s: RefInput, tf: Timeframe, i: number): number {
+  const v = referenceStats(s)
+    .map((st) => st.maxRows.get(tf)?.[i] ?? 0)
+    .sort((a, b) => b - a);
   if (v.length === 0) return 0;
   return v[Math.floor((1 - TILE_DAY_QUANTILE) * v.length + 1e-9)]!;
 }
@@ -397,10 +441,10 @@ export function referenceRows(
  * P95, nicht finale Tage), lehnt der Wächter in routes/tiles.ts einzeln mit 422 ab.
  */
 export function computeTiles(
-  s: Pick<SymbolState, 'tickRefUnits' | 'tickUnits' | 'stats' | 'days'>,
+  s: Pick<SymbolState, 'tickRefUnits' | 'tickUnits'> & RefInput,
   maxSourceRows: number,
 ): { tiles: Record<string, Record<string, number>>; src: Map<string, FpTableName> } {
-  const { avg, max } = rowsPerDay(s as SymbolState);
+  const { avg, max } = rowsPerDay(s);
   const tiles: Record<string, Record<string, number>> = {};
   const src = new Map<string, FpTableName>();
   for (const tf of TIMEFRAME_LIST) {
@@ -415,7 +459,7 @@ export function computeTiles(
       const table = chooseFpSource(tfSec / 60, R, avg as Record<FpTableName, number>);
       const bar = barTableFor(tfSec / 60);
       let barMax = 0;
-      for (const st of s.stats.values()) barMax = Math.max(barMax, st.rows.get(bar) ?? 0);
+      for (const st of referenceStats(s)) barMax = Math.max(barMax, st.rows.get(bar) ?? 0);
       // Quellzeilengrenze je Kachel: n halbieren, bis eine Kachel sie sicher einhält; reicht selbst
       // n = 32 nicht, wird (tf, R) nicht angeboten
       const est = (bars: number) => ((max[table]! + barMax) * bars * tfSec) / 86_400;

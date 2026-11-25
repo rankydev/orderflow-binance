@@ -198,7 +198,13 @@ beforeAll(async () => {
 }, 120_000);
 
 afterAll(async () => {
-  await admin?.end();
+  // Testrolle wieder entfernen (Rechte in der Testdatenbank zuerst)
+  try {
+    await admin?.unsafe(`DROP OWNED BY ${TEST_ROLE}`);
+    await admin?.unsafe(`DROP ROLE IF EXISTS ${TEST_ROLE}`);
+  } finally {
+    await admin?.end();
+  }
 });
 
 /** Legt of_api_test als Spiegel von of_api in der Testdatenbank an (Rechte + Rolleneinstellungen). */
@@ -259,6 +265,32 @@ describe('Rolle of_api', () => {
        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
          AND has_table_privilege('of_api', c.oid, 'SELECT') ORDER BY 1`;
     expect(rows.map((r) => r.t)).toEqual([...API_READABLE].sort());
+  });
+
+  it('die echte Rolle of_api direkt geprüft (nicht über den Spiegel)', async () => {
+    const [r] = await admin<
+      { su: boolean; cr: boolean; db: boolean; create: boolean; cfg: string[] }[]
+    >`
+      SELECT rolsuper AS su, rolcreaterole AS cr, rolcreatedb AS db,
+             has_schema_privilege('of_api', 'public', 'CREATE') AS create, rolconfig AS cfg
+        FROM pg_roles WHERE rolname = 'of_api'`;
+    expect(r).toMatchObject({ su: false, cr: false, db: false, create: false });
+    expect([...r!.cfg].sort()).toEqual(
+      [
+        'default_transaction_read_only=on',
+        'idle_in_transaction_session_timeout=60s',
+        'lock_timeout=5s',
+        'statement_timeout=15s',
+        'work_mem=16MB',
+      ].sort(),
+    );
+    for (const p of ['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE'])
+      for (const t of API_READABLE) {
+        const [x] = await admin<
+          { ok: boolean }[]
+        >`SELECT has_table_privilege('of_api', ${t}, ${p}) AS ok`;
+        expect(x!.ok, `${p} ${t}`).toBe(false);
+      }
   });
 
   it('die Testrolle ist nicht of_api (Tests ändern kein Passwort der echten Rolle)', async () => {
@@ -799,8 +831,16 @@ describe('Betriebsschutz: Status-Listener, Diagnose-Header, CORS-Liste, Zeitgren
       const cat = api.deps.catalog;
       await cat.stop();
       cat.lastError = 'connect ECONNREFUSED';
+      cat.lastErrorKind = 'connection';
       cat.lastRefresh = Date.now() - 500; // Ausfall kürzer als die Schwelle: weiter bedient
       expect((await get(api, url)).res.headers.get('x-cache')).toBe('hit');
+      // Sperren eines Imports (55P03) über die Schwelle: weiter bedient, Health „degraded"
+      cat.lastErrorKind = 'lock';
+      cat.lastRefresh = Date.now() - 2_000; // > staleAfterMs, < 3 · staleAfterMs (sonst „hängt")
+      expect((await get(api, url)).res.headers.get('x-cache')).toBe('hit');
+      const deg = await get(api, '/api/v1/health');
+      expect([deg.res.status, deg.json().status]).toEqual([200, 'degraded']);
+      cat.lastErrorKind = 'connection';
       cat.lastRefresh = Date.now() - 5_000;
       for (const h of [{}, { 'If-None-Match': a.res.headers.get('etag')! }]) {
         const r = await get(api, url, { headers: h });
@@ -945,6 +985,11 @@ describe('Grenzen (422 mit Vorschlag)', () => {
     );
     const daily = await get(api, `/api/v1/profiles/daily?sym=BTCUSDT&${day}&R=100`);
     expect(daily.res.status).toBe(422);
+    // `If-None-Match: *` macht aus der Ablehnung nie ein 304
+    const star = await get(api, `/api/v1/profile?sym=BTCUSDT&${day}&R=100`, {
+      headers: { 'If-None-Match': '*' },
+    });
+    expect(star.res.status).toBe(422);
   });
 
   it('angebotene Kombinationen halten die Quellzeilengrenze ein (kein 422 für angebotene Kacheln)', async () => {
@@ -1029,8 +1074,13 @@ describe('Versionen, Unveränderlichkeit, Cache', () => {
     expect((await get(api, u(k))).res.headers.get('x-cache')).toBe('hit'); // keine zweite Abfrage
     for (const kk of [k - 1, k + 1]) expect((await get(api, u(kk))).res.status).toBe(200);
     // auch mit If-None-Match nie 304 für die abgelehnte Kachel
-    const inm = await get(api, u(k), { headers: { 'If-None-Match': '"x"' } });
-    expect(inm.res.status).toBe(422);
+    for (const v of ['"x"', '*']) {
+      const inm = await get(api, u(k), { headers: { 'If-None-Match': v } });
+      expect(inm.res.status, v).toBe(422);
+    }
+    // `*` auf eine erfolgreich gecachte Kachel derselben Version → 304
+    await get(api, u(k + 1));
+    expect((await get(api, u(k + 1), { headers: { 'If-None-Match': '*' } })).res.status).toBe(304);
     // neue Version des (nicht finalen) Ausreißer-Tages: Angebot und cfg unverändert
     const d = new Date(PROVISIONAL_DAY * DAY_MS).toISOString().slice(0, 10);
     await admin`UPDATE data_day SET version = version + 1 WHERE sym_id = ${SYM_ID} AND day = ${d}::date`;
@@ -1039,6 +1089,27 @@ describe('Versionen, Unveränderlichkeit, Cache', () => {
     expect(s1.tileConfigVersion).toBe(s0.tileConfigVersion);
     expect(s1.tiles).toEqual(s0.tiles);
     expect((await get(api, u(k))).res.status).toBe(422);
+  });
+
+  it('Neuimport von Referenztagen mit gleichen Daten ändert tileConfigVersion nie', async () => {
+    const cfgOf = async () =>
+      ((await get(api, '/api/v1/symbols')).json().symbols as SymJson[])[0]!.tileConfigVersion;
+    const before = await cfgOf();
+    const ref = [FIRST_DAY, FIRST_DAY + 1, FIRST_DAY + 2, FIRST_DAY + 3].map((d) =>
+      new Date(d * DAY_MS).toISOString().slice(0, 10),
+    );
+    // Phase 1: alle im Zustand importing (nicht unveränderlich), Folgetag veraltet
+    await admin`UPDATE data_day SET state = 'importing', state_before_import = 'final_ok'
+                 WHERE sym_id = ${SYM_ID} AND day = ANY(${ref}::date[])`;
+    await admin`UPDATE data_day SET stale = true WHERE sym_id = ${SYM_ID} AND day = ${new Date(BAD_DAY * DAY_MS).toISOString().slice(0, 10)}::date`;
+    await waitCatalog();
+    expect(await cfgOf()).toBe(before);
+    // Phase 2: Import fertig, neue Version, gleiche Daten
+    await admin`UPDATE data_day SET state = 'final_ok', state_before_import = NULL, version = version + 1
+                 WHERE sym_id = ${SYM_ID} AND day = ANY(${ref}::date[])`;
+    await admin`UPDATE data_day SET stale = false, version = version + 1 WHERE sym_id = ${SYM_ID} AND day = ${new Date(BAD_DAY * DAY_MS).toISOString().slice(0, 10)}::date`;
+    await waitCatalog();
+    expect(await cfgOf()).toBe(before);
   });
 
   it('geänderte Kachelkonfiguration → 409 auf alte cfg; Rücknahme und Neustart liefern dieselbe cfg', async () => {

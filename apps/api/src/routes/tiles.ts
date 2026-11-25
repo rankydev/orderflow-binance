@@ -191,8 +191,14 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     req.ctx.rowsEstimate = est;
     const tileCap = Math.min(deps.cfg.maxTileSourceRows, deps.cfg.maxSourceRows);
     if (est > tileCap) {
-      // Kommt bei angebotenen Kombinationen nicht vor (computeTiles prüft dieselbe Grenze).
-      throw unprocessable(`Kachel zu groß (≈ ${est} Quellzeilen > ${tileCap})`);
+      // Das Angebot hält die Grenze auf den Referenztagen ein; ein ungewöhnlich schwerer laufender oder
+      // neuer Tag kann sie je Kachel überschreiten → 422 nur für diese Kachel (wie der Zell-Wächter).
+      throw unprocessable(`Kachel zu groß (≈ ${est} Quellzeilen > ${tileCap}); gröberes R wählen`, {
+        reason: 'tile_source_rows_exceeded',
+        rowsEstimate: est,
+        limit: tileCap,
+        suggestR: coarserOffered(s.tiles, tf, R),
+      });
     }
     const width = R * s.tickRefUnits;
     return serveVersioned(deps, req, reply, key, pre, async (ctx) => {

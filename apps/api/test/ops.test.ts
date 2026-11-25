@@ -5,6 +5,8 @@ import { createHash, createHmac, pbkdf2Sync } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { ResponseCache } from '../src/cache.ts';
 import { Catalog } from '../src/catalog.ts';
+import { assertFresh, type Deps } from '../src/context.ts';
+import { HttpError } from '../src/errors.ts';
 import { parseApiConfig } from '../src/config.ts';
 import { isConnectionLoss, type Sql } from '../src/db.ts';
 import { cacheControl } from '../src/http.ts';
@@ -121,5 +123,75 @@ describe('Datenbankausfall', () => {
     await cat.refresh();
     expect(cat.failures).toBe(0);
     expect(logs.at(-1)).toMatch(/^info:.*wieder erfolgreich/);
+  });
+});
+
+describe('Aktualität des Versionsstands (Review Pass 3)', () => {
+  function fake(over: Record<string, unknown>) {
+    let refreshed = 0;
+    const catalog = {
+      ready: true,
+      lastRefresh: Date.now(),
+      lastError: null as string | null,
+      lastErrorKind: null as string | null,
+      refresh: () => {
+        refreshed++;
+        return Promise.resolve();
+      },
+      ...over,
+    };
+    const deps = { cfg: { staleAfterMs: 1_000 }, catalog } as unknown as Deps;
+    return { deps, refreshed: () => refreshed };
+  }
+  const status = (d: Deps) => {
+    try {
+      assertFresh(d);
+      return 200;
+    } catch (e) {
+      return e instanceof HttpError ? e.status : -1;
+    }
+  };
+
+  it('Verbindungsverlust über der Schwelle → 503 und sofort ein neuer Versuch', () => {
+    const f = fake({
+      lastError: 'x',
+      lastErrorKind: 'connection',
+      lastRefresh: Date.now() - 2_000,
+    });
+    expect(status(f.deps)).toBe(503);
+    expect(f.refreshed()).toBe(1);
+  });
+  it('Sperren/Zeitlimits eines Imports → weiter bedienen', () => {
+    for (const k of ['lock', 'timeout'])
+      expect(
+        status(fake({ lastError: 'x', lastErrorKind: k, lastRefresh: Date.now() - 2_000 }).deps),
+      ).toBe(200);
+  });
+  it('hängende Aktualisierung ohne Fehler (3 · Schwelle) → 503', () => {
+    expect(status(fake({ lastRefresh: Date.now() - 2_500 }).deps)).toBe(200);
+    expect(status(fake({ lastRefresh: Date.now() - 3_500 }).deps)).toBe(503);
+  });
+  it('Katalog: eigenes Zeitlimit macht eine hängende Aktualisierung zum Verbindungsfehler', async () => {
+    const sql = { begin: () => new Promise(() => {}) } as unknown as Sql;
+    const cat = new Catalog(sql, {
+      pollMs: 1000,
+      lockRetries: 0,
+      maxSourceRows: 1,
+      refreshTimeoutMs: 50,
+      log: () => {},
+    });
+    await cat.refresh();
+    expect(cat.lastErrorKind).toBe('connection');
+    expect(cat.lastError).toMatch(/hängt/);
+  });
+  it('Katalog: Sperr-Zeitüberschreitung wird als lock eingeordnet', async () => {
+    const sql = {
+      begin: async () => {
+        throw Object.assign(new Error('lock timeout'), { code: '55P03' });
+      },
+    } as unknown as Sql;
+    const cat = new Catalog(sql, { pollMs: 1000, lockRetries: 0, maxSourceRows: 1, log: () => {} });
+    await cat.refresh();
+    expect(cat.lastErrorKind).toBe('lock');
   });
 });

@@ -42,7 +42,16 @@ export async function serveVersioned(
   pre: { dataVersion: string; final: boolean },
   compute: (ctx: ReqCtx) => Promise<CachedResponse>,
 ): Promise<FastifyReply> {
-  if (matchesEtag(req, pre.dataVersion)) {
+  // `If-None-Match: *` heißt „irgendeine Fassung existiert": nur mit einer gespeicherten erfolgreichen
+  // Antwort dieser Version beantworten, sonst rechnen (eine Ablehnung wird nie zu 304, Review Pass 3).
+  const inm = req.headers['if-none-match'];
+  const star = (Array.isArray(inm) ? inm.join(',') : (inm ?? '')).trim() === '*';
+  const cached = star ? deps.cache.peek(`${key}|${pre.dataVersion}`) : undefined;
+  if (
+    star
+      ? cached !== undefined && (cached.status ?? 200) === 200
+      : matchesEtag(req, pre.dataVersion)
+  ) {
     req.ctx.cache = 'revalidated';
     req.ctx.bytes = 0;
     reply.header('ETag', `"${pre.dataVersion}"`);
