@@ -60,7 +60,13 @@ export class BarStore {
       if (bad.length > 0)
         throw new Error(`Bar-Abschnitt ${c} passt nicht zur Anfrage: ${bad.join(', ')}`);
     }
-    checkStatsColumns(dec.extra, dec.bars.time.length);
+    // W-1: Stats-Spalten sind Zusätze – eine unbrauchbare Spalte wird verworfen (mit Hinweis), der
+    // Abschnitt (Zeit, OHLC, Mengen) bleibt
+    for (const [name, why] of statsColumnProblems(dec.extra, dec.bars.time.length)) {
+      delete dec.extra![name];
+      this.badColumns.set(name, why);
+      console.warn(`Bar-Abschnitt ${c}: ${name} unbrauchbar (${why}) – Spalte verworfen`);
+    }
     // Der Decoder garantiert streng aufsteigende Zeiten innerhalb [from, to) → setData-sicher.
     this.chunks.delete(c);
     this.chunks.set(c, dec.bars);
@@ -71,6 +77,8 @@ export class BarStore {
   }
 
   private readonly dataToAt = new Map<number, number>();
+  /** Verworfene Stats-Spalten (Name → Grund), für die Hinweise im Grid */
+  readonly badColumns = new Map<string, string>();
   /** Zusatzspalten `x.*` je Abschnitt (z. B. künftige Stats-Felder), durchgereicht */
   private readonly extra = new Map<number, Record<string, Int32Array | Float64Array>>();
 
@@ -274,27 +282,45 @@ export const STATS_X_COLUMNS = ['x.maxDelta', 'x.minDelta', 'x.cotHigh', 'x.cotL
 
 /**
  * Form der Stats-Spalten prüfen, wenn vorhanden (fehlende Spalten sind erlaubt = nicht geliefert): Länge =
- * Anzahl Bars, endliche Zahlen, x.trades ganzzahlig ≥ 0, minDelta ≤ maxDelta je Bar. Wirft bei Abweichung.
+ * Anzahl Bars, endliche Zahlen, x.trades ganzzahlig ≥ 0, minDelta ≤ maxDelta je Bar (sonst beide
+ * unbrauchbar). Liefert [Spalte, Grund] je unbrauchbarer Spalte; wirft nie (W-1).
  */
-export function checkStatsColumns(
+export function statsColumnProblems(
   extra: Record<string, Int32Array | Float64Array> | undefined,
   nBars: number,
-): void {
-  if (!extra) return;
+): [string, string][] {
+  const out: [string, string][] = [];
+  if (!extra) return out;
   for (const name of STATS_X_COLUMNS) {
     const c = extra[name];
     if (!c) continue;
-    if (c.length !== nBars) throw new Error(`${name}: Länge ${c.length} ≠ ${nBars} Bars`);
+    if (c.length !== nBars) {
+      out.push([name, `Länge ${c.length} ≠ ${nBars} Bars`]);
+      continue;
+    }
     for (let i = 0; i < c.length; i++) {
       const v = c[i]!;
-      if (!Number.isFinite(v)) throw new Error(`${name}[${i}] nicht endlich`);
-      if (name === 'x.trades' && (v < 0 || !Number.isInteger(v)))
-        throw new Error(`${name}[${i}] = ${v} keine Anzahl`);
+      if (!Number.isFinite(v)) {
+        out.push([name, `Bar ${i} nicht endlich`]);
+        break;
+      }
+      if (name === 'x.trades' && (v < 0 || !Number.isInteger(v))) {
+        out.push([name, `Bar ${i}: ${v} keine Anzahl`]);
+        break;
+      }
     }
   }
+  const bad = new Set(out.map(([n]) => n));
   const mx = extra['x.maxDelta'];
   const mn = extra['x.minDelta'];
-  if (mx && mn)
+  if (mx && mn && !bad.has('x.maxDelta') && !bad.has('x.minDelta'))
     for (let i = 0; i < nBars; i++)
-      if (mn[i]! > mx[i]!) throw new Error(`x.minDelta[${i}] > x.maxDelta[${i}]`);
+      if (mn[i]! > mx[i]!) {
+        out.push(
+          ['x.maxDelta', `Bar ${i}: minDelta > maxDelta`],
+          ['x.minDelta', `Bar ${i}: minDelta > maxDelta`],
+        );
+        break;
+      }
+  return out;
 }

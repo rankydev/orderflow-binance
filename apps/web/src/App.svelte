@@ -223,6 +223,7 @@
       if (params.has('at') && Number.isFinite(atParam)) tpoView.centerOn(atParam * 1000);
     }
     tpoView.setOptions({ ...$state.snapshot(tpo), vaPct: prof.va } as TpoOptions);
+    ctl.suspend(); // H-2: der verdeckte Chart lädt nichts, solange TPO sichtbar ist
   }
   function setView(v: 'chart' | 'tpo'): void {
     view = v;
@@ -231,6 +232,8 @@
       tpoView?.destroy();
       tpoView = null;
       tro = null;
+      ctl?.resume(); // vorgemerkten Symbolwechsel anwenden, Bedarf neu
+      refreshLists();
     }
     syncUrl();
   }

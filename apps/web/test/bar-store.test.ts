@@ -257,12 +257,12 @@ describe('BarStore.settled (W-3: Datenzeit statt Uhr des Besuchers)', () => {
   });
 });
 
-import { checkStatsColumns } from '../src/lib/bar-store.ts';
+import { statsColumnProblems } from '../src/lib/bar-store.ts';
 
-describe('Stats-Spalten (stats=1) prüfen', () => {
-  it('fehlende Spalten sind erlaubt; Länge, Endlichkeit, Anzahl, minDelta ≤ maxDelta', () => {
-    expect(() => checkStatsColumns(undefined, 3)).not.toThrow();
-    expect(() => checkStatsColumns({ 'x.other': Float64Array.of(1) }, 3)).not.toThrow();
+describe('Stats-Spalten (stats=1) prüfen (W-1: verwerfen statt Abschnitt ablehnen)', () => {
+  it('fehlende Spalten erlaubt; Länge, Endlichkeit, Anzahl, minDelta ≤ maxDelta', () => {
+    expect(statsColumnProblems(undefined, 3)).toEqual([]);
+    expect(statsColumnProblems({ 'x.other': Float64Array.of(1) }, 3)).toEqual([]);
     const ok = {
       'x.maxDelta': Float64Array.of(5, 0, 2),
       'x.minDelta': Float64Array.of(-1, 0, 2),
@@ -270,14 +270,54 @@ describe('Stats-Spalten (stats=1) prüfen', () => {
       'x.cotLow': Float64Array.of(-3, 0, 2),
       'x.trades': Int32Array.of(10, 0, 7),
     };
-    expect(() => checkStatsColumns(ok, 3)).not.toThrow();
-    expect(() => checkStatsColumns({ ...ok, 'x.trades': Int32Array.of(1, 2) }, 3)).toThrow(/Länge/);
-    expect(() => checkStatsColumns({ ...ok, 'x.cotHigh': Float64Array.of(1, NaN, 2) }, 3)).toThrow(
-      /endlich/,
-    );
-    expect(() => checkStatsColumns({ ...ok, 'x.minDelta': Float64Array.of(-1, 1, 2) }, 3)).toThrow(
-      /minDelta/,
-    );
-    expect(() => checkStatsColumns({ 'x.trades': Int32Array.of(-1, 0, 0) }, 3)).toThrow(/Anzahl/);
+    expect(statsColumnProblems(ok, 3)).toEqual([]);
+    const names = (x: Record<string, Int32Array | Float64Array>) =>
+      statsColumnProblems(x, 3).map(([n]) => n);
+    expect(names({ ...ok, 'x.trades': Int32Array.of(1, 2) })).toEqual(['x.trades']);
+    expect(names({ ...ok, 'x.cotHigh': Float64Array.of(1, NaN, 2) })).toEqual(['x.cotHigh']);
+    expect(names({ ...ok, 'x.minDelta': Float64Array.of(-1, 1, 2) })).toEqual([
+      'x.maxDelta',
+      'x.minDelta',
+    ]);
+    expect(names({ 'x.trades': Int32Array.of(-1, 0, 0) })).toEqual(['x.trades']);
+  });
+
+  it('ein Abschnitt mit unbrauchbarer Spalte bleibt erhalten; die Spalte fehlt, der Grund ist gemerkt', () => {
+    const t = [0, 60, 120];
+    const buf = encodeTile({
+      meta: {
+        kind: 'bars',
+        sym: 'S',
+        tf: '1m',
+        tfSec: 60,
+        R: null,
+        priceDecimals: 2,
+        qtyDecimals: 3,
+        tickRefUnits: 10,
+        from: 0,
+        to: 60_000_000,
+        tile: null,
+        dataVersion: 'v',
+        final: true,
+      },
+      bars: {
+        time: Int32Array.from(t),
+        open: Int32Array.of(100, 100, 100),
+        high: Int32Array.of(100, 100, 100),
+        low: Int32Array.of(100, 100, 100),
+        close: Int32Array.of(100, 100, 100),
+        buyQ: Float64Array.of(1, 1, 1),
+        sellQ: Float64Array.of(0, 0, 0),
+        buyA: Int32Array.of(1, 1, 1),
+        sellA: Int32Array.of(0, 0, 0),
+      },
+      extra: { 'x.cotHigh': Float64Array.of(1, NaN, 2), 'x.trades': Int32Array.of(4, 5, 6) },
+    }).buffer as ArrayBuffer;
+    const b = new BarStore('S|1m', 2);
+    expect(() => b.addEncoded(0, buf)).not.toThrow();
+    const items = b.items(0, 0);
+    expect(items).toHaveLength(3); // Kerzen bleiben
+    expect(items[1]!.x).toEqual({ 'x.trades': 5 }); // x.cotHigh verworfen
+    expect(b.badColumns.get('x.cotHigh')).toContain('nicht endlich');
   });
 });

@@ -571,12 +571,54 @@ export class ChartController {
 
   // ---------------------------------------------------------------- Einstellungen (vom UI)
 
+  /**
+   * H-2: Chart ruht (TPO-Ansicht): keine Anfragen, keine Bewertung; Symbol-/tf-Wechsel werden vorgemerkt
+   * und beim Fortsetzen angewendet.
+   */
+  suspend(): void {
+    this.suspended = true;
+    this.barQueue.cancelAll();
+    this.fpQueue.cancelAll();
+    this.profile.suspended = true;
+    this.profile.frame();
+  }
+
+  resume(): void {
+    if (!this.suspended) return;
+    this.suspended = false;
+    this.profile.suspended = false;
+    const p = this.pending;
+    this.pending = null;
+    if (p && this.sym) {
+      if (p.sym !== this.sym.name) this.setSeries(p.sym, p.tf, null);
+      else if (p.tf !== this.tf) this.setTimeframe(p.tf);
+      else this.ensureWindow();
+    } else this.ensureWindow();
+    this.evaluate();
+    this.scheduleFrame();
+  }
+
+  get isSuspended(): boolean {
+    return this.suspended;
+  }
+
+  private suspended = false;
+  private pending: { sym: string; tf: string } | null = null;
+
   setSymbol(name: string): void {
+    if (this.suspended) {
+      this.pending = { sym: name, tf: this.pending?.tf ?? this.tf };
+      return;
+    }
     if (name === this.sym?.name) return;
     this.setSeries(name, this.tf, null);
   }
 
   setTimeframe(tf: string): void {
+    if (this.suspended && this.sym) {
+      this.pending = { sym: this.pending?.sym ?? this.sym.name, tf };
+      return;
+    }
     if (!this.sym || tf === this.tf) return;
     const a = this.currentAnchor();
     // W8: beim Wechsel auf einen feineren tf die Mitte des alten Bars verankern, nicht seinen Beginn
@@ -669,7 +711,7 @@ export class ChartController {
         : [],
     });
     this.statsCtx.notes = {
-      ...this.statsCtx.missingNotes(this.barsStats),
+      ...this.statsCtx.missingNotes(this.barsStats, this.bars.badColumns),
       ...(cvdAligned(offsetH, this.tfSec) ? {} : { cvd: CVD_UNALIGNED_NOTE }),
     };
     this.statsCtx.rowSize = rowLabel(this.R, this.sym);
@@ -867,6 +909,7 @@ export class ChartController {
    * `rebuild = false`: nur anfordern (während einer Geste, K1). Liefert true bei neuem Fenster.
    */
   private ensureWindow(force = false, rebuild = true): boolean {
+    if (this.suspended) return false;
     const [df, dt] = this.dataRangeSec();
     const vis = this.anchor ? null : this.visibleTimeRange();
     const center = this.anchor ? this.anchor.centerSec : vis ? (vis[0] + vis[1]) / 2 : dt;
@@ -1136,7 +1179,7 @@ export class ChartController {
 
   /** Gestenende: Zeilengröße, Modus, Fenster, Farbreferenz (KONZEPT §7.2). */
   private evaluate(): void {
-    if (!this.sym || this.items.length === 0) return;
+    if (this.suspended || !this.sym || this.items.length === 0) return;
     this.evaluateProfile();
     const rs = this.availableR();
     // Gründe, warum kein Footprint möglich ist (nicht zoombedingt) – sichtbar in der Anzeige (A)
@@ -1212,7 +1255,7 @@ export class ChartController {
   }
 
   private frame(): void {
-    if (!this.sym || this.items.length === 0) return;
+    if (this.suspended || !this.sym || this.items.length === 0) return;
     const vis = this.visibleTimeRange();
     if (!vis) return;
     const center = (vis[0] + vis[1]) / 2;

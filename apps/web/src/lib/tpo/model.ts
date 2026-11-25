@@ -5,6 +5,7 @@
 // Rein, ganzzahlig in price_unit; keine I/O. Erweiterungspunkte: Periode (Woche/Monat), Split/Merge,
 // Sessions, Poor High/Low, Rotation Factor – siehe `TpoPeriod` und `computeTpo`.
 import { maxNearMiddle, valueArea } from '@orderflow/core/browser';
+import { isProfileLadderR } from '../profile/model.ts';
 
 export const DAY_MS = 86_400_000;
 
@@ -115,9 +116,11 @@ export interface TpoDay {
    * Zellen in Blockreihenfolge: cellBlock/cellRow/cellCol; cellCol = Spalte im gestapelten Modus (k-ter
    * TPO dieser Zeile, links beginnend). Im Split-Modus ist die Spalte = Block.
    */
-  cellBlock: Int32Array;
+  cellBlock: Uint16Array;
   cellRow: Int32Array;
-  cellCol: Int32Array;
+  cellCol: Uint16Array;
+  /** Index der ersten Zelle je Block (Zellen eines Blocks liegen zusammen, Zeilen aufsteigend) */
+  blockStart: Int32Array;
   maxCount: number;
   total: number;
   poc: number | null;
@@ -136,6 +139,9 @@ export interface TpoDay {
   missingBlocks: number;
   /** letzter Block mit Daten (laufender Tag) oder −1 */
   lastBlock: number;
+  /** Poor High/Low (§6.5): oberste bzw. unterste Zeile mit ≥ 2 TPOs */
+  poorHigh: boolean;
+  poorLow: boolean;
 }
 
 /**
@@ -149,6 +155,7 @@ export function computeTpo(
   o: Pick<TpoOptions, 'blockMin' | 'ibMin' | 'vaPct'>,
   width: number,
   dataTo = Infinity,
+  dataFrom = -Infinity,
 ): TpoDay {
   const nBlocks = Math.round(1440 / o.blockMin);
   const blockLo = new Int32Array(nBlocks).fill(-1);
@@ -188,13 +195,15 @@ export function computeTpo(
     rowHi = Math.max(rowHi, blockHi[b]!);
     lastBlock = b;
   }
-  // fehlende Blöcke: vor dem Datenende (bzw. vor dem letzten Block mit Daten) ohne Bars
-  const expected = Math.min(
-    nBlocks,
-    Math.ceil((Math.min(dataTo, dayStart + DAY_MS) - dayStart) / (o.blockMin * 60_000)),
-  );
+  // fehlende Blöcke (H-7): ohne Bars, aber ganz im Datenbereich [dataFrom, dataTo) – vor dem Datenbeginn
+  // bzw. nach dem Datenende erwartet niemand Bars
+  const bms = o.blockMin * 60_000;
   let missingBlocks = 0;
-  for (let b = 0; b < expected; b++) if (blockLo[b] === -1) missingBlocks++;
+  for (let b = 0; b < nBlocks; b++) {
+    const bs = dayStart + b * bms;
+    if (bs < dataFrom || bs >= dataTo) continue;
+    if (blockLo[b] === -1) missingBlocks++;
+  }
   if (lastBlock < 0) {
     return {
       dayStart,
@@ -205,9 +214,10 @@ export function computeTpo(
       blockHi,
       rowLo: 0,
       counts: new Int32Array(0),
-      cellBlock: new Int32Array(0),
+      cellBlock: new Uint16Array(0),
       cellRow: new Int32Array(0),
-      cellCol: new Int32Array(0),
+      cellCol: new Uint16Array(0),
+      blockStart: new Int32Array(nBlocks),
       maxCount: 0,
       total: 0,
       poc: null,
@@ -222,6 +232,8 @@ export function computeTpo(
       below: 0,
       missingBlocks,
       lastBlock,
+      poorHigh: false,
+      poorLow: false,
     };
   }
   const rows = rowHi - rowLo + 1;
@@ -232,12 +244,14 @@ export function computeTpo(
     for (let r = blockLo[b]!; r <= blockHi[b]!; r++) counts[r - rowLo]!++;
     total += blockHi[b]! - blockLo[b]! + 1;
   }
-  const cellBlock = new Int32Array(total);
+  const cellBlock = new Uint16Array(total);
   const cellRow = new Int32Array(total);
-  const cellCol = new Int32Array(total);
+  const cellCol = new Uint16Array(total);
+  const blockStart = new Int32Array(nBlocks);
   const fill = new Int32Array(rows);
   let k = 0;
   for (let b = 0; b < nBlocks; b++) {
+    blockStart[b] = k;
     if (blockLo[b] === -1) continue;
     for (let r = blockLo[b]!; r <= blockHi[b]!; r++) {
       cellBlock[k] = b;
@@ -272,6 +286,7 @@ export function computeTpo(
     cellBlock,
     cellRow,
     cellCol,
+    blockStart,
     maxCount,
     total,
     poc,
@@ -286,7 +301,51 @@ export function computeTpo(
     below,
     missingBlocks,
     lastBlock,
+    poorHigh: rows >= 1 && counts[rows - 1]! >= 2,
+    poorLow: rows >= 1 && counts[0]! >= 2,
   };
+}
+
+/**
+ * Zeilengröße mit Untergrenze (W-2): höchstens TPO_MAX_ROWS_PER_DAY Zeilen je Tag über alle gegebenen
+ * Tagesspannen (price_unit). Liefert das kleinste R der Leiter ≥ R, das passt (sonst das größte).
+ */
+export const TPO_MAX_ROWS_PER_DAY = 20_000;
+export function tpoMinR(
+  ranges: readonly [number, number][],
+  tickRefUnits: number,
+  ladder: readonly number[],
+  R: number,
+  maxRows = TPO_MAX_ROWS_PER_DAY,
+): number {
+  const fits = (r: number) =>
+    ranges.every(
+      ([lo, hi]) =>
+        Math.floor(hi / (r * tickRefUnits)) - Math.floor(lo / (r * tickRefUnits)) + 1 <= maxRows,
+    );
+  if (fits(R)) return R;
+  for (const r of ladder) if (r > R && fits(r)) return r;
+  return ladder[ladder.length - 1] ?? R;
+}
+
+/**
+ * Sichtbare Zellen eines Tages im Zeilenbereich [rowBot, rowTop] (W-2: nicht alle Zellen prüfen): je
+ * Block der Teilbereich seiner Zellen; ruft f(k) für jede sichtbare Zelle k auf.
+ */
+export function forVisibleCells(
+  day: TpoDay,
+  rowBot: number,
+  rowTop: number,
+  f: (k: number) => void,
+): void {
+  for (let b = 0; b <= day.lastBlock; b++) {
+    const lo = day.blockLo[b]!;
+    if (lo === -1) continue;
+    const r0 = Math.max(lo, rowBot);
+    const r1 = Math.min(day.blockHi[b]!, rowTop);
+    const k0 = day.blockStart[b]!;
+    for (let r = r0; r <= r1; r++) f(k0 + (r - lo));
+  }
 }
 
 /** Spalte einer Zelle: gestapelt (k-ter TPO der Zeile) oder Split (Spalte = Block). */
@@ -379,7 +438,8 @@ export function parseTpoParams(q: URLSearchParams): { view: 'chart' | 'tpo'; tpo
       vaPct: d.vaPct,
       split: q.get('ts') === '1',
       volume: q.get('tvp') !== '0',
-      R: q.get('tr') && /^\d+$/.test(q.get('tr')!) ? Number(q.get('tr')) : null,
+      // H-6: nur Werte der Leiter {1, 2, 5}·10^k bis 1 000 000
+      R: int('tr', isProfileLadderR, -1) > 0 ? Number(q.get('tr')) : null,
     },
   };
 }

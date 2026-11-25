@@ -237,6 +237,8 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   /** Hinweis zum Bereich (gekürzt, vertauscht, außerhalb der Daten) */
   rangeNote = '';
   selecting = false;
+  /** Chart ruht (TPO-Ansicht): keine Anfragen (H-2) */
+  suspended = false;
   /** Nach Datenankunft/Zustandsänderung (UI aktualisiert Anzeige/Zusammenfassung). */
   onChange: (() => void) | null = null;
 
@@ -398,7 +400,7 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   frame(): void {
     const s = this.host.sym();
     const vis = this.host.visibleTimeRange();
-    if (!s || !vis || this.mode === 'off' || this.R === null) {
+    if (this.suspended || !s || !vis || this.mode === 'off' || this.R === null) {
       this.queue.setWanted([], new Set());
       return;
     }
@@ -535,6 +537,9 @@ export class ProfileLayer implements IPanePrimitive<Time> {
             dataVersion: d.dataVersion,
             vwap: d.vwap,
           });
+        // H-5: ein Tag kann bei gleicher Version final werden (z. B. nach der Prüfung) – Flag übernehmen,
+        // damit die Querprüfung ihn erfasst
+        else if (old.final !== d.final) old.final = d.final;
         if (!d.final && openFrom === null) openFrom = d.from;
       }
       // Tage ohne Trades bzw. ohne gespeicherte Daten (Anzeige unterscheidet beide)

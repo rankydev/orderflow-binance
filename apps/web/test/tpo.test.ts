@@ -184,3 +184,93 @@ describe('Zeilengröße und URL', () => {
     expect(parseTpoParams(new URLSearchParams('tb=7')).tpo.blockMin).toBe(30);
   });
 });
+
+// ---------------------------------------------------------------- Prüfrunde 391df0e (W-2, H-1, H-3, H-6, H-7)
+import { forVisibleCells, tpoMinR, TPO_MAX_ROWS_PER_DAY } from '../src/lib/tpo/model.ts';
+import { evictTpoDays, tpoBarsHeaderProblem } from '../src/lib/tpo/view.ts';
+
+describe('TPO: Speichergrenzen und Prüfungen', () => {
+  const day = computeTpo(
+    bars(),
+    T0,
+    { blockMin: 30, ibMin: 60, vaPct: 70 },
+    10,
+    T0 + 4 * 3_600_000,
+  );
+
+  it('W-2: Zeilengröße von unten begrenzt (≤ 20 000 Zeilen je Tag)', () => {
+    const ladder = [1, 2, 5, 10, 20, 50, 100];
+    // Spanne 5 850 USD = 585 000 price_unit bei tickRefUnits 10: R 1 → 58 501 Zeilen; R 5 → 11 701
+    expect(tpoMinR([[6_000_000, 6_585_000]], 10, ladder, 1)).toBe(5);
+    expect(tpoMinR([[6_000_000, 6_585_000]], 10, ladder, 10)).toBe(10);
+    expect(tpoMinR([[0, 10]], 10, ladder, 1)).toBe(1);
+    expect(TPO_MAX_ROWS_PER_DAY).toBe(20_000);
+  });
+
+  it('W-2: Zellbudget verdrängt die ältesten Tage, nie sichtbare ± 1', () => {
+    const days = new Map<number, { total: number }>([
+      [1, { total: 100 }],
+      [2, { total: 100 }],
+      [3, { total: 100 }],
+      [4, { total: 100 }],
+    ]);
+    // Budget 150, sichtbar ± 1 = Tage 1…2 → 3 und 4 fallen (älteste zuerst, aber 1/2 geschützt)
+    expect(evictTpoDays(days, 400, 150, 1, 2)).toBe(200);
+    expect([...days.keys()]).toEqual([1, 2]);
+    // nichts zu verdrängen unterhalb des Budgets
+    expect(evictTpoDays(days, 200, 500, 9, 9)).toBe(200);
+  });
+
+  it('W-2: Zeichnen besucht nur die Zellen sichtbarer Zeilen (je Block Teilbereich)', () => {
+    const seen: number[] = [];
+    forVisibleCells(day, 12, 12, (k) => seen.push(k));
+    // Zeile 12: B0 (k = 2), B1 (k = 4), B2 (k = 6)
+    expect(seen).toEqual([2, 4, 6]);
+    expect([...day.blockStart.slice(0, 5)]).toEqual([0, 3, 6, 7, 7]);
+    const all: number[] = [];
+    forVisibleCells(day, -1e9, 1e9, (k) => all.push(k));
+    expect(all).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+  });
+
+  it('H-1: Poor High/Low = oberste/unterste Zeile mit ≥ 2 TPOs', () => {
+    // Zählung [2, 2, 3, 1]: unten 2 → Poor Low; oben 1 → kein Poor High
+    expect([day.poorLow, day.poorHigh]).toEqual([true, false]);
+    const t = (m: number) => T0 / 1000 + m * 60;
+    const b: TpoBars = {
+      time: [t(0), t(30)],
+      open: [0, 0],
+      high: [29, 29],
+      low: [0, 10],
+      close: [0, 0],
+    };
+    const d2 = computeTpo(b, T0, { blockMin: 30, ibMin: 60, vaPct: 70 }, 10);
+    expect([...d2.counts]).toEqual([1, 2, 2]);
+    expect([d2.poorLow, d2.poorHigh]).toEqual([false, true]);
+  });
+
+  it('H-7: fehlende Blöcke nur im Datenbereich (erster Tag mit Offset beginnt vor dataFrom)', () => {
+    // Tag ab 22:00 des Vortags (offsetH −2), Daten ab T0 00:00 → die ersten 4 Blöcke liegen vor dataFrom
+    const start = T0 - 2 * 3_600_000;
+    const t = (m: number) => T0 / 1000 + m * 60;
+    const b: TpoBars = { time: [t(0)], open: [1], high: [9], low: [1], close: [1] };
+    const d = computeTpo(b, start, { blockMin: 30, ibMin: 60, vaPct: 70 }, 10, start + D, T0);
+    // erwartet: Blöcke 4…47 (44), davon nur Block 4 mit Bars → 43 fehlend
+    expect(d.missingBlocks).toBe(43);
+  });
+
+  it('H-3: Tages-Bars werden gegen Art, Symbol, tf und Zeitraum geprüft', () => {
+    const h = { kind: 'bars', sym: 'BTCUSDT', tf: '30m', from: T0, to: T0 + D };
+    expect(tpoBarsHeaderProblem(h, 'BTCUSDT', '30m', T0)).toBe('');
+    expect(tpoBarsHeaderProblem({ ...h, to: T0 + D - 1800_000 }, 'BTCUSDT', '30m', T0)).toContain(
+      'Zeitraum',
+    );
+    expect(tpoBarsHeaderProblem({ ...h, tf: '1m' }, 'BTCUSDT', '30m', T0)).toContain('tf');
+  });
+
+  it('H-6: URL tr nur auf der Leiter', () => {
+    expect(parseTpoParams(new URLSearchParams('tr=0')).tpo.R).toBeNull();
+    expect(parseTpoParams(new URLSearchParams('tr=3')).tpo.R).toBeNull();
+    expect(parseTpoParams(new URLSearchParams('tr=2000000')).tpo.R).toBeNull();
+    expect(parseTpoParams(new URLSearchParams('tr=50')).tpo.R).toBe(50);
+  });
+});

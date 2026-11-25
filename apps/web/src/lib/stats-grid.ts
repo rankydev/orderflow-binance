@@ -325,10 +325,15 @@ export class StatsContext {
   rowSize = '';
 
   /** Hinweise für Zeilen, deren API-Spalte im Fenster fehlt (nicht geliefert ≠ 0). */
-  missingNotes(statsRequested: boolean): Partial<Record<StatRow, string>> {
+  missingNotes(
+    statsRequested: boolean,
+    bad: ReadonlyMap<string, string> = new Map(),
+  ): Partial<Record<StatRow, string>> {
     const out: Partial<Record<StatRow, string>> = {};
     for (const def of STAT_ROWS)
-      if (def.column && !this.cols[def.id])
+      if (def.column && bad.has(def.column))
+        out[def.id] = `${def.column} unbrauchbar (${bad.get(def.column)}) – verworfen`;
+      else if (def.column && !this.cols[def.id])
         out[def.id] = statsRequested
           ? `– (${def.column} für diesen Zeitrahmen nicht geliefert)`
           : `– (${def.column} fehlt)`;

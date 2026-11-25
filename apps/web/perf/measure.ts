@@ -779,6 +779,59 @@ async function main(): Promise<void> {
     }
   }
 
+  // W-2: manuell feine TPO-Zeilen über 60 Tage, dann über alle 90 Tage pannen – vorbereitete Zellen
+  // bleiben begrenzt (Budget 3 Mio., sichtbare Tage geschützt), Renderer-Speicher vorher/nachher.
+  if (process.env.PERF_ONLY !== 'profile') {
+    await page.goto(`${URL0}?sym=BTCUSDT-SYN90&view=tpo&tr=1&debug`);
+    await page.waitForFunction(() => (window as Any).__tpo?.readout().daysLoaded > 0, null, {
+      timeout: 20_000,
+    });
+    const before = await heap();
+    await page.evaluate(() => {
+      const t = (window as Any).__tpo;
+      t.colW = (t.canvas.clientWidth - 70) / 60;
+      t.evaluate();
+    });
+    for (let i = 0; i < 100; i++) {
+      const r = await page.evaluate(() => (window as Any).__tpo.readout());
+      if (r.inFlight === 0 && r.daysLoaded >= 60) break;
+      await page.waitForTimeout(150);
+    }
+    let maxCells = 0;
+    await scenario('tpo_60d_fine', async () => {
+      for (let i = 0; i < 6; i++) {
+        await drag(700, 25);
+        await idle(300);
+        maxCells = Math.max(
+          maxCells,
+          await page.evaluate(() => (window as Any).__tpo.preparedCells as number),
+        );
+      }
+      for (let i = 0; i < 6; i++) {
+        await drag(-700, 25);
+        await idle(300);
+        maxCells = Math.max(
+          maxCells,
+          await page.evaluate(() => (window as Any).__tpo.preparedCells as number),
+        );
+      }
+    });
+    const after = await heap();
+    const ro = await page.evaluate(() => (window as Any).__tpo.readout());
+    results.tpo_60d_fine.memory = { before, after, maxPreparedCells: maxCells, readout: ro };
+    console.log('tpo_60d_fine memory', JSON.stringify(results.tpo_60d_fine.memory));
+    check(
+      `tpo_60d_fine: Zeilengröße angehoben (${ro.rLabel}; ${ro.note})`,
+      ro.note.includes('angehoben'),
+    );
+    check(`tpo_60d_fine: vorbereitete Zellen ${maxCells} ≤ 3,5 Mio.`, maxCells <= 3_500_000);
+    check(
+      `tpo_60d_fine: Renderer-RSS ${before.rendererRssMB} → ${after.rendererRssMB} MB (≤ +300 MB)`,
+      after.rendererRssMB - before.rendererRssMB <= 300,
+    );
+    check(`tpo_60d_fine: keine Long Tasks`, results.tpo_60d_fine.longTasks === 0);
+  }
+
   // ---------------------------------------------------------------- Volume Profile
   // Tagesprofile über 30 und ~150 Tage (herausgezoomt, 1h bzw. 4h – 4h nur, wenn angeboten; sonst 1h
   // über den ganzen Datenbereich), Pannen mit Profilen, Bereichsprofil über einen Monat. Budgets:

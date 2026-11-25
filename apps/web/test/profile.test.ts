@@ -1078,3 +1078,44 @@ describe('Profil-Vertrag: vwap, Tageslisten, 422-Grund, Grenzen, 503', () => {
     }
   });
 });
+
+describe('H-5: Tag wird bei gleicher dataVersion final', () => {
+  it('das Flag des behaltenen Profils wird übernommen', async () => {
+    let now = 1_000;
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    try {
+      let finalNow = false;
+      const { layer } = setup(
+        (u) => {
+          const from = Number(u.searchParams.get('from'));
+          const days = [];
+          for (let d = from; d < T0 + 3 * D; d += D)
+            days.push({
+              ...dayBody(d, 23),
+              final: d < T0 + 2 * D || finalNow,
+              dataVersion: `v${d}`,
+            });
+          return json(envelope(u, { kind: 'profiles/daily', offsetH: 0, final: finalNow, days }));
+        },
+        undefined,
+        { barsCoverFinal: () => false },
+      );
+      layer.manualR = 1;
+      layer.frame();
+      for (let i = 0; i < 8; i++) await flush();
+      const cache = (
+        layer as unknown as { cache: Map<string, { profiles: Map<number, { final: boolean }> }> }
+      ).cache;
+      const p = [...cache.values()][0]!.profiles.get(T0 + 2 * D)!;
+      expect(p.final).toBe(false);
+      finalNow = true;
+      now += 61_000;
+      layer.frame();
+      for (let i = 0; i < 8; i++) await flush();
+      expect([...cache.values()][0]!.profiles.get(T0 + 2 * D)).toBe(p); // gleiches Objekt …
+      expect(p.final).toBe(true); // … aber nun final
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

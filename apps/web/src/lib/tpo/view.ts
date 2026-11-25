@@ -29,10 +29,13 @@ import {
 import { clampBatch, PROFILE_COLORS, vwapProblem } from '../profile/layer.ts';
 import { RequestQueue, type Want } from '../request-queue.ts';
 import type { SymbolInfo } from '../types.ts';
+import { GestureTracker } from '../gesture.ts';
 import {
   blockShade,
   chooseSourceTf,
   computeTpo,
+  forVisibleCells,
+  tpoMinR,
   DAY_MS,
   letterOf,
   rowLetters,
@@ -58,11 +61,14 @@ export const TPO_CACHE_DAYS = 150;
 export const TPO_NONFINAL_TTL_MS = 60_000;
 const AXIS_W = 70;
 const HEADER_H = 18;
-const FOOTER_H = 82;
+const FOOTER_H = 92;
 const PAD = 6;
 const LETTER_W = 10;
 const SHADES = 12;
-const GESTURE_END_MS = 150;
+/** Höchstzahl vorbereiteter TPO-Zellen über alle Tage (W-2; ≈ 8 B je Zelle → ≤ 24 MB). */
+export const TPO_MAX_CELLS = 3_000_000;
+/** Unter dieser Zeilenhöhe (px) wird je Pixelzeile nur die Profilform gezeichnet (keine Einzelzellen). */
+export const TPO_HIST_ROW_PX = 1.5;
 
 interface Raw {
   bars: TpoBars;
@@ -88,6 +94,7 @@ const IB_COLOR = '#5ee7f0';
 const SINGLE_COLOR = '#ff9a5c';
 const OPEN_COLOR = '#e6edf3';
 const CLOSE_COLOR = '#ff5c7a';
+const POOR_COLOR = '#c77dff';
 
 export interface TpoReadout {
   R: number;
@@ -96,7 +103,7 @@ export interface TpoReadout {
   tf: string;
   daysVisible: number;
   daysLoaded: number;
-  lod: 'letters' | 'blocks';
+  lod: 'letters' | 'blocks' | 'profile';
   requests: number;
   inFlight: number;
   error: string;
@@ -116,9 +123,24 @@ export class TpoView {
   private pTop = 0;
   private pBot = 0;
   private fitted = false;
-  /** Preisbereich folgt den geladenen Tagen, bis der Nutzer ihn verschiebt oder zoomt */
-  private autoFit = true;
   private autoR: number | null = null;
+  /** Untergrenze der Zeilengröße aus den Tagesspannen (W-2) und Tagesgrenze des letzten Einpassens */
+  private rFloor = 0;
+  private fitOffset = Number.NaN;
+  private cellsHeld = 0;
+  private vpError = '';
+  private vpRFloor = 0;
+  private vpNote = '';
+  private readonly vpReq = new Map<
+    string,
+    { from: number; to: number; va: number; offsetH: number }
+  >();
+  private readonly tracker: GestureTracker;
+  private dprQuery: MediaQueryList | null = null;
+  private readonly onDpr = () => {
+    this.watchDpr();
+    this.resize();
+  };
   private readonly raw = new Map<string, Raw>();
   private days = new Map<number, TpoDay>();
   private daysKey = '';
@@ -127,7 +149,6 @@ export class TpoView {
   private readonly queue: RequestQueue;
   private readonly vpQueue: RequestQueue;
   private frameReq = 0;
-  private gestureTimer: ReturnType<typeof setTimeout> | null = null;
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private drag: { x: number; y: number } | null = null;
   private hoverPos: { x: number; y: number } | null = null;
@@ -139,6 +160,9 @@ export class TpoView {
   private error = '';
   private lod: 'letters' | 'blocks' = 'blocks';
   private visibleCount = 0;
+  private lodHist = false;
+  private histMax = new Float64Array(0);
+  private histVa = new Uint8Array(0);
   private readonly rects: Rect[] = [];
   onHover: ((text: string) => void) | null = null;
   onChange: (() => void) | null = null;
@@ -148,19 +172,58 @@ export class TpoView {
     this.host = host;
     this.canvas = document.createElement('canvas');
     this.canvas.className = 'tpo-canvas';
+    this.canvas.setAttribute('role', 'img');
+    this.canvas.setAttribute(
+      'aria-label',
+      'TPO-Ansicht: ein Market Profile je Tag; Ziehen verschiebt, Mausrad zoomt den Preis, Shift + Mausrad die Spaltenbreite',
+    );
+    // H-8: gleiche Gestenregeln wie der Chart (Gestenende nach 150 ms, Watchdog gegen verlorenes pointerup)
+    this.tracker = new GestureTracker({
+      onEnd: () => {
+        if (!this.tracker.held) this.drag = null;
+        this.evaluate();
+      },
+      onResize: () => this.evaluate(),
+    });
     container.appendChild(this.canvas);
     this.ctx = this.canvas.getContext('2d')!;
     this.queue = new RequestQueue(
       (k, b) => this.onBars(k, b),
       (_k, status) => {
         this.error = `TPO-Bars: HTTP ${status}`;
+        if (!this.fitted && this.visibleLoaded()) this.fit();
         this.onChange?.();
       },
     );
     this.queue.label = () => 'TPO-Bars';
     this.vpQueue = new RequestQueue(
       (k, b) => this.onProfiles(k, b),
-      () => {},
+      (k, status, _e, body) => {
+        // 422 mit suggestR: Volumenprofil einmal gröber (seine Zeilen weichen dann von den TPO-Zeilen ab)
+        if (status === 422) {
+          let sug: unknown = null;
+          try {
+            sug = (JSON.parse(body ?? '') as { suggestR?: unknown }).suggestR;
+          } catch {
+            /* kein JSON */
+          }
+          const used = Number(k.split('|')[2]);
+          if (typeof sug === 'number' && sug > used && sug > this.vpRFloor) {
+            this.vpRFloor = sug;
+            this.vpNote = `Volumenprofil mit gröberen Zeilen (R ${sug}, Server-Vorschlag)`;
+            this.wants();
+            return;
+          }
+        }
+        // H-3: Volumenprofil-Fehler sichtbar (422 = Zeitraum/Zeilen zu groß für diese Zeilengröße)
+        this.vpError =
+          status === 422
+            ? 'TPO-Volumenprofil: zu viele Zeilen für diese Zeilengröße'
+            : status === 0
+              ? 'TPO-Volumenprofil: Antwort unbrauchbar'
+              : `TPO-Volumenprofil: HTTP ${status}`;
+        this.onChange?.();
+      },
       undefined,
       2,
     );
@@ -177,15 +240,22 @@ export class TpoView {
     };
     on('pointerdown', (e) => {
       this.drag = { x: e.clientX, y: e.clientY };
+      this.tracker.pointerDown();
       this.canvas.setPointerCapture(e.pointerId);
     });
     on('pointermove', (e) => {
       if (this.drag) {
+        // verlorenes pointerup: keine Taste mehr gedrückt → Ziehen beenden
+        if (e.buttons === 0) {
+          this.drag = null;
+          this.tracker.pointerUp();
+          return;
+        }
         const dx = e.clientX - this.drag.x;
         const dy = e.clientY - this.drag.y;
         this.drag = { x: e.clientX, y: e.clientY };
+        this.tracker.pointerMove(e.buttons);
         this.pan(dx, dy);
-        this.gesture();
         return;
       }
       const r = this.canvas.getBoundingClientRect();
@@ -198,9 +268,14 @@ export class TpoView {
     });
     const up = () => {
       this.drag = null;
+      this.tracker.pointerUp();
     };
     on('pointerup', up);
     on('pointercancel', up);
+    on('lostpointercapture', up);
+    const blur = () => up();
+    window.addEventListener('blur', blur);
+    this.listeners.push(() => window.removeEventListener('blur', blur));
     on('pointerleave', () => {
       this.hoverPos = null;
       this.onHover?.('');
@@ -212,14 +287,22 @@ export class TpoView {
         const r = this.canvas.getBoundingClientRect();
         if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
           const d = e.shiftKey ? e.deltaY : e.deltaX;
-          this.zoomColumns(Math.exp(-d * 0.002));
+          this.zoomColumns(Math.exp(-d * 0.002), e.clientX - r.left);
         } else this.zoomPrice(Math.exp(e.deltaY * 0.002), e.clientY - r.top);
-        this.gesture();
+        this.tracker.wheel();
       },
       false,
     );
     this.refreshTimer = setInterval(() => this.wants(), 15_000);
+    this.watchDpr();
     this.resize();
+  }
+
+  /** Anderer Monitor mit anderer Pixeldichte bei gleicher Größe: Canvas neu auflösen. */
+  private watchDpr(): void {
+    this.dprQuery?.removeEventListener('change', this.onDpr);
+    this.dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+    this.dprQuery.addEventListener('change', this.onDpr);
   }
 
   destroy(): void {
@@ -229,7 +312,8 @@ export class TpoView {
     this.ro.disconnect();
     if (this.frameReq) cancelAnimationFrame(this.frameReq);
     if (this.hoverReq) cancelAnimationFrame(this.hoverReq);
-    if (this.gestureTimer) clearTimeout(this.gestureTimer);
+    this.tracker.dispose();
+    this.dprQuery?.removeEventListener('change', this.onDpr);
     if (this.refreshTimer) clearInterval(this.refreshTimer);
     this.canvas.remove();
   }
@@ -249,15 +333,15 @@ export class TpoView {
     const max = Math.max(0, (b[1] - b[0]) * this.colW);
     this.scrollPx = Math.min(max, Math.max(0, (b[1] - d + 0.5) * this.colW - this.plotW() / 2));
     this.fitted = false;
-    this.autoFit = true;
     this.evaluate();
   }
 
   /** Symbol gewechselt: Ansicht neu einpassen. */
   reset(): void {
     this.fitted = false;
-    this.autoFit = true;
     this.autoR = null;
+    this.rFloor = 0;
+    this.cellsHeld = 0;
     this.scrollPx = 0;
     this.days.clear();
     this.daysKey = '';
@@ -267,7 +351,7 @@ export class TpoView {
   }
 
   get R(): number {
-    return this.opts.R ?? this.autoR ?? 100;
+    return Math.max(this.opts.R ?? this.autoR ?? 100, this.rFloor);
   }
 
   ladder(): number[] {
@@ -332,7 +416,6 @@ export class TpoView {
   }
 
   private pan(dx: number, dy: number): void {
-    if (dy !== 0) this.autoFit = false;
     const b = this.dayBounds();
     if (!b) return;
     const max = Math.max(0, (b[1] - b[0]) * this.colW);
@@ -344,32 +427,31 @@ export class TpoView {
   }
 
   zoomPrice(f: number, yCss: number): void {
-    this.autoFit = false;
     const u = this.pTop - ((yCss - HEADER_H) / this.plotH()) * (this.pTop - this.pBot);
     this.pTop = u + (this.pTop - u) * f;
     this.pBot = u + (this.pBot - u) * f;
     this.schedule();
   }
 
-  zoomColumns(f: number): void {
+  /** Spaltenbreite ändern, verankert an der Zeigerposition x (CSS-px, Standard: rechter Rand). */
+  zoomColumns(f: number, xCss = this.plotW()): void {
     const old = this.colW;
     this.colW = Math.min(1600, Math.max(60, this.colW * f));
-    this.scrollPx *= this.colW / old;
+    // Abstand des Ankers vom rechten Rand in „Tagen" bleibt gleich: (pw − x + scroll) / colW
+    const pw = this.plotW();
+    const daysFromRight = (pw - xCss + this.scrollPx) / old;
+    const b = this.dayBounds();
+    const max = b ? Math.max(0, (b[1] - b[0]) * this.colW) : 0;
+    this.scrollPx = Math.min(max, Math.max(0, daysFromRight * this.colW - (pw - xCss)));
     this.schedule();
-  }
-
-  /** Laufende Geste: Bewertung erst GESTURE_END_MS nach der letzten Eingabe. */
-  private gesture(): void {
-    if (this.gestureTimer) clearTimeout(this.gestureTimer);
-    this.gestureTimer = setTimeout(() => {
-      this.gestureTimer = null;
-      this.evaluate();
-    }, GESTURE_END_MS);
   }
 
   /** Gestenende/Einstellungen: Zeilengröße (Hysterese), Neuberechnung, Bedarf, Zeichnen. */
   evaluate(): void {
     const s = this.host.sym();
+    // H-4: neu einpassen nur bei Symbol- oder Tagesgrenzenwechsel (sonst springen Preisachse und R)
+    if (this.host.offsetH() !== this.fitOffset) this.fitted = false;
+    if (s) this.updateRFloor(s);
     if (s && this.fitted && this.opts.R === null) {
       const pxPerUnit = this.plotH() / (this.pTop - this.pBot);
       this.autoR = tpoRowSize(this.autoR, this.ladder(), pxPerUnit, s.tickRefUnits);
@@ -423,7 +505,7 @@ export class TpoView {
       this.vpQueue.setWanted([], new Set());
       return;
     }
-    const R = this.R;
+    const R = Math.max(this.R, this.vpRFloor);
     const vw: Want[] = [];
     const vr = new Set<string>();
     const batches = wantedDayBatches(
@@ -438,6 +520,7 @@ export class TpoView {
       vr.add(key);
       if (this.vpBatches.has(key)) return;
       const [from, to] = clampBatch(batchWindow(b, off), s, off);
+      this.vpReq.set(key, { from, to, va: this.opts.vaPct, offsetH: off });
       vw.push({
         key,
         url: `${this.host.api.base}/api/v1/profiles/daily?sym=${encodeURIComponent(s.name)}&from=${from}&to=${to}&R=${R}&offsetH=${off}&va=${this.opts.vaPct}`,
@@ -451,27 +534,43 @@ export class TpoView {
     const s = this.host.sym();
     if (!s || !key.startsWith(`${s.name}|`)) return;
     const dec = decodeTile(buf);
-    const [, tf, , dStr] = key.split('|');
-    if (dec.header.kind !== 'bars' || dec.header.sym !== s.name || dec.header.tf !== tf)
-      throw new Error('Bars passen nicht zur Anfrage');
+    const [, tf, offStr, dStr] = key.split('|');
+    const from = tpoDayStart(Number(dStr), Number(offStr));
+    // H-3: Kopf gegen die Anfrage (Art, Symbol, tf, Zeitraum des Tages)
+    const bad = tpoBarsHeaderProblem(dec.header, s.name, tf!, from);
+    if (bad) throw new Error(`Bars passen nicht zur Anfrage: ${bad}`);
     this.raw.set(key, { bars: dec.bars, final: dec.header.final, loadedAt: performance.now() });
     while (this.raw.size > TPO_CACHE_DAYS) this.raw.delete(this.raw.keys().next().value as string);
     this.error = '';
     this.days.delete(Number(dStr));
     this.recomputeDays();
-    if (!this.fitted || this.autoFit) this.fit();
+    // erstes Einpassen, sobald die sichtbaren Tage da sind (nicht bei jeder Ankunft, H-4)
+    if (!this.fitted && this.visibleLoaded()) this.fit();
     this.schedule();
     this.onChange?.();
   }
 
   private onProfiles(key: string, buf: ArrayBuffer): void {
     const s = this.host.sym();
-    if (!s) return;
+    const req = this.vpReq.get(key);
+    this.vpReq.delete(key);
+    if (!s || !req) return;
     const x = JSON.parse(new TextDecoder().decode(buf)) as DailyProfilesResponse;
     const problems = checkDailyProfiles(x);
     if (problems.length > 0) throw new Error(problems.slice(0, 2).join('; '));
     const R = Number(key.split('|')[2]);
-    if (x.R !== R || x.sym !== s.name) throw new Error('Profil passt nicht zur Anfrage');
+    // H-3: wie die anderen Ansichten gegen die Anfrage prüfen
+    if (
+      x.R !== R ||
+      x.sym !== s.name ||
+      x.tickRefUnits !== s.tickRefUnits ||
+      x.va !== req.va ||
+      x.offsetH !== req.offsetH ||
+      x.from !== req.from ||
+      x.to !== req.to
+    )
+      throw new Error('Profil passt nicht zur Anfrage');
+    this.vpError = '';
     for (const d of x.days) {
       const vw = vwapProblem(d);
       if (vw) throw new Error(vw);
@@ -498,19 +597,67 @@ export class TpoView {
       // Volumenprofile hängen an R: bei neuer Zeilengröße neu
       this.vp.clear();
       this.vpBatches.clear();
+      this.vpRFloor = 0;
+      this.vpNote = '';
     }
+    if (k !== this.daysKey || this.days.size === 0) this.cellsHeld = 0;
     const vis = this.visibleDays();
     if (!vis) return;
     for (let d = vis[0] - 1; d <= vis[1] + 1; d++) {
-      if (this.days.has(d)) continue;
+      const have = this.days.get(d);
+      if (have) {
+        this.days.delete(d); // LRU: Zugriff frischt auf
+        this.days.set(d, have);
+        continue;
+      }
       const r = this.raw.get(this.rawKey(s.name, tf, d));
       if (!r) continue;
-      this.days.set(d, computeTpo(r.bars, tpoDayStart(d, off), this.opts, w, s.dataTo));
+      const day = computeTpo(r.bars, tpoDayStart(d, off), this.opts, w, s.dataTo, s.dataFrom);
+      this.days.set(d, day);
+      this.cellsHeld += day.total;
     }
-    // begrenzt halten (nur sichtbare Umgebung)
-    if (this.days.size > 3 * TPO_CACHE_DAYS)
-      for (const d of [...this.days.keys()])
-        if (d < vis[0] - 60 || d > vis[1] + 60) this.days.delete(d);
+    // W-2: Zellbudget über alle vorbereiteten Tage, LRU, sichtbare Tage ± 1 bleiben
+    this.cellsHeld = evictTpoDays(this.days, this.cellsHeld, TPO_MAX_CELLS, vis[0] - 1, vis[1] + 1);
+  }
+
+  /** Vorbereitete Zellen (Messung, W-2). */
+  get preparedCells(): number {
+    return this.cellsHeld;
+  }
+
+  /** W-2: Zeilengröße von unten begrenzen (≤ 20 000 Zeilen je Tag über die geladenen sichtbaren Tage). */
+  private updateRFloor(s: SymbolInfo): void {
+    const vis = this.visibleDays();
+    if (!vis) return;
+    const tf = this.sourceTf();
+    const ranges: [number, number][] = [];
+    for (let d = vis[0] - 1; d <= vis[1] + 1; d++) {
+      const r = this.raw.get(this.rawKey(s.name, tf, d));
+      if (!r || r.bars.time.length === 0) continue;
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (let i = 0; i < r.bars.time.length; i++) {
+        lo = Math.min(lo, r.bars.low[i]!);
+        hi = Math.max(hi, r.bars.high[i]!);
+      }
+      ranges.push([lo, hi]);
+    }
+    const want = this.opts.R ?? this.autoR ?? 100;
+    const r = tpoMinR(ranges, s.tickRefUnits, this.ladder(), want);
+    this.rFloor = r > want ? r : 0;
+  }
+
+  /** Sind alle sichtbaren Tage geladen (oder nicht mehr angefragt)? */
+  private visibleLoaded(): boolean {
+    const s = this.host.sym();
+    const vis = this.visibleDays();
+    if (!s || !vis) return false;
+    const tf = this.sourceTf();
+    for (let d = vis[0]; d <= vis[1]; d++) {
+      const key = this.rawKey(s.name, tf, d);
+      if (!this.raw.has(key) && !this.queue.isFinal(key)) return false;
+    }
+    return true;
   }
 
   /** Preisbereich auf die sichtbaren Tage einpassen (erste Daten, Symbolwechsel). */
@@ -534,6 +681,7 @@ export class TpoView {
     this.pTop = hi + m;
     this.pBot = lo - m;
     this.fitted = true;
+    this.fitOffset = this.host.offsetH();
     this.autoR = null;
     this.evaluate();
   }
@@ -552,11 +700,19 @@ export class TpoView {
       tf: this.sourceTf(),
       daysVisible: this.visibleCount,
       daysLoaded: this.raw.size,
-      lod: this.lod,
+      lod: this.lodHist ? 'profile' : this.lod,
       requests: this.queue.stats.started + this.vpQueue.stats.started,
       inFlight: this.queue.stats.inFlight + this.vpQueue.stats.inFlight,
-      error: this.error || this.queue.lastError,
-      note: missing > 0 ? `${missing} Blöcke ohne Daten in den sichtbaren Tagen (Löcher)` : '',
+      error: this.error || this.queue.lastError || this.vpError || this.vpQueue.lastError,
+      note: [
+        missing > 0 ? `${missing} Blöcke ohne Daten in den sichtbaren Tagen (Löcher)` : '',
+        this.vpNote,
+        this.rFloor > 0 && s
+          ? `Zeilengröße auf ${exactDecimal(this.rFloor * s.tickRefUnits, s.priceDecimals)} angehoben (≤ 20 000 Zeilen je Tag)`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('; '),
       lastDrawMs: this.stats.lastMs,
     };
   }
@@ -628,6 +784,7 @@ export class TpoView {
     ctx.clip();
     const rowH = (this.R * s.tickRefUnits * ph) / (this.pTop - this.pBot);
     this.lod = rowH >= TPO_ROW.letterMin ? 'letters' : 'blocks';
+    this.lodHist = false;
     for (let d = vis[0]; d <= vis[1]; d++) {
       const x0 = this.dayX(d);
       this.visibleCount++;
@@ -686,50 +843,78 @@ export class TpoView {
     ctx.beginPath();
     ctx.rect(x0, HEADER_H, this.colW, ph);
     ctx.clip();
-    const inVa = (r: number) =>
+    const inVa = (r: number): boolean =>
       day.val !== null && day.vah !== null && r >= day.val && r <= day.vah;
-    // Zellen je Farbe gebündelt (Blöcke) bzw. Buchstaben
-    const buckets: number[][] = Array.from({ length: 2 * SHADES }, () => []);
-    const n = day.cellBlock.length;
     const gap = rowH >= 5 ? 1 : 0;
-    for (let k = 0; k < n; k++) {
-      const r = day.cellRow[k]!;
-      if (r > rowTop || r < rowBot) continue;
-      const b = day.cellBlock[k]!;
-      const c = this.opts.split ? b : day.cellCol[k]!;
-      const x = left + c * cellW;
-      const y = this.yOf((r + 1) * w);
-      const sh = blockShade(b, day.nBlocks, SHADES) + (inVa(r) ? 0 : SHADES);
-      const bk = buckets[sh]!;
-      bk.push(x, y);
-    }
     const h = Math.max(1, rowH - gap);
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    if (letters)
-      ctx.font = `${Math.min(12, Math.floor(rowH * 0.85))}px ui-monospace, Menlo, monospace`;
-    for (let sh = 0; sh < buckets.length; sh++) {
-      const xs = buckets[sh]!;
-      if (xs.length === 0) continue;
-      ctx.fillStyle = sh < SHADES ? IN_VA[sh]! : OUT_VA[sh - SHADES]!;
-      if (!letters) {
+    const hist = rowH < TPO_HIST_ROW_PX;
+    if (hist) {
+      // W-2: Zeilen unter 1,5 px – je Pixelzeile die größte TPO-Zahl als Balken (die Form des gestapelten
+      // Profils), statt Millionen Zellen; Farbe innerhalb/außerhalb der VA
+      this.lodHist = true;
+      const n = Math.ceil(ph);
+      const mx =
+        this.histMax.length >= n
+          ? this.histMax.fill(0, 0, n)
+          : (this.histMax = new Float64Array(n));
+      const va =
+        this.histVa.length >= n ? this.histVa.fill(0, 0, n) : (this.histVa = new Uint8Array(n));
+      const r0 = Math.max(rowBot, day.rowLo);
+      const r1 = Math.min(rowTop, day.rowLo + day.counts.length - 1);
+      for (let r = r0; r <= r1; r++) {
+        const y = Math.floor(this.yOf((r + 0.5) * w) - HEADER_H);
+        if (y < 0 || y >= n) continue;
+        const c = day.counts[r - day.rowLo]!;
+        if (c > mx[y]!) {
+          mx[y] = c;
+          va[y] = inVa(r) ? 1 : 0;
+        }
+      }
+      for (const inside of [1, 0]) {
+        ctx.fillStyle = inside ? IN_VA[3]! : OUT_VA[3]!;
         ctx.beginPath();
-        for (let i = 0; i < xs.length; i += 2)
-          ctx.rect(xs[i]!, xs[i + 1]!, Math.max(1, cellW - (cellW >= 3 ? 1 : 0)), h);
+        for (let y = 0; y < n; y++)
+          if (mx[y]! > 0 && va[y] === inside) ctx.rect(left, HEADER_H + y, mx[y]! * cellW, 1);
         ctx.fill();
       }
-      this.stats.cells += xs.length / 2;
-    }
-    if (letters) {
-      // Buchstaben: Block-Index aus der Zellreihenfolge (Farbe = Verlauf, VA kräftiger)
-      for (let k = 0; k < n; k++) {
+      this.stats.cells += Math.max(0, r1 - r0 + 1);
+    } else {
+      // Zellen je Farbe gebündelt (Blöcke) bzw. Buchstaben
+      const buckets: number[][] = Array.from({ length: 2 * SHADES }, () => []);
+      // W-2: nur die Zellen der sichtbaren Zeilen (je Block ein Teilbereich), nicht alle Zellen
+      forVisibleCells(day, rowBot, rowTop, (k) => {
         const r = day.cellRow[k]!;
-        if (r > rowTop || r < rowBot) continue;
         const b = day.cellBlock[k]!;
         const c = this.opts.split ? b : day.cellCol[k]!;
-        const sh = blockShade(b, day.nBlocks, SHADES);
-        ctx.fillStyle = inVa(r) ? IN_VA[sh]! : OUT_VA[sh]!;
-        ctx.fillText(letterOf(b), left + c * cellW + cellW / 2, this.yOf((r + 0.5) * w));
+        const sh = blockShade(b, day.nBlocks, SHADES) + (inVa(r) ? 0 : SHADES);
+        buckets[sh]!.push(left + c * cellW, this.yOf((r + 1) * w));
+      });
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      if (letters)
+        ctx.font = `${Math.min(12, Math.floor(rowH * 0.85))}px ui-monospace, Menlo, monospace`;
+      for (let sh = 0; sh < buckets.length; sh++) {
+        const xs = buckets[sh]!;
+        if (xs.length === 0) continue;
+        ctx.fillStyle = sh < SHADES ? IN_VA[sh]! : OUT_VA[sh - SHADES]!;
+        if (!letters) {
+          ctx.beginPath();
+          for (let i = 0; i < xs.length; i += 2)
+            ctx.rect(xs[i]!, xs[i + 1]!, Math.max(1, cellW - (cellW >= 3 ? 1 : 0)), h);
+          ctx.fill();
+        }
+        this.stats.cells += xs.length / 2;
+      }
+      if (letters) {
+        // Buchstaben: Block-Index aus der Zellreihenfolge (Farbe = Verlauf, VA kräftiger)
+        forVisibleCells(day, rowBot, rowTop, (k) => {
+          const r = day.cellRow[k]!;
+          const b = day.cellBlock[k]!;
+          const c = this.opts.split ? b : day.cellCol[k]!;
+          const sh = blockShade(b, day.nBlocks, SHADES);
+          ctx.fillStyle = inVa(r) ? IN_VA[sh]! : OUT_VA[sh]!;
+          ctx.fillText(letterOf(b), left + c * cellW + cellW / 2, this.yOf((r + 0.5) * w));
+        });
       }
     }
     const usedW = cols * cellW;
@@ -745,6 +930,13 @@ export class TpoView {
     if (day.val !== null) ctx.fillRect(left, Math.round(rowY(day.val - 1)), usedW, 1);
     ctx.fillStyle = SINGLE_COLOR;
     for (const r of day.singles) ctx.fillRect(left + usedW + 2, rowY(r), 3, h);
+    // Poor High/Low (H-1): gestrichelte Linie an der Ober- bzw. Unterkante des Profils
+    const dashed = (y: number) => {
+      ctx.fillStyle = POOR_COLOR;
+      for (let x = left; x < left + usedW + 10; x += 6) ctx.fillRect(x, Math.round(y), 3, 2);
+    };
+    if (day.poorHigh) dashed(rowY(day.rowLo + day.counts.length - 1) - 2);
+    if (day.poorLow) dashed(rowY(day.rowLo - 1));
     if (day.ibPrice) {
       ctx.fillStyle = IB_COLOR;
       const yt = this.yOf(day.ibPrice[1]);
@@ -795,10 +987,16 @@ export class TpoView {
       if (day.poc !== null) lines.push(`POC ${row(day.poc)}`);
       lines.push(`TPO ${day.total} (↑${day.above} ↓${day.below})`);
       if (day.ibPrice) lines.push(`IB ${px(day.ibPrice[0])}–${px(day.ibPrice[1])}`);
+      if (day.poorHigh || day.poorLow)
+        lines.push(
+          [day.poorHigh ? 'Poor High' : '', day.poorLow ? 'Poor Low' : '']
+            .filter(Boolean)
+            .join(' · '),
+        );
     }
     if (day.missingBlocks > 0) lines.push(`${day.missingBlocks} Blöcke ohne Daten`);
     lines
-      .slice(0, 6)
+      .slice(0, 7)
       .forEach((l, i) => ctx.fillText(l, x0 + PAD, y0 + i * 12, this.colW - 2 * PAD));
   }
 }
@@ -821,4 +1019,38 @@ function niceStep(raw: number): number {
   const p = 10 ** Math.floor(Math.log10(raw));
   for (const m of [1, 2, 5, 10]) if (m * p >= raw) return m * p;
   return 10 * p;
+}
+
+/**
+ * W-2: vorbereitete Tage über das Zellbudget hinaus verdrängen – älteste Benutzung zuerst (Map-Reihenfolge
+ * = LRU), Tage in [keepLo, keepHi] (sichtbar ± 1) nie. Liefert die verbleibende Zellzahl.
+ */
+export function evictTpoDays(
+  days: Map<number, { total: number }>,
+  held: number,
+  budget: number,
+  keepLo: number,
+  keepHi: number,
+): number {
+  for (const [d, day] of days) {
+    if (held <= budget) break;
+    if (d >= keepLo && d <= keepHi) continue;
+    days.delete(d);
+    held -= day.total;
+  }
+  return held;
+}
+
+/** H-3: Kopf einer Tages-Bar-Antwort gegen die Anfrage; '' = passt. */
+export function tpoBarsHeaderProblem(
+  h: { kind: string; sym: string; tf: string | null; from: number; to: number },
+  sym: string,
+  tf: string,
+  from: number,
+): string {
+  if (h.kind !== 'bars') return `kind ${h.kind}`;
+  if (h.sym !== sym) return `sym ${h.sym}`;
+  if (h.tf !== tf) return `tf ${h.tf}`;
+  if (h.from !== from || h.to !== from + DAY_MS) return `Zeitraum [${h.from}, ${h.to})`;
+  return '';
 }

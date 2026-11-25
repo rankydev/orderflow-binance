@@ -141,7 +141,10 @@ Volumenprofile) markiert jeder Block (Standard 30 min, wählbar 5 min…4 h) jed
 Buchstaben A–Z, a–z, danach von vorn (bei 5-min-Blöcken unterscheidet der Farbverlauf die Durchläufe), unter 9 px
 Zeilenhöhe Blöcke. POC und VA 70 % (Kern-Helfer, gleiche Regeln), VA kräftiger, außerhalb blasser, VAH/VAL-Linien, Initial
 Balance (erste 60 min) als Balken links, Single Prints orange, Open/Close-Striche, Volumenprofil rechts (gleiche
-Zeilengröße), Zusammenfassung je Tag (Range, VA, POC, TPO ↑/↓, IB, fehlende Blöcke). Quelle: die Bars des gröbsten
+Zeilengröße), Poor High/Low (oberste/unterste Zeile mit ≥ 2 TPOs, gestrichelt), Zusammenfassung je Tag (Range, VA,
+POC, TPO ↑/↓, IB, Poor High/Low, fehlende Blöcke). Speicher: höchstens 20 000 Zeilen je Tag (feinere manuelle
+Zeilengröße wird angehoben, mit Hinweis) und 3 Mio. vorbereitete Zellen (LRU, sichtbare Tage ± 1 bleiben); unter
+1,5 px Zeilenhöhe nur die Profilform je Pixelzeile. In der TPO-Ansicht ruht der Chart (keine Anfragen). Quelle: die Bars des gröbsten
 angebotenen Zeitrahmens, der Blockgröße, Initial Balance und Tagesgrenze teilt (30-min-Blöcke: 30m-Bars), je Tag eine
 Anfrage, nur sichtbare Tage ± 1. Ziehen verschiebt Tage und Preis, Mausrad zoomt den Preis, Shift + Mausrad die
 Spaltenbreite. URL: `view=tpo`, `tb=<min>`, `tib=<min>`, `ts=1` (Split), `tvp=0` (ohne Volumenprofil), `tr=<Ticks>`.
