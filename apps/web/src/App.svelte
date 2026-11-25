@@ -91,7 +91,9 @@
           refreshLists();
           ready = true;
           // Bereich aus der URL erst mit bekanntem Datenbereich setzen
-          if (prof.range && !ctl!.profile.range) ctl!.profile.setRange(prof.range);
+          if (prof.range && !ctl!.profile.range) {
+            if (!ctl!.profile.setRange(prof.range, prof.rangeNote)) readProfile();
+          }
           syncUrl();
         })
         .catch((e: unknown) => {
@@ -143,6 +145,7 @@
     p.manualR = prof.R;
     p.extend = prof.extend;
     p.showVa = prof.showVa;
+    p.scaleMode = prof.scale;
     if (!prof.range && p.range) p.clearRange();
     p.changed();
     pro = p.readout();
@@ -213,12 +216,17 @@
     ['buysell', 'Buy/Sell'],
     ['delta', 'Delta'],
   ];
-  const OFFSETS = Array.from({ length: 25 }, (_, i) => i - 12);
+  // −11…+12: −12 und +12 ergäben dieselben Tagesgrenzen (12:00 UTC)
+  const OFFSETS = Array.from({ length: 24 }, (_, i) => i - 11);
   function startSelect(): void {
     if (!ctl || !ready) return;
     if (ctl.profile.selecting) ctl.profile.cancelSelect();
     else ctl.profile.startSelect();
     pro = ctl.profile.readout();
+  }
+  function dismissProfileError(): void {
+    ctl?.profile.dismissError();
+    if (ctl) pro = ctl.profile.readout();
   }
   function clearRange(): void {
     ctl?.profile.clearRange();
@@ -329,6 +337,14 @@
       >
         verlängern
       </button>
+      <button
+        class:active={prof.scale === 'common'}
+        aria-pressed={prof.scale === 'common'}
+        title="Tagesprofile: gemeinsame Skala über die sichtbaren Tage statt je Profil"
+        onclick={() => setProf({ scale: prof.scale === 'common' ? 'profile' : 'common' })}
+      >
+        gemeinsame Skala
+      </button>
     </div>
     <label>
       VA
@@ -406,7 +422,10 @@
         {#if pro && pro.mode !== 'off'}
           · Profil {pro.rLabel}{pro.rAuto ? ' (auto)' : ''}
           {#if pro.note}<span class="hint">· {pro.note}</span>{/if}
-          {#if pro.error}<span class="err">· {pro.error}</span>{/if}
+          {#if pro.error}<span class="err">· {pro.error}</span>
+            <button class="dismiss" title="Meldung schließen" onclick={dismissProfileError}>
+              ✕
+            </button>{/if}
         {:else if pro?.note}<span class="hint">· {pro.note}</span>{/if}
       </span>
     {/if}
@@ -440,13 +459,18 @@
           gezeichnet · Requests {pro.requests}
         </span>
         {#if pro.note}<span class="hint" data-k="pnote">{pro.note}</span>{/if}
-        {#if pro.error}<span class="err" data-k="perror">{pro.error}</span>{/if}
+        {#if pro.error}<span class="err" data-k="perror">{pro.error}</span>
+          <button class="dismiss" title="Meldung schließen" onclick={dismissProfileError}>
+            ✕
+          </button>{/if}
       {/if}
     {/if}
     <span class="legend">
       Mengen in Basiswährung (BTC) · Delta = Ask − Bid · Bid×Ask: Bid links, Ask rechts · gelber
       Rahmen = POC · Profil: Bid (rot) links, Ask (grün) rechts; Delta grün/rot nach Vorzeichen;
-      gelbe Linie = POC, graue Linien = VAH/VAL
+      gelbe Linie = POC, graue Linien = VAH/VAL; Skala {prof.scale === 'common'
+        ? 'gemeinsam über die sichtbaren Tage'
+        : 'je Profil (längster Balken = größte Zeile des Tages)'}
     </span>
     <span class="hover">{hover}</span>
     <a class="attr" href={CHARTS_URL} rel="noreferrer">{CHARTS_ATTRIBUTION}</a>
@@ -532,6 +556,10 @@
   }
   .diag-toggle {
     padding: 0 6px;
+    font: inherit;
+  }
+  .dismiss {
+    padding: 0 4px;
     font: inherit;
   }
   .legend {

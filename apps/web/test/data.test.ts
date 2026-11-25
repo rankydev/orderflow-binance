@@ -558,3 +558,22 @@ describe('RequestQueue (§5.4 + Review W2)', () => {
     expect(retryAfterMs(null)).toBeNull();
   });
 });
+
+describe('Kachel-422 (TILE-FORMAT.md)', () => {
+  it('reason aus dem Körper; ohne reason endgültig, mit reason nach REJECT_TTL_MS erneut', async () => {
+    const { tileRejectReason } = await import('../src/lib/controller.ts');
+    expect(tileRejectReason('{"error":"x","reason":"tile_cells_exceeded","suggestR":50}')).toBe(
+      'tile_cells_exceeded',
+    );
+    expect(tileRejectReason('{"error":"x"}')).toBe('');
+    expect(tileRejectReason('<html>')).toBe('');
+    expect(tileRejectReason(undefined)).toBe('');
+    let now = 0;
+    const store = new FootprintStore(3, undefined, () => now);
+    store.markRejected('S', 1);
+    store.markRejected('S', 2, true);
+    now = REJECT_TTL_MS + 1;
+    expect(store.has('S', 1)).toBe(false); // wird erneut angefragt
+    expect(store.has('S', 2)).toBe(true); // bleibt abgelehnt
+  });
+});

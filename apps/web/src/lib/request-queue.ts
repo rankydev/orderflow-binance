@@ -12,6 +12,8 @@ export interface Want {
   key: string;
   url: string;
   priority: number;
+  /** am Browser-Cache vorbei laden (z. B. Neuladen nach einer Querprüfungs-Abweichung) */
+  reload?: boolean;
 }
 
 export interface QueueStats {
@@ -25,7 +27,10 @@ export interface QueueStats {
   queued: number;
 }
 
-export type FetchFn = (url: string, init: { signal: AbortSignal }) => Promise<Response>;
+export type FetchFn = (
+  url: string,
+  init: { signal: AbortSignal; cache?: RequestCache },
+) => Promise<Response>;
 export type Scheduler = (fn: () => void, ms: number) => () => void;
 
 const RETRYABLE = new Set([408, 425, 429]);
@@ -181,7 +186,7 @@ export class RequestQueue {
     const release = () => {
       if (this.inFlight.get(w.key) === ac) this.inFlight.delete(w.key);
     };
-    this.fetchFn(w.url, { signal: ac.signal })
+    this.fetchFn(w.url, w.reload ? { signal: ac.signal, cache: 'reload' } : { signal: ac.signal })
       .then(async (res) => {
         if (ac.signal.aborted) return;
         if (res.ok) {

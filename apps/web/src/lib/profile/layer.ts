@@ -2,8 +2,10 @@
 // Pane-Primitive von lightweight-charts – gezeichnet im Zeichenzyklus der Bibliothek unter den Kerzen
 // bzw. Footprint-Zellen, kein DOM-Overlay. Mausbewegungen zeichnen nur im Auswahlmodus neu (Vorschau).
 // Daten wie bei den Kacheln: nur Sichtbares + 1 Tag Padding, Tagesprofile in Batches à 16 Tage über
-// /profiles/daily, Abbruch bei Bedarfswechsel, LRU, Wiederholung/Backoff über die RequestQueue, Fehler
-// sichtbar, 422 → einmal mit suggestR, finale Tage gegen die geladenen Bars geprüft.
+// /profiles/daily (nicht finaler Rest eines Batches getrennt nachgeladen), Abbruch bei Bedarfswechsel,
+// LRU, Wiederholung/Backoff über eine eigene RequestQueue mit 2 parallelen Anfragen, die zurücksteht,
+// solange Kacheln/Bars laden (W-4), Fehler sichtbar, 422 → einmal mit suggestR, finale Tage gegen die
+// geladenen Bars geprüft.
 import {
   checkDailyProfiles,
   checkRangeProfile,
@@ -26,25 +28,31 @@ import {
   batchWindow,
   compareProfileWithBars,
   DAY_MS,
-  DAY_PROFILE_SHARE,
   dailyKey,
+  dayDetail,
   firstTouch,
   MIN_DAY_PX,
+  MINUTE_MS,
   Paint,
   PROFILE_DEFAULTS,
   prepareProfile,
   profileDayOf,
   profileDayWindow,
   profileLadder,
+  profilePlacement,
   profileRects,
   profileRowSize,
+  profileScale,
   rangeFromBars,
   RANGE_PROFILE_SHARE,
   rangeKey,
+  rowBarLength,
   rowMidY,
   wantedDayBatches,
+  type DayDetail,
   type PreparedProfile,
   type ProfileMode,
+  type ProfileScaleMode,
   type ProfileView,
   type Rect,
 } from './model.ts';
@@ -64,8 +72,12 @@ export interface ProfileHost {
   visibleTimeRange(): [number, number] | null;
   /** Preis → y (CSS-px) der gerade sichtbaren Serie. */
   priceToY(price: number): number | null;
-  /** Liegen die Bars von [fromMs, toMs) vollständig, final und ohne Lücke im Fenster? */
+  /** Liegen die Bars von [fromMs, toMs) vollständig, unveränderlich und ohne Lücke im Fenster? */
   barsCoverFinal(fromMs: number, toMs: number): boolean;
+  /** Zeichnet der Footprint gerade Zellen (Detailstufe ≥ 2)? Dann schmalere Profile (W-2c). */
+  footprintActive(): boolean;
+  /** Laden gerade Kacheln oder Bars (laufend oder wartend)? Dann stehen Profile zurück (W-4). */
+  busy(): boolean;
 }
 
 /** Farben (Kerzenfarben, halbtransparent, damit Kerzen/Zellen davor lesbar bleiben). */
@@ -77,7 +89,7 @@ export const PROFILE_COLORS: Record<Paint, string> = {
   [Paint.DeltaNeg]: 'rgba(239, 83, 80, 0.55)',
 };
 const PAINT_ORDER = [Paint.Total, Paint.Sell, Paint.Buy, Paint.DeltaPos, Paint.DeltaNeg] as const;
-const POC_COLOR = 'rgba(242, 201, 76, 0.95)';
+export const POC_COLOR = 'rgba(242, 201, 76, 0.95)';
 const VA_LINE = 'rgba(190, 200, 220, 0.70)';
 const VA_FILL = 'rgba(190, 200, 220, 0.06)';
 const RANGE_FILL = 'rgba(100, 140, 220, 0.07)';
@@ -86,19 +98,44 @@ const RANGE_EDGE = 'rgba(100, 140, 220, 0.85)';
 export const PROFILE_CACHE_ENTRIES = 96;
 /** Nicht finale Antworten (laufender Tag) nach so vielen ms neu anfragen (Server: no-cache). */
 export const PROFILE_NONFINAL_TTL_MS = 60_000;
+/** Parallele Profilanfragen (die API hat 4 Datenbank-Slots; Kacheln und Bars haben Vorrang, W-4). */
+export const PROFILE_MAX_PARALLEL = 2;
+/** Wartezeit, bis zurückgestellter Profilbedarf erneut geprüft wird (ms). */
+export const PROFILE_HOLD_MS = 150;
 /** Mindestbreite des Bereichsprofils (px), auch bei schmalem Bereich. */
 const RANGE_MIN_W = 40;
+/** Längster Bereich wie die API (3 660 Tage). */
+const MAX_RANGE_MS = 3_660 * DAY_MS;
+/** Länge des POC-Strichs der Silhouette (CSS-px). */
+const POC_TICK_PX = 6;
+/** Obergrenze der Hilfstabellen (422-Untergrenzen, Querprüfungszähler). */
+const MAX_AUX_ENTRIES = 512;
 
 interface Entry {
   final: boolean;
   loadedAt: number;
   /** Tagesprofile eines Batches nach Tagesbeginn (ms); Bereichsprofil unter 0. */
   profiles: Map<number, PreparedProfile>;
+  /** Tagesprofile: Beginn des nicht finalen Rests (wird allein nachgeladen), sonst null. */
+  openFrom: number | null;
+  /** Ende des angefragten Zeitraums (ms) */
+  to: number;
+}
+
+/** Angefragter Zeitraum je Schlüssel (Antwort wird dagegen geprüft). */
+interface Request {
+  from: number;
+  to: number;
+  offsetH: number;
+  va: number;
+  /** Rest-Anfrage: Schlüssel des Batches, in den die Tage übernommen werden */
+  base: string | null;
 }
 
 export interface ProfileReadout {
   mode: ProfileMode;
   view: ProfileView;
+  scale: ProfileScaleMode;
   R: number;
   rAuto: boolean;
   rLabel: string;
@@ -107,6 +144,8 @@ export interface ProfileReadout {
   /** Hinweise (ausgelassene Tage, Server-R-Vorschlag), sonst ''. */
   note: string;
   error: string;
+  /** Fehler bleibt bis Symbolwechsel/Schließen stehen (Querprüfung) */
+  sticky: boolean;
   selecting: boolean;
   requests: number;
   inFlight: number;
@@ -124,12 +163,14 @@ export interface RangeSummary {
   va: string;
 }
 
-/** Gezeichnete Fläche eines Profils (CSS-px) für den Hover. */
-interface Hit {
+/** Gezeichnetes Profil (CSS-px) für den Hover: Balkenlängen aus Ansicht und Skala (W-1). */
+export interface Hit {
   x0: number;
-  x1: number;
+  maxW: number;
   p: PreparedProfile;
   range: boolean;
+  view: ProfileView;
+  scale: number;
 }
 
 export class ProfileLayer implements IPanePrimitive<Time> {
@@ -137,6 +178,8 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   view: ProfileView = PROFILE_DEFAULTS.view;
   va = PROFILE_DEFAULTS.va;
   offsetH = PROFILE_DEFAULTS.offsetH;
+  /** Skala der Tagesprofile: je Profil (Standard) oder gemeinsam über die sichtbaren Tage */
+  scaleMode: ProfileScaleMode = 'profile';
   /** VA-Fläche + VAH/VAL-Linien zeigen */
   showVa = true;
   /** POC/VAH/VAL nach rechts verlängern, bis der Preis sie berührt (Naked Levels) */
@@ -145,6 +188,8 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   manualR: number | null = null;
   /** Bereich [from, to) in ms (Minuten), höchstens einer */
   range: [number, number] | null = null;
+  /** Hinweis zum Bereich (gekürzt, vertauscht, außerhalb der Daten) */
+  rangeNote = '';
   selecting = false;
   /** Nach Datenankunft/Zustandsänderung (UI aktualisiert Anzeige/Zusammenfassung). */
   onChange: (() => void) | null = null;
@@ -153,9 +198,13 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   private readonly host: ProfileHost;
   private readonly queue: RequestQueue;
   private readonly cache = new Map<string, Entry>();
+  private readonly requests = new Map<string, Request>();
+  private readonly reloadKeys = new Set<string>();
   private requestUpdate: (() => void) | null = null;
   private readonly views: IPanePrimitivePaneView[];
   private error = '';
+  /** W-3: wiederholte Abweichung von den Bars – bleibt bis Symbolwechsel oder Schließen */
+  private stickyError = '';
   private daysDrawn = 0;
   private daysSkipped = 0;
   /** 422: R-Untergrenze je Anfrage-Bereich (Schlüssel ohne R), höchstens ein Versuch je Bereich. */
@@ -165,8 +214,19 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   private selectHover: number | null = null;
   private readonly rects: Rect[] = [];
   private hits: Hit[] = [];
+  private holdTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Naked-Level-Ergebnisse je (Profil, Zeile) für das aktuelle Item-Array (nicht je Frame) */
+  private nakedItems: readonly BarItem[] | null = null;
+  private readonly naked = new Map<string, number>();
   /** Zähler für Tests/Messung */
-  readonly counters = { draws: 0, rectsDrawn: 0, crossChecks: 0, crossMismatches: 0 };
+  readonly counters = {
+    draws: 0,
+    rectsDrawn: 0,
+    crossChecks: 0,
+    crossMismatches: 0,
+    held: 0,
+    nakedScans: 0,
+  };
   /** Zeichenzeiten (ms) der letzten 512 Frames als Ring, Index = counters.draws mod 512 (Messung). */
   readonly drawMs = new Float64Array(512);
 
@@ -175,7 +235,8 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     this.queue = new RequestQueue(
       (key, buf) => this.onLoaded(key, buf),
       (key, status, _err, body) => this.onRejected(key, status, body),
-      fetchFn,
+      fetchFn ?? ((u, i) => fetch(u, i)),
+      PROFILE_MAX_PARALLEL,
     );
     this.queue.label = (k) => (k.startsWith('pd|') ? 'Tagesprofile' : 'Bereichsprofil');
     const renderer: IPrimitivePaneRenderer = {
@@ -201,6 +262,8 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   }
 
   destroy(): void {
+    if (this.holdTimer) clearTimeout(this.holdTimer);
+    this.holdTimer = null;
     this.queue.cancelAll();
   }
 
@@ -220,10 +283,21 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   resetForSymbol(): void {
     this.autoR = null;
     this.rFloor.clear();
+    this.crossFails.clear();
+    this.stickyError = '';
+    this.error = '';
     this.range = null;
+    this.rangeNote = '';
     if (this.mode === 'range') this.mode = 'off';
     else if (this.mode === 'both') this.mode = 'daily';
     this.cancelSelect();
+  }
+
+  /** Fehler schließen (auch den stehenbleibenden der Querprüfung). */
+  dismissError(): void {
+    this.stickyError = '';
+    this.error = '';
+    this.onChange?.();
   }
 
   /** Gestenende: automatische Zeilengröße nach Pixelhöhe (px je price_unit der sichtbaren Skala). */
@@ -272,33 +346,46 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     const wants: Want[] = [];
     const retain = new Set<string>();
     const now = performance.now();
-    const add = (key: string, url: string, priority: number) => {
+    const want = (key: string, url: string, priority: number, req: Request) => {
       retain.add(key);
-      const e = this.cache.get(key);
-      if (e && (e.final || now - e.loadedAt < PROFILE_NONFINAL_TTL_MS)) {
-        // LRU: Benutzung frischt auf
-        this.cache.delete(key);
-        this.cache.set(key, e);
-        return;
-      }
-      if (e && this.queue.isFinal(key)) this.queue.forgetFailure(key);
-      wants.push({ key, url, priority });
+      if (this.queue.isFinal(key) && this.reloadKeys.has(key)) this.queue.forgetFailure(key);
+      this.requests.set(key, req);
+      wants.push({ key, url, priority, reload: this.reloadKeys.has(key) });
+    };
+    const fresh = (key: string, e: Entry | undefined): boolean => {
+      if (!e) return false;
+      // LRU: Benutzung frischt auf
+      this.cache.delete(key);
+      this.cache.set(key, e);
+      return e.final || now - e.loadedAt < PROFILE_NONFINAL_TTL_MS;
     };
     const base = `${this.host.apiBase}/api/v1`;
     const sym = encodeURIComponent(s.name);
+    const oh = this.offsetH;
+    const va = this.va;
     if (this.mode === 'daily' || this.mode === 'both') {
       // LOD: sind die Tage so schmal, dass kein Profil gezeichnet würde, gar nicht erst laden
       if (this.dayWidthPx() >= MIN_DAY_PX) {
-        const batches = wantedDayBatches(vis[0], vis[1], this.offsetH, s.dataFrom, s.dataTo);
+        const batches = wantedDayBatches(vis[0], vis[1], oh, s.dataFrom, s.dataTo);
         batches.forEach((b, i) => {
           const key = this.dailyKeyFor(s.name, b);
           const r = Number(key.split('|')[2]);
-          const [from, to] = clampBatch(batchWindow(b, this.offsetH), s, this.offsetH);
-          add(
-            key,
-            `${base}/profiles/daily?sym=${sym}&from=${from}&to=${to}&R=${r}&offsetH=${this.offsetH}&va=${this.va}`,
+          const e = this.cache.get(key);
+          if (fresh(key, e)) {
+            retain.add(key);
+            return;
+          }
+          // nicht finaler Batch: nur den offenen Rest neu laden (finale Tage bleiben im Cache)
+          const [from, to] =
+            e && e.openFrom !== null ? [e.openFrom, e.to] : clampBatch(batchWindow(b, oh), s, oh);
+          const k = e && e.openFrom !== null ? `${key}|tail` : key;
+          want(
+            k,
+            `${base}/profiles/daily?sym=${sym}&from=${from}&to=${to}&R=${r}&offsetH=${oh}&va=${va}`,
             i + 1,
+            { from, to, offsetH: oh, va, base: k === key ? null : key },
           );
+          if (k !== key) retain.add(key);
         });
       }
     }
@@ -306,7 +393,26 @@ export class ProfileLayer implements IPanePrimitive<Time> {
       const [from, to] = this.range;
       const key = this.rangeKeyFor(s.name, from, to);
       const r = Number(key.split('|')[2]);
-      add(key, `${base}/profile?sym=${sym}&from=${from}&to=${to}&R=${r}&va=${this.va}`, 0);
+      if (fresh(key, this.cache.get(key))) retain.add(key);
+      else
+        want(key, `${base}/profile?sym=${sym}&from=${from}&to=${to}&R=${r}&va=${va}`, 0, {
+          from,
+          to,
+          offsetH: oh,
+          va,
+          base: null,
+        });
+    }
+    // W-4: Kacheln und Bars haben Vorrang – solange sie laden, keine neuen Profilanfragen
+    if (wants.length > 0 && this.host.busy()) {
+      this.counters.held++;
+      this.queue.setWanted([], retain);
+      if (!this.holdTimer)
+        this.holdTimer = setTimeout(() => {
+          this.holdTimer = null;
+          this.frame();
+        }, PROFILE_HOLD_MS);
+      return;
     }
     this.queue.setWanted(wants, retain);
   }
@@ -319,38 +425,76 @@ export class ProfileLayer implements IPanePrimitive<Time> {
 
   private onLoaded(key: string, buf: ArrayBuffer): void {
     const s = this.host.sym();
-    if (!s) return;
+    const req = this.requests.get(key);
+    this.requests.delete(key);
+    this.reloadKeys.delete(key);
+    if (!s || !req) return;
     const json: unknown = JSON.parse(new TextDecoder().decode(buf));
     const R = Number(key.split('|')[2]);
+    const bad = (x: {
+      R: number;
+      sym: string;
+      tickRefUnits: number;
+      va: number;
+      from: number;
+      to: number;
+    }) =>
+      x.R !== R ||
+      x.sym !== s.name ||
+      x.tickRefUnits !== s.tickRefUnits ||
+      x.va !== req.va ||
+      x.from !== req.from ||
+      x.to !== req.to;
     if (key.startsWith('pd|')) {
       const x = json as DailyProfilesResponse;
       const problems = checkDailyProfiles(x);
       if (problems.length > 0) throw new Error(problems.slice(0, 3).join('; '));
-      if (x.R !== R || x.sym !== s.name || x.tickRefUnits !== s.tickRefUnits)
-        throw new Error('Antwort passt nicht zur Anfrage');
-      const profiles = new Map<number, PreparedProfile>();
+      if (bad(x) || x.offsetH !== req.offsetH) throw new Error('Antwort passt nicht zur Anfrage');
+      const target = req.base ? this.cache.get(req.base) : undefined;
+      const profiles = target ? target.profiles : new Map<number, PreparedProfile>();
+      const baseKey = req.base ?? key;
+      let openFrom: number | null = null;
       for (const d of x.days) {
-        const k = `${key}#${d.from}`;
+        if (d.from < req.from || d.to > req.to) throw new Error('Tag außerhalb der Anfrage');
+        const k = `${baseKey}#${d.from}`;
         profiles.set(d.from, prepareProfile(k, d, d.from, d.to, d.final, R, s.tickRefUnits));
+        if (!d.final && openFrom === null) openFrom = d.from;
       }
-      this.put(key, { final: x.final, loadedAt: performance.now(), profiles });
+      // Antwort nicht final, aber alle gelieferten Tage final (z. B. offener Tag ohne Trades)
+      if (!x.final && openFrom === null) openFrom = Math.max(req.from, req.to - DAY_MS);
+      if (req.base && !target) return; // Batch inzwischen verdrängt: beim nächsten Bedarf ganz laden
+      this.put(baseKey, {
+        final: x.final,
+        loadedAt: performance.now(),
+        profiles,
+        openFrom: x.final ? null : openFrom,
+        to: target ? target.to : req.to,
+      });
+      this.error = '';
+      this.crossCheck(baseKey);
     } else {
       const x = json as RangeProfileResponse;
       const problems = checkRangeProfile(x);
       if (problems.length > 0) throw new Error(problems.slice(0, 3).join('; '));
-      if (x.R !== R || x.sym !== s.name || x.tickRefUnits !== s.tickRefUnits)
-        throw new Error('Antwort passt nicht zur Anfrage');
+      if (bad(x)) throw new Error('Antwort passt nicht zur Anfrage');
       const p = prepareProfile(key, x.profile, x.from, x.to, x.final, R, s.tickRefUnits);
-      this.put(key, { final: x.final, loadedAt: performance.now(), profiles: new Map([[0, p]]) });
+      this.put(key, {
+        final: x.final,
+        loadedAt: performance.now(),
+        profiles: new Map([[0, p]]),
+        openFrom: null,
+        to: x.to,
+      });
+      this.error = '';
+      this.crossCheck(key);
     }
-    this.error = '';
-    this.crossCheck(key);
     this.onChange?.();
     this.redraw();
   }
 
   private onRejected(key: string, status: number, body?: string): void {
-    const parts = key.split('|');
+    this.requests.delete(key);
+    const parts = key.replace(/\|tail$/, '').split('|');
     const usedR = Number(parts[2]);
     const scope = [parts[0], parts[1], ...parts.slice(3)].join('|');
     if (status === 422) {
@@ -364,12 +508,15 @@ export class ProfileLayer implements IPanePrimitive<Time> {
       }
       // einmal mit dem Vorschlag wiederholen (gilt nur für den aktuellen Datenstand, daher kein Cache)
       if (suggest !== null && suggest > usedR && !this.rFloor.has(scope)) {
+        if (this.rFloor.size >= MAX_AUX_ENTRIES) this.rFloor.clear();
         this.rFloor.set(scope, suggest);
         this.frame();
         this.onChange?.();
         return;
       }
       this.error = `${this.queue.label(key)}: Zeitraum zu groß für R ${usedR}`;
+    } else if (status === 400 && key.startsWith('pr|')) {
+      this.error = 'Bereichsprofil: Bereich zu groß oder außerhalb der Daten';
     } else {
       this.error =
         status === 0
@@ -389,8 +536,8 @@ export class ProfileLayer implements IPanePrimitive<Time> {
 
   /**
    * Auftrag 6: finale Tagesprofile (und ein finales Bereichsprofil) gegen die Summe der geladenen Bars
-   * desselben Zeitraums – nur, wenn die Bars den Zeitraum vollständig und final abdecken. Erste
-   * Abweichung → einmal neu laden; wiederholt → sichtbarer Fehler.
+   * desselben Zeitraums – nur, wenn die Bars den Zeitraum vollständig und unveränderlich abdecken.
+   * Erste Abweichung → einmal am Browser-Cache vorbei neu laden; wiederholt → Fehler, der stehen bleibt.
    */
   crossCheck(key: string): void {
     const e = this.cache.get(key);
@@ -406,15 +553,17 @@ export class ProfileLayer implements IPanePrimitive<Time> {
         continue;
       }
       this.counters.crossMismatches++;
+      if (this.crossFails.size >= MAX_AUX_ENTRIES) this.crossFails.clear();
       const n = (this.crossFails.get(ck) ?? 0) + 1;
       this.crossFails.set(ck, n);
       const day = new Date(p.from).toISOString().slice(0, 16).replace('T', ' ');
       console.warn(`Profil ${day} UTC passt nicht zu den Bars: ${diff}`);
       if (n === 1) {
-        this.cache.delete(key); // einmal neu laden
+        this.cache.delete(key); // einmal neu laden, am Browser-Cache vorbei (final = max-age 1 Woche)
+        this.reloadKeys.add(key);
         this.frame();
       } else {
-        this.error = `Profil ab ${day} UTC passt nicht zu den Bars (${diff})`;
+        this.stickyError = `Profil ab ${day} UTC passt nicht zu den Bars (${diff})`;
       }
       return;
     }
@@ -458,15 +607,40 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     return true;
   }
 
-  /** Bereich setzen (Auswahl oder URL), Modus so erweitern, dass er sichtbar ist. */
-  setRange(r: [number, number]): void {
-    this.range = r;
+  /**
+   * Bereich setzen (Auswahl oder URL): auf den Datenbereich (Minuten) und höchstens 3 660 Tage gekürzt,
+   * mit sichtbarem Hinweis; außerhalb der Daten nicht übernommen. Modus so erweitern, dass er sichtbar
+   * ist. Liefert false, wenn kein Bereich gesetzt wurde.
+   */
+  setRange(r: [number, number], note = ''): boolean {
+    const s = this.host.sym();
     this.selecting = false;
     this.selectAnchor = null;
     this.selectHover = null;
+    let [from, to] = r;
+    const notes = note ? [note] : [];
+    if (s) {
+      const lo = Math.floor(s.dataFrom / MINUTE_MS) * MINUTE_MS;
+      const hi = Math.ceil(s.dataTo / MINUTE_MS) * MINUTE_MS;
+      if (to <= lo || from >= hi) {
+        this.rangeNote = 'Bereich außerhalb der Daten – nicht übernommen';
+        this.changed();
+        return false;
+      }
+      if (from < lo || to > hi) notes.push('Bereich auf den Datenbereich gekürzt');
+      from = Math.max(from, lo);
+      to = Math.min(to, hi);
+    }
+    if (to - from > MAX_RANGE_MS) {
+      from = to - MAX_RANGE_MS;
+      notes.push('Bereich auf 3 660 Tage gekürzt');
+    }
+    this.range = [from, to];
+    this.rangeNote = notes.join('; ');
     if (this.mode === 'off') this.mode = 'range';
     else if (this.mode === 'daily') this.mode = 'both';
     this.changed();
+    return true;
   }
 
   /** Zeigerzeit während der Auswahl (nur dann wird neu gezeichnet). */
@@ -480,6 +654,7 @@ export class ProfileLayer implements IPanePrimitive<Time> {
 
   clearRange(): void {
     this.range = null;
+    this.rangeNote = '';
     if (this.mode === 'range') this.mode = 'off';
     else if (this.mode === 'both') this.mode = 'daily';
     this.changed();
@@ -498,6 +673,7 @@ export class ProfileLayer implements IPanePrimitive<Time> {
       );
     if (this.daysSkipped > 0)
       notes.push(`${this.daysSkipped} Tagesprofile ausgelassen (Tag < ${MIN_DAY_PX} px breit)`);
+    if (this.rangeNote) notes.push(this.rangeNote);
     if (this.selecting)
       notes.push(
         this.selectAnchor === null
@@ -507,13 +683,15 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     return {
       mode: this.mode,
       view: this.view,
+      scale: this.scaleMode,
       R,
       rAuto: this.manualR === null,
       rLabel: s && R ? `${exactDecimal(R * s.tickRefUnits, s.priceDecimals)} USDT` : '',
       daysDrawn: this.daysDrawn,
       daysSkipped: this.daysSkipped,
       note: notes.join('; '),
-      error: this.error || this.queue.lastError,
+      error: this.stickyError || this.error || this.queue.lastError,
+      sticky: this.stickyError !== '',
       selecting: this.selecting,
       requests: this.queue.stats.started,
       inFlight: this.queue.stats.inFlight,
@@ -565,35 +743,42 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     };
   }
 
+  /** Gezeichnete Profile des letzten Frames (Hover, Tests). */
+  get drawnHits(): readonly Hit[] {
+    return this.hits;
+  }
+
   /**
-   * Hover über einem gezeichneten Profil (x in CSS-px, unit = Preis in price_unit): exakte Werte der
-   * Zeile, sonst ''. Nur gezeichnete Flächen zählen (letzter Frame), Bereichsprofil vor Tagesprofil.
+   * Hover über einem gezeichneten Profilbalken (x in CSS-px, unit = Preis in price_unit): exakte Werte
+   * der Zeile, sonst '' (dann zeigt der Controller Footprint/Kerze). Getroffen ist nur der gezeichnete
+   * Balken dieser Zeile, nicht die ganze Profilbreite (W-1). Bereichsprofil vor Tagesprofil.
    */
   hoverText(x: number, unit: number): string {
     const s = this.host.sym();
     if (!s) return '';
-    for (const h of this.hits) {
-      if (x < h.x0 || x > h.x1) continue;
-      const p = h.p;
-      const r = Math.floor(unit / p.width);
-      const i = r - p.rowLo;
-      if (i < 0 || i >= p.buy.length) continue;
-      const b = p.buy[i]!;
-      const sl = p.sell[i]!;
-      const q = qtyFormatter(s);
-      const px = (u: number) => exactDecimal(u, s.priceDecimals);
-      const which = h.range
-        ? 'Bereichsprofil'
-        : `Tagesprofil ${new Date(p.from).toISOString().slice(0, 10)}`;
-      const marks = [r === p.poc ? 'POC' : '', r === p.vah ? 'VAH' : '', r === p.val ? 'VAL' : '']
-        .filter(Boolean)
-        .join('/');
-      return (
-        `${which} · Zeile [${px(r * p.width)}, ${px((r + 1) * p.width)})${marks ? ` ${marks}` : ''}` +
-        ` · Bid (Verkäufer) ${q(sl)} · Ask (Käufer) ${q(b)} · gesamt ${q(b + sl)} · Delta ${q(b - sl)}`
-      );
-    }
-    return '';
+    const hit = hitAt(this.hits, x, unit);
+    if (!hit) return '';
+    const { h, i } = hit;
+    const p = h.p;
+    const r = p.rowLo + i;
+    const b = p.buy[i]!;
+    const sl = p.sell[i]!;
+    const q = qtyFormatter(s);
+    const px = (u: number) => exactDecimal(u, s.priceDecimals);
+    const which = h.range
+      ? 'Bereichsprofil'
+      : `Tagesprofil ab ${new Date(p.from).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+    const marks = [r === p.poc ? 'POC' : '', r === p.vah ? 'VAH' : '', r === p.val ? 'VAL' : '']
+      .filter(Boolean)
+      .join('/');
+    const scaleTxt = `längster Balken = ${h.view === 'delta' ? '|Delta| ' : ''}${q(h.scale)}${
+      !h.range && this.scaleMode === 'common' ? ' (gemeinsame Skala)' : ''
+    }`;
+    return (
+      `${which} · Zeile [${px(r * p.width)}, ${px((r + 1) * p.width)})${marks ? ` ${marks}` : ''}` +
+      ` · Bid (Verkäufer) ${q(sl)} · Ask (Käufer) ${q(b)} · gesamt ${q(b + sl)} · Delta ${q(b - sl)}` +
+      ` · ${scaleTxt}`
+    );
   }
 
   // ---------------------------------------------------------------- Zeichnen
@@ -602,13 +787,9 @@ export class ProfileLayer implements IPanePrimitive<Time> {
    * x (CSS-px) des Beginns der Zeit t (ms) auf der indexbasierten Zeitachse: linke Kante des ersten
    * Bars ≥ t; außerhalb des Fensters linear mit tf fortgesetzt.
    */
-  private xOfTime(
-    tMs: number,
-    items: readonly BarItem[],
-    tfSec: number,
-    bs: number,
-  ): number | null {
+  xOfTime(tMs: number, items: readonly BarItem[], tfSec: number, bs: number): number | null {
     const n = items.length;
+    if (n === 0) return null;
     const t = tMs / 1000;
     let lo = 0;
     let hi = n;
@@ -654,8 +835,10 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     if (yA === null || yB === null || yA === yB) return;
     const A = (yB - yA) / (1000 * s.tickRefUnits);
     const yU = (u: number) => (yA + A * (u - ref)) * vpr;
+    const uAt = (yCss: number) => ref + (yCss - yA) / A;
     const H = scope.bitmapSize.height;
     const W = scope.bitmapSize.width / hpr;
+    const g: DrawGeom = { ctx, hpr, vpr, A, yU, uAt, H, W, items, bs };
     this.counters.draws++;
 
     // Auswahlvorschau
@@ -667,50 +850,71 @@ export class ProfileLayer implements IPanePrimitive<Time> {
       if (xa !== null && xb !== null) this.drawRangeBox(ctx, xa, xb, hpr, H);
     }
     if (this.mode === 'off') return;
+    const footprint = this.host.footprintActive();
 
-    // Tagesprofile
+    // Tagesprofile: erst Lage und Detailstufe, dann (bei gemeinsamer Skala) das Maximum, dann zeichnen
     if (this.mode === 'daily' || this.mode === 'both') {
       const d0 = profileDayOf(vis[0] * 1000, this.offsetH) - 1;
       const d1 = profileDayOf(vis[1] * 1000, this.offsetH) + 1;
       const dMin = profileDayOf(s.dataFrom, this.offsetH);
       const dMax = profileDayOf(s.dataTo - 1, this.offsetH);
+      const list: { p: PreparedProfile; x0: number; maxW: number; detail: DayDetail }[] = [];
       for (let d = Math.max(d0, dMin); d <= Math.min(d1, dMax); d++) {
         const [from, to] = profileDayWindow(d, this.offsetH);
         const xa = this.xOfTime(from, items, tf, bs);
         const xb = this.xOfTime(to, items, tf, bs);
-        if (xa === null || xb === null || xb < 0 || xa > W) continue;
-        if (xb - xa < MIN_DAY_PX) {
+        if (xa === null || xb === null || xb <= 0 || xa >= W) continue;
+        const detail = dayDetail(xb - xa);
+        if (detail === 'skip') {
           this.daysSkipped++;
           continue;
         }
+        const place = profilePlacement(xa, xb, W, footprint);
         const p = this.dayProfileAt(from);
-        if (!p) continue;
-        this.drawProfile(
-          ctx,
-          p,
-          xa,
-          (xb - xa) * DAY_PROFILE_SHARE,
-          hpr,
-          vpr,
-          A,
-          yU,
-          H,
-          W,
-          items,
-          false,
-        );
+        if (!place || !p || p.buy.length === 0) continue;
+        list.push({ p, ...place, detail });
+      }
+      // gemeinsame Skala: größte Zeile über die sichtbaren, gleich gebinnten Tagesprofile
+      const common = { total: 0, delta: 0 };
+      if (this.scaleMode === 'common' && list.length > 0) {
+        const w = list[0]!.p.width;
+        for (const x of list) {
+          if (x.p.width !== w) continue;
+          common.total = Math.max(common.total, x.p.maxVol);
+          common.delta = Math.max(common.delta, x.p.maxAbsDelta);
+        }
+      }
+      for (const x of list) {
+        const view: ProfileView = x.detail === 'silhouette' ? 'total' : this.view;
+        const c =
+          this.scaleMode === 'common' && x.p.width === list[0]!.p.width
+            ? view === 'delta'
+              ? common.delta
+              : common.total
+            : 0;
+        this.drawProfile(g, x.p, x.x0, x.maxW, x.detail, view, c || profileScale(x.p, view), false);
         this.daysDrawn++;
       }
     }
-    // Bereichsprofil (über den Tagesprofilen)
+    // Bereichsprofil (über den Tagesprofilen, eigene Skala, gleiche klebende Lage)
     if ((this.mode === 'range' || this.mode === 'both') && this.range) {
       const xa = this.xOfTime(this.range[0], items, tf, bs);
       const xb = this.xOfTime(this.range[1], items, tf, bs);
-      if (xa !== null && xb !== null && xb >= 0 && xa <= W) {
+      if (xa !== null && xb !== null && xb > 0 && xa < W) {
         this.drawRangeBox(ctx, xa, xb, hpr, H);
         const p = this.rangeProfile();
-        const w = Math.max(RANGE_MIN_W, (xb - xa) * RANGE_PROFILE_SHARE);
-        if (p) this.drawProfile(ctx, p, xa, w, hpr, vpr, A, yU, H, W, items, true);
+        const place = profilePlacement(xa, xb, W, footprint, RANGE_PROFILE_SHARE, RANGE_MIN_W);
+        if (p && place && p.buy.length > 0)
+          this.drawProfile(
+            g,
+            p,
+            place.x0,
+            place.maxW,
+            'full',
+            this.view,
+            profileScale(p, this.view),
+            true,
+          );
       }
     }
   }
@@ -731,36 +935,35 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   }
 
   private drawProfile(
-    ctx: CanvasRenderingContext2D,
+    g: DrawGeom,
     p: PreparedProfile,
     x0: number,
     maxW: number,
-    hpr: number,
-    vpr: number,
-    A: number,
-    yU: (u: number) => number,
-    H: number,
-    W: number,
-    items: readonly BarItem[],
+    detail: DayDetail,
+    view: ProfileView,
+    scale: number,
     isRange: boolean,
   ): void {
-    if (p.buy.length === 0) return;
-    // Hover nur über den Balken (Bereichsprofil zuerst geprüft)
-    const hit = { x0, x1: x0 + maxW, p, range: isRange };
+    const { ctx, hpr, vpr, A, yU, uAt, H } = g;
+    const hit: Hit = { x0, maxW, p, range: isRange, view, scale };
     if (isRange) this.hits.unshift(hit);
     else this.hits.push(hit);
+    const full = detail === 'full';
     const rowPx = -A * p.width * vpr;
     const gap = rowPx >= 4 * vpr ? Math.max(1, Math.floor(vpr)) : 0;
     const bx = Math.round(x0 * hpr);
     const bw = maxW * hpr;
-    if (this.showVa && p.val !== null && p.vah !== null) {
+    if (full && this.showVa && p.val !== null && p.vah !== null) {
       const yt = Math.round(yU((p.vah + 1) * p.width));
       const yb = Math.round(yU(p.val * p.width));
       ctx.fillStyle = VA_FILL;
       ctx.fillRect(bx, yt, Math.round(bw), yb - yt);
     }
+    // sichtbare Zeilen analytisch (oben/unten der Pane), statt alle Zeilen umzurechnen
+    const rTop = Math.floor(uAt(0) / p.width);
+    const rBot = Math.floor(uAt(H / vpr) / p.width);
     this.rects.length = 0;
-    profileRects(p, this.view, bx, bw, yU, 0, H, gap, this.rects);
+    profileRects(p, view, bx, bw, yU, 0, H, gap, this.rects, 0.5, scale, [rBot, rTop]);
     this.counters.rectsDrawn += this.rects.length;
     for (const paint of PAINT_ORDER) {
       let any = false;
@@ -776,13 +979,35 @@ export class ProfileLayer implements IPanePrimitive<Time> {
       }
     }
     const lw = Math.max(1, Math.floor(vpr));
+    if (!full) {
+      // Silhouette: nur ein kurzer POC-Strich
+      if (p.poc !== null) {
+        const y = Math.round(rowMidY(p.poc, p.width, yU));
+        ctx.fillStyle = POC_COLOR;
+        ctx.fillRect(bx, y - (lw >> 1), Math.round(Math.min(maxW, POC_TICK_PX) * hpr), lw);
+      }
+      return;
+    }
     const line = (row: number | null, color: string) => {
       if (row === null) return;
       const y = Math.round(rowMidY(row, p.width, yU));
       if (y < 0 || y > H) return;
-      const xEnd = this.extend ? this.nakedEnd(row, p, items, x0 + maxW, W) : x0 + maxW;
       ctx.fillStyle = color;
-      ctx.fillRect(bx, y - (lw >> 1), Math.round(xEnd * hpr) - bx, lw);
+      const end = x0 + maxW;
+      ctx.fillRect(bx, y - (lw >> 1), Math.round(end * hpr) - bx, lw);
+      if (!this.extend) return;
+      const ext = this.nakedEnd(row, p, g);
+      if (!ext || ext.x <= end) return;
+      const xa = Math.round(end * hpr);
+      const xb = Math.round(Math.min(ext.x, g.W) * hpr);
+      if (ext.touched) ctx.fillRect(xa, y - (lw >> 1), xb - xa, lw);
+      else {
+        // im geladenen Fenster nicht berührt: gestrichelt bis zum letzten geladenen Bar (C)
+        const on = Math.round(4 * hpr);
+        const off = Math.round(3 * hpr);
+        for (let x = xa; x < xb; x += on + off)
+          ctx.fillRect(x, y - (lw >> 1), Math.min(on, xb - x), lw);
+      }
     };
     if (this.showVa) {
       line(p.vah, VA_LINE);
@@ -791,28 +1016,59 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     line(p.poc, POC_COLOR);
   }
 
-  /** Naked Level: x des ersten Bars nach dem Profil, dessen Spanne die Zeilenmitte berührt. */
-  private nakedEnd(
+  /**
+   * Naked Level der Zeile `row`: erster Bar nach dem Profil, dessen Spanne das Zeilenintervall schneidet
+   * (touched, x = linke Kante dieses Bars), sonst bis zur rechten Kante des letzten geladenen Bars
+   * (touched = false). Ergebnis je (Profil, Zeile) zwischengespeichert, solange das Item-Array gleich
+   * bleibt (nicht je Frame). null: keine Bars nach dem Profil geladen.
+   */
+  nakedEnd(
     row: number,
     p: PreparedProfile,
-    items: readonly BarItem[],
-    min: number,
-    W: number,
-  ): number {
-    const price = (row + 0.5) * p.width;
-    let lo = 0;
-    let hi = items.length;
-    const toSec = p.to / 1000;
-    while (lo < hi) {
-      const m = (lo + hi) >>> 1;
-      if (items[m]!.time < toSec) lo = m + 1;
-      else hi = m;
+    g: Pick<DrawGeom, 'items' | 'bs'>,
+  ): { x: number; touched: boolean } | null {
+    const items = g.items;
+    if (items !== this.nakedItems) {
+      this.nakedItems = items;
+      this.naked.clear();
     }
-    const idx = firstTouch(items, lo, price);
-    if (idx < 0) return Math.max(min, W); // bis zum Rand (im Fenster nicht berührt)
-    const x = this.host.chart.timeScale().logicalToCoordinate(idx as never);
-    return x === null ? min : Math.max(min, x);
+    const ck = `${p.key}|${row}`;
+    let idx = this.naked.get(ck);
+    if (idx === undefined) {
+      this.counters.nakedScans++;
+      let lo = 0;
+      let hi = items.length;
+      const toSec = p.to / 1000;
+      while (lo < hi) {
+        const m = (lo + hi) >>> 1;
+        if (items[m]!.time < toSec) lo = m + 1;
+        else hi = m;
+      }
+      idx = lo >= items.length ? -2 : firstTouch(items, lo, row * p.width, (row + 1) * p.width);
+      this.naked.set(ck, idx);
+    }
+    if (idx === -2) return null;
+    const ts = this.host.chart.timeScale();
+    if (idx >= 0) {
+      const x = ts.logicalToCoordinate(idx as never);
+      return x === null ? null : { x: x - g.bs / 2, touched: true };
+    }
+    const x = ts.logicalToCoordinate((items.length - 1) as never);
+    return x === null ? null : { x: x + g.bs / 2, touched: false };
   }
+}
+
+interface DrawGeom {
+  ctx: CanvasRenderingContext2D;
+  hpr: number;
+  vpr: number;
+  A: number;
+  yU: (u: number) => number;
+  uAt: (yCss: number) => number;
+  H: number;
+  W: number;
+  items: readonly BarItem[];
+  bs: number;
 }
 
 /** Batch auf den Datenbereich kürzen (ganze Profiltage; die API verlangt Tagesgrenzen mit Offset). */
@@ -841,4 +1097,17 @@ function mapView(items: readonly BarItem[], f: (it: BarItem) => number): Float64
   const out = new Float64Array(items.length);
   for (let i = 0; i < items.length; i++) out[i] = f(items[i]!);
   return out;
+}
+
+/**
+ * Hover-Treffer (W-1): erstes gezeichnetes Profil, dessen Balken der Zeile unter `unit` bis `x` reicht
+ * (x0 ≤ x ≤ x0 + Balkenlänge, Balken ≥ 1 px). Rand rechts vom Balken = kein Treffer → Footprint/Kerze.
+ */
+export function hitAt(hits: readonly Hit[], x: number, unit: number): { h: Hit; i: number } | null {
+  for (const h of hits) {
+    const i = Math.floor(unit / h.p.width) - h.p.rowLo;
+    const len = rowBarLength(h.p, h.view, i, h.maxW, h.scale);
+    if (len >= 1 && x >= h.x0 && x <= h.x0 + len) return { h, i };
+  }
+  return null;
 }

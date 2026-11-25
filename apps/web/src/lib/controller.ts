@@ -20,7 +20,13 @@ import {
   type Time,
   type WhitespaceData,
 } from 'lightweight-charts';
-import { ApiClient, IncompatibleServerError, SERVER_MISMATCH, timeoutSignal } from './api.ts';
+import {
+  ApiClient,
+  IncompatibleServerError,
+  SERVER_MISMATCH,
+  SymbolsHttpError,
+  timeoutSignal,
+} from './api.ts';
 import { exactDecimal } from './format.ts';
 import { GestureTracker } from './gesture.ts';
 import { MismatchRecovery, REFETCH_TIMEOUT_MS, RETRY_MS, tileConfigChanged } from './mismatch.ts';
@@ -62,7 +68,7 @@ import {
   type ViewGeometry,
 } from './lod.ts';
 import { ProfileLayer } from './profile/layer.ts';
-import { RequestQueue, type Want } from './request-queue.ts';
+import { isTransient, RequestQueue, type Want } from './request-queue.ts';
 import { BAR_CHUNK_BARS, chunkIndexAt, chunkSpanSec, wantedTiles, windowChunks } from './tiles.ts';
 import type { BarItem, ColorMode, ColorScope, FootprintType, Lod, SymbolInfo } from './types.ts';
 import { isTimeframe, tfSeconds } from '@orderflow/core/browser';
@@ -228,7 +234,7 @@ export class ChartController {
     this.barQueue.label = (k) => `Bars ${tileLabel(k)}`;
     this.fpQueue = new RequestQueue(
       (key, buf) => this.onFpTile(key, buf),
-      (key, status, err) => this.onFpRejected(key, status, err),
+      (key, status, err, body) => this.onFpRejected(key, status, err, body),
     );
     this.fpQueue.label = (k) => `Kachel ${tileLabel(k)}`;
 
@@ -242,6 +248,13 @@ export class ChartController {
       priceToY: (price) =>
         (this.mode === 'footprint' ? this.fp : this.candle).priceToCoordinate(price),
       barsCoverFinal: (fromMs, toMs) => this.barsCoverFinal(fromMs, toMs),
+      footprintActive: () => this.mode === 'footprint' && this.rc.stats.lod >= 2,
+      // W-4: Kacheln und Bars zuerst (die API hat 4 Datenbank-Slots)
+      busy: () => {
+        const f = this.fpQueue.stats;
+        const b = this.barQueue.stats;
+        return f.inFlight + f.queued + b.inFlight + b.queued > 0;
+      },
     });
     this.chart.panes()[0]!.attachPrimitive(this.profile);
     // Bereichsauswahl (zwei Klicks, Bar-genau); außerhalb des Auswahlmodus ohne Wirkung
@@ -473,8 +486,9 @@ export class ChartController {
   onSymbols: (() => void) | null = null;
   private cancelSymbolsRefresh: (() => void) | null = null;
 
-  private scheduleSymbolsRefresh(): void {
+  private scheduleSymbolsRefresh(delayMs = SYMBOLS_REFRESH_MS): void {
     this.cancelSymbolsRefresh?.();
+    let next = SYMBOLS_REFRESH_MS;
     const id = setTimeout(() => {
       this.cancelSymbolsRefresh = null;
       if (this.destroyed) return;
@@ -496,9 +510,13 @@ export class ChartController {
           // Versuch in SYMBOLS_REFRESH_MS)
           if (!this.destroyed && e instanceof IncompatibleServerError)
             this.blocked = SERVER_MISMATCH;
+          // 503/429 (+ Retry-After), z. B. veralteter Katalog: wie jede vorübergehende Antwort früher
+          // erneut, Retry-After beachtet (begrenzt)
+          if (e instanceof SymbolsHttpError && isTransient(e.status))
+            next = Math.min(SYMBOLS_REFRESH_MS, Math.max(2_000, e.retryAfterMs ?? 10_000));
         })
-        .finally(() => this.scheduleSymbolsRefresh());
-    }, SYMBOLS_REFRESH_MS);
+        .finally(() => this.scheduleSymbolsRefresh(next));
+    }, delayMs);
     this.cancelSymbolsRefresh = () => clearTimeout(id);
   }
 
@@ -524,6 +542,7 @@ export class ChartController {
     const a = this.currentAnchor();
     // W8: beim Wechsel auf einen feineren tf die Mitte des alten Bars verankern, nicht seinen Beginn
     if (a) a.centerSec = tfSwitchAnchorTime(a.centerSec, this.tfSec, tfSeconds(tf));
+    this.profile.cancelSelect(); // der Anfang einer laufenden Auswahl ist ein Bar des alten tf
     this.setSeries(this.sym.name, tf, a);
   }
 
@@ -1183,12 +1202,17 @@ export class ChartController {
     if (series !== this.bars.series) return;
     const span = chunkSpanSec(this.tfSec) * 1000;
     // K2: Abschnitt gegen die Anfrage prüfen (wirft → als unbrauchbar gezählt, nicht wiederholt)
-    this.bars.addEncoded(Number(c), buf, {
-      sym: this.sym.name,
-      tf: this.tf,
-      from: Number(c) * span,
-      to: (Number(c) + 1) * span,
-    });
+    this.bars.addEncoded(
+      Number(c),
+      buf,
+      {
+        sym: this.sym.name,
+        tf: this.tf,
+        from: Number(c) * span,
+        to: (Number(c) + 1) * span,
+      },
+      this.sym.dataTo,
+    );
     // N3: Fehler beim Fensterwechsel gehören nicht zur Antwort (sonst würde der gültige Abschnitt
     // als Lücke überschrieben) – eigene, sichtbare Meldung
     // b: gehört der Abschnitt zu einer zurückgestellten Kachel, Fenster sofort aus den neuen Daten bauen
@@ -1289,12 +1313,19 @@ export class ChartController {
     }
   }
 
-  private onFpRejected(key: string, status: number, err?: unknown): void {
+  private onFpRejected(key: string, status: number, err?: unknown, body?: string): void {
     if (this.destroyed) return; // d: nach destroy() keine Verarbeitung mehr
     const i = key.lastIndexOf('#');
     const cfg = this.takeRequestCfg(key);
     if (cfg !== this.sym.tileConfigVersion) return; // Antwort der alten Konfiguration (W-1)
-    this.fpStore.markRejected(key.slice(0, i), Number(key.slice(i + 1)));
+    // TILE-FORMAT.md: 422 mit `reason` (tile_cells_exceeded / tile_source_rows_exceeded) gilt nur für
+    // diese Kachel und den Datenstand → nach REJECT_TTL_MS erneut (Kerzen bis dahin); 422 ohne `reason`
+    // = (tf, R) nicht angeboten → für diese Konfiguration endgültig.
+    this.fpStore.markRejected(
+      key.slice(0, i),
+      Number(key.slice(i + 1)),
+      status === 422 && !tileRejectReason(body),
+    );
     // A: Kachel passt nicht zur Anfrage (n/R/…) oder 409 (Kachelkonfiguration veraltet) → Server und
     // Seite sind nicht auf demselben Stand
     if (status === 409 || err instanceof TileMismatchError) this.onServerMismatch(cfg);
@@ -1572,4 +1603,14 @@ export function parseAt(
   const hi = Math.floor(dataToMs / 1000) - 1;
   if (hi < lo) return undefined;
   return Math.min(hi, Math.max(lo, sec));
+}
+
+/** `reason` einer 422-Kachelantwort (TILE-FORMAT.md) oder '' (kein JSON / ohne reason). */
+export function tileRejectReason(body: string | undefined): string {
+  try {
+    const j = JSON.parse(body ?? '') as { reason?: unknown };
+    return typeof j.reason === 'string' ? j.reason : '';
+  } catch {
+    return '';
+  }
 }

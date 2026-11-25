@@ -89,7 +89,7 @@ Produktion (statisches Bundle, spricht `/api/v1` am **eigenen Ursprung** an, z. 
 `/api/` → API auf 127.0.0.1:8780):
 
 ```bash
-npm run build -w @orderflow/web                          # → apps/web/dist (≈ 302 kB JS, ≈ 102 kB gzip)
+npm run build -w @orderflow/web                          # → apps/web/dist (≈ 308 kB JS, ≈ 105 kB gzip)
 API_PROXY=http://127.0.0.1:8780 npx -w @orderflow/web vite preview   # Build lokal gegen die echte API prüfen
 API_PROXY=http://127.0.0.1:8780 npm run dev -w @orderflow/web        # Entwicklung gegen die echte API statt Fixtures
 ```
@@ -119,17 +119,23 @@ TILE-FORMAT.md, „Offen für die Live-Phase"). Messung (T11) im Browser:
 `PLAYWRIGHT_CORE=<pfad zu playwright-core> node apps/web/perf/measure.ts` bei laufendem Dev-Server.
 
 **Volumenprofil + Delta** (Vertrag: [`docs/PROFILE-API.md`](docs/PROFILE-API.md)): standardmäßig je sichtbarem Tag
-ein Profil ab dem Tagesbeginn nach rechts (80 % der Tagesbreite), unter Kerzen/Footprint gezeichnet (Pane-Primitive,
-kein DOM-Overlay). Ansichten „Total", „Buy/Sell" (Standard; Bid rot links, Ask grün rechts gestapelt) und „Delta"
+ein Profil ab dem Tagesbeginn nach rechts, unter Kerzen/Footprint gezeichnet (Pane-Primitive, kein DOM-Overlay).
+Breite = min(80 % des Tages, max(120 px, 30 % der Pane)); ist der Tag breiter als die Pane und der Footprint zeigt
+Zellen, höchstens 25 % der Pane. Liegt der Tagesbeginn links außerhalb, bleibt das Profil am linken Rand sichtbar
+(auch das Bereichsprofil). Schmale Tage: unter 16 px ausgelassen (Anzeige sagt es), 16–48 px nur die Silhouette
+(Total-Form + POC-Strich), ab 48 px alles. Skala je Profil (Standard) oder „gemeinsame Skala" über die sichtbaren
+Tage; der Hover nennt die Länge des längsten Balkens. Ansichten „Total", „Buy/Sell" (Standard; Bid rot links, Ask grün rechts gestapelt) und „Delta"
 (|Ask − Bid| ab dem Tagesbeginn, grün/rot nach Vorzeichen) – ein Klick in der Werkzeugleiste. Gelbe Linie = POC,
 VA-Fläche + graue VAH/VAL („VA"), „verlängern" = POC/VAH/VAL bis zur ersten Berührung durch den Preis (naked).
 „Bereich wählen": zwei Klicks im Chart (Bar-genau, auf Minuten gerundet, Esc bricht ab) → Bereichsprofil mit
 Zusammenfassung unter dem Chart (Zeitraum, gesamt/Ask/Bid/Delta in Lots und BTC, POC, VA). Profil-Zeilengröße
 automatisch nach Pixelhöhe (≈ 5 px, unabhängig vom Footprint-R) oder fest („Profilzeile"); lehnt der Server mit 422
-ab, wird einmal mit `suggestR` neu angefragt (Hinweis in der Anzeige). Tage schmaler als 8 px werden ausgelassen
-(Anzeige sagt es). Tagesprofile werden in Blöcken à 16 Tage geladen (`/profiles/daily`), nur sichtbar ± 1 Tag, mit
-Abbruch und LRU; finale Tage werden gegen die geladenen Bars geprüft (Abweichung → einmal neu laden, dann Fehler).
-URL: `pm=off|daily|range|both`, `pv=total|buysell|delta`, `va=<1…100>`, `oh=<−12…12>` (Tagesbeginn UTC + h),
+ab, wird einmal mit `suggestR` neu angefragt (Hinweis in der Anzeige). Tagesprofile werden in Blöcken à 16 Tage geladen (`/profiles/daily`), nur sichtbar ± 1 Tag, mit
+Abbruch und LRU, höchstens 2 parallel und erst, wenn keine Kacheln/Bars laden; von einem nicht finalen Block wird
+nur der offene Rest neu geladen. Finale Tage werden gegen die geladenen Bars geprüft (Abweichung → einmal am
+Browser-Cache vorbei neu laden, dann eine Meldung, die bis zum Schließen stehen bleibt).
+URL: `pm=off|daily|range|both`, `pv=total|buysell|delta`, `va=<1…100>`, `oh=<−11…12>` (Tagesbeginn UTC + h),
+`ps=common` (gemeinsame Skala),
 `pr=<Ticks>` (fest), `pe=1` (verlängern), `pl=0` (ohne VA), `pf=`/`pt=` (Bereich, ISO-Minute UTC, z. B.
 `2026-10-27T00:00`); nur vom Standard Abweichendes steht in der URL (Standard: `PROFILE_DEFAULTS` in
 `apps/web/src/lib/profile/model.ts`). Messung nur der Profil-Szenarien, auch gegen die echte API:

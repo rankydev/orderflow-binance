@@ -250,14 +250,15 @@ export class FootprintStore {
     this.bytes += t.bytes;
   }
 
-  markRejected(series: string, k: number): void {
+  /** Ablehnung merken; `permanent` = nie erneut anfragen (für diese Konfiguration). */
+  markRejected(series: string, k: number, permanent = false): void {
     let m = this.bySeries.get(series);
     if (!m) {
       m = new Map();
       this.bySeries.set(series, m);
     }
     m.set(k, 'rejected');
-    this.rejectedAt.set(FootprintStore.key(series, k), this.now());
+    this.rejectedAt.set(FootprintStore.key(series, k), permanent ? Infinity : this.now());
   }
 
   /** Kachel vergessen (wird beim nächsten Bedarf neu angefragt). */

@@ -1,10 +1,13 @@
 // Volume Profile (KONZEPT §6.3, docs/PROFILE-API.md): reine Funktionen und die Schicht ohne Browser.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   batchOfDay,
   batchWindow,
   compareProfileWithBars,
   dailyKey,
+  dayDetail,
+  profilePlacement,
+  rowBarLength,
   firstTouch,
   isProfileLadderR,
   Paint,
@@ -25,8 +28,12 @@ import {
 } from '../src/lib/profile/model.ts';
 import {
   clampBatch,
+  hitAt,
   PROFILE_COLORS,
+  PROFILE_MAX_PARALLEL,
+  PROFILE_NONFINAL_TTL_MS,
   ProfileLayer,
+  type Hit,
   type ProfileHost,
 } from '../src/lib/profile/layer.ts';
 import type { BarItem, SymbolInfo } from '../src/lib/types.ts';
@@ -220,9 +227,18 @@ describe('Naked Levels und Querprüfung', () => {
       { h: 20, l: 12 },
       { h: 30, l: 21 },
     ];
-    expect(firstTouch(bars, 0, 15)).toBe(1);
-    expect(firstTouch(bars, 2, 15)).toBe(-1);
-    expect(firstTouch(bars, 0, 21)).toBe(2);
+    // Zeilenintervall [lo, hi): Schnitt mit [l, h]
+    expect(firstTouch(bars, 0, 15, 16)).toBe(1);
+    expect(firstTouch(bars, 2, 15, 16)).toBe(-1);
+    expect(firstTouch(bars, 0, 21, 22)).toBe(2);
+    // Ränder: h = lo berührt; l = hi nicht (halboffen)
+    expect(firstTouch(bars, 0, 10, 11)).toBe(0);
+    expect(firstTouch([{ h: 20, l: 12 }], 0, 11, 12)).toBe(-1);
+    // Intervall statt Mitte: Mitte 14 ungetroffen, Zeile [10, 18) aber von [9, 11] berührt
+    expect(firstTouch([{ h: 11, l: 9 }], 0, 10, 18)).toBe(0);
+    // end begrenzt, fromIdx < 0 wird geklemmt, leere Liste
+    expect(firstTouch(bars, -5, 21, 22, 2)).toBe(-1);
+    expect(firstTouch([], 0, 1, 2)).toBe(-1);
   });
   it('vergleicht buy+sell mit der Summe der Bars im Zeitraum', () => {
     const p = { buyQ: 9, sellQ: 8, from: 0, to: 3600_000 };
@@ -250,7 +266,9 @@ describe('URL-Zustand', () => {
       R: 50,
       extend: true,
       showVa: false,
+      scale: 'profile',
       range: [Date.UTC(2026, 9, 27), Date.UTC(2026, 10, 2, 12, 30)],
+      rangeNote: '',
     });
     expect(profileParamsQuery(p)).toBe(
       '&pm=both&pv=delta&va=68&oh=1&pr=50&pe=1&pl=0&pf=2026-10-27T00:00&pt=2026-11-02T12:30',
@@ -331,7 +349,7 @@ function envelope(u: URL, extra: object) {
     tickRefUnits: 10,
     from: Number(u.searchParams.get('from')),
     to: Number(u.searchParams.get('to')),
-    va: 70,
+    va: Number(u.searchParams.get('va') ?? 70),
     dataVersion: 'v',
     final: true,
     sources: [],
@@ -340,8 +358,13 @@ function envelope(u: URL, extra: object) {
   };
 }
 
-function setup(handler: (u: URL) => Response, items: BarItem[] = bars(T0, 72, 3600, 1)) {
+function setup(
+  handler: (u: URL) => Response,
+  items: BarItem[] = bars(T0, 72, 3600, 1),
+  over: Partial<ProfileHost> = {},
+) {
   const calls: string[] = [];
+  const inits: (RequestCache | undefined)[] = [];
   const host: ProfileHost = {
     chart: { timeScale: () => ({ options: () => ({ barSpacing: 10 }) }) } as never,
     apiBase: '',
@@ -351,12 +374,16 @@ function setup(handler: (u: URL) => Response, items: BarItem[] = bars(T0, 72, 36
     visibleTimeRange: () => [T0 / 1000, (T0 + 3 * D) / 1000],
     priceToY: () => 0,
     barsCoverFinal: () => true,
+    footprintActive: () => false,
+    busy: () => false,
+    ...over,
   };
-  const layer = new ProfileLayer(host, (url) => {
+  const layer = new ProfileLayer(host, (url, init) => {
     calls.push(url);
+    inits.push(init.cache);
     return Promise.resolve(handler(new URL(url, 'http://x')));
   });
-  return { layer, calls };
+  return { layer, calls, inits, host };
 }
 const json = (x: unknown, status = 200) =>
   new Response(JSON.stringify(x), { status, headers: { 'Content-Type': 'application/json' } });
@@ -433,9 +460,9 @@ describe('ProfileLayer', () => {
   it('LOD: zu schmale Tage werden nicht angefragt', async () => {
     const { layer, calls } = setup(() => json({}));
     layer.manualR = 1;
-    // 1h, barSpacing 10 → Tag 240 px; mit 0,25 px → 6 px < MIN_DAY_PX (8)
+    // 1h, barSpacing 10 → Tag 240 px; mit 0,5 px → 12 px < MIN_DAY_PX (16)
     (layer as unknown as { host: ProfileHost }).host.chart = {
-      timeScale: () => ({ options: () => ({ barSpacing: 0.25 }) }),
+      timeScale: () => ({ options: () => ({ barSpacing: 0.5 }) }),
     } as never;
     layer.frame();
     await flush();
@@ -463,5 +490,274 @@ describe('ProfileLayer', () => {
     expect(s.poc).toBe('2.00–2.20');
     layer.clearRange();
     expect(layer.mode).toBe('daily');
+  });
+});
+
+// ---------------------------------------------------------------- Review-Runde (W-1 … W-4, B, C)
+
+describe('Lage der Profile (W-2: Deckel und klebender Anker)', () => {
+  const PANE = 1000;
+  it('Tagesbeginn sichtbar: Profil hängt am Beginn, Breite gedeckelt auf max(120, 0,3 · Pane)', () => {
+    // Tag 200…1304 px breit (1h, 46 px je Bar) → 0,8 · 1104 = 883 > 300 → 300
+    expect(profilePlacement(200, 1304, PANE, false)).toEqual({ x0: 200, maxW: 300 });
+    // schmaler Tag: 0,8 · Tagesbreite
+    expect(profilePlacement(100, 200, PANE, false)).toEqual({ x0: 100, maxW: 80 });
+    // kleine Pane: Untergrenze 120 px
+    expect(profilePlacement(0, 1000, 300, false)).toEqual({ x0: 0, maxW: 120 });
+  });
+  it('Tag überdeckt die Pane: Profil klebt am linken Rand (Footprint aktiv: 0,25 · Pane)', () => {
+    // 1m: Tag 66 240 px, Beginn 60 000 px links außerhalb
+    expect(profilePlacement(-60_000, 6_240, PANE, false)).toEqual({ x0: 0, maxW: 300 });
+    expect(profilePlacement(-60_000, 6_240, PANE, true)).toEqual({ x0: 0, maxW: 250 });
+  });
+  it('Tag endet in der Pane: Profil endet mit dem Tag (x0 = Ende − Breite), sonst unsichtbar', () => {
+    expect(profilePlacement(-2_000, 150, PANE, false)).toEqual({ x0: -150, maxW: 300 });
+    expect(profilePlacement(-2_000, -10, PANE, false)).toBeNull();
+    expect(profilePlacement(1_200, 2_000, PANE, false)).toBeNull();
+    // Footprint-Deckel nur, wenn der Tag breiter als die Pane ist
+    expect(profilePlacement(-500, 400, PANE, true)).toEqual({ x0: 0, maxW: 300 });
+  });
+  it('Bereich: Anteil 0,6, Mindestbreite 40 px', () => {
+    expect(profilePlacement(10, 30, PANE, false, 0.6, 40)).toEqual({ x0: 10, maxW: 20 });
+    expect(profilePlacement(10, 110, PANE, false, 0.6, 40)).toEqual({ x0: 10, maxW: 60 });
+  });
+});
+
+describe('Detailstufe schmaler Tage (B)', () => {
+  it('< 16 px aus, 16…48 px Silhouette, ab 48 px alles', () => {
+    expect(dayDetail(15.9)).toBe('skip');
+    expect(dayDetail(16)).toBe('silhouette');
+    expect(dayDetail(47.9)).toBe('silhouette');
+    expect(dayDetail(48)).toBe('full');
+  });
+});
+
+describe('Hover-Treffer (W-1)', () => {
+  const p = mini(); // Zeilen 10…13, Volumen [4, 8, 4, 1], Delta [0, 4, −4, 1]
+  const hit = (view: 'total' | 'delta', scale: number): Hit => ({
+    x0: 100,
+    maxW: 80,
+    p,
+    range: false,
+    view,
+    scale,
+  });
+  it('trifft nur den gezeichneten Balken der Zeile, nicht die ganze Profilbreite', () => {
+    const h = [hit('total', 8)];
+    // Zeile 10 (Preis 100…109): Balken 40 px → 100…140
+    expect(hitAt(h, 140, 105)?.i).toBe(0);
+    expect(hitAt(h, 141, 105)).toBeNull(); // rechts vom Balken → Footprint/Kerze
+    expect(hitAt(h, 99, 105)).toBeNull();
+    // Zeile 13: 10 px
+    expect(hitAt(h, 110, 135)?.i).toBe(3);
+    expect(hitAt(h, 111, 135)).toBeNull();
+    // außerhalb der Zeilen
+    expect(hitAt(h, 100, 95)).toBeNull();
+    expect(hitAt(h, 100, 140)).toBeNull();
+  });
+  it('Delta-Ansicht: Länge nach |Delta|; Delta 0 ist nie ein Treffer', () => {
+    const h = [hit('delta', 4)];
+    expect(hitAt(h, 100, 105)).toBeNull(); // Zeile 10: Delta 0
+    expect(hitAt(h, 180, 125)?.i).toBe(2); // |−4| → 80 px
+  });
+  it('gemeinsame Skala verkürzt den Balken (Skala 16 statt 8)', () => {
+    expect(rowBarLength(p, 'total', 1, 80, 16)).toBe(40);
+    expect(hitAt([hit('total', 16)], 141, 115)).toBeNull();
+  });
+  it('Bereichsprofil zuerst (Reihenfolge der Treffer)', () => {
+    const r: Hit = { ...hit('total', 8), range: true };
+    expect(hitAt([r, hit('total', 8)], 120, 115)?.h.range).toBe(true);
+  });
+});
+
+describe('Zeitachse und Naked Levels (Schicht, ohne Browser)', () => {
+  // indexbasierte Zeitachse: x(logical) = 10 · logical, 10 px je Bar
+  const chart = {
+    timeScale: () => ({
+      options: () => ({ barSpacing: 10 }),
+      logicalToCoordinate: (l: number) => 10 * l,
+    }),
+  } as never;
+  const items = bars(T0, 48, 3600, 1); // 2 Tage 1h
+  it('xOfTime: linke Kante des ersten Bars ≥ t; vor/nach dem Fenster linear fortgesetzt', () => {
+    const { layer } = setup(() => json({}), items, { chart });
+    expect(layer.xOfTime(T0, items, 3600, 10)).toBe(-5);
+    expect(layer.xOfTime(T0 + D, items, 3600, 10)).toBe(235); // Index 24
+    expect(layer.xOfTime(T0 + 30 * 60_000, items, 3600, 10)).toBe(5); // nächster Bar
+    expect(layer.xOfTime(T0 - D, items, 3600, 10)).toBe(-245); // −24 Bars
+    expect(layer.xOfTime(T0 + 3 * D, items, 3600, 10)).toBe(715); // 47 + 25 Bars
+  });
+  it('nakedEnd: berührt → linke Kante des Bars; unberührt → Ende der geladenen Bars; je Fenster einmal', () => {
+    const its = bars(T0, 48, 3600, 1).map((b, i) => (i === 30 ? { ...b, h: 200, l: 150 } : b));
+    const { layer } = setup(() => json({}), its, { chart });
+    const p = prepareProfile('k', { ...dayBodyLike(), rowLo: 10 }, T0, T0 + D, true, 1, 10);
+    // Zeile 15 ([150, 160)): erst Bar 30 reicht hinein
+    expect(layer.nakedEnd(15, p, { items: its, bs: 10 })).toEqual({ x: 295, touched: true });
+    // Zeile 12 ([120, 130)): h = 120 aller Bars berührt → erster Bar nach dem Tag (Index 24)
+    expect(layer.nakedEnd(12, p, { items: its, bs: 10 })).toEqual({ x: 235, touched: true });
+    // Zeile 40: nie berührt → rechte Kante des letzten Bars
+    expect(layer.nakedEnd(40, p, { items: its, bs: 10 })).toEqual({ x: 475, touched: false });
+    const scans = layer.counters.nakedScans;
+    layer.nakedEnd(40, p, { items: its, bs: 10 });
+    expect(layer.counters.nakedScans).toBe(scans); // aus dem Zwischenspeicher
+    // Profil am Ende der Daten: keine Bars danach
+    const late = prepareProfile('l', dayBodyLike(), T0 + D, T0 + 2 * D, true, 1, 10);
+    expect(layer.nakedEnd(15, late, { items: its, bs: 10 })).toBeNull();
+  });
+});
+
+function dayBodyLike() {
+  const body: Partial<ReturnType<typeof dayBody>> = { ...dayBody(T0, 5) };
+  delete body.day;
+  delete body.from;
+  delete body.to;
+  delete body.final;
+  return body as Omit<ReturnType<typeof dayBody>, 'day' | 'from' | 'to' | 'final'>;
+}
+
+describe('ProfileLayer: Review-Punkte', () => {
+  const daily =
+    (final: (from: number) => boolean, q = 23) =>
+    (u: URL) => {
+      const from = Number(u.searchParams.get('from'));
+      const to = Number(u.searchParams.get('to'));
+      const days = [];
+      for (let d = from; d < to; d += D) days.push({ ...dayBody(d, q), final: final(d) });
+      return json(
+        envelope(u, {
+          kind: 'profiles/daily',
+          offsetH: 0,
+          final: days.every((d) => d.final),
+          days,
+        }),
+      );
+    };
+  const settle = async () => {
+    for (let i = 0; i < 8; i++) await flush();
+  };
+
+  it('W-4: höchstens 2 parallel; solange Kacheln/Bars laden, keine neuen Profilanfragen', async () => {
+    expect(PROFILE_MAX_PARALLEL).toBe(2);
+    let busy = true;
+    const { layer, calls } = setup(
+      daily(() => true),
+      undefined,
+      { busy: () => busy },
+    );
+    layer.manualR = 1;
+    layer.frame();
+    await settle();
+    expect(calls).toHaveLength(0);
+    expect(layer.counters.held).toBe(1);
+    busy = false;
+    layer.frame();
+    await settle();
+    expect(calls).toHaveLength(1);
+    layer.destroy();
+  });
+
+  it('Gesamthistorie: jeder Batch genau einmal, danach aus dem Cache', async () => {
+    const sym = { ...SYM, dataFrom: T0 - 160 * D, dataTo: T0 + 7 * D };
+    const { layer, calls } = setup(
+      daily(() => true),
+      bars(T0, 72, 3600, 1),
+      {
+        sym: () => sym,
+        visibleTimeRange: () => [sym.dataFrom / 1000, sym.dataTo / 1000],
+        barsCoverFinal: () => false,
+      },
+    );
+    layer.manualR = 1;
+    layer.frame();
+    await settle();
+    const n = calls.length;
+    const b0 = batchOfDay(sym.dataFrom / D);
+    const b1 = batchOfDay((sym.dataTo - 1) / D);
+    expect(n).toBe(b1 - b0 + 1);
+    expect(new Set(calls).size).toBe(n);
+    layer.frame();
+    await settle();
+    expect(calls).toHaveLength(n);
+  });
+
+  it('nicht finaler Rest: nach 60 s nur der offene Teil, finale Tage bleiben im Cache', async () => {
+    let now = 1_000;
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    try {
+      const last = T0 + 2 * D;
+      const { layer, calls } = setup(
+        daily((d) => d < last),
+        undefined,
+        { barsCoverFinal: () => false },
+      );
+      layer.manualR = 1;
+      layer.frame();
+      await settle();
+      expect(calls).toHaveLength(1);
+      layer.frame();
+      await settle();
+      expect(calls).toHaveLength(1); // innerhalb der 60 s
+      now += PROFILE_NONFINAL_TTL_MS + 1;
+      layer.frame();
+      await settle();
+      expect(calls).toHaveLength(2);
+      const u = new URL(calls[1]!, 'http://x');
+      expect(Number(u.searchParams.get('from'))).toBe(last);
+      expect(Number(u.searchParams.get('to'))).toBe(T0 + 3 * D);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('W-3: Neuladen nach Abweichung am Browser-Cache vorbei; Meldung bleibt stehen', async () => {
+    const { layer, calls, inits } = setup(daily(() => true, 99)); // Bars: 24 Lots je Tag
+    layer.manualR = 1;
+    layer.frame();
+    await settle();
+    expect(calls).toHaveLength(2);
+    expect(inits).toEqual([undefined, 'reload']);
+    const msg = layer.readout().error;
+    expect(msg).toContain('passt nicht zu den Bars');
+    expect(layer.readout().sticky).toBe(true);
+    // ein späterer erfolgreicher Ladevorgang löscht die Meldung nicht
+    layer.va = 68;
+    layer.frame();
+    await settle();
+    expect(layer.readout().error).toBe(msg);
+    layer.dismissError();
+    expect(layer.readout().error).toBe('');
+  });
+
+  it('prüft Antworten gegen offsetH/va/from/to der Anfrage', async () => {
+    const { layer } = setup((u) =>
+      json(envelope(u, { kind: 'profiles/daily', offsetH: 3, days: [] })),
+    );
+    layer.manualR = 1;
+    layer.frame();
+    await settle();
+    expect(layer.readout().error).toContain('unbrauchbar');
+  });
+
+  it('Bereich: auf die Daten gekürzt (Hinweis), außerhalb nicht übernommen', () => {
+    const { layer } = setup(() => json({}));
+    expect(layer.setRange([T0 - D, T0 + H])).toBe(true);
+    expect(layer.range).toEqual([T0, T0 + H]);
+    expect(layer.readout().note).toContain('gekürzt');
+    expect(layer.setRange([T0 + 10 * D, T0 + 11 * D])).toBe(false);
+    expect(layer.readout().note).toContain('außerhalb der Daten');
+  });
+});
+
+describe('URL: Offset ±12 und Skala', () => {
+  it('oh = −12 und +12 ergeben dieselben Grenzen → 12; ps=common', () => {
+    expect(parseProfileParams(new URLSearchParams('oh=-12')).offsetH).toBe(12);
+    expect(parseProfileParams(new URLSearchParams('oh=12')).offsetH).toBe(12);
+    expect(parseProfileParams(new URLSearchParams('oh=-11')).offsetH).toBe(-11);
+    const p = parseProfileParams(
+      new URLSearchParams('ps=common&pf=2026-11-02T00:00&pt=2026-11-01T00:00'),
+    );
+    expect(p.scale).toBe('common');
+    expect(p.rangeNote).toContain('vertauscht');
+    expect(profileParamsQuery(p)).toContain('&ps=common');
   });
 });

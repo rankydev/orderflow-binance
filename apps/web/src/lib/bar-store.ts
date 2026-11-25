@@ -44,8 +44,11 @@ export class BarStore {
     return this.chunks.has(c);
   }
 
-  /** Dekodiert und prüft gegen die Anfrage (K2): Art, Symbol, tf, Zeitraum; wirft bei Abweichung. */
-  addEncoded(c: number, buf: ArrayBuffer, expect?: ChunkExpectation): void {
+  /**
+   * Dekodiert und prüft gegen die Anfrage (K2): Art, Symbol, tf, Zeitraum; wirft bei Abweichung.
+   * `dataToMs`: Datenende laut Server (/symbols) beim Laden – Datenzeit statt Uhr des Besuchers (W-3).
+   */
+  addEncoded(c: number, buf: ArrayBuffer, expect?: ChunkExpectation, dataToMs = 0): void {
     const dec = decodeTile(buf);
     if (expect) {
       const h = dec.header;
@@ -61,21 +64,22 @@ export class BarStore {
     this.chunks.delete(c);
     this.chunks.set(c, dec.bars);
     this.state.set(c, dec.header.final ? 'final' : 'provisional');
-    this.loadedAt.set(c, Date.now());
+    this.dataToAt.set(c, dataToMs);
   }
 
-  private readonly loadedAt = new Map<number, number>();
+  private readonly dataToAt = new Map<number, number>();
 
   /**
    * Bars c0…c1 für den Zeitraum bis `endMs` vergleichbar? Geladen, keine Lücke und je Abschnitt final
-   * oder – bei einem vorläufigen Abschnitt (enthält den laufenden Tag) – erst geladen, als `endMs`
-   * schon länger als `settleMs` zurücklag (dann ändern sich diese Bars nicht mehr).
+   * oder – bei einem vorläufigen Abschnitt (enthält den laufenden Tag) – geladen, als das Datenende des
+   * Servers schon mehr als `settleMs` hinter `endMs` lag (dann ändern sich diese Bars nicht mehr). Die
+   * Uhr des Besuchers spielt keine Rolle (W-3).
    */
   settled(c0: number, c1: number, endMs: number, settleMs: number): boolean {
     for (let c = c0; c <= c1; c++) {
       const st = this.state.get(c);
       if (st === 'final') continue;
-      if (st !== 'provisional' || (this.loadedAt.get(c) ?? 0) < endMs + settleMs) return false;
+      if (st !== 'provisional' || (this.dataToAt.get(c) ?? 0) < endMs + settleMs) return false;
     }
     return true;
   }
@@ -90,7 +94,7 @@ export class BarStore {
   drop(c: number): void {
     this.chunks.delete(c);
     this.state.delete(c);
-    this.loadedAt.delete(c);
+    this.dataToAt.delete(c);
   }
 
   /** Alle Abschnitte c0…c1 geladen, final und keine Lücke? */

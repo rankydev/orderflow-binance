@@ -23,7 +23,7 @@ import type { BarItem } from '../src/lib/types.ts';
 const items = (times: number[], v = 1) =>
   times.map((t) => ({ time: t, t, v }) as unknown as BarItem);
 
-function chunk(sym: string, tf: string, from: number, to: number, times: number[]) {
+function chunk(sym: string, tf: string, from: number, to: number, times: number[], final = true) {
   const n = times.length;
   const i = (v: number) => Int32Array.from({ length: n }, () => v);
   return encodeTile({
@@ -40,7 +40,7 @@ function chunk(sym: string, tf: string, from: number, to: number, times: number[
       to,
       tile: null,
       dataVersion: 'v',
-      final: true,
+      final,
     },
     bars: {
       time: Int32Array.from(times),
@@ -235,5 +235,24 @@ describe('6: URL-Parameter at', () => {
   it('Kurzbezeichnung von Anfrageschlüsseln ohne Symbol-Interna', () => {
     expect(tileLabel('BTCUSDT|1m|20#29219')).toBe('1m R20 #29219');
     expect(tileLabel('BTCUSDT|5m#12')).toBe('5m #12');
+  });
+});
+
+describe('BarStore.settled (W-3: Datenzeit statt Uhr des Besuchers)', () => {
+  const span = 60_000_000;
+  const DAY = 86_400_000;
+  it('final immer; vorläufig nur, wenn das Datenende beim Laden ≥ Zeitraumende + settle lag', () => {
+    const b = new BarStore('S|1m', 2);
+    b.addEncoded(0, chunk('S', '1m', 0, span, [0], true), undefined, 5 * DAY);
+    b.addEncoded(1, chunk('S', '1m', span, 2 * span, [span / 1000], false), undefined, 3 * DAY);
+    expect(b.settled(0, 0, 10 * DAY, DAY)).toBe(true); // final
+    expect(b.settled(1, 1, 2 * DAY, DAY)).toBe(true); // 2 d + 1 d ≤ 3 d
+    expect(b.settled(1, 1, 2 * DAY + 1, DAY)).toBe(false);
+    expect(b.settled(0, 2, 0, DAY)).toBe(false); // Abschnitt 2 fehlt
+    b.markEmpty(2);
+    expect(b.settled(2, 2, 0, DAY)).toBe(false); // Lücke
+    // ohne Datenende (0) nie vergleichbar, egal wie die Uhr steht
+    b.addEncoded(3, chunk('S', '1m', 3 * span, 4 * span, [], false));
+    expect(b.settled(3, 3, 0, DAY)).toBe(false);
   });
 });

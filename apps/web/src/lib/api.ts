@@ -1,5 +1,6 @@
 // URL-Form der API (KONZEPT §5.5). Die Entwicklungs-Fixtures (dev/fixture-api.ts) bedienen dieselben
 // Pfade; die echte API ist nur eine andere Basis-URL (VITE_API_BASE, Standard: gleicher Ursprung).
+import { retryAfterMs } from './request-queue.ts';
 import type { SymbolsResponse } from './types.ts';
 
 /** Version der /symbols-Form, die diese Seite versteht (Feld `schema` der Antwort). */
@@ -100,12 +101,23 @@ export class ApiClient {
       // es eine HTML-Fehlerseite mit Serverdetails
       const body = await res.text().catch(() => '');
       console.warn(`symbols: HTTP ${res.status}`, body.slice(0, 200));
-      throw new Error(`symbols: HTTP ${res.status}`);
+      throw new SymbolsHttpError(res.status, retryAfterMs(res.headers.get('Retry-After')));
     }
     const body: unknown = await res.json();
     const problems = checkSymbolsResponse(body);
     if (problems.length === 1 && problems[0] === NO_SYMBOLS) throw new NoDataError();
     if (problems.length > 0) throw new IncompatibleServerError(problems);
     return body as SymbolsResponse;
+  }
+}
+
+/** /symbols antwortete mit einem HTTP-Fehler (z. B. 503 + Retry-After bei veraltetem Katalog). */
+export class SymbolsHttpError extends Error {
+  readonly status: number;
+  readonly retryAfterMs: number | null;
+  constructor(status: number, retryAfter: number | null) {
+    super(`symbols: HTTP ${status}`);
+    this.status = status;
+    this.retryAfterMs = retryAfter;
   }
 }

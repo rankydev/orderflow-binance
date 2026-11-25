@@ -708,9 +708,12 @@ async function main(): Promise<void> {
     check(`${name}: keine Long Tasks`, results[name].longTasks === 0);
     check(`${name}: keine doppelten Profil-Anfragen`, new Set(purls).size === purls.length);
     check(`${name}: keine Profilfehler (${ro.error})`, ro.error === '');
+    // schmale Tage (< 16 px) werden nach Regel ausgelassen – dann muss die Anzeige es sagen
     check(
-      `${name}: Profile gezeichnet (${ro.daysDrawn} Tage)`,
-      ro.mode === 'range' || ro.daysDrawn > 0,
+      `${name}: Profile gezeichnet (${ro.daysDrawn}) oder sichtbar ausgelassen (${ro.daysSkipped})`,
+      ro.mode === 'range' ||
+        ro.daysDrawn > 0 ||
+        (ro.daysSkipped > 0 && ro.note.includes('ausgelassen')),
     );
   };
   const offered = await page.evaluate(

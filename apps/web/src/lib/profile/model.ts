@@ -29,14 +29,51 @@ export const PROFILE_DEFAULTS: {
 /** Tage je Anfrage an /profiles/daily (ausgerichtet an Vielfachen seit Epoch, damit Batches cachebar sind). */
 export const DAILY_BATCH_DAYS = 16;
 /**
- * Ein Tagesprofil wird ausgelassen, wenn der Tag schmaler als so viele Pixel ist (LOD). Gemessen: bei
- * 8 px (≈ 6 px Balken) sind Form, POC und VA ganzer Historien auf 4h/1d noch erkennbar; darunter nicht.
+ * Detailstufen der Tagesprofile nach Tagesbreite (Review B): unter MIN_DAY_PX ausgelassen (bei 6–8 px
+ * ist ein Volumenunterschied von 10 % kleiner als ein Pixel), bis FULL_DAY_PX nur die Silhouette
+ * (Total-Form + kurzer POC-Strich, keine VA, keine Linien), darüber alles.
  */
-export const MIN_DAY_PX = 8;
+export const MIN_DAY_PX = 16;
+export const FULL_DAY_PX = 48;
+export type DayDetail = 'skip' | 'silhouette' | 'full';
+export function dayDetail(dayWidthPx: number): DayDetail {
+  return dayWidthPx < MIN_DAY_PX ? 'skip' : dayWidthPx < FULL_DAY_PX ? 'silhouette' : 'full';
+}
+/** Profilbreite: Deckel in Pixeln (Review W-2): max(PROFILE_CAP_MIN_PX, PROFILE_CAP_PANE · Panebreite). */
+export const PROFILE_CAP_MIN_PX = 120;
+export const PROFILE_CAP_PANE = 0.3;
+/** Tag breiter als die Pane und Footprint-Detailstufe aktiv: höchstens so viel der Panebreite. */
+export const PROFILE_CAP_PANE_FOOTPRINT = 0.25;
 /** Anteil der Tagesbreite, den das Tagesprofil nach rechts einnimmt (§6.3: 0,8). */
 export const DAY_PROFILE_SHARE = 0.8;
 /** Anteil der Bereichsbreite für das Bereichsprofil. */
 export const RANGE_PROFILE_SHARE = 0.6;
+
+/**
+ * Lage eines Profils in CSS-px (Review W-2): Zeitraum [xa, xb) auf der Zeitachse, Pane [0, paneW).
+ *  - Breite maxW = min(share · (xb − xa), max(120, 0,3 · paneW)); ist der Zeitraum breiter als die Pane
+ *    und die Footprint-Detailstufe aktiv, höchstens 0,25 · paneW (Zellen bleiben lesbar);
+ *  - Anker „klebend": x0 = clamp(xa, 0, xb − maxW) – liegt der Beginn links außerhalb, bleibt das Profil
+ *    am linken Rand sichtbar, solange sein Zeitraum reicht; sonst hängt es am Beginn.
+ * Liefert null, wenn das Profil die Pane nicht schneidet.
+ */
+export function profilePlacement(
+  xa: number,
+  xb: number,
+  paneW: number,
+  footprint: boolean,
+  share = DAY_PROFILE_SHARE,
+  minW = 0,
+): { x0: number; maxW: number } | null {
+  const span = xb - xa;
+  if (!(span > 0)) return null;
+  let maxW = Math.min(share * span, Math.max(PROFILE_CAP_MIN_PX, PROFILE_CAP_PANE * paneW));
+  if (footprint && span > paneW) maxW = Math.min(maxW, PROFILE_CAP_PANE_FOOTPRINT * paneW);
+  maxW = Math.max(maxW, Math.min(minW, span));
+  const x0 = Math.min(Math.max(xa, 0), xb - maxW);
+  if (x0 + maxW <= 0 || x0 >= paneW) return null;
+  return { x0, maxW };
+}
 
 /** Tagesindex d des Profiltags, der t (ms) enthält: Tag d überdeckt [d·24h + off, (d+1)·24h + off). */
 export function profileDayOf(tMs: number, offsetH: number): number {
@@ -262,12 +299,17 @@ export function profileRects(
   gap: number,
   out: Rect[] = [],
   minLen = 0.5,
+  scaleOverride = 0,
+  rowRange: [number, number] | null = null,
 ): Rect[] {
   const n = p.buy.length;
   if (n === 0) return out;
-  const scale = view === 'delta' ? p.maxAbsDelta : p.maxVol;
+  const scale = scaleOverride > 0 ? scaleOverride : profileScale(p, view);
   if (!(scale > 0)) return out;
-  for (let i = 0; i < n; i++) {
+  // sichtbare Zeilen analytisch (rowRange = [rTop, rBottom] absolute Zeilen), sonst alle
+  const i0 = rowRange ? Math.max(0, Math.min(rowRange[0], rowRange[1]) - p.rowLo) : 0;
+  const i1 = rowRange ? Math.min(n - 1, Math.max(rowRange[0], rowRange[1]) - p.rowLo) : n - 1;
+  for (let i = i0; i <= i1; i++) {
     const r = p.rowLo + i;
     const yt = Math.round(yOfUnit((r + 1) * p.width));
     const yb = Math.round(yOfUnit(r * p.width));
@@ -296,25 +338,49 @@ export function profileRects(
   return out;
 }
 
+/** Skala eines Profils: größtes Volumen bzw. größtes |Delta| einer Zeile. */
+export function profileScale(
+  p: Pick<PreparedProfile, 'maxVol' | 'maxAbsDelta'>,
+  view: ProfileView,
+): number {
+  return view === 'delta' ? p.maxAbsDelta : p.maxVol;
+}
+
+/** Länge (px) des Balkens der Zeile i (Index ab rowLo) bei voller Länge maxW – für den Hover (W-1). */
+export function rowBarLength(
+  p: PreparedProfile,
+  view: ProfileView,
+  i: number,
+  maxW: number,
+  scale: number,
+): number {
+  if (i < 0 || i >= p.buy.length || !(scale > 0)) return 0;
+  const b = p.buy[i]!;
+  const s = p.sell[i]!;
+  return ((view === 'delta' ? Math.abs(b - s) : b + s) / scale) * maxW;
+}
+
 /** Zeile r → Mitte in y (für POC/VAH/VAL-Linien). */
 export function rowMidY(r: number, width: number, yOfUnit: (u: number) => number): number {
   return (yOfUnit(r * width) + yOfUnit((r + 1) * width)) / 2;
 }
 
 /**
- * Naked-Level (§6.3 „Linien verlängern"): ab Index `fromIdx` der erste Bar, dessen [low, high] den Preis
- * berührt; −1 = bis zum Ende der vorhandenen Bars nicht berührt. Höchstens `cap` Bars werden geprüft.
+ * Naked-Level (§6.3 „Linien verlängern"): ab Index `fromIdx` der erste Bar, dessen [low, high] das
+ * Zeilenintervall [lo, hi) schneidet (konservativer als nur die Zeilenmitte); −1 = bis `end` (exklusiv)
+ * nicht berührt.
  */
 export function firstTouch(
   bars: ArrayLike<{ h: number; l: number }>,
   fromIdx: number,
-  price: number,
-  cap = 5000,
+  lo: number,
+  hi: number,
+  end = bars.length,
 ): number {
-  const end = Math.min(bars.length, fromIdx + cap);
-  for (let i = Math.max(0, fromIdx); i < end; i++) {
+  const e = Math.min(bars.length, end);
+  for (let i = Math.max(0, fromIdx); i < e; i++) {
     const b = bars[i]!;
-    if (b.l <= price && b.h >= price) return i;
+    if (b.l < hi && b.h >= lo) return i;
   }
   return -1;
 }
@@ -338,7 +404,7 @@ export function compareProfileWithBars(
 
 // ---------------------------------------------------------------- URL-Zustand
 
-/** Profil-Einstellungen in der URL: pm, pv, va, oh, pr, pe, pl, pf/pt (nur abweichend vom Standard). */
+/** Profil-Einstellungen in der URL: pm, pv, va, oh, pr, pe, pl, ps, pf/pt (nur abweichend vom Standard). */
 export interface ProfileParams {
   mode: ProfileMode;
   view: ProfileView;
@@ -348,8 +414,14 @@ export interface ProfileParams {
   R: number | null;
   extend: boolean;
   showVa: boolean;
+  /** Skala der Tagesprofile: je Profil (Standard) oder gemeinsam über die sichtbaren Tage (ps=common) */
+  scale: ProfileScaleMode;
   range: [number, number] | null;
+  /** Hinweis zum Bereich aus der URL (z. B. vertauscht), sonst '' */
+  rangeNote: string;
 }
+
+export type ProfileScaleMode = 'profile' | 'common';
 
 const MODES: readonly ProfileMode[] = ['off', 'daily', 'range', 'both'];
 const VIEWS: readonly ProfileView[] = ['total', 'buysell', 'delta'];
@@ -376,9 +448,9 @@ export function formatUrlTime(ms: number): string {
   return new Date(ms).toISOString().slice(0, 16);
 }
 
-/** Offset auf −12…12 normieren (o und o ± 24 ergeben dieselben Tagesgrenzen). */
+/** Offset auf −11…12 normieren (o und o ± 24 ergeben dieselben Tagesgrenzen). */
 export function normalizeOffset(o: number): number {
-  return ((((o + 12) % 24) + 24) % 24) - 12;
+  return ((((o + 11) % 24) + 24) % 24) - 11;
 }
 
 export function parseProfileParams(q: URLSearchParams): ProfileParams {
@@ -397,6 +469,7 @@ export function parseProfileParams(q: URLSearchParams): ProfileParams {
   const t = parseUrlTime(q.get('pt'));
   let mode = pm && MODES.includes(pm) ? pm : d.mode;
   const range = f !== null && t !== null && f !== t ? snapRange(f, t) : null;
+  const rangeNote = range && f! > t! ? 'Bereich: pf nach pt – vertauscht übernommen' : '';
   // Bereich in der URL, Modus ohne Bereich → Bereich zusätzlich zeigen
   if (range && mode === 'daily') mode = 'both';
   if (range && mode === 'off') mode = 'range';
@@ -408,7 +481,9 @@ export function parseProfileParams(q: URLSearchParams): ProfileParams {
     R: pr !== null && isProfileLadderR(pr) ? pr : null,
     extend: q.get('pe') === '1',
     showVa: q.get('pl') !== '0',
+    scale: q.get('ps') === 'common' ? 'common' : 'profile',
     range,
+    rangeNote,
   };
 }
 
@@ -423,6 +498,7 @@ export function profileParamsQuery(p: ProfileParams): string {
   if (p.R !== null) q += `&pr=${p.R}`;
   if (p.extend) q += '&pe=1';
   if (!p.showVa) q += '&pl=0';
+  if (p.scale === 'common') q += '&ps=common';
   if (p.range && (p.mode === 'range' || p.mode === 'both'))
     q += `&pf=${formatUrlTime(p.range[0])}&pt=${formatUrlTime(p.range[1])}`;
   return q;
