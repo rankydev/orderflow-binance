@@ -17,6 +17,7 @@ import {
 } from 'lightweight-charts';
 import { colorIndex, colorIndexVolume, NEUTRAL_INDEX } from './color.ts';
 import {
+  imbalanceKey,
   IMB_BUY,
   IMB_BUY_STACK,
   IMB_SELL,
@@ -30,6 +31,7 @@ import {
   tileValueArea,
   type FootprintStore,
   type PreparedTile,
+  type TileState,
 } from './footprint-store.ts';
 import {
   L2_MIN_BAR_SPACING,
@@ -48,6 +50,8 @@ type Scope = Parameters<Parameters<Target['useBitmapCoordinateSpace']>[0]>[0];
 export const UP_COLOR = '#26a69a';
 export const DOWN_COLOR = '#ef5350';
 const POC_COLOR = '#f2c94c';
+/** Bar-VA-Balken erst ab diesem Bar-Abstand (darunter läge er in der Nachbarspalte, H-3). */
+export const BAR_VA_MIN_BS = 12;
 
 // Marken im Footprint (P4): Indizes in die Markenbündel und ihre Farben
 export const MK_DPOC_POS = 0;
@@ -509,7 +513,8 @@ export class FootprintRenderer implements ICustomSeriesPaneRenderer {
         barRows++;
       }
       // Value Area je Bar: schmaler Balken links neben der Spalte (VAL … VAH)
-      if (rc.showBarVa) {
+      // H-3: unter BAR_VA_MIN_BS läge der Balken in der Nachbarspalte → ausgeblendet
+      if (rc.showBarVa && bs >= BAR_VA_MIN_BS) {
         const [vlo, vhi] = tileValueArea(tile, rc.vaPct);
         const lo = vlo[bi]!;
         const hi = vhi[bi]!;
@@ -535,6 +540,9 @@ export class FootprintRenderer implements ICustomSeriesPaneRenderer {
       }
       this.rowsPerBar.push(barRows);
     }
+    // H-2: Stacked-Zonen von Bars links der Ansicht, deren Projektion noch in die Pane reicht
+    if (imbOpts && tiles && from > 0)
+      this.leftZones(d, from, tiles, span, imbOpts, unitBottom, unitTop, yU, hpr, colW, W);
     this.cells.fill(ctx, rc.palette);
     this.marks.fill(ctx, MARK_STYLES, MARK_FILLS);
     ctx.lineWidth = Math.max(1, Math.floor(vpr));
@@ -585,6 +593,88 @@ export class FootprintRenderer implements ICustomSeriesPaneRenderer {
       }
     }
     if (this.fallback.length > 0) this.drawCandles(ctx, d, hpr, yU);
+  }
+
+  /** Projektionsende je Zone (Index in d.bars oder −1), gültig für `zoneVersion` (je Fenster/Option) */
+  private readonly zoneEnd = new Map<string, number>();
+  private zoneVersion = '';
+
+  /**
+   * Zonen links der Ansicht (H-2): Ursprungs-Bar im Fenster vor `from`; gezeichnet, wenn die Zone bis
+   * mindestens `from` unberührt bleibt. Das Ende je Zone wird einmal je Fenster und Option gesucht
+   * (bis zum Fensterende, früher Abbruch bei Berührung) und zwischengespeichert – nicht je Frame.
+   */
+  private leftZones(
+    d: PaneRendererCustomData<Time, FpItem>,
+    from: number,
+    tiles: Map<number, TileState>,
+    span: number,
+    o: ImbalanceOptions,
+    unitBottom: number,
+    unitTop: number,
+    yU: (u: number) => number,
+    hpr: number,
+    colW: number,
+    W: number,
+  ): void {
+    const bars = d.bars;
+    const n = bars.length;
+    const version = `${this.rc.series}|${n}|${bars[0]!.originalData.t}|${bars[n - 1]!.originalData.t}|${imbalanceKey(o)}`;
+    if (version !== this.zoneVersion) {
+      this.zoneVersion = version;
+      this.zoneEnd.clear();
+    }
+    const tFrom = bars[from]!.originalData.t;
+    const k0 = Math.floor(bars[0]!.originalData.t / span);
+    const k1 = Math.floor(tFrom / span);
+    const idxOf = (t: number) => {
+      let lo = 0;
+      let hi = n;
+      while (lo < hi) {
+        const m = (lo + hi) >>> 1;
+        if (bars[m]!.originalData.t < t) lo = m + 1;
+        else hi = m;
+      }
+      return lo < n && bars[lo]!.originalData.t === t ? lo : -1;
+    };
+    for (let k = k0; k <= k1; k++) {
+      const st = tiles.get(k);
+      if (!st || st === 'rejected') continue;
+      const flags = tileImbalance(st, o);
+      const w = st.width;
+      for (let bi = 0; bi < st.nBars; bi++) {
+        const t = st.time[bi]!;
+        if (t >= tFrom) break;
+        const s = st.levelOffset[bi]!;
+        const e = st.levelOffset[bi + 1]!;
+        let any = false;
+        for (let j = s; j < e; j++) if (flags[j]! & (IMB_BUY_STACK | IMB_SELL_STACK)) any = true;
+        if (!any) continue;
+        const oi = idxOf(t);
+        if (oi < 0) continue;
+        for (const [lo, hi, side] of stackZones(st.row, flags, s, e)) {
+          if ((hi + 1) * w <= unitBottom || lo * w > unitTop) continue;
+          const key = `${t}|${lo}|${side}`;
+          let end = this.zoneEnd.get(key);
+          if (end === undefined) {
+            end = -1;
+            for (let i = oi + 1; i < n; i++) {
+              const b = bars[i]!.originalData;
+              if (b.l < (hi + 1) * w && b.h >= lo * w) {
+                end = i;
+                break;
+              }
+            }
+            this.zoneEnd.set(key, end);
+          }
+          if (end >= 0 && end <= from) continue; // vor der Ansicht berührt
+          const xe = end < 0 ? W : Math.round(bars[end]!.x * hpr - colW / 2);
+          const yt = Math.round(yU((hi + 1) * w));
+          const yb = Math.round(yU(lo * w));
+          if (xe > 0) this.marks.push(side === 0 ? MK_PROJ_BUY : MK_PROJ_SELL, 0, yt, xe, yb - yt);
+        }
+      }
+    }
   }
 
   /** Kerzen für die Bars in `fallback` (L1 oder Bars ohne geladene Kachel), zwei Füllungen insgesamt. */

@@ -126,7 +126,11 @@ horizontal, Stacked ab 3 Zeilen mit Zone und Projektion bis zur ersten Berührun
 Einstellung für die gezeichnete Zeilengröße berechnet. „Stats" blendet das Stats-Grid als zweite Pane ein (an den
 Bars ausgerichtet, Zeilen wählbar, K-Format, Schattierung z über die sichtbaren Bars, Text ab 30 px Bar-Abstand,
 darunter nur Farbe, unter 4 px aus). Zeilen ohne API-Spalte (Trades, Max/Min Δ, COT High/Low) zeigen „(API)" und
-keine Werte, bis `/bars` die `x.`-Spalten liefert. Standard: `FOOTPRINT_DEFAULTS` in
+keine Werte, bis `/bars` die `x.`-Spalten liefert. Tages-CVD: „–", wenn die Tagesgrenze (UTC + offsetH) nicht auf einer
+Bar-Grenze liegt oder nach einem fehlenden Datenabschnitt bis zur nächsten Tagesgrenze; Minuten ohne Trades
+fehlen in den Daten (z. B. 2026-10-27), der CVD summiert die vorhandenen Bars. Werkzeugleiste: selten
+Gebrauchtes in „Footprint ▾" (Marken, Farbe, Imbalance-Einstellungen, Stats-Zeilen) und „Profil ▾" (Modus, VA,
+verlängern, Skala, Tagesbeginn, Profilzeile); Esc oder Klick daneben schließt. Standard: `FOOTPRINT_DEFAULTS` in
 `apps/web/src/lib/footprint-options.ts`. URL: `type=delta|bidask|volume|deltavol`, `fm=profile`, `poc=0`, `dpoc=1`,
 `bva=1`, `imb=1`, `imbr=<%>`, `imbd=<Lots>`, `imbz=1`, `imbh=1`, `imbs=<n>`, `sg=1`, `sgr=<Zeilen>`.
 

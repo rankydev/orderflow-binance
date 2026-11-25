@@ -71,7 +71,10 @@ import type { FootprintOptions } from './footprint-options.ts';
 import { ProfileLayer } from './profile/layer.ts';
 import {
   computeStats,
+  CVD_UNALIGNED_NOTE,
+  cvdAligned,
   highLowRatio,
+  STATS_BOTTOM_PX,
   STATS_ROW_PX,
   StatsContext,
   StatsSeriesView,
@@ -634,7 +637,7 @@ export class ChartController {
       if (this.chart.panes().length > 1) this.chart.removePane(1);
     }
     const pane = this.chart.panes()[1];
-    if (pane) pane.setHeight(rows.length * STATS_ROW_PX + 10);
+    if (pane) pane.setHeight(rows.length * STATS_ROW_PX + STATS_BOTTOM_PX);
     this.statsSeries?.applyOptions({});
   }
 
@@ -643,12 +646,19 @@ export class ChartController {
     if (!this.statsSeries || !this.sym) return;
     const span = chunkSpanSec(this.tfSec);
     this.statsCtx.qtyDecimals = this.sym.qtyDecimals;
+    const offsetH = this.profile.offsetH;
     this.statsCtx.cols = computeStats(this.items, {
-      offsetH: this.profile.offsetH,
+      offsetH,
       tfSec: this.tfSec,
       dataTo: this.sym.dataTo,
       windowStartSec: this.win ? this.win[0] * span : Infinity,
+      // F-2: Abschnitte ohne Daten im Fenster → CVD ab dort bis zur nächsten Tagesgrenze unbekannt
+      gaps: this.win
+        ? this.bars.gapChunks(this.win[0], this.win[1]).map((c) => [c * span, (c + 1) * span])
+        : [],
     });
+    this.statsCtx.notes = cvdAligned(offsetH, this.tfSec) ? {} : { cvd: CVD_UNALIGNED_NOTE };
+    this.statsCtx.rowSize = rowLabel(this.R, this.sym);
     this.statsSeries.applyOptions({});
   }
 
@@ -800,6 +810,9 @@ export class ChartController {
     };
     this.candle.setData([]);
     this.fp.setData([]);
+    // H-1: Stats-Pane gehört zur alten Serie
+    this.statsSeries?.setData([]);
+    this.statsCtx.reset();
     this.ensureWindow();
   }
 
@@ -1002,6 +1015,7 @@ export class ChartController {
     if (!n) return;
     const series = `${this.sym.name}|${this.tf}|${r}`;
     if (r !== this.R) this.counters.rChanges++;
+    this.statsCtx.rowSize = rowLabel(r, this.sym); // Ratios/Imbalances gelten für die gezeichnete Größe
     // W6: bis die sichtbaren Kacheln der neuen Größe da sind, zeichnet der Renderer fehlende Bars mit
     // der bisherigen Größe (gleicher tf) statt als Kerzen.
     if (this.rc.series !== series && this.rc.series.startsWith(`${this.sym.name}|${this.tf}|`)) {

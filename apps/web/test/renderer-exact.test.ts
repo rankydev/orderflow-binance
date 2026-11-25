@@ -308,3 +308,91 @@ describe('Renderer exakt: Marken (P4)', () => {
     ]);
   });
 });
+
+describe('Renderer exakt: Stacked-Zone eines Bars links der Ansicht (H-2)', () => {
+  it('unberührt → Projektion vom linken Rand bis zum rechten Rand', () => {
+    const t = tile();
+    // zweiter Bar (t = 60 s) weit oberhalb der Zone: Zeile 1010
+    t.bars = {
+      time: Int32Array.of(0, 60),
+      open: Int32Array.of(1000 * W, 1010 * W),
+      high: Int32Array.of(1003 * W - 1, 1011 * W - 1),
+      low: Int32Array.of(1000 * W, 1010 * W),
+      close: Int32Array.of(1003 * W - 1, 1011 * W - 1),
+      buyQ: Float64Array.of(4, 1),
+      sellQ: Float64Array.of(7, 1),
+      buyA: new Int32Array(2),
+      sellA: new Int32Array(2),
+    };
+    t.levels = {
+      levelOffset: Int32Array.of(0, 3, 4),
+      row: Int32Array.of(1000, 1001, 1002, 1010),
+      buy: Float64Array.of(3, 1, 0, 1),
+      sell: Float64Array.of(1, 2, 4, 1),
+      buyA: new Int32Array(4),
+      sellA: new Int32Array(4),
+    };
+    const rc = new RenderContext();
+    const store = new FootprintStore(3);
+    store.addEncoded('X|1m|5', encodeTile(t).buffer as ArrayBuffer);
+    Object.assign(rc, {
+      store,
+      series: 'X|1m|5',
+      n: 32,
+      tfSec: 60,
+      width: W,
+      priceScale: 100,
+      type: 'delta',
+      colorRef: 4,
+      imbalance: { ...IMBALANCE_DEFAULTS, includeZero: true, stack: 2 },
+    });
+    rc.palette = palette('gradient');
+    const r = new FootprintRenderer(rc);
+    const mk = (time: number, h: number, l: number): FpItem => ({
+      time: time as FpItem['time'],
+      t: time,
+      open: l / 100,
+      high: h / 100,
+      low: l / 100,
+      close: h / 100,
+      o: l,
+      h,
+      l,
+      c: h,
+      v: 2,
+      b: 1,
+      s: 1,
+      ba: 0,
+      sa: 0,
+    });
+    r.data = {
+      bars: [
+        { x: -50, time: 0, originalData: mk(0, 1003 * W - 1, 1000 * W), barColor: '' },
+        { x: 150, time: 60, originalData: mk(60, 1011 * W - 1, 1010 * W), barColor: '' },
+      ],
+      barSpacing: 100,
+      visibleRange: { from: 1, to: 2 },
+      conflationFactor: 1,
+    };
+    const lo = 1000 * W;
+    const hi = 1003 * W;
+    const conv = (p: number) => 300 - ((p * 100 - lo) / (hi - lo)) * 300;
+    const ctx = new Ctx();
+    r.draw(
+      {
+        useBitmapCoordinateSpace: (f: (s: unknown) => void) =>
+          f({
+            context: ctx,
+            mediaSize: { width: 200, height: 300 },
+            bitmapSize: { width: 400, height: 600 },
+            horizontalPixelRatio: 2,
+            verticalPixelRatio: 2,
+          }),
+      } as never,
+      conv as never,
+    );
+    expect(ctx.rects.filter((x) => x.style === MARK_STYLES[MK_PROJ_SELL])).toEqual([
+      { x: 0, y: 0, w: 400, h: 400, style: MARK_STYLES[MK_PROJ_SELL], op: 'fill' },
+    ]);
+  });
+});

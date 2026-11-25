@@ -101,6 +101,13 @@ export class BarStore {
     this.dataToAt.delete(c);
   }
 
+  /** Abschnitte in c0…c1, die als Lücke (ohne Daten) geführt werden. */
+  gapChunks(c0: number, c1: number): number[] {
+    const out: number[] = [];
+    for (let c = c0; c <= c1; c++) if (this.state.get(c) === 'gap') out.push(c);
+    return out;
+  }
+
   /** Alle Abschnitte c0…c1 geladen, final und keine Lücke? */
   allFinal(c0: number, c1: number): boolean {
     for (let c = c0; c <= c1; c++) if (this.state.get(c) !== 'final') return false;

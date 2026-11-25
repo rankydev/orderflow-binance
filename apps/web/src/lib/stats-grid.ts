@@ -74,14 +74,14 @@ export const STAT_ROWS: readonly StatRowDef[] = [
   { id: 'volSec', label: 'Vol/s', unit: 'qtyPerSec', signed: false, title: 'Volumen / Bar-Dauer' },
   {
     id: 'hiRatio',
-    label: 'High R',
+    label: 'High Ratio',
     unit: 'ratio',
     signed: false,
     title: 'b(oberste−1) / b(oberste), Footprint-Zeilen',
   },
   {
     id: 'loRatio',
-    label: 'Low R',
+    label: 'Low Ratio',
     unit: 'ratio',
     signed: false,
     title: 's(unterste+1) / s(unterste), Footprint-Zeilen',
@@ -135,7 +135,9 @@ export const STATS_DEFAULT_ROWS: readonly StatRow[] = ['vol', 'delta', 'deltaPct
 export const STATS_TEXT_MIN_BS = 30;
 export const STATS_SHADE_MIN_BS = 4;
 export const STATS_ROW_PX = 16;
-export const STATS_LABEL_PX = 74;
+export const STATS_LABEL_PX = 84;
+/** Freiraum unter der letzten Zeile: dort sitzt das Logo der Bibliothek (Attribution, H-5). */
+export const STATS_BOTTOM_PX = 30;
 
 export interface StatsInput {
   offsetH: number;
@@ -144,6 +146,15 @@ export interface StatsInput {
   dataTo: number;
   /** Beginn des Datenfensters (s): CVD nur, wenn der Tagesbeginn im Fenster liegt */
   windowStartSec: number;
+  /** Bar-Abschnitte im Fenster ohne Daten (Lücken, markEmpty) als [von, bis) in s */
+  gaps?: readonly [number, number][];
+}
+
+/** F-1: Tages-CVD nur, wenn die Tagesgrenze (UTC + offsetH) auf einer Bar-Grenze liegt. */
+export const CVD_UNALIGNED_NOTE = 'CVD: Tagesgrenze liegt nicht auf der Bar-Grenze';
+
+export function cvdAligned(offsetH: number, tfSec: number): boolean {
+  return (((offsetH * 3600) % tfSec) + tfSec) % tfSec === 0;
 }
 
 /** Spalten je Zeile, Index = Item-Index des Fensters; NaN = nicht berechenbar („–"). */
@@ -151,8 +162,12 @@ export type StatsColumns = Partial<Record<StatRow, Float64Array>>;
 
 /**
  * Werte je Bar aus den Items des Fensters (einmal je Fensterwechsel). Mengen in Lots, Delta % in Prozent,
- * Vol/s in Lots je Sekunde. CVD setzt an jeder Tagesgrenze (UTC + offsetH) zurück und ist NaN, solange der
- * Tagesbeginn vor dem Fenster liegt (sonst fehlte der Anfang des Tages).
+ * Vol/s in Lots je Sekunde. CVD setzt an jeder Tagesgrenze (UTC + offsetH) zurück und ist NaN
+ *  - solange der Tagesbeginn vor dem Fenster liegt (sonst fehlte der Anfang des Tages),
+ *  - ab einer Lücke (Abschnitt ohne Daten) bis zur nächsten Tagesgrenze (F-2),
+ *  - immer, wenn die Tagesgrenze nicht auf einer Bar-Grenze liegt (F-1; dann fehlt die Spalte ganz).
+ * Minuten ohne Trades fehlen in den Daten der API grundsätzlich (z. B. das Loch am 2026-10-27): der CVD
+ * summiert die vorhandenen Bars – das ist der Datenstand, kein Rechenfehler.
  */
 export function computeStats(items: readonly BarItem[], x: StatsInput): StatsColumns {
   const n = items.length;
@@ -163,13 +178,15 @@ export function computeStats(items: readonly BarItem[], x: StatsInput): StatsCol
     sell: col(),
     delta: col(),
     deltaPct: col(),
-    cvd: col(),
+    ...(cvdAligned(x.offsetH, x.tfSec) ? { cvd: col() } : {}),
     aggN: col(),
     aggDelta: col(),
     volSec: col(),
   };
   const off = x.offsetH * 3600;
+  const gaps = x.gaps ?? [];
   let day = Number.NaN;
+  let dayStart = 0;
   let cvd = Number.NaN;
   for (let i = 0; i < n; i++) {
     const it = items[i]!;
@@ -181,14 +198,19 @@ export function computeStats(items: readonly BarItem[], x: StatsInput): StatsCol
     out.sell![i] = s;
     out.delta![i] = b - s;
     out.deltaPct![i] = v > 0 ? ((b - s) / v) * 100 : Number.NaN;
-    const d = Math.floor((it.t - off) / 86_400);
-    if (d !== day) {
-      day = d;
-      // Tagesbeginn im Fenster? Sonst fehlt der Anfang → unbekannt bis zur nächsten Grenze
-      cvd = d * 86_400 + off >= x.windowStartSec ? 0 : Number.NaN;
+    if (out.cvd) {
+      const d = Math.floor((it.t - off) / 86_400);
+      if (d !== day) {
+        day = d;
+        dayStart = d * 86_400 + off;
+        // Tagesbeginn im Fenster? Sonst fehlt der Anfang → unbekannt bis zur nächsten Grenze
+        cvd = dayStart >= x.windowStartSec ? 0 : Number.NaN;
+      }
+      // Lücke zwischen Tagesbeginn und diesem Bar → unbekannt bis zur nächsten Grenze
+      for (const [gs, ge] of gaps) if (gs < it.t && ge > dayStart) cvd = Number.NaN;
+      cvd += b - s;
+      out.cvd[i] = cvd;
     }
-    cvd += b - s;
-    out.cvd![i] = cvd;
     out.aggN![i] = it.ba + it.sa;
     out.aggDelta![i] = it.ba - it.sa;
     const dur = Math.min(x.tfSec, x.dataTo / 1000 - it.t);
@@ -296,6 +318,17 @@ export class StatsContext {
   qtyDecimals = 3;
   /** High/Low Ratio eines Bars (Footprint-Level der gezeichneten Zeilengröße) oder null */
   hlRatio: ((t: number) => [number, number] | null) | null = null;
+  /** Hinweis statt Werten je Zeile (z. B. CVD bei nicht ausgerichteter Tagesgrenze) */
+  notes: Partial<Record<StatRow, string>> = {};
+  /** Zeilengröße, mit der Ratios (und Imbalances) gerechnet sind, z. B. „20 USDT" (H-4) */
+  rowSize = '';
+
+  /** Serie gewechselt (Symbol/tf): Werte der alten Serie verwerfen (H-1). */
+  reset(): void {
+    this.cols = {};
+    this.notes = {};
+    this.rowSize = '';
+  }
   /** Letzter Frame: Stufe ('text' | 'shade' | 'hidden'), gezeichnete Zellen, Zeit */
   stats = {
     lod: 'hidden' as 'text' | 'shade' | 'hidden',
@@ -401,6 +434,20 @@ class StatsRenderer implements ICustomSeriesPaneRenderer {
       const missing = !!def.column && !sc.cols[def.id];
       ctx.fillStyle = missing ? '#6b7380' : '#9aa4b2';
       ctx.fillText(missing ? `${def.label} (API)` : def.label, Math.round(4 * hpr), y + rh / 2);
+      const note =
+        sc.notes[def.id] ??
+        ((def.id === 'hiRatio' || def.id === 'loRatio') && sc.rowSize ? `Zeile ${sc.rowSize}` : '');
+      if (note) {
+        // Hinweis rechts (Ratios: Zeilengröße der Footprint-Level) bzw. statt Werten
+        const w = ctx.measureText(note).width;
+        const x = sc.notes[def.id]
+          ? lw + Math.round(8 * hpr)
+          : scope.bitmapSize.width - w - 6 * hpr;
+        ctx.fillStyle = 'rgba(15, 18, 23, 0.92)';
+        ctx.fillRect(x - 3 * hpr, y + 1, w + 6 * hpr, rh - 2);
+        ctx.fillStyle = '#c9a74a';
+        ctx.fillText(note, x, y + rh / 2);
+      }
       ctx.fillStyle = '#1f2630';
       ctx.fillRect(0, y + rh - 1, scope.bitmapSize.width, 1);
     });

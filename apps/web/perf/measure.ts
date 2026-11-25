@@ -501,6 +501,36 @@ async function main(): Promise<void> {
       results.stress_pan_near_budget.lodFrames = s.lodFrames;
       results.stress_pan_near_budget.budgetFallbacks = s.budgetFallbacks;
     }
+    // H-6: erster Frame nach dem Einschalten von Imbalances/Bar-VA bei Kacheln nahe der Zellgrenze
+    // (alle sichtbaren Kacheln werden dabei einmal synchron berechnet)
+    {
+      const r = await page.evaluate(async () => {
+        const c = (window as Any).__of;
+        const f0 = c.rc.stats.frames;
+        c.setFootprintOptions(
+          {
+            type: c.rc.type,
+            mode: 'box',
+            poc: true,
+            deltaPoc: true,
+            barVa: true,
+            imbalance: true,
+            imb: { ratio: 300, minDiff: 0, includeZero: true, horizontal: false, stack: 2 },
+            stats: false,
+            statsRows: ['vol'],
+          },
+          70,
+        );
+        await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+        return { ms: c.drawTimes(f0), cells: c.rc.stats.cellsDrawn, vc: c.rc.stats.vc };
+      });
+      results.marksFirstDraw = { maxMs: Math.max(0, ...r.ms), cells: r.cells, vc: r.vc };
+      console.log('marksFirstDraw', JSON.stringify(results.marksFirstDraw));
+      check(
+        `erster Frame mit Marken (${r.cells} Zellen) ${results.marksFirstDraw.maxMs.toFixed(1)} ≤ 16 ms`,
+        results.marksFirstDraw.maxMs <= 16,
+      );
+    }
 
     // K1: eine einzige lange Geste (horizontales Mausrad) weit über das Datenfenster hinaus; danach
     // muss die Ansicht auf Daten stehen (nicht neben dem Fenster) und die Zielzeit ungefähr stimmen.

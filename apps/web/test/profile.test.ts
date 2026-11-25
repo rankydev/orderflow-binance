@@ -163,6 +163,7 @@ function mini(): PreparedProfile {
       buyQ: 9,
       sellQ: 8,
       notional: '1955',
+      vwap: 115,
       low: 100,
       high: 139,
     },
@@ -336,6 +337,8 @@ function dayBody(from: number, q: number) {
     buyQ: q,
     sellQ: 1,
     notional: '0',
+    vwap: 105,
+    dataVersion: 'v',
     low: 100,
     high: 119,
   };

@@ -253,6 +253,7 @@ export class FixtureStore {
         buyQ: 0,
         sellQ: 0,
         notional: '0',
+        vwap: null,
         low: null,
         high: null,
       };
@@ -285,6 +286,8 @@ export class FixtureStore {
       buyQ,
       sellQ,
       notional: notional.toString(),
+      // VWAP wie die API: notional / Volumen, 6 Nachkommastellen (ganzzahlig gerechnet)
+      vwap: Number((notional * 1_000_000n) / BigInt(buyQ + sellQ)) / 1_000_000,
       low,
       high,
     };
@@ -335,16 +338,26 @@ export class FixtureStore {
       throw new HttpError(400, 'from/to nicht an Tagesgrenzen (mit offsetH)');
     if ((to - from) / D > 400) throw new HttpError(400, 'höchstens 400 Tage');
     const days: DailyProfile[] = [];
+    const missingDays: string[] = [];
     let rows = 0;
     for (let d = from; d < to; d += D) {
+      const day = new Date(d - off).toISOString().slice(0, 10);
+      if (d + D <= sym.dataFrom || d >= sym.dataTo) {
+        missingDays.push(day);
+        continue;
+      }
       const body = this.profileBody(sym, R, d, d + D, va);
-      if (body.buy.length === 0) continue;
+      if (body.buy.length === 0) {
+        missingDays.push(day);
+        continue;
+      }
       rows += body.buy.length;
       days.push({
-        day: new Date(d - off).toISOString().slice(0, 10),
+        day,
         from: d,
         to: d + D,
         final: true,
+        dataVersion: `fixture:${sym.name}:v1:${day}`,
         ...body,
       });
     }
@@ -357,6 +370,8 @@ export class FixtureStore {
       kind: 'profiles/daily',
       offsetH,
       days,
+      emptyDays: [],
+      missingDays,
     };
     return JSON.stringify(out);
   }

@@ -22,7 +22,10 @@ import {
 } from '../src/lib/footprint-options.ts';
 import {
   computeStats,
+  CVD_UNALIGNED_NOTE,
+  cvdAligned,
   formatStat,
+  StatsContext,
   highLowRatio,
   meanSd,
   shadeIntensity,
@@ -234,5 +237,75 @@ describe('URL-Zustand Footprint/Stats', () => {
     expect(footprintParamsQuery(o)).toBe(`&${q.replace('type=deltavol&', '')}`);
     const bad = parseFootprintParams(new URLSearchParams('type=x&imbr=50&imbs=99&sgr=nope'));
     expect(bad).toEqual(FOOTPRINT_DEFAULTS);
+  });
+});
+
+describe('Tages-CVD: Grenzen und Lücken (F-1, F-2, H-1)', () => {
+  const H = 3600;
+  it('F-1: Tagesgrenze nicht auf der Bar-Grenze → kein CVD (Hinweis), ausgerichtet → CVD', () => {
+    expect(cvdAligned(1, 4 * H)).toBe(false); // 4h, Tag ab 01:00
+    expect(cvdAligned(0, 86_400)).toBe(true);
+    expect(cvdAligned(2, 86_400)).toBe(false); // 1d mit Offset
+    expect(cvdAligned(-3, H)).toBe(true);
+    expect(cvdAligned(-2, 4 * H)).toBe(false);
+    expect(cvdAligned(4, 4 * H)).toBe(true);
+    // Beispiel der Prüfung: 4h, offsetH +1, Bars 00/04/08 Uhr mit Delta 1/10/100
+    const items = [item(0, 1, 0), item(4 * H, 10, 0), item(8 * H, 100, 0)];
+    const c = computeStats(items, { offsetH: 1, tfSec: 4 * H, dataTo: 1e12, windowStartSec: 0 });
+    expect(c.cvd).toBeUndefined();
+    expect(CVD_UNALIGNED_NOTE).toContain('Bar-Grenze');
+    const c4 = computeStats(items, {
+      offsetH: 4,
+      tfSec: 4 * H,
+      dataTo: 1e12,
+      windowStartSec: -86_400,
+    });
+    // Tag ab 04:00: 00:00 gehört zum Vortag (dessen Beginn im Fenster liegt), dann Rücksetzen
+    expect([...c4.cvd!]).toEqual([1, 10, 110]);
+  });
+
+  it('F-2: ab einer Lücke im Tag bis zur nächsten Tagesgrenze „–"; Lücke über den Tagesbeginn → ganzer Tag', () => {
+    const D = 86_400;
+    const items = [
+      item(0, 1, 0),
+      item(H, 2, 0),
+      item(5 * H, 3, 0),
+      item(D, 4, 0),
+      item(D + H, 5, 0),
+    ];
+    // Lücke [2h, 5h) im ersten Tag
+    const c = computeStats(items, {
+      offsetH: 0,
+      tfSec: H,
+      dataTo: 1e12,
+      windowStartSec: 0,
+      gaps: [[2 * H, 5 * H]],
+    });
+    expect(c.cvd![0]).toBe(1);
+    expect(c.cvd![1]).toBe(3);
+    expect(Number.isNaN(c.cvd![2])).toBe(true); // nach der Lücke
+    expect([c.cvd![3], c.cvd![4]]).toEqual([4, 9]); // nächster Tag wieder bekannt
+    // Lücke über den Beginn des zweiten Tages [D − 1h, D + 1h) → der ganze zweite Tag unbekannt
+    const items2 = [item(0, 1, 0), item(H, 2, 0), item(D + H, 5, 0), item(D + 2 * H, 1, 0)];
+    const c2 = computeStats(items2, {
+      offsetH: 0,
+      tfSec: H,
+      dataTo: 1e12,
+      windowStartSec: 0,
+      gaps: [[D - H, D + H]],
+    });
+    expect([c2.cvd![0], c2.cvd![1]]).toEqual([1, 3]); // erster Tag vor der Lücke
+    expect(Number.isNaN(c2.cvd![2]) && Number.isNaN(c2.cvd![3])).toBe(true);
+  });
+
+  it('H-1: Zurücksetzen beim Serienwechsel verwirft Werte, Hinweise und Zeilengröße', () => {
+    const sc = new StatsContext();
+    sc.cols = { vol: Float64Array.of(1) };
+    sc.notes = { cvd: CVD_UNALIGNED_NOTE };
+    sc.rowSize = '20 USDT';
+    sc.reset();
+    expect(sc.cols).toEqual({});
+    expect(sc.notes).toEqual({});
+    expect(sc.rowSize).toBe('');
   });
 });
