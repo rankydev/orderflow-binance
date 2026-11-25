@@ -254,6 +254,29 @@ CONNECTION_TIMEOUT_MS/ADMIN_PORT/DIAG_HEADERS/NONFINAL_TTL_MS/MAX_CONNECTIONS/MA
   `Retry-After: 1`); 96 gemischte Anfragen über 6 Verbindungen alle 200; API-Log bei `warn` leer;
   API 151 MiB.
 
+## Rollout 2026-11-25 (ausgeführt)
+
+Release `20261125T084611Z-ba55a900e2` (Commit ba55a90), DB-Transfer mit identischen Prüfberichten
+(388 Zeilen, 334/334 Digests), Zertifikat Let's Encrypt bis 2027-02-23 (Renewal-Probelauf mit
+`--cert-name` erfolgreich), Monitor-Timer aktiv, Nachbarn vor/nach identisch (82 Prüfzeilen).
+Screenshots der öffentlichen Seite: `docs-screenshots/public-btcusdt-{1m,15m}.png`.
+
+Messungen (VPS, Abfrage auf dem Server über 127.0.0.1:8780, erster Abruf = Cache-Fehlgriff der API
+gegen die DB; Wiederholung = Antwort-Cache der API):
+
+| Anfrage (BTC / ETH)                                       | erster Abruf (Server) | Wiederholung (Server) | Budget kalt / warm |
+| --------------------------------------------------------- | --------------------- | --------------------- | ------------------ |
+| Bars 1m (1 Tag), 1h (30 Tage)                             | 17–62 ms              | 1,7–2,6 ms            | 300 / 100 ms       |
+| Bars 1h 30 Tage `stats=1`                                 | 116–130 ms            | ≈ 2 ms                | 300 / 100 ms       |
+| Footprint 1m/15m/4h, automatische und feinste Zeilengröße | 34–141 ms             | 1,5–5,1 ms            | 800 / 250 ms       |
+| Profil 7 Tage / Tagesprofile 30 Tage                      | 15–31 ms              | 1,2–2,3 ms            | –                  |
+
+Netz vom Mac: TCP ≈ 19 ms (1 RTT), TLS fertig nach ≈ 39 ms; Erstabruf von außen 71–213 ms
+(= neue Verbindung + Server), Wiederholung auf bestehender Verbindung 18–23 ms (≈ RTT + 2 ms).
+20 gleichzeitige gemischte Erstabrufe: alle 200, langsamster 478 ms (Pool 4 → Warteschlange),
+Wanduhr 0,54 s; warm 68–151 ms. Speicher: DB 1,2 GiB / 2 GiB, API 165 MiB / 600 MiB;
+MemAvailable 5,43 → 4,67 GB, Platte 80 → 75 GB frei.
+
 ## Offen
 
 - HTTP/2 (betrifft alle Sites auf 443) – Entscheidung des Nutzers.
