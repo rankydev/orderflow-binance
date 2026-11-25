@@ -18,7 +18,9 @@ NOW="${BASE%.txt}-after-$(date -u +%H%M%S).txt"
 remote < "$DEPLOY_DIR/bin/server-snapshot.sh" > "$NOW" || die "Schnappschuss fehlgeschlagen"
 snapshot_valid "$NOW" || die "Schnappschuss unvollständig ($NOW)"
 for u in https://genius.rankyhub.com/ https://rankyhub.com/ https://takt.rankyhub.com/; do
-  printf 'external|%s|%s\n' "$u" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$u")" >> "$NOW"
+  # Außensicht nur informativ: genius antwortet von außen schon vor dem Rollout teils erst nach
+  # 6–20 s (von innen 10 ms) – als Pflichtvergleich ein Fehlalarm; maßgeblich sind site|/site6|
+  printf 'info|external|%s|%s\n' "$u" "$(curl -s -o /dev/null -w '%{http_code} %{time_total}s' --max-time 30 "$u")" >> "$NOW"
 done
 if diff <(grep -v '^info|' "$BASE") <(grep -v '^info|' "$NOW"); then
   log "Nachbardienste unverändert (Units, Startzeiten, Container, pm2, Ports, Dateien, Statuscodes)"

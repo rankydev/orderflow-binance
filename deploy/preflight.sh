@@ -58,9 +58,11 @@ remote < "$DEPLOY_DIR/bin/server-snapshot.sh" > "$BASE" || die "Schnappschuss fe
 snapshot_valid "$BASE" || die "Schnappschuss unvollständig ($BASE) – Preflight abgebrochen"
 # Außensicht vom Mac (gleiche Statuscodes erwartet wie vom Server aus)
 for u in https://genius.rankyhub.com/ https://rankyhub.com/ https://takt.rankyhub.com/; do
-  printf 'external|%s|%s\n' "$u" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$u")" >> "$BASE"
+  # Außensicht nur informativ: genius antwortet von außen schon vor dem Rollout teils erst nach
+  # 6–20 s (von innen 10 ms) – als Pflichtvergleich ein Fehlalarm; maßgeblich sind site|/site6|
+  printf 'info|external|%s|%s\n' "$u" "$(curl -s -o /dev/null -w '%{http_code} %{time_total}s' --max-time 30 "$u")" >> "$BASE"
 done
-grep -E '^(site|external|container|pm2|unit)' "$BASE" >&2
+grep -E '^(site|info\|external|container|pm2|unit)' "$BASE" >&2
 [ "$fail" = 0 ] || die "Preflight nicht bestanden"
 log "Preflight bestanden"
 echo "$BASE"
