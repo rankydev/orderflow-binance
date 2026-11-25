@@ -59,7 +59,33 @@ export function bigintOf(v: unknown): bigint {
   throw new Error(`Wert ${String(v)} ist keine exakte Ganzzahl`);
 }
 
-const pgCode = (e: unknown): string | undefined =>
+/**
+ * Verbindungsverlust/Neustart der Datenbank (→ 503 + Retry-After; der Pool baut neue Verbindungen
+ * auf): Klasse 08 (connection exception), 57P01–57P03 (admin/crash shutdown, cannot connect now),
+ * 53300 (too many connections) und die Fehlercodes des Treibers bzw. des Sockets.
+ */
+export function isConnectionLoss(code: string | undefined): boolean {
+  if (!code) return false;
+  return (
+    code.startsWith('08') ||
+    code === '57P01' ||
+    code === '57P02' ||
+    code === '57P03' ||
+    code === '53300' ||
+    [
+      'ECONNREFUSED',
+      'ECONNRESET',
+      'EPIPE',
+      'ETIMEDOUT',
+      'CONNECT_TIMEOUT',
+      'CONNECTION_CLOSED',
+      'CONNECTION_ENDED',
+      'CONNECTION_DESTROYED',
+    ].includes(code)
+  );
+}
+
+export const pgCode = (e: unknown): string | undefined =>
   typeof e === 'object' && e !== null && 'code' in e
     ? String((e as { code: unknown }).code)
     : undefined;
@@ -134,13 +160,7 @@ export async function readTx<T>(
         throw busy('Daten werden gerade ersetzt (Sperre), bitte gleich erneut', 2);
       }
       if (code === '57014') throw busy('Abfrage zu langsam (statement_timeout)', 2);
-      if (
-        code === '53300' ||
-        code === '57P03' ||
-        code === 'ECONNREFUSED' ||
-        code === 'CONNECT_TIMEOUT'
-      )
-        throw busy('Datenbank nicht erreichbar', 5);
+      if (isConnectionLoss(code)) throw busy('Datenbank nicht erreichbar', 5);
       throw e;
     }
   }

@@ -1,10 +1,10 @@
 // GET /api/v1/quality (KONZEPT §4.9; Vertrag in docs/PROFILE-API.md, Abschnitt Qualität) und
-// GET /api/v1/health (nur lokal, KONZEPT §2.5; die vollständige Health-Prüfung mit Recorder,
-// Platte und Uhr kommt mit P2).
+// GET /api/v1/health (öffentlich nur {status}); die ausführliche Antwort liefert der getrennte
+// Status-Listener auf 127.0.0.1 (KONZEPT §2.5; Recorder-, Platten- und Uhrprüfung folgen mit P2).
 import { formatDay } from '@orderflow/core';
-import type { FastifyInstance, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyReply } from 'fastify';
 import { guardedRead, requireSymbol, type Deps } from '../context.ts';
-import { badRequest, notFound } from '../errors.ts';
+import { badRequest } from '../errors.ts';
 import { acceptsGzip, etagOfBody, makeResponse, send } from '../http.ts';
 import { DAY_MS, MAX_TIME_MS, Params, SYMBOL_RE } from '../params.ts';
 import { coveredDays } from '../plan.ts';
@@ -14,16 +14,51 @@ export const QUALITY_SCHEMA = 1;
 export const MAX_QUALITY_DAYS = 1_100;
 export const MAX_ISSUES = 20_000;
 
-/** Nur direkte lokale Aufrufe (nicht über nginx, das X-Forwarded-For setzt). */
-export function isLocalRequest(req: FastifyRequest): boolean {
-  const ip = req.socket.remoteAddress ?? '';
-  const local = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
-  return (
-    local && req.headers['x-forwarded-for'] === undefined && req.headers['x-real-ip'] === undefined
-  );
+/** Gründe, warum die API nicht gesund ist (leer = gesund). */
+function healthReasons(deps: Deps): string[] {
+  const reasons: string[] = [];
+  const cat = deps.catalog;
+  const age = cat.lastRefresh > 0 ? Date.now() - cat.lastRefresh : null;
+  if (!cat.ready) reasons.push('Katalog noch nicht geladen');
+  else if (age! > Math.max(30_000, deps.cfg.pollMs * 10))
+    reasons.push(`Katalog seit ${Math.round(age! / 1000)} s nicht aktualisiert`);
+  if (cat.lastError) reasons.push(`Datenbank: ${cat.lastError}`);
+  return reasons;
 }
 
-export function registerStatusRoutes(app: FastifyInstance, deps: Deps, startedAt: number): void {
+/** Ausführliche Health-Antwort – nur auf dem Loopback-Status-Listener (buildAdminApp). */
+export function healthDetail(deps: Deps, startedAt: number, reply: FastifyReply): FastifyReply {
+  const reasons = healthReasons(deps);
+  const cat = deps.catalog;
+  const mem = process.memoryUsage();
+  reply.header('Cache-Control', 'no-store');
+  return reply.code(reasons.length === 0 ? 200 : 503).send({
+    status: reasons.length === 0 ? 'healthy' : 'unhealthy',
+    reasons,
+    uptimeS: Math.round((Date.now() - startedAt) / 1000),
+    catalog: {
+      ready: cat.ready,
+      ageMs: cat.lastRefresh > 0 ? Date.now() - cat.lastRefresh : null,
+      lastError: cat.lastError,
+    },
+    symbols: cat.symbols().map((x) => ({
+      name: x.name,
+      dataFrom: x.dataFrom,
+      dataTo: x.dataTo,
+      days: x.days.size,
+      tileConfigVersion: x.tileConfigVersion,
+    })),
+    cache: deps.cache.stats(),
+    limiter: {
+      running: deps.limiter.running,
+      waiting: deps.limiter.waiting,
+      rejected: deps.limiter.rejected,
+    },
+    memory: { rss: mem.rss, heapUsed: mem.heapUsed, external: mem.external },
+  });
+}
+
+export function registerStatusRoutes(app: FastifyInstance, deps: Deps): void {
   app.get('/api/v1/quality', async (req, reply) => {
     const p = new Params(req.query);
     const symName = p.str('sym', SYMBOL_RE);
@@ -64,37 +99,11 @@ export function registerStatusRoutes(app: FastifyInstance, deps: Deps, startedAt
     return send(req, reply, r);
   });
 
+  // Öffentliche Liveness ohne Interna (Review W3); Details nur auf dem Status-Listener.
   app.get('/api/v1/health', async (req, reply) => {
     new Params(req.query).done();
-    if (!isLocalRequest(req)) throw notFound('unbekannter Endpunkt /api/v1/health');
-    const reasons: string[] = [];
-    const cat = deps.catalog;
-    const age = cat.lastRefresh > 0 ? Date.now() - cat.lastRefresh : null;
-    if (!cat.ready) reasons.push('Katalog noch nicht geladen');
-    else if (age! > Math.max(30_000, deps.cfg.pollMs * 10))
-      reasons.push(`Katalog seit ${Math.round(age! / 1000)} s nicht aktualisiert`);
-    if (cat.lastError) reasons.push(`Datenbank: ${cat.lastError}`);
-    const mem = process.memoryUsage();
+    const ok = healthReasons(deps).length === 0;
     reply.header('Cache-Control', 'no-store');
-    return reply.code(reasons.length === 0 ? 200 : 503).send({
-      status: reasons.length === 0 ? 'healthy' : 'unhealthy',
-      reasons,
-      uptimeS: Math.round((Date.now() - startedAt) / 1000),
-      catalog: { ready: cat.ready, ageMs: age, lastError: cat.lastError },
-      symbols: cat.symbols().map((x) => ({
-        name: x.name,
-        dataFrom: x.dataFrom,
-        dataTo: x.dataTo,
-        days: x.days.size,
-        tileConfigVersion: x.tileConfigVersion,
-      })),
-      cache: deps.cache.stats(),
-      limiter: {
-        running: deps.limiter.running,
-        waiting: deps.limiter.waiting,
-        rejected: deps.limiter.rejected,
-      },
-      memory: { rss: mem.rss, heapUsed: mem.heapUsed, external: mem.external },
-    });
+    return reply.code(ok ? 200 : 503).send({ status: ok ? 'ok' : 'unavailable' });
   });
 }

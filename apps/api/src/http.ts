@@ -8,8 +8,16 @@ import type { CachedResponse } from './cache.ts';
 
 const gzipAsync = promisify(gzipCb);
 
-export const IMMUTABLE = 'public, max-age=31536000, immutable';
+/**
+ * Finale Antworten (Review W5): eine Woche, ohne `immutable` – danach revalidiert der Browser per ETag
+ * (304 ohne Datenabfrage). Ein Neuimport eines finalen Tages ist so nach höchstens einer Woche sichtbar.
+ */
+export const FINAL_CACHE = 'public, max-age=604800';
 export const NO_CACHE = 'no-cache';
+
+export function cacheControl(final: boolean): string {
+  return final ? FINAL_CACHE : NO_CACHE;
+}
 /** Unter dieser Größe lohnt gzip nicht. */
 const GZIP_MIN = 1024;
 
@@ -39,7 +47,7 @@ export function etagOfBody(body: Buffer | string): string {
   return createHash('sha256').update(body).digest('base64url').slice(0, 27);
 }
 
-function matchesEtag(req: FastifyRequest, etag: string): boolean {
+export function matchesEtag(req: FastifyRequest, etag: string): boolean {
   const inm = req.headers['if-none-match'];
   if (!inm) return false;
   const v = Array.isArray(inm) ? inm.join(',') : inm;
@@ -50,7 +58,7 @@ function matchesEtag(req: FastifyRequest, etag: string): boolean {
 /** Sendet eine Antwort mit ETag/304, Cache-Control und gzip. */
 export function send(req: FastifyRequest, reply: FastifyReply, r: CachedResponse): FastifyReply {
   reply.header('ETag', `"${r.etag}"`);
-  reply.header('Cache-Control', r.final ? IMMUTABLE : NO_CACHE);
+  reply.header('Cache-Control', cacheControl(r.final));
   reply.header('Vary', 'Accept-Encoding, Origin');
   if (matchesEtag(req, r.etag)) {
     req.ctx.bytes = 0;

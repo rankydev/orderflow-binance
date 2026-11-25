@@ -32,6 +32,28 @@ export interface ApiConfig {
   /** Harte Zeilengrenze je Profil-Antwort (KONZEPT §1.4); Kacheln folgen TILE-FORMAT.md (60 000). */
   maxCells: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
+  /** Höchstalter nicht finaler Antworten im Server-Cache (ms); 0 = nicht cachen (Review W1). */
+  nonFinalTtlMs: number;
+  /** Socket-Inaktivität bis zum Schließen (ms) – gegen Slow-Loris und Leerlauf-Sockets (W2). */
+  connectionTimeoutMs: number;
+  /** Höchstdauer einer Anfrage inkl. Kopfzeilen (ms) (W2). */
+  requestTimeoutMs: number;
+  /**
+   * Keep-Alive im Leerlauf (ms). Über dem `keepalive_timeout` des nginx-upstream-Blocks (Standard
+   * 60 s), damit nginx eine Verbindung nie wiederverwendet, die die API gerade schließt (sonst 502).
+   */
+  keepAliveTimeoutMs: number;
+  /** Anfragen je Socket (0 = unbegrenzt). */
+  maxRequestsPerSocket: number;
+  /** Höchstzahl offener Verbindungen am öffentlichen Port. */
+  maxConnections: number;
+  /**
+   * Port des getrennten Status-Listeners (nur 127.0.0.1) mit der ausführlichen Health-Antwort (W3);
+   * 0 = aus. Der öffentliche Port liefert unter /api/v1/health nur {status}.
+   */
+  adminPort: number;
+  /** Diagnose-Header X-Source, X-Rows-Estimate, Server-Timing (Standard aus). */
+  diagHeaders: boolean;
 }
 
 const intIn = (
@@ -102,7 +124,17 @@ export function parseApiConfig(env: Env): ApiConfig {
     maxSourceRows: intIn(problems, env, 'OF_API_MAX_SOURCE_ROWS', 1_500_000, 1, 1e9),
     maxCells: intIn(problems, env, 'OF_API_MAX_CELLS', 60_000, 1, 1e7),
     logLevel: base?.logLevel ?? 'info',
+    nonFinalTtlMs: intIn(problems, env, 'OF_API_NONFINAL_TTL_MS', 10_000, 0, 600_000),
+    connectionTimeoutMs: intIn(problems, env, 'OF_API_CONNECTION_TIMEOUT_MS', 30_000, 100, 600_000),
+    requestTimeoutMs: intIn(problems, env, 'OF_API_REQUEST_TIMEOUT_MS', 30_000, 100, 600_000),
+    keepAliveTimeoutMs: intIn(problems, env, 'OF_API_KEEPALIVE_TIMEOUT_MS', 65_000, 100, 600_000),
+    maxRequestsPerSocket: intIn(problems, env, 'OF_API_MAX_REQUESTS_PER_SOCKET', 1_000, 0, 1e6),
+    maxConnections: intIn(problems, env, 'OF_API_MAX_CONNECTIONS', 1_024, 1, 1e6),
+    adminPort: intIn(problems, env, 'OF_API_ADMIN_PORT', 8781, 0, 65535),
+    diagHeaders: /^(1|true|on)$/i.test(env.OF_API_DIAG_HEADERS?.trim() ?? ''),
   };
+  if (cfg.adminPort !== 0 && cfg.adminPort === cfg.port)
+    problems.push('OF_API_ADMIN_PORT muss sich von OF_API_PORT unterscheiden');
   if (problems.length > 0) throw new ConfigError(problems);
   return cfg;
 }

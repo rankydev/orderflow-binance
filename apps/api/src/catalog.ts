@@ -105,6 +105,9 @@ export class Catalog extends EventEmitter {
   /** Zeitpunkt (ms) der letzten erfolgreichen Aktualisierung; 0 = noch nie. */
   lastRefresh = 0;
   lastError: string | null = null;
+  /** Fehlschläge in Folge (Backoff, gedrosselte Warnung). */
+  failures = 0;
+  private lastWarnAt = -Infinity;
 
   constructor(sql: Sql, opt: CatalogOptions) {
     super();
@@ -129,9 +132,14 @@ export class Catalog extends EventEmitter {
     const first = this.refresh();
     const loop = () => {
       if (this.stopped) return;
+      // Backoff bei Fehlern (Datenbank weg): pollMs · 2^n, höchstens 30 s
+      const delay =
+        this.failures === 0
+          ? this.opt.pollMs
+          : Math.min(30_000, this.opt.pollMs * 2 ** Math.min(this.failures, 10));
       this.timer = setTimeout(() => {
         this.refresh().finally(loop);
-      }, this.opt.pollMs);
+      }, delay);
       this.timer.unref();
     };
     void first.finally(loop);
@@ -151,12 +159,26 @@ export class Catalog extends EventEmitter {
     this.running = this.doRefresh()
       .then(() => {
         this.lastRefresh = Date.now();
+        if (this.failures > 0)
+          this.opt.log('info', 'Katalog-Aktualisierung wieder erfolgreich', {
+            failures: this.failures,
+          });
+        this.failures = 0;
         this.lastError = null;
       })
       .catch((e: unknown) => {
         if (this.stopped) return;
+        this.failures++;
         this.lastError = e instanceof Error ? e.message : String(e);
-        this.opt.log('warn', 'Katalog-Aktualisierung fehlgeschlagen', { err: this.lastError });
+        // gedrosselt: erste Meldung sofort, danach höchstens eine je 60 s (keine Log-Flut)
+        const now = Date.now();
+        if (now - this.lastWarnAt >= 60_000) {
+          this.lastWarnAt = now;
+          this.opt.log('warn', 'Katalog-Aktualisierung fehlgeschlagen', {
+            err: this.lastError,
+            failures: this.failures,
+          });
+        }
       })
       .finally(() => {
         this.running = null;

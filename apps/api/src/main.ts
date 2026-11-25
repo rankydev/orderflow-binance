@@ -2,7 +2,8 @@
 //   node --env-file-if-exists=.env apps/api/src/main.ts      (bzw. npm start -w @orderflow/api)
 // Beenden mit SIGINT/SIGTERM: keine neuen Verbindungen, laufende Anfragen fertig, Pools schließen.
 import { ConfigError } from '@orderflow/core';
-import { buildApp } from './app.ts';
+import { buildAdminApp, buildApp } from './app.ts';
+import type { Deps } from './context.ts';
 import { ResponseCache } from './cache.ts';
 import { Catalog } from './catalog.ts';
 import { parseApiConfig, type ApiConfig } from './config.ts';
@@ -11,6 +12,9 @@ import { Limiter } from './limiter.ts';
 
 export interface RunningApi {
   url: string;
+  /** Status-Listener (nur 127.0.0.1) oder null, wenn OF_API_ADMIN_PORT = 0. */
+  adminUrl: string | null;
+  deps: Deps;
   close: () => Promise<void>;
 }
 
@@ -31,7 +35,8 @@ export async function startApi(
     maxSourceRows: cfg.maxSourceRows,
     log: (level, msg, obj) => app?.log[level](obj ?? {}, msg),
   });
-  app = buildApp({ cfg, sql, catalog, cache, limiter }, opt);
+  const deps: Deps = { cfg, sql, catalog, cache, limiter };
+  app = buildApp(deps, opt);
   catalog.on('dayChanged', (ev) => app?.log.debug(ev, 'dayChanged'));
   await catalog.start();
   if (!catalog.ready) app.log.warn({ err: catalog.lastError }, 'Katalog beim Start nicht geladen');
@@ -49,12 +54,18 @@ export async function startApi(
       'Katalog geladen',
     );
   const url = await app.listen({ host: cfg.host, port: cfg.port });
+  // Status-Listener immer nur auf Loopback, unabhängig von OF_API_HOST (Review W3)
+  const admin = cfg.adminPort > 0 ? buildAdminApp(deps) : null;
+  const adminUrl = admin ? await admin.listen({ host: '127.0.0.1', port: cfg.adminPort }) : null;
   let closing: Promise<void> | null = null;
   return {
     url,
+    adminUrl,
+    deps,
     close: () =>
       (closing ??= (async () => {
         await app.close();
+        await admin?.close();
         await catalog.stop();
         await Promise.all([sql.end({ timeout: 5 }), catSql.end({ timeout: 5 })]);
       })()),

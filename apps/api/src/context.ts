@@ -17,7 +17,8 @@ export interface Deps {
 export interface ReqCtx {
   /** Wird ausgelöst, wenn der Client die Verbindung schließt, bevor die Antwort fertig ist. */
   ac: AbortController;
-  cache: 'hit' | 'miss' | null;
+  /** hit: Cache; miss: berechnet; shared: an laufende gleiche Berechnung angehängt; revalidated: 304 */
+  cache: 'hit' | 'miss' | 'shared' | 'revalidated' | null;
   src: string | null;
   rowsEstimate: number | null;
   db: ReadStats | null;

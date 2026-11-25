@@ -3,6 +3,7 @@
 // Passwort nie aus.  Aufruf: npm run role:password -w @orderflow/api
 import { parseConfig } from '@orderflow/core';
 import { connect } from '@orderflow/db';
+import { alterRolePasswordSql } from '../scram.ts';
 
 async function main(): Promise<number> {
   const admin = parseConfig(process.env);
@@ -29,8 +30,8 @@ async function main(): Promise<number> {
       console.error(`Rolle ${role} ist Superuser – verweigert`);
       return 1;
     }
-    // Zeichensatz oben geprüft → als Literal sicher; Identifier per sql(…) gequotet.
-    await sql.unsafe(`ALTER ROLE ${'"' + role + '"'} PASSWORD '${pw}'`);
+    // Nur den clientseitig berechneten SCRAM-Verifier senden, nie den Klartext (Review W4a).
+    await sql.unsafe(alterRolePasswordSql(role, pw));
     console.log(`Passwort der Rolle ${role} gesetzt`);
     return 0;
   } finally {

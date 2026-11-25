@@ -10,6 +10,7 @@ import {
 import type { FastifyInstance } from 'fastify';
 import { rowsOnFor, type SymbolState } from '../catalog.ts';
 import { guardedRead, requireSymbol, type Deps } from '../context.ts';
+import { serveVersioned } from '../respond.ts';
 import { badRequest, HttpError, unprocessable } from '../errors.ts';
 import { etagOfBody, makeResponse, send, acceptsGzip } from '../http.ts';
 import { checkRange, MAX_TIME_MS, Params, SYMBOL_RE } from '../params.ts';
@@ -122,40 +123,34 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     const [d0, d1] = coveredDays(from, to);
     const parts = ['bars', s.name, tf, from, to];
     const pre = versionOf(parts, d0, d1, (d) => s.days.get(d));
-    const key = `bars|${s.name}|${tf}|${from}|${to}|${pre.dataVersion}`;
-    const hit = pre.final ? deps.cache.get(key) : undefined;
-    if (hit) {
-      req.ctx.cache = 'hit';
-      return send(req, reply, hit);
-    }
-    req.ctx.cache = 'miss';
     const table = barTableFor(tfSec / 60);
     req.ctx.src = table;
     const est = estimateRows(table, from, to, rowsOnFor(s));
     req.ctx.rowsEstimate = est;
     if (est > deps.cfg.maxSourceRows)
       throw unprocessable(`Bereich zu groß (≈ ${est} Quellzeilen > ${deps.cfg.maxSourceRows})`);
-    const { days, bars } = await guardedRead(deps, req.ctx, async (tx) => {
-      const days = await readDays(tx, s.symId, d0, d1);
-      const bars = await queryBars(tx, s.symId, table, tfSec, from, to);
-      return { days, bars };
+    const key = `bars|${s.name}|${tf}|${from}|${to}`;
+    return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
+      const { days, bars } = await guardedRead(deps, ctx, async (tx) => {
+        const days = await readDays(tx, s.symId, d0, d1);
+        const bars = await queryBars(tx, s.symId, table, tfSec, from, to);
+        return { days, bars };
+      });
+      const ver = versionOf(parts, d0, d1, (d) => days.get(d));
+      if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
+      const meta: TileMeta = {
+        ...baseMeta(s, tf, tfSec),
+        kind: 'bars',
+        R: null,
+        from,
+        to,
+        tile: null,
+        dataVersion: ver.dataVersion,
+        final: ver.final,
+      };
+      const body = asBuffer(encodeTile({ meta, bars: barColumns(bars) }));
+      return makeResponse(body, BIN, ver.dataVersion, ver.final, true);
     });
-    const ver = versionOf(parts, d0, d1, (d) => days.get(d));
-    if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
-    const meta: TileMeta = {
-      ...baseMeta(s, tf, tfSec),
-      kind: 'bars',
-      R: null,
-      from,
-      to,
-      tile: null,
-      dataVersion: ver.dataVersion,
-      final: ver.final,
-    };
-    const body = asBuffer(encodeTile({ meta, bars: barColumns(bars) }));
-    const r = await makeResponse(body, BIN, ver.dataVersion, ver.final, acceptsGzip(req));
-    if (ver.final) deps.cache.set(`bars|${s.name}|${tf}|${from}|${to}|${ver.dataVersion}`, r);
-    return send(req, reply, r);
   });
 
   app.get('/api/v1/footprint', async (req, reply) => {
@@ -188,13 +183,7 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     const [d0, d1] = coveredDays(from, to);
     const parts = ['fp', s.name, tf, R, n, tile, s.tileConfigVersion];
     const pre = versionOf(parts, d0, d1, (d) => s.days.get(d));
-    const key = `fp|${s.name}|${tf}|${R}|${tile}|${s.tileConfigVersion}|`;
-    const hit = pre.final ? deps.cache.get(key + pre.dataVersion) : undefined;
-    if (hit) {
-      req.ctx.cache = 'hit';
-      return send(req, reply, hit);
-    }
-    req.ctx.cache = 'miss';
+    const key = `fp|${s.name}|${tf}|${R}|${tile}|${s.tileConfigVersion}`;
     req.ctx.src = table;
     const barTable = barTableFor(tfSec / 60);
     const rowsOn = rowsOnFor(s);
@@ -205,41 +194,50 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
       throw unprocessable(`Kachel zu groß (≈ ${est} Quellzeilen > ${deps.cfg.maxSourceRows})`);
     }
     const width = R * s.tickRefUnits;
-    const { days, bars, levels } = await guardedRead(deps, req.ctx, async (tx) => {
-      const days = await readDays(tx, s.symId, d0, d1);
-      const bars = await queryBars(tx, s.symId, barTable, tfSec, from, to);
-      const levels = await queryLevels(tx, s.symId, table, tfSec, width, s.tickRefUnits, from, to);
-      return { days, bars, levels };
-    });
-    const ver = versionOf(parts, d0, d1, (d) => days.get(d));
-    if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
-    // Kacheln folgen der Grenze aus TILE-FORMAT.md (60 000), nicht OF_API_MAX_CELLS (nur Profile)
-    if (levels.row.length > TILE_MAX_CELLS) {
-      // Zwischen Import und Neuberechnung möglich (TILE-FORMAT.md): neu berechnen, dann 409.
-      await deps.catalog.refresh();
-      const now = deps.catalog.symbol(s.name);
-      if (now && now.tileConfigVersion !== cfgV) {
-        throw new HttpError(409, 'Kachelkonfiguration wurde neu berechnet', {
-          tileConfigVersion: now.tileConfigVersion,
-        });
+    return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
+      const { days, bars, levels } = await guardedRead(deps, ctx, async (tx) => {
+        const days = await readDays(tx, s.symId, d0, d1);
+        const bars = await queryBars(tx, s.symId, barTable, tfSec, from, to);
+        const levels = await queryLevels(
+          tx,
+          s.symId,
+          table,
+          tfSec,
+          width,
+          s.tickRefUnits,
+          from,
+          to,
+        );
+        return { days, bars, levels };
+      });
+      const ver = versionOf(parts, d0, d1, (d) => days.get(d));
+      if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
+      // Kacheln folgen der Grenze aus TILE-FORMAT.md (60 000), nicht OF_API_MAX_CELLS (nur Profile)
+      if (levels.row.length > TILE_MAX_CELLS) {
+        // Zwischen Import und Neuberechnung möglich (TILE-FORMAT.md): neu berechnen, dann 409.
+        await deps.catalog.refresh();
+        const now = deps.catalog.symbol(s.name);
+        if (now && now.tileConfigVersion !== cfgV) {
+          throw new HttpError(409, 'Kachelkonfiguration wurde neu berechnet', {
+            tileConfigVersion: now.tileConfigVersion,
+          });
+        }
+        throw new HttpError(500, `Kachel mit ${levels.row.length} Zellen über der harten Grenze`);
       }
-      throw new HttpError(500, `Kachel mit ${levels.row.length} Zellen über der harten Grenze`);
-    }
-    const meta: TileMeta = {
-      ...baseMeta(s, tf, tfSec),
-      kind: 'footprint',
-      R,
-      from,
-      to,
-      tile: { index: tile, n },
-      dataVersion: ver.dataVersion,
-      final: ver.final,
-    };
-    const body = asBuffer(
-      encodeTile({ meta, bars: barColumns(bars), levels: levelColumns(bars, levels) }),
-    );
-    const r = await makeResponse(body, BIN, ver.dataVersion, ver.final, acceptsGzip(req));
-    if (ver.final) deps.cache.set(key + ver.dataVersion, r);
-    return send(req, reply, r);
+      const meta: TileMeta = {
+        ...baseMeta(s, tf, tfSec),
+        kind: 'footprint',
+        R,
+        from,
+        to,
+        tile: { index: tile, n },
+        dataVersion: ver.dataVersion,
+        final: ver.final,
+      };
+      const body = asBuffer(
+        encodeTile({ meta, bars: barColumns(bars), levels: levelColumns(bars, levels) }),
+      );
+      return makeResponse(body, BIN, ver.dataVersion, ver.final, true);
+    });
   });
 }

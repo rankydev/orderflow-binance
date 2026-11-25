@@ -17,7 +17,7 @@ import type { FastifyInstance } from 'fastify';
 import { rowsOnFor, type SymbolState } from '../catalog.ts';
 import { guardedRead, requireSymbol, type Deps } from '../context.ts';
 import { badRequest, HttpError, unprocessable } from '../errors.ts';
-import { acceptsGzip, makeResponse, send } from '../http.ts';
+import { makeResponse } from '../http.ts';
 import {
   checkRange,
   DAY_MS,
@@ -43,6 +43,7 @@ import {
   type ProfileBarRow,
   type ProfileLevelRow,
 } from '../queries.ts';
+import { serveVersioned } from '../respond.ts';
 import { versionOf } from '../versions.ts';
 
 /** Größte Zeilengröße eines Profils in Ticks. */
@@ -200,55 +201,43 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
     const [d0, d1] = coveredDays(from, to);
     const parts = ['profile', s.name, from, to, R, va];
     const pre = versionOf(parts, d0, d1, (d) => s.days.get(d));
-    const key = `profile|${parts.join('|')}|`;
-    const hit = pre.final ? deps.cache.get(key + pre.dataVersion) : undefined;
-    if (hit) {
-      req.ctx.cache = 'hit';
-      return send(req, reply, hit);
-    }
-    req.ctx.cache = 'miss';
-    const w = R * s.tickRefUnits;
-    const { days, bars, levels } = await guardedRead(deps, req.ctx, async (tx) => {
-      const days = await readDays(tx, s.symId, d0, d1);
-      const bars = await queryProfileBars(tx, s.symId, plan.barSegs, null);
-      const b = bars[0];
-      if (b) {
-        const cells = rowOf(b.high, w) - rowOf(b.low, w) + 1;
-        if (cells > deps.cfg.maxCells) {
-          throw unprocessable(`${cells} Zeilen > ${deps.cfg.maxCells}; gröberes R wählen`, {
-            suggestR: suggestR(deps, s, R, from, to, false, (r) => {
-              const x = r * s.tickRefUnits;
-              return rowOf(b.high, x) - rowOf(b.low, x) + 1;
-            }),
-          });
+    const key = `profile|${parts.join('|')}`;
+    return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
+      const w = R * s.tickRefUnits;
+      const { days, bars, levels } = await guardedRead(deps, ctx, async (tx) => {
+        const days = await readDays(tx, s.symId, d0, d1);
+        const bars = await queryProfileBars(tx, s.symId, plan.barSegs, null);
+        const b = bars[0];
+        if (b) {
+          const cells = rowOf(b.high, w) - rowOf(b.low, w) + 1;
+          if (cells > deps.cfg.maxCells) {
+            throw unprocessable(`${cells} Zeilen > ${deps.cfg.maxCells}; gröberes R wählen`, {
+              suggestR: suggestR(deps, s, R, from, to, false, (r) => {
+                const x = r * s.tickRefUnits;
+                return rowOf(b.high, x) - rowOf(b.low, x) + 1;
+              }),
+            });
+          }
         }
-      }
-      const levels = b
-        ? await queryProfileLevels(tx, s.symId, plan.segs, w, s.tickRefUnits, null)
-        : [];
-      return { days, bars, levels };
+        const levels = b
+          ? await queryProfileLevels(tx, s.symId, plan.segs, w, s.tickRefUnits, null)
+          : [];
+        return { days, bars, levels };
+      });
+      const ver = versionOf(parts, d0, d1, (d) => days.get(d));
+      if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
+      const out: RangeProfileResponse = {
+        ...envelope(s, R, from, to, va),
+        kind: 'profile',
+        dataVersion: ver.dataVersion,
+        final: ver.final,
+        sources: plan.segs,
+        sourceRowsEstimate: plan.estimate,
+        profile: buildBody(bars[0], levels, 0, levels.length, w, va),
+      };
+      const body = Buffer.from(JSON.stringify(out));
+      return makeResponse(body, 'application/json', ver.dataVersion, ver.final, true);
     });
-    const ver = versionOf(parts, d0, d1, (d) => days.get(d));
-    if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
-    const out: RangeProfileResponse = {
-      ...envelope(s, R, from, to, va),
-      kind: 'profile',
-      dataVersion: ver.dataVersion,
-      final: ver.final,
-      sources: plan.segs,
-      sourceRowsEstimate: plan.estimate,
-      profile: buildBody(bars[0], levels, 0, levels.length, w, va),
-    };
-    const body = Buffer.from(JSON.stringify(out));
-    const r = await makeResponse(
-      body,
-      'application/json',
-      ver.dataVersion,
-      ver.final,
-      acceptsGzip(req),
-    );
-    if (ver.final) deps.cache.set(key + ver.dataVersion, r);
-    return send(req, reply, r);
   });
 
   app.get('/api/v1/profiles/daily', async (req, reply) => {
@@ -280,76 +269,66 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
     const [d0, d1] = coveredDays(from, to);
     const parts = ['daily', s.name, from, to, R, offsetH, va];
     const pre = versionOf(parts, d0, d1, (d) => s.days.get(d));
-    const key = `daily|${parts.join('|')}|`;
-    const hit = pre.final ? deps.cache.get(key + pre.dataVersion) : undefined;
-    if (hit) {
-      req.ctx.cache = 'hit';
-      return send(req, reply, hit);
-    }
-    req.ctx.cache = 'miss';
-    const w = R * s.tickRefUnits;
-    const cellsOf = (bars: ProfileBarRow[], x: number) =>
-      bars.reduce((a, b) => a + rowOf(b.high, x) - rowOf(b.low, x) + 1, 0);
-    const { days, bars, levels } = await guardedRead(deps, req.ctx, async (tx) => {
-      const days = await readDays(tx, s.symId, d0, d1);
-      const bars = await queryProfileBars(tx, s.symId, plan.barSegs, off);
-      const cells = cellsOf(bars, w);
-      if (cells > deps.cfg.maxCells) {
-        throw unprocessable(`${cells} Zeilen > ${deps.cfg.maxCells}; gröberes R wählen`, {
-          suggestR: suggestR(deps, s, R, from, to, true, (r) => cellsOf(bars, r * s.tickRefUnits)),
-        });
-      }
-      const levels =
-        bars.length > 0
-          ? await queryProfileLevels(tx, s.symId, plan.segs, w, s.tickRefUnits, off)
-          : [];
-      return { days, bars, levels };
-    });
-    const ver = versionOf(parts, d0, d1, (d) => days.get(d));
-    if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
-    const out: DailyProfile[] = [];
-    let i = 0;
-    for (const b of bars) {
-      while (i < levels.length && levels[i]!.day < b.day) {
-        throw new HttpError(500, `Level am Tag ${levels[i]!.day} ohne Bars`);
-      }
-      let j = i;
-      while (j < levels.length && levels[j]!.day === b.day) j++;
-      const dayFrom = b.day * DAY_MS + off;
-      // überdeckte UTC-Tage des Tagesprofils
-      const u0 = Math.floor(dayFrom / DAY_MS);
-      const u1 = Math.floor((dayFrom + DAY_MS - 1) / DAY_MS);
-      let final = true;
-      for (let u = u0; u <= u1; u++) if (!days.get(u)?.immutable) final = false;
-      out.push({
-        day: formatDay(b.day),
-        from: dayFrom,
-        to: dayFrom + DAY_MS,
-        final,
-        ...buildBody(b, levels, i, j, w, va),
+    const key = `daily|${parts.join('|')}`;
+    return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
+      const w = R * s.tickRefUnits;
+      const cellsOf = (bars: ProfileBarRow[], x: number) =>
+        bars.reduce((a, b) => a + rowOf(b.high, x) - rowOf(b.low, x) + 1, 0);
+      const { days, bars, levels } = await guardedRead(deps, ctx, async (tx) => {
+        const days = await readDays(tx, s.symId, d0, d1);
+        const bars = await queryProfileBars(tx, s.symId, plan.barSegs, off);
+        const cells = cellsOf(bars, w);
+        if (cells > deps.cfg.maxCells) {
+          throw unprocessable(`${cells} Zeilen > ${deps.cfg.maxCells}; gröberes R wählen`, {
+            suggestR: suggestR(deps, s, R, from, to, true, (r) =>
+              cellsOf(bars, r * s.tickRefUnits),
+            ),
+          });
+        }
+        const levels =
+          bars.length > 0
+            ? await queryProfileLevels(tx, s.symId, plan.segs, w, s.tickRefUnits, off)
+            : [];
+        return { days, bars, levels };
       });
-      i = j;
-    }
-    if (i !== levels.length) throw new HttpError(500, 'Level ohne Bars');
-    const res: DailyProfilesResponse = {
-      ...envelope(s, R, from, to, va),
-      kind: 'profiles/daily',
-      offsetH,
-      dataVersion: ver.dataVersion,
-      final: ver.final,
-      sources: plan.segs,
-      sourceRowsEstimate: plan.estimate,
-      days: out,
-    };
-    const body = Buffer.from(JSON.stringify(res));
-    const r = await makeResponse(
-      body,
-      'application/json',
-      ver.dataVersion,
-      ver.final,
-      acceptsGzip(req),
-    );
-    if (ver.final) deps.cache.set(key + ver.dataVersion, r);
-    return send(req, reply, r);
+      const ver = versionOf(parts, d0, d1, (d) => days.get(d));
+      if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
+      const out: DailyProfile[] = [];
+      let i = 0;
+      for (const b of bars) {
+        while (i < levels.length && levels[i]!.day < b.day) {
+          throw new HttpError(500, `Level am Tag ${levels[i]!.day} ohne Bars`);
+        }
+        let j = i;
+        while (j < levels.length && levels[j]!.day === b.day) j++;
+        const dayFrom = b.day * DAY_MS + off;
+        // überdeckte UTC-Tage des Tagesprofils
+        const u0 = Math.floor(dayFrom / DAY_MS);
+        const u1 = Math.floor((dayFrom + DAY_MS - 1) / DAY_MS);
+        let final = true;
+        for (let u = u0; u <= u1; u++) if (!days.get(u)?.immutable) final = false;
+        out.push({
+          day: formatDay(b.day),
+          from: dayFrom,
+          to: dayFrom + DAY_MS,
+          final,
+          ...buildBody(b, levels, i, j, w, va),
+        });
+        i = j;
+      }
+      if (i !== levels.length) throw new HttpError(500, 'Level ohne Bars');
+      const res: DailyProfilesResponse = {
+        ...envelope(s, R, from, to, va),
+        kind: 'profiles/daily',
+        offsetH,
+        dataVersion: ver.dataVersion,
+        final: ver.final,
+        sources: plan.segs,
+        sourceRowsEstimate: plan.estimate,
+        days: out,
+      };
+      const body = Buffer.from(JSON.stringify(res));
+      return makeResponse(body, 'application/json', ver.dataVersion, ver.final, true);
+    });
   });
 }

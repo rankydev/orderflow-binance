@@ -5,7 +5,7 @@ import { corsAllowed } from './config.ts';
 import { newCtx, type Deps } from './context.ts';
 import { HttpError } from './errors.ts';
 import { registerProfileRoutes } from './routes/profile.ts';
-import { registerStatusRoutes } from './routes/status.ts';
+import { healthDetail, registerStatusRoutes } from './routes/status.ts';
 import { registerTileRoutes } from './routes/tiles.ts';
 
 export interface AppOptions {
@@ -14,7 +14,6 @@ export interface AppOptions {
 }
 
 export function buildApp(deps: Deps, opt: AppOptions = {}): FastifyInstance {
-  const startedAt = Date.now();
   const app = Fastify({
     logger:
       opt.logger === false
@@ -29,8 +28,20 @@ export function buildApp(deps: Deps, opt: AppOptions = {}): FastifyInstance {
     bodyLimit: 1024,
     return503OnClosing: true,
     forceCloseConnections: 'idle',
+    // Review W2: Fastify setzt sonst connectionTimeout/requestTimeout = 0 (aus)
+    connectionTimeout: deps.cfg.connectionTimeoutMs,
+    requestTimeout: deps.cfg.requestTimeoutMs,
+    keepAliveTimeout: deps.cfg.keepAliveTimeoutMs,
+    maxRequestsPerSocket: deps.cfg.maxRequestsPerSocket,
+    http: {
+      headersTimeout: Math.min(20_000, deps.cfg.requestTimeoutMs),
+      // Node prüft request-/headersTimeout nur in diesem Takt (Standard 30 s)
+      connectionsCheckingInterval: Math.min(1_000, deps.cfg.requestTimeoutMs),
+    },
     routerOptions: { ignoreTrailingSlash: false, maxParamLength: 200 },
   });
+
+  app.server.maxConnections = deps.cfg.maxConnections;
 
   app.decorateRequest('ctx', null as never);
   app.addHook('onRequest', async (req, reply) => {
@@ -42,17 +53,26 @@ export function buildApp(deps: Deps, opt: AppOptions = {}): FastifyInstance {
     const origin = req.headers.origin;
     if (typeof origin === 'string' && corsAllowed(deps.cfg.cors, origin)) {
       reply.header('Access-Control-Allow-Origin', deps.cfg.cors === '*' ? '*' : origin);
-      reply.header('Access-Control-Expose-Headers', 'ETag, Retry-After, X-Cache, X-Source');
+      reply.header(
+        'Access-Control-Expose-Headers',
+        deps.cfg.diagHeaders
+          ? 'ETag, Retry-After, X-Cache, X-Source, X-Rows-Estimate'
+          : 'ETag, Retry-After, X-Cache',
+      );
     }
   });
 
   app.addHook('onSend', async (req, reply, payload) => {
     const c = req.ctx;
+    reply.header('X-Content-Type-Options', 'nosniff');
     if (c?.cache) reply.header('X-Cache', c.cache);
-    if (c?.src) reply.header('X-Source', c.src);
-    if (c?.rowsEstimate !== null && c?.rowsEstimate !== undefined)
-      reply.header('X-Rows-Estimate', String(c.rowsEstimate));
-    if (c?.db) reply.header('Server-Timing', `db;dur=${c.db.dbMs.toFixed(1)}`);
+    // Tabellennamen, Zeilenschätzung und DB-Zeit nur auf Wunsch (OF_API_DIAG_HEADERS)
+    if (deps.cfg.diagHeaders) {
+      if (c?.src) reply.header('X-Source', c.src);
+      if (c?.rowsEstimate !== null && c?.rowsEstimate !== undefined)
+        reply.header('X-Rows-Estimate', String(c.rowsEstimate));
+      if (c?.db) reply.header('Server-Timing', `db;dur=${c.db.dbMs.toFixed(1)}`);
+    }
     return payload;
   });
 
@@ -113,6 +133,17 @@ export function buildApp(deps: Deps, opt: AppOptions = {}): FastifyInstance {
 
   registerTileRoutes(app, deps);
   registerProfileRoutes(app, deps);
-  registerStatusRoutes(app, deps, startedAt);
+  registerStatusRoutes(app, deps);
   return app;
+}
+
+/**
+ * Getrennter Status-Listener (Review W3): nur 127.0.0.1, ein Pfad /health mit Interna (Katalogfehler,
+ * Speicher, Cache, Limiter). Der öffentliche Port kennt nur die knappe Liveness-Antwort.
+ */
+export function buildAdminApp(deps: Deps): FastifyInstance {
+  const startedAt = Date.now();
+  const admin = Fastify({ logger: false, connectionTimeout: 10_000, requestTimeout: 10_000 });
+  admin.get('/health', async (_req, reply) => healthDetail(deps, startedAt, reply));
+  return admin;
 }

@@ -1,14 +1,19 @@
-// Antwort-Cache im Prozess (KONZEPT §5.4): LRU nach Bytes, nur für unveränderliche Antworten
-// (final = true), vorkomprimiert (gzip) gespeichert. Schlüssel enthält die Datenversion; ein Treffer
-// ist damit genau die Antwort, die eine neue Berechnung auf demselben Datenstand liefern würde.
+// Antwort-Cache im Prozess (KONZEPT §5.4): LRU nach Bytes, vorkomprimiert (gzip) gespeichert. Der
+// Schlüssel enthält die Datenversion (Versionen aller überdeckten Tage, fehlende Tage als „-"); ein
+// Treffer ist damit die Antwort, die eine neue Berechnung auf demselben Datenstand liefern würde.
+// Nicht finale Antworten liegen ebenfalls im Cache, aber nur kurz (expiresAt): so fängt der Cache den
+// Ansturm auf den laufenden Tag ab, und Daten, die sich künftig ohne Versionssprung ändern könnten
+// (Live-Minuten ab P2), veralten höchstens um diese Frist.
 
 export interface CachedResponse {
   body: Buffer;
   gzip: Buffer | null;
   type: string;
   etag: string;
-  /** true → Cache-Control immutable (nur unveränderliche Daten gelangen in den Cache). */
+  /** true → Browser darf eine Woche cachen (TILE-FORMAT.md), sonst no-cache. */
   final: boolean;
+  /** Ablaufzeit (ms, Date.now()) für nicht finale Einträge; null = nur LRU. */
+  expiresAt?: number | null;
 }
 
 export class ResponseCache {
@@ -28,15 +33,23 @@ export class ResponseCache {
 
   get(key: string): CachedResponse | undefined {
     const e = this.map.get(key);
-    if (!e) {
-      this.misses++;
-      return undefined;
+    if (e && e.expiresAt != null && e.expiresAt <= Date.now()) {
+      this.map.delete(key);
+      this.bytes -= ResponseCache.size(e);
+    } else if (e) {
+      // LRU: ans Ende verschieben
+      this.map.delete(key);
+      this.map.set(key, e);
+      this.hits++;
+      return e;
     }
-    // LRU: ans Ende verschieben
-    this.map.delete(key);
-    this.map.set(key, e);
-    this.hits++;
-    return e;
+    this.misses++;
+    return undefined;
+  }
+
+  /** Nur für Tests/Diagnose. */
+  has(key: string): boolean {
+    return this.map.has(key);
   }
 
   set(key: string, e: CachedResponse): void {
