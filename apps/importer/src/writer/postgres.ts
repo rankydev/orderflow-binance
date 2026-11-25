@@ -176,9 +176,9 @@ export interface PostgresWriterOptions {
   /** Backfill-Modus (§4.1): Columnstore-Jobs pausieren, fertige Chunks explizit konvertieren. */
   backfill?: boolean;
   /**
-   * Ersatz in Columnstore-Chunks: false (Standard) = betroffene Chunks vor dem Ersetzen in den
-   * Rowstore wandeln und danach wieder konvertieren (KONZEPT §3.9; gemessen 5× schneller als
-   * DELETE/COPY direkt auf dem Columnstore); true = direktes DML auf dem Columnstore (Messoption).
+   * Ersatz in Columnstore-Chunks: im Backfill-Modus betroffene Chunks vorher in den Rowstore wandeln
+   * und danach wieder konvertieren (gemessen ≈ 5× schneller); sonst (und mit true immer) direktes
+   * DML auf dem Columnstore, das Leser mit älteren Snapshots nicht stört.
    */
   directDml?: boolean;
   /** Nur lesen (--plan): kein Lock, keine Job-Reparatur, keine Schreibzugriffe. */
@@ -423,21 +423,27 @@ export class PostgresWriter implements DayWriter {
   }
 
   /**
-   * Columnstore-Chunks, die den Tag überdecken, in den Rowstore wandeln; liefert ihre Namen.
-   * Hält bis zum Commit eine exklusive Sperre auf diesen Chunks (Leser warten, Review N5) –
-   * deshalb nur tatsächlich komprimierte, tatsächlich betroffene Chunks.
+   * Columnstore-Chunks, die den Tag überdecken, in den Rowstore wandeln – jeden in einer EIGENEN
+   * kurzen Transaktion vor dem Ersatz. In einer gemeinsamen Transaktion hielte der Schreiber
+   * exklusive Sperren auf mehreren Chunks gleichzeitig, während ein Leser mit einer Anweisung über
+   * mehrere Tabellen Lesesperren in anderer Reihenfolge nimmt → Deadlock (im DB-Test beobachtet).
+   * Einzeln gibt es keinen Zyklus; die Daten ändern sich dabei nicht.
    */
-  private async rowstoreDay(tx: Tx, from: Date, to: Date): Promise<string[]> {
+  private async rowstoreDay(from: Date, to: Date): Promise<string[]> {
     const tables = [...DIGEST_TABLES];
-    const chunks = await tx`
+    const chunks = await this.db`
       SELECT format('%I.%I', chunk_schema, chunk_name) AS c
         FROM timescaledb_information.chunks
        WHERE hypertable_schema = 'public' AND hypertable_name = ANY(${tables}::text[])
-         AND is_compressed AND range_start < ${to} AND range_end > ${from}`;
+         AND is_compressed AND range_start < ${to} AND range_end > ${from}
+       ORDER BY hypertable_name, range_start`;
     for (const c of chunks) {
-      await tx.unsafe('CALL convert_to_rowstore($1::regclass, if_columnstore => true)', [
-        c.c as string,
-      ]);
+      await this.db.begin(async (tx) => {
+        await this.ensureLock(tx);
+        await tx.unsafe('CALL convert_to_rowstore($1::regclass, if_columnstore => true)', [
+          c.c as string,
+        ]);
+      });
     }
     return chunks.map((c) => c.c as string);
   }
@@ -498,9 +504,13 @@ export class PostgresWriter implements DayWriter {
     let reconvert: string[] = [];
     let out: WriteOutcome;
     try {
+      // Rowstore-Umweg nur im Backfill-Modus. convert_to_rowstore/convert_to_columnstore schreiben
+      // den Chunk neu und sind für ÄLTERE Snapshots nicht MVCC-sicher (ein Leser mit früherem
+      // Snapshot sieht den Chunk danach leer – „Bar ohne Level" in der API, dort nachgewiesen).
+      // Im Online-Betrieb daher direktes DML (Timescale entpackt nur betroffene Batches, MVCC-sicher).
+      if (this.opt.backfill && !this.opt.directDml) reconvert = await this.rowstoreDay(from, to);
       out = await this.db.begin(async (tx) => {
         await this.ensureLock(tx);
-        if (!this.opt.directDml) reconvert = await this.rowstoreDay(tx, from, to);
         for (const t of DIGEST_TABLES) {
           await tx.unsafe(`DELETE FROM ${t} WHERE sym_id = $1 AND ts >= $2 AND ts < $3`, [
             symId,

@@ -27,7 +27,7 @@ import type { DayWriter } from '../src/writer/types.ts';
 import { archive } from './synth.ts';
 
 const base = parseConfig(process.env).db;
-const cfg: DbConfig = { ...base, database: `${base.database}_test` };
+const cfg: DbConfig = { ...base, database: `${base.database}_test_importer` }; // eigene DB: andere Agenten nutzen _test parallel
 const BTC = getSymbol('BTCUSDT');
 let sql: Sql;
 let dataDir: string;
@@ -499,5 +499,65 @@ describe('Review vor dem Backfill (DB)', () => {
     } finally {
       await w.close();
     }
+  });
+});
+
+describe('Leser während des Schreibens (Konsistenz je Snapshot)', () => {
+  it('jede Momentaufnahme: jede bar_1m-Minute hat Level, Summen über Basis, Rollups und Bars stimmen', async () => {
+    const reader = connect(cfg);
+    const check = async () => {
+      // eine Anweisung = ein Snapshot (READ COMMITTED); die API muss Bars und Level ebenso in EINEM
+      // Snapshot lesen (eine Anweisung oder REPEATABLE READ), sonst kann ein Commit dazwischen liegen
+      const [r] = await reader`
+        WITH d AS (SELECT '2026-09-16'::timestamptz AS f, '2026-09-17'::timestamptz AS t)
+        SELECT
+          (SELECT count(*)::int FROM bar_1m b, d WHERE b.ts >= d.f AND b.ts < d.t AND NOT EXISTS
+             (SELECT 1 FROM fp_1m x WHERE x.sym_id = b.sym_id AND x.ts = b.ts)) AS bars_without_levels,
+          (SELECT coalesce(sum(buy_q + sell_q), 0)::bigint FROM fp_1m, d WHERE ts >= d.f AND ts < d.t) AS q1,
+          (SELECT coalesce(sum(buy_q + sell_q), 0)::bigint FROM fp_1m_b10, d WHERE ts >= d.f AND ts < d.t) AS q10,
+          (SELECT coalesce(sum(buy_q + sell_q), 0)::bigint FROM fp_1h_b100, d WHERE ts >= d.f AND ts < d.t) AS qh,
+          (SELECT coalesce(sum(buy_q + sell_q), 0)::bigint FROM fp_1d_b1000, d WHERE ts >= d.f AND ts < d.t) AS qd,
+          (SELECT coalesce(sum(buy_q + sell_q), 0)::bigint FROM bar_1m, d WHERE ts >= d.f AND ts < d.t) AS qb,
+          (SELECT coalesce(sum(buy_q + sell_q), 0)::bigint FROM bar_1d, d WHERE ts >= d.f AND ts < d.t) AS qbd`;
+      return r!;
+    };
+    let stop = false;
+    let reads = 0;
+    const problems: unknown[] = [];
+    const loop = (async () => {
+      while (!stop) {
+        const r = await check();
+        reads++;
+        const sums = [r.q1, r.q10, r.qh, r.qd, r.qb, r.qbd].map(String);
+        if (r.bars_without_levels !== 0 || new Set(sums).size !== 1) problems.push(r);
+      }
+    })();
+    for (let i = 0; i < 3; i++) {
+      const w = await opened(new PostgresWriter(cfg, BTC));
+      await new Importer({
+        dataDir,
+        spec: BTC,
+        firstDay: parseDay('2026-09-16'),
+        lastDay: parseDay('2026-09-16'),
+        prefer: 'monthly',
+        neighbours: false,
+        writer: w,
+        importerVersion: 'int-test',
+        sidecar: false,
+        log: () => {},
+        force: true,
+      }).run();
+      await w.close();
+      // zwischendurch komprimieren und wieder ersetzen (Rowstore-Umweg im nächsten Lauf)
+      const k = new PostgresWriter(cfg, BTC);
+      await k.open();
+      await k.convertFinishedChunks(Date.UTC(2026, 9, 1));
+      await k.close();
+    }
+    stop = true;
+    await loop;
+    await reader.end();
+    expect(reads).toBeGreaterThan(10);
+    expect(problems).toEqual([]);
   });
 });
