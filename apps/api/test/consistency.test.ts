@@ -3,6 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import { checkCoverage, checkProfile, checkTile } from '../src/consistency.ts';
 import { DataInconsistency, readTx, type Sql } from '../src/db.ts';
+import { hasMinute, maskOf, minuteCount } from '../src/minutes.ts';
 import { HttpError } from '../src/errors.ts';
 
 const bars = (time: number[], q: number[]) => ({
@@ -79,37 +80,69 @@ describe('checkTile / checkProfile', () => {
 describe('checkCoverage (leerer Ausschnitt, obwohl gespeicherte Minuten ihn belegen)', () => {
   const D = 86_400_000;
   const H = 3_600_000;
-  /** Minuten je Stunde: `filled` Stunden ab 0 mit 60 Minuten, danach 0 (Loch bis Tagesende). */
-  const hoursUntil = (filled: number) =>
-    Int16Array.from({ length: 24 }, (_, h) => (h < filled ? 60 : 0));
+  const M = 60_000;
+  const range = (a: number, b: number) => Array.from({ length: b - a }, (_, i) => a + i);
+  /** Minuten [0, filledMin) gespeichert, danach nichts (Loch bis Tagesende). */
+  const until = (filledMin: number) => maskOf(range(0, filledMin));
   it('halb gefüllter Tag: leere Fenster im Loch sind gültig, auch 8 h; im gefüllten Teil nicht', () => {
-    const day = () => hoursUntil(6); // Daten 00:00–06:00, danach nichts (wie der Live-Tag)
+    const day = () => until(6 * 60); // Daten 00:00–06:00, danach nichts (wie der Live-Tag)
     for (const [a, b] of [
       [7 * H, 8 * H],
       [7 * H, 11 * H],
       [8 * H, 16 * H],
       [6 * H, D],
+      [6 * H, 6 * H + 15 * M],
     ])
       expect(() => checkCoverage([], a!, b!, day, false, {})).not.toThrow();
     expect(() => checkCoverage([], 1 * H, 5 * H, day, true, {})).toThrow(/leer/);
-    // Teilstunde am Rand allein ist kein Beleg (nur voll überdeckte Stunden zählen)
+    // über den Rand: die gespeicherten Minuten 05:30–05:59 liegen im Fenster → ohne Bar ungültig
+    expect(() => checkCoverage([], 5 * H + 30 * M, 6 * H + 30 * M, day, true, {})).toThrow(/leer/);
     expect(() =>
-      checkCoverage([], 5 * H + 30 * 60_000, 6 * H + 30 * 60_000, day, true, {}),
+      checkCoverage([5 * H + 30 * M], 5 * H + 30 * M, 6 * H + 30 * M, day, true, {}),
+    ).not.toThrow();
+  });
+  it('Fenster unter einer Stunde: 15 min mit gespeicherten Minuten, ohne Bar → ungültig', () => {
+    // nur die Minuten 10:20–10:24 gespeichert (z. B. ein ruhiger Markt)
+    const sparse = () => maskOf(range(10 * 60 + 20, 10 * 60 + 25));
+    expect(() => checkCoverage([], 10 * H + 15 * M, 10 * H + 30 * M, sparse, true, {})).toThrow(
+      /Minute .*T10:20/,
+    );
+    expect(() =>
+      checkCoverage([10 * H + 15 * M], 10 * H + 15 * M, 10 * H + 30 * M, sparse, true, {}),
+    ).not.toThrow();
+    // Fenster direkt daneben (keine gespeicherte Minute darin) → gültig leer
+    expect(() =>
+      checkCoverage([], 10 * H + 25 * M, 10 * H + 40 * M, sparse, true, {}),
+    ).not.toThrow();
+    expect(() => checkCoverage([], 10 * H, 10 * H + 20 * M, sparse, true, {})).not.toThrow();
+    // ein einzelnes 1-Minuten-Fenster
+    expect(() => checkCoverage([], 10 * H + 24 * M, 10 * H + 25 * M, sparse, true, {})).toThrow();
+    expect(() =>
+      checkCoverage([], 10 * H + 25 * M, 10 * H + 26 * M, sparse, true, {}),
     ).not.toThrow();
   });
   it('unveränderlicher Tag mit echtem mehrstündigem Loch bleibt gültig; Tag ohne Statistik: keine Prüfung', () => {
-    const hole = () => Int16Array.from({ length: 24 }, (_, h) => (h >= 5 && h < 9 ? 0 : 58));
+    const hole = () => maskOf([...range(0, 5 * 60), ...range(9 * 60, 1440)]);
     expect(() => checkCoverage([], 5 * H, 9 * H, hole, true, {})).not.toThrow();
     expect(() => checkCoverage([], 4 * H, 9 * H, hole, true, {})).toThrow(/leer/);
     expect(() => checkCoverage([], 0, D, () => undefined, true, {})).not.toThrow();
   });
   it('über Mitternacht: jedes Tagesstück für sich; whole = der ganze Zeitraum', () => {
-    const hours = (d: number) => (d === 0 ? hoursUntil(24) : hoursUntil(0)); // Tag 1 ohne Daten
+    const mins = (d: number) => (d === 0 ? until(1440) : until(0)); // Tag 1 ohne Daten
     // Bar nur am ersten Tag, zweites Stück ohne Belege → gültig
-    expect(() => checkCoverage([22 * H], 20 * H, D + 4 * H, hours, true, {})).not.toThrow();
+    expect(() => checkCoverage([22 * H], 20 * H, D + 4 * H, mins, true, {})).not.toThrow();
     // Bars nur im (leeren) zweiten Stück, erstes Stück belegt → ungültig
-    expect(() => checkCoverage([D + H], 20 * H, D + 4 * H, hours, true, {})).toThrow(/leer/);
-    expect(() => checkCoverage([D + H], 20 * H, D + 4 * H, hours, true, {}, true)).not.toThrow();
+    expect(() => checkCoverage([D + H], 20 * H, D + 4 * H, mins, true, {})).toThrow(/leer/);
+    expect(() => checkCoverage([D + H], 20 * H, D + 4 * H, mins, true, {}, true)).not.toThrow();
+  });
+  it('Minutenmaske: Bits, Zählung, Grenzen', () => {
+    const m = maskOf([0, 29, 30, 59, 60, 1439]);
+    expect([0, 29, 30, 59, 60, 1439].every((x) => hasMinute(m, x))).toBe(true);
+    expect([1, 28, 31, 61, 1438].some((x) => hasMinute(m, x))).toBe(false);
+    expect(minuteCount(m)).toBe(6);
+    expect(minuteCount(maskOf(range(0, 1440)))).toBe(1440);
+    expect(Math.max(...maskOf(range(0, 1440)))).toBe(2 ** 30 - 1);
+    expect(() => maskOf([1440])).toThrow();
   });
 });
 

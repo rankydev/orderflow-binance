@@ -33,6 +33,7 @@ import {
   type Sql,
 } from '@orderflow/db';
 import { randomBytes } from 'node:crypto';
+import { createServer as createHttpServer, type ServerResponse } from 'node:http';
 import { createConnection, createServer, type AddressInfo, type Socket } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -40,7 +41,9 @@ import { checkSymbolsResponse } from '../../web/src/lib/api.ts';
 import { BarStore } from '../../web/src/lib/bar-store.ts';
 import { FootprintStore } from '../../web/src/lib/footprint-store.ts';
 import { parseApiConfig, type ApiConfig } from '../src/config.ts';
-import { createPool, readTx } from '../src/db.ts';
+import { Catalog, STATS_RUN_DAYS } from '../src/catalog.ts';
+import { createPool, readTx, ReadTx } from '../src/db.ts';
+import { maskOf } from '../src/minutes.ts';
 import { startApi, type RunningApi } from '../src/main.ts';
 import { FP_TABLE_NAMES } from '../src/plan.ts';
 import { chunkLockList, queryLevels, tsLit } from '../src/queries.ts';
@@ -319,6 +322,105 @@ describe('Rolle of_api', () => {
       expect(u!.u).toBe(TEST_ROLE);
     } finally {
       await sql.end();
+    }
+  });
+});
+
+describe('Katalogstart: Budget unabhängig von der Zahl der Tage, nie ein Footprint-Scan', () => {
+  it('Start: 2 + 4 · Symbole Abfragen, nur Bar-Tabellen; ohne Änderung danach 2; Schranken ≥ tatsächlich', async () => {
+    const sql = createPool({ ...apiCfg(), dbPool: 1 }, 'orderflow-api-catalog-test');
+    const texts: string[] = [];
+    const orig = ReadTx.prototype.rows;
+    ReadTx.prototype.rows = function (text, params) {
+      texts.push(text);
+      return orig.call(this, text, params);
+    };
+    const cat = new Catalog(sql, {
+      pollMs: 3_600_000,
+      lockRetries: 3,
+      maxSourceRows: 300_000,
+      log: () => {},
+    });
+    try {
+      await cat.refresh();
+      expect(cat.ready).toBe(true);
+      const syms = cat.symbols();
+      expect(syms.length).toBeGreaterThan(0);
+      const days = syms.reduce((n, s) => n + s.days.size, 0);
+      expect(days).toBeGreaterThanOrEqual(LAST_DAY - FIRST_DAY + 1);
+      // symbol + data_day, je Symbol: LOCK der Bar-Chunks, Tagesstände, 2 Statistik-Abfragen – bis
+      // STATS_RUN_DAYS zusammenhängende Tage je Lauf, also unabhängig von der Zahl der Tage
+      expect(STATS_RUN_DAYS).toBeGreaterThanOrEqual(366);
+      expect(texts.length).toBe(2 + 4 * syms.length);
+      // kein Statement liest eine Footprint-Tabelle (≈ 2,7 GB je Symbol bei 167 Tagen, der alte Start)
+      for (const t of texts) expect(t).not.toMatch(/\bfp_\w+/);
+      texts.length = 0;
+      await cat.refresh();
+      expect(texts.length).toBe(2);
+      // Zeilen: Bars exakt, Footprint als obere Schranke; Minutenmaske = gespeicherte Minuten
+      const s = syms[0]!;
+      for (const [d, st] of s.stats) {
+        const A = tsLit(d * DAY_MS);
+        const B = tsLit((d + 1) * DAY_MS);
+        for (const t of [...FP_TABLE_NAMES, 'bar_1m', 'bar_1h', 'bar_1d'] as const) {
+          const cnt = await admin.unsafe<{ c: string }[]>(
+            `SELECT count(*) AS c FROM ${t} WHERE sym_id = ${s.symId} AND ts >= ${A} AND ts < ${B}`,
+          );
+          const actual = Number(cnt[0]!.c);
+          const got = st.rows.get(t) ?? 0;
+          if (t.startsWith('bar_')) expect(got, `${t} ${d}`).toBe(actual);
+          else {
+            expect(got, `${t} ${d}`).toBeGreaterThanOrEqual(actual);
+            if (actual === 0) expect(got).toBe(0);
+          }
+        }
+        const mins = await admin.unsafe<{ m: number }[]>(
+          `SELECT (extract(epoch from ts - ${A}) / 60)::int AS m FROM bar_1m
+            WHERE sym_id = ${s.symId} AND ts >= ${A} AND ts < ${B}`,
+        );
+        const want = maskOf(mins.map((x) => x.m));
+        expect([...st.minutes!]).toEqual([...want]);
+      }
+    } finally {
+      ReadTx.prototype.rows = orig;
+      await cat.stop();
+      await sql.end();
+    }
+  });
+
+  it('Recorder-Ereignis (SSE minute) → Katalog sofort aktuell, ohne auf die Abfrage zu warten', async () => {
+    const clients = new Set<ServerResponse>();
+    const srv = createHttpServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(': bereit\n\n');
+      clients.add(res);
+      req.on('close', () => clients.delete(res));
+    }).listen(0, '127.0.0.1');
+    await new Promise((r) => srv.once('listening', r));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}/events`;
+    // Abfrage praktisch aus (10 min): nur das Ereignis kann die neue Version bringen
+    const api = await start({ pollMs: 600_000, recorderEventsUrl: url });
+    const date = new Date(PROVISIONAL_DAY * DAY_MS).toISOString().slice(0, 10);
+    try {
+      const s = api.deps.catalog.symbol('BTCUSDT')!;
+      const v0 = s.days.get(PROVISIONAL_DAY)!.version;
+      for (let i = 0; i < 100 && !api.deps.events?.status.connected; i++) await sleep(20);
+      expect(api.deps.events?.status.connected).toBe(true);
+      await admin`UPDATE data_day SET version = version + 1 WHERE sym_id = ${SYM_ID} AND day = ${date}::date`;
+      for (const c of clients)
+        c.write(`event: minute\ndata: ${JSON.stringify({ symbol: 'BTCUSDT', ts: 0 })}\n\n`);
+      let v = v0;
+      for (let i = 0; i < 100 && v === v0; i++) {
+        await sleep(20);
+        v = api.deps.catalog.symbol('BTCUSDT')!.days.get(PROVISIONAL_DAY)!.version;
+      }
+      expect(v).toBe(v0 + 1);
+      // die Statistik des Tages passt zur neuen Version (Leerprüfung bleibt aktiv)
+      expect(api.deps.catalog.symbol('BTCUSDT')!.stats.get(PROVISIONAL_DAY)!.version).toBe(v0 + 1);
+    } finally {
+      await api.close();
+      for (const c of clients) c.destroy();
+      await new Promise((r) => srv.close(r));
     }
   });
 });
@@ -1724,6 +1826,18 @@ describe('Leerprüfung: echte Lücken bleiben gültig, der Gefahrenfall wird erk
     expect(decodeTile(x.buf).header.nBars).toBe(
       refBars(3600, BAD_DAY * DAY_MS - 4 * H, a + 3 * H).length,
     );
+    // Fenster unter einer Stunde am Rand des Lochs: ganz im Loch → leer; über den Rand → die Bars davor
+    const M = MINUTE_MS;
+    for (const [from, to] of [
+      [a, a + 15 * M],
+      [b - 15 * M, b],
+      [a - 10 * M, a + 5 * M],
+      [b - 5 * M, b + 10 * M],
+    ]) {
+      const r = await get(api, `/api/v1/bars?sym=BTCUSDT&tf=1m&from=${from}&to=${to}`);
+      expect(r.res.status, `${from}`).toBe(200);
+      expect(decodeTile(r.buf).header.nBars).toBe(refBars(60, from!, to!).length);
+    }
   });
 
   it('halb gefüllter nicht finaler Tag: Fenster im Loch (auch 8 h) → 200 leer, nie 503', async () => {
@@ -1774,6 +1888,18 @@ describe('Leerprüfung: echte Lücken bleiben gültig, der Gefahrenfall wird erk
         const r = await get(api, `/api/v1/bars?sym=BTCUSDT&tf=1m&from=${a}&to=${b}`);
         expect(r.res.status).toBe(503);
         expect(r.res.headers.get('cache-control')).toBe('no-store');
+        expect(r.json().error).toMatch(/inkonsistent/);
+      }
+      // Fenster unter einer Stunde (Minutenmaske statt Stunden): 15 min mitten in der Stunde
+      const m15 = a + 15 * MINUTE_MS;
+      expect(gone.some((x) => x.ts >= m15 && x.ts < m15 + 15 * MINUTE_MS)).toBe(true);
+      for (const path of [
+        `/api/v1/bars?sym=BTCUSDT&tf=1m&from=${m15}&to=${m15 + 15 * MINUTE_MS}`,
+        `/api/v1/bars?sym=BTCUSDT&tf=15m&from=${m15}&to=${m15 + 15 * MINUTE_MS}`,
+        `/api/v1/profile?sym=BTCUSDT&from=${m15}&to=${m15 + 15 * MINUTE_MS}&R=10`,
+      ]) {
+        const r = await get(api, path);
+        expect(r.res.status, path).toBe(503);
         expect(r.json().error).toMatch(/inkonsistent/);
       }
     } finally {

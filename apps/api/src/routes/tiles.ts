@@ -8,7 +8,7 @@ import {
   type TileMeta,
 } from '@orderflow/core';
 import type { FastifyInstance } from 'fastify';
-import { coarserOffered, hoursFor, rowsOnFor, type SymbolState } from '../catalog.ts';
+import { coarserOffered, minutesFor, rowsOnFor, type SymbolState } from '../catalog.ts';
 import { assertFresh, guardedRead, requireSymbol, type Deps } from '../context.ts';
 import { serveVersioned } from '../respond.ts';
 import { badRequest, HttpError, unprocessable } from '../errors.ts';
@@ -208,7 +208,7 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
             bars.time.map((t) => t * 1000),
             from,
             to,
-            hoursFor(s, (d) => days.get(d)?.version),
+            minutesFor(s, (d) => days.get(d)?.version),
             allImmutable(days, d0, d1),
             { sym: s.name, d0, d1, tf },
           );
@@ -307,7 +307,7 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
             bars.time.map((t) => t * 1000),
             from,
             to,
-            hoursFor(s, (d) => days.get(d)?.version),
+            minutesFor(s, (d) => days.get(d)?.version),
             allImmutable(days, d0, d1),
             { sym: s.name, d0, d1, tf, R, tile },
           );

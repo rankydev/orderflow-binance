@@ -9,6 +9,7 @@ import { Catalog } from './catalog.ts';
 import { parseApiConfig, type ApiConfig } from './config.ts';
 import { createPool } from './db.ts';
 import { Limiter } from './limiter.ts';
+import { RecorderEvents } from './recorder-events.ts';
 
 export interface RunningApi {
   url: string;
@@ -37,10 +38,15 @@ export async function startApi(
     refreshTimeoutMs: Math.max(10_000, 3 * cfg.statementTimeoutMs),
     log: (level, msg, obj) => app?.log[level](obj ?? {}, msg),
   });
-  const deps: Deps = { cfg, sql, catalog, cache, limiter };
+  // Recorder-Ereignis (Minute festgeschrieben) → sofort aktualisieren statt bis zur nächsten Abfrage
+  const events = cfg.recorderEventsUrl
+    ? new RecorderEvents(cfg.recorderEventsUrl, () => catalog.poke())
+    : null;
+  const deps: Deps = { cfg, sql, catalog, cache, limiter, events };
   app = buildApp(deps, opt);
   catalog.on('dayChanged', (ev) => app?.log.debug(ev, 'dayChanged'));
   await catalog.start();
+  events?.start();
   if (!catalog.ready) app.log.warn({ err: catalog.lastError }, 'Katalog beim Start nicht geladen');
   else
     app.log.info(
@@ -58,6 +64,7 @@ export async function startApi(
   const shutdown = async () => {
     await app.close();
     await admin?.close();
+    await events?.stop();
     await catalog.stop();
     await Promise.all([sql.end({ timeout: 5 }), catSql.end({ timeout: 5 })]);
   };

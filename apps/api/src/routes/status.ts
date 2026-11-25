@@ -60,6 +60,7 @@ export function healthDetail(deps: Deps, startedAt: number, reply: FastifyReply)
       ageMs: cat.lastRefresh > 0 ? Date.now() - cat.lastRefresh : null,
       lastError: cat.lastError,
     },
+    recorderEvents: deps.events ? { ...deps.events.status } : null,
     symbols: cat.symbols().map((x) => ({
       name: x.name,
       dataFrom: x.dataFrom,

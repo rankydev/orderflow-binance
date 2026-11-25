@@ -14,7 +14,7 @@ import {
   type RangeProfileResponse,
 } from '@orderflow/core';
 import type { FastifyInstance } from 'fastify';
-import { hoursFor, rowsOnFor, type SymbolState } from '../catalog.ts';
+import { minutesFor, rowsOnFor, type SymbolState } from '../catalog.ts';
 import { guardedRead, requireSymbol, type Deps } from '../context.ts';
 import { badRequest, HttpError, unprocessable } from '../errors.ts';
 import { makeResponse } from '../http.ts';
@@ -244,7 +244,7 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
           const where = { sym: s.name, d0, d1, R };
           checkProfile(bars, levels, imm, where);
           // ein leeres Range-Profil über einem Zeitraum, der Trades haben müsste → Snapshot unbrauchbar
-          const minutesOn = hoursFor(s, (d) => days.get(d)?.version);
+          const minutesOn = minutesFor(s, (d) => days.get(d)?.version);
           checkCoverage(bars.length > 0 ? [from] : [], from, to, minutesOn, imm, where, true);
           return { days, bars, levels };
         },
@@ -328,7 +328,7 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
           const where = { sym: s.name, d0, d1, R };
           checkProfile(bars, levels, imm, where);
           // je Tagesprofil: ein leerer Tag, der Trades haben müsste → Snapshot unbrauchbar
-          const minutesOn = hoursFor(s, (d) => days.get(d)?.version);
+          const minutesOn = minutesFor(s, (d) => days.get(d)?.version);
           const have = new Set(bars.map((b) => b.day));
           for (let a = from; a < to; a += DAY_MS) {
             if (!have.has(Math.floor((a - off) / DAY_MS)))

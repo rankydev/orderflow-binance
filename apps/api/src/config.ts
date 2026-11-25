@@ -27,6 +27,12 @@ export interface ApiConfig {
   cacheBytes: number;
   /** Abfrageintervall der Tagesversionen (data_day) in ms. */
   pollMs: number;
+  /**
+   * Ereignis-Feed des Recorders (SSE, `event: minute` je festgeschriebener Minute), z. B.
+   * http://recorder:7701/events; jedes Ereignis stößt sofort eine Katalog-Aktualisierung an, statt bis
+   * zur nächsten Abfrage (pollMs) zu warten. null = aus (die Abfrage allein genügt, nur langsamer).
+   */
+  recorderEventsUrl: string | null;
   /** Höchstzahl geschätzter Quellzeilen je Anfrage (KONZEPT §1.4). */
   maxSourceRows: number;
   /**
@@ -131,6 +137,7 @@ export function parseApiConfig(env: Env): ApiConfig {
     lockRetries: intIn(problems, env, 'OF_API_LOCK_RETRIES', 3, 0, 10),
     cacheBytes: intIn(problems, env, 'OF_API_CACHE_MB', 200, 0, 4096) * 1024 * 1024,
     pollMs: intIn(problems, env, 'OF_API_POLL_MS', 1_000, 100, 600_000),
+    recorderEventsUrl: eventsUrl(problems, env.OF_API_RECORDER_EVENTS_URL),
     maxSourceRows: intIn(problems, env, 'OF_API_MAX_SOURCE_ROWS', 1_500_000, 1, 1e9),
     maxTileSourceRows: intIn(problems, env, 'OF_API_MAX_TILE_SOURCE_ROWS', 300_000, 1, 1e9),
     maxCells: intIn(problems, env, 'OF_API_MAX_CELLS', 60_000, 1, 1e7),
@@ -149,6 +156,27 @@ export function parseApiConfig(env: Env): ApiConfig {
     problems.push('OF_API_ADMIN_PORT muss sich von OF_API_PORT unterscheiden');
   if (problems.length > 0) throw new ConfigError(problems);
   return cfg;
+}
+
+function eventsUrl(problems: string[], raw: string | undefined): string | null {
+  const v = raw?.trim();
+  if (!v) return null;
+  let u: URL;
+  try {
+    u = new URL(v);
+  } catch {
+    problems.push(`OF_API_RECORDER_EVENTS_URL: "${v}" ist keine URL`);
+    return null;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    problems.push('OF_API_RECORDER_EVENTS_URL: nur http(s)');
+    return null;
+  }
+  if (u.username || u.password) {
+    problems.push('OF_API_RECORDER_EVENTS_URL: ohne Zugangsdaten');
+    return null;
+  }
+  return u.href;
 }
 
 /** Ursprung erlaubt? (CORS, nur GET ohne Credentials, TILE-FORMAT.md) */

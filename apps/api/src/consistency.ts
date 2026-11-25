@@ -4,6 +4,7 @@
 // oder ein echter Datenfehler (unveränderlicher Tag). Beides wird nie zu 500: DataInconsistency →
 // readTx wiederholt mit neuem Snapshot → 503 + Retry-After; bei unveränderlichen Tagen zusätzlich
 // laut protokolliert und in Health und /quality gemeldet (context.ts).
+import { hasMinute } from './minutes.ts';
 import { DataInconsistency } from './db.ts';
 import type { BarRows, DaySnap, LevelRows, ProfileBarRow, ProfileLevelRow } from './queries.ts';
 
@@ -80,36 +81,40 @@ export function checkProfile(
 
 /**
  * Verteidigung in der Tiefe (Review Pass 5/6): Ein Snapshot, in dem ein Chunk leer erscheint, sieht in
- * sich konsistent aus (keine Bars UND keine Level). Maßstab ist, was für genau diese Stunden gespeichert
- * ist: die Katalogstatistik zählt je Tag und UTC-Stunde die Minuten mit Trades (bar_1m), im gesperrten
+ * sich konsistent aus (keine Bars UND keine Level). Maßstab ist, was für genau diese Minuten gespeichert
+ * ist: die Katalogstatistik hält je Tag die Minuten mit Trades (bar_1m) als Bitmaske, im gesperrten
  * Snapshot ihrer Tagesversion, und wird nur verwendet, wenn diese Version der des Lese-Snapshots
- * gleicht. Ein Ausschnitt (je UTC-Tag; bei `whole` der ganze Zeitraum) ist unmöglich leer, wenn er eine
- * VOLL überdeckte Stunde mit ≥ 1 gespeicherten Minute enthält, aber keine einzige Bar. Echte Lücken
- * (Ausfälle, der unfertige Live-Tag, unvollständige Tage) haben 0 Minuten in ihren Stunden und lösen
- * nichts aus – exakt, ohne Schwelle und ohne Tagesdurchschnitt.
+ * gleicht. Ein Ausschnitt (je UTC-Tag; bei `whole` der ganze Zeitraum) ist unmöglich leer, wenn eine
+ * gespeicherte Minute in ihm beginnt, aber keine einzige Bar. Fenster sind an tf ≥ 1 min ausgerichtet
+ * (checkRange), der Bar einer solchen Minute beginnt also im selben Ausschnitt – das gilt auch für
+ * Fenster unter einer Stunde. Echte Lücken (Ausfälle, der unfertige Live-Tag, unvollständige Tage)
+ * haben keine gespeicherten Minuten und lösen nichts aus – exakt, ohne Schwelle.
  */
 export function checkCoverage(
   barStartsMs: ArrayLike<number>,
   from: number,
   to: number,
-  hoursOn: (day: number) => Int16Array | undefined,
+  minutesOn: (day: number) => Uint32Array | undefined,
   immutable: boolean,
   where: Record<string, unknown>,
   /** true: der ganze Zeitraum als ein Ausschnitt (Profile); sonst je UTC-Tag. */
   whole = false,
 ): void {
   const DAY = 86_400_000;
-  const HOUR = 3_600_000;
+  const MIN = 60_000;
   const pieces: { a: number; b: number; evidence: number | null }[] = [];
   for (let d = Math.floor(from / DAY); d * DAY < to; d++) {
     const a = Math.max(from, d * DAY);
     const b = Math.min(to, (d + 1) * DAY);
-    // erste voll überdeckte Stunde mit gespeicherten Minuten in [a, b)
+    // erste gespeicherte Minute, die in [a, b) beginnt
     let evidence: number | null = null;
-    const hours = hoursOn(d);
-    if (hours) {
-      for (let h = Math.ceil(a / HOUR) * HOUR; h + HOUR <= b && evidence === null; h += HOUR)
-        if (hours[(h - d * DAY) / HOUR]! > 0) evidence = h;
+    const mask = minutesOn(d);
+    if (mask) {
+      for (let m = Math.ceil((a - d * DAY) / MIN); d * DAY + m * MIN < b && m < 1440; m++)
+        if (hasMinute(mask, m)) {
+          evidence = d * DAY + m * MIN;
+          break;
+        }
     }
     if (whole && pieces.length > 0) {
       pieces[0]!.b = b;
@@ -125,7 +130,7 @@ export function checkCoverage(
     }
     if (!any)
       throw new DataInconsistency(
-        `Ausschnitt ${new Date(a).toISOString()}…${new Date(b).toISOString()} leer, gespeichert sind Minuten in der Stunde ab ${new Date(evidence).toISOString()}`,
+        `Ausschnitt ${new Date(a).toISOString()}…${new Date(b).toISOString()} leer, gespeichert ist die Minute ${new Date(evidence).toISOString()}`,
         immutable,
         where,
       );

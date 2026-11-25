@@ -4,8 +4,10 @@
 // Zeilenstatistik für die Schätzung der Quellzeilen (KONZEPT §5.1).
 //
 // Persistenz ohne Schreibzugriff: Alles hier ist eine Funktion der gespeicherten Daten. Je UTC-Tag
-// werden (a) die größte Zeilenzahl eines Bars je (tf, R) und (b) die Zeilenzahl je Quelltabelle
-// berechnet und mit data_day.version als Schlüssel gehalten; ändert sich eine Version (Import,
+// werden (a) die größte Zeilenzahl eines Bars je (tf, R), (b) die Zeilenzahl je Quelltabelle (Bars
+// exakt, Footprint als obere Schranke aus den Bars) und (c) die gespeicherten Minuten berechnet – nur
+// aus den Bar-Tabellen, nie aus den Footprint-Tabellen (Startzeit, bench/catalog-start.ts) – und
+// mit data_day.version als Schlüssel gehalten; ändert sich eine Version (Import,
 // Randauflösung, Kaskade), wird nur dieser Tag neu berechnet. maxRows je (tf, R) ist das Maximum
 // über die Tage (Bars der Zeitrahmen ≤ 1d überqueren nie eine UTC-Tagesgrenze, also exakt), und
 // tileConfigVersion ist ein Hash über die angebotenen (tf, R) → n. Nach einem Neustart ergibt sich
@@ -16,6 +18,7 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
   chooseFpSource,
+  fpTableGrid,
   ladder,
   TIMEFRAMES,
   tileBarsForMax,
@@ -26,6 +29,7 @@ import { int, readTx, type ReadTx, type Sql } from './db.ts';
 import { chunkLockList, QUALITY_FP_SQL, readDays, tsLit } from './queries.ts';
 import { BAR_TABLES, barTableFor, FP_TABLE_NAMES, type BarTable, type RowsOn } from './plan.ts';
 import { DAY_MS, SYMBOL_RE } from './params.ts';
+import { minuteCount } from './minutes.ts';
 
 /** Größte angebotene Zeilengröße einer Footprint-Kachel in Ticks (wie die Fixtures). */
 export const TILE_MAX_R = 10_000;
@@ -33,6 +37,17 @@ export const TILE_LADDER: readonly number[] = ladder(TILE_MAX_R);
 /** Erhöhen, wenn sich der Inhalt von Kacheln bei gleichem Datenstand ändert (trennt alle Caches). */
 export const TILE_BUILD_VERSION = 2;
 export const TIMEFRAME_LIST = Object.keys(TIMEFRAMES) as Timeframe[];
+
+/** Höchstzahl Tage je Statistik-Abfrage (zusammenhängender Lauf). */
+export const STATS_RUN_DAYS = 366;
+
+/** Je Footprint-Tabelle: Zeitrahmen ihres Rasters und Bin (für die Zeilenschranke aus den Bars). */
+const FP_BOUND = FP_TABLE_NAMES.map((t) => {
+  const g = fpTableGrid(t);
+  const tf = TIMEFRAME_LIST.find((x) => TIMEFRAMES[x] === g.tfMin * 60);
+  if (!tf) throw new Error(`kein Zeitrahmen für das Raster von ${t}`);
+  return { table: t, tf, bin: g.bin };
+});
 
 /** Nominale Zeilen/Tag (KONZEPT §3.6, BTC), nur falls noch keine Statistik vorliegt. */
 const NOMINAL_ROWS: Record<FpTableName, number> = {
@@ -61,14 +76,20 @@ export interface DayStats {
   version: number;
   /** je tf: größte Zeilenzahl eines Bars je Leiterstufe (Index wie TILE_LADDER) */
   maxRows: Map<Timeframe, Int32Array>;
-  /** Zeilen je Tabelle an diesem Tag */
+  /**
+   * Zeilen je Tabelle an diesem Tag: Bar-Tabellen exakt gezählt; Footprint-Tabellen als OBERE SCHRANKE
+   * aus den Bars ihres Zeitrasters, Σ über die Bars von (⌊high/w⌋ − ⌊low/w⌋ + 1) mit w = bin · tickRef
+   * (ein Bar hat höchstens so viele Level, wie seine Spanne Zeilen hat). Gemessen auf echten Daten:
+   * gebinnte Tabellen ≈ exakt, fp_1m ≈ 1,15–1,27 × tatsächlich. Kein Scan der Footprint-Tabellen –
+   * die waren beim Start ≈ 2,7 GB je Symbol (siehe bench/catalog-start.ts).
+   */
   rows: Map<FpTableName | BarTable, number>;
   /**
-   * Minuten mit Trades je UTC-Stunde (bar_1m-Zeilen, 24 Einträge), im selben gesperrten Snapshot wie
-   * die Version gezählt: Grundlage der Leerprüfung (consistency.ts) – was der Importer bzw. Recorder für
-   * genau diese Stunde gespeichert hat, keine Schätzung.
+   * Gespeicherte Minuten mit Trades (bar_1m) als Bitmaske: Wort 2·h + ⌊m/30⌋, Bit m mod 30 für Minute m
+   * der UTC-Stunde h (48 Wörter). Im selben gesperrten Snapshot wie die Version gelesen: Grundlage der
+   * Leerprüfung (consistency.ts) – was Importer bzw. Recorder für genau diese Minute gespeichert haben.
    */
-  hours?: Int16Array;
+  minutes?: Uint32Array;
 }
 
 export interface SymbolState {
@@ -214,6 +235,19 @@ export class Catalog extends EventEmitter {
     await this.running?.catch(() => {});
   }
 
+  /** Eine Aktualisierung wurde angestoßen, während eine lief (die vielleicht zu früh begann). */
+  private again = false;
+
+  /**
+   * Aktualisierung jetzt anstoßen (Ereignis des Recorders: eine Minute ist festgeschrieben). Läuft
+   * schon eine, folgt ihr genau eine weitere – die laufende hat ihren Snapshot evtl. vor dem Ereignis.
+   */
+  poke(): void {
+    if (this.stopped) return;
+    if (this.running) this.again = true;
+    else void this.refresh();
+  }
+
   /** Aktualisiert jetzt (eine laufende Aktualisierung wird abgewartet, nicht verdoppelt). */
   refresh(): Promise<void> {
     if (this.running) return this.running;
@@ -261,6 +295,10 @@ export class Catalog extends EventEmitter {
       .finally(() => {
         clearTimeout(timer);
         this.running = null;
+        if (this.again && !this.stopped) {
+          this.again = false;
+          void this.refresh();
+        }
       });
     return this.running;
   }
@@ -358,8 +396,10 @@ export class Catalog extends EventEmitter {
       const todo = [...s.days.values()]
         .filter((i) => i.hasData && s.stats.get(i.day)?.version !== i.version)
         .map((i) => i.day);
-      for (const [a, b] of runs(todo, 31)) {
-        const ranges = [...FP_TABLE_NAMES, ...BAR_TABLES].map((table) => ({
+      // Ein Lauf liest nur die Bar-Tabellen (≈ 45 KB je Tag und Symbol in bar_1m); bis zu einem Jahr je
+      // Abfrage – die Zahl der Abfragen hängt so praktisch nur von der Zahl der Symbole ab.
+      for (const [a, b] of runs(todo, STATS_RUN_DAYS)) {
+        const ranges = BAR_TABLES.map((table) => ({
           table,
           from: a * DAY_MS,
           to: (b + 1) * DAY_MS,
@@ -408,20 +448,35 @@ export class Catalog extends EventEmitter {
       const v = snap.get(d)?.version ?? info.version;
       fresh.set(d, { version: v, maxRows: new Map(), rows: new Map() });
     }
+    // (1) je tf und Tag: größte Zeilenzahl eines Bars je Leiterstufe, dazu die Zeilenschranke der
+    // Footprint-Tabellen mit diesem Raster (NULL, wo das Raster nicht passt) – nur aus den Bar-Tabellen
     const parts: string[] = [];
+    const tickRef = s.tickRefUnits;
     for (const tf of TIMEFRAME_LIST) {
       const tfSec = TIMEFRAMES[tf];
       const table = barTableFor(tfSec / 60);
       const direct = tfSec === { bar_1m: 60, bar_1h: 3600, bar_1d: 86400 }[table];
+      // Schranke je Bar: Level ≤ Zeilen seiner Spanne; bei zusammengefassten Bars zusätzlich ≤ Σ der
+      // Schranken seiner Quell-Bars (Kurssprünge zwischen Minuten machen die Spanne sonst zu grob)
+      const fps = FP_BOUND.filter((f) => f.tf === tf);
       const src = direct
         ? `SELECT ts AS t, high_px AS h, low_px AS l FROM ${table}
             WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B}`
         : `SELECT time_bucket('${tfSec} seconds'::interval, ts) AS t, max(high_px) AS h, min(low_px) AS l
+                  ${fps.map((f, i) => `, sum(high_px / ${f.bin * tickRef} - low_px / ${f.bin * tickRef} + 1) AS s${i}`).join('')}
              FROM ${table} WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 1`;
       // eine Spalte je Leiterstufe (ein Durchlauf, kein Kreuzprodukt); Breiten sind geprüfte Ganzzahlen
-      const cols = widths.map((w) => `max(b.h / ${w} - b.l / ${w} + 1)::int`).join(', ');
+      const cols = widths.map((w) => `max(b.h / ${w} - b.l / ${w} + 1)::int`);
+      const bounds = FP_BOUND.map((f) => {
+        const i = fps.indexOf(f);
+        if (i < 0) return 'NULL::int8';
+        const w = f.bin * tickRef;
+        return direct
+          ? `sum(b.h / ${w} - b.l / ${w} + 1)::int8`
+          : `sum(least(b.h / ${w} - b.l / ${w} + 1, b.s${i}))::int8`;
+      });
       parts.push(
-        `SELECT '${tf}'::text, (extract(epoch from time_bucket('1 day'::interval, b.t))::int8 / 86400)::int, ${cols}
+        `SELECT '${tf}'::text, (extract(epoch from time_bucket('1 day'::interval, b.t))::int8 / 86400)::int, ${[...cols, ...bounds].join(', ')}
            FROM (${src}) b GROUP BY time_bucket('1 day'::interval, b.t)`,
       );
     }
@@ -433,49 +488,59 @@ export class Catalog extends EventEmitter {
         String(r[0]) as Timeframe,
         Int32Array.from(widths, (_, i) => int(r[2 + i])),
       );
+      FP_BOUND.forEach((f, i) => {
+        const v = r[2 + widths.length + i];
+        if (v !== null && v !== undefined) st.rows.set(f.table, int(v));
+      });
     }
-    const cnt: string[] = [];
-    for (const t of [...FP_TABLE_NAMES, ...BAR_TABLES]) {
-      cnt.push(
-        // GROUP BY time_bucket direkt (vektorisiert); der Tagesindex entsteht außerhalb
-        `SELECT '${t}'::text, (extract(epoch from q.b)::int8 / 86400)::int, q.c FROM (
-           SELECT time_bucket('1 day'::interval, ts) AS b, count(*) AS c
-             FROM ${t} WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 1) q`,
-      );
-    }
-    for (const r of await tx.rows(cnt.join('\nUNION ALL\n'), [s.symId])) {
-      fresh.get(int(r[1]))?.rows.set(String(r[0]) as FpTableName | BarTable, int(r[2]));
-    }
-    const hr = await tx.rows(
-      `SELECT (extract(epoch from q.b)::int8 / 3600)::int8, q.c FROM (
-         SELECT time_bucket('1 hour'::interval, ts) AS b, count(*) AS c
-           FROM bar_1m WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 1) q`,
+    // (2) Bar-Zeilen je Tag exakt und die gespeicherten Minuten als Maske (je Stunde zwei 30-Bit-Wörter)
+    const cr = await tx.rows(
+      `SELECT 'm'::text, (extract(epoch from q.b)::int8 / 3600)::int8, q.lo, q.hi FROM (
+         SELECT time_bucket('1 hour'::interval, ts) AS b,
+                coalesce(bit_or(1 << extract(minute from ts)::int) FILTER (WHERE extract(minute from ts) < 30), 0) AS lo,
+                coalesce(bit_or(1 << (extract(minute from ts)::int - 30)) FILTER (WHERE extract(minute from ts) >= 30), 0) AS hi
+           FROM bar_1m WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 1) q
+       UNION ALL
+       SELECT t, (extract(epoch from q.b)::int8 / 86400)::int8, q.c, 0 FROM (
+         SELECT 'bar_1h'::text AS t, time_bucket('1 day'::interval, ts) AS b, count(*)::int AS c
+           FROM bar_1h WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 2
+         UNION ALL
+         SELECT 'bar_1d'::text, time_bucket('1 day'::interval, ts), count(*)::int
+           FROM bar_1d WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 2) q`,
       [s.symId],
     );
-    for (const r of hr) {
-      const h = int(r[0]);
-      const st = fresh.get(Math.floor(h / 24));
-      if (!st) continue;
-      st.hours ??= new Int16Array(24);
-      st.hours[h % 24] = int(r[1]);
+    for (const r of cr) {
+      const k = String(r[0]);
+      const x = int(r[1]);
+      if (k === 'm') {
+        const st = fresh.get(Math.floor(x / 24));
+        if (!st) continue;
+        st.minutes ??= new Uint32Array(48);
+        st.minutes[2 * (x % 24)] = int(r[2]);
+        st.minutes[2 * (x % 24) + 1] = int(r[3]);
+      } else fresh.get(x)?.rows.set(k as BarTable, int(r[2]));
     }
-    for (const st of fresh.values()) st.hours ??= new Int16Array(24);
+    for (const st of fresh.values()) {
+      st.minutes ??= new Uint32Array(48);
+      const n = minuteCount(st.minutes);
+      if (n > 0) st.rows.set('bar_1m', n);
+    }
     for (const [d, st] of fresh) s.stats.set(d, st);
   }
 }
 
 /**
- * Für die Leerprüfung: Minuten mit Trades je Stunde eines Tages – nur, wenn die Statistik zur
+ * Für die Leerprüfung: gespeicherte Minuten eines Tages (Maske) – nur, wenn die Statistik zur
  * Tagesversion des Lese-Snapshots gehört (sonst keine Aussage, also keine Prüfung).
  */
-export function hoursFor(
+export function minutesFor(
   s: SymbolState,
   snapVersion: (day: number) => number | undefined,
-): (day: number) => Int16Array | undefined {
+): (day: number) => Uint32Array | undefined {
   return (day) => {
     const st = s.stats.get(day);
     const v = snapVersion(day);
-    return st?.hours && v !== undefined && st.version === v ? st.hours : undefined;
+    return st?.minutes && v !== undefined && st.version === v ? st.minutes : undefined;
   };
 }
 

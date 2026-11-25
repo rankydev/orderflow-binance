@@ -128,6 +128,15 @@ angeboten nur, wenn 32 · m ≤ 60 000 und die Quellzeilengrenze je Kachel auch 
   `tiles` und damit `tileConfigVersion` können sich also höchstens einmal je Import bzw. je Tag ändern, der
   unveränderlich wird, nie im Wechsel innerhalb eines Tages. Die Regel ist deterministisch (gleiche Daten →
   gleiche Version, auch nach Neustart).
+- **Statistik je Tag (2026-11-25):** nur aus den Bar-Tabellen – Zeilen je Bar je (tf, R), Bar-Zeilen exakt, die
+  gespeicherten Minuten als Bitmaske und die **Quellzeilen der Footprint-Tabellen als obere Schranke**
+  Σ über die Bars des Tabellenrasters von min(⌊high/w⌋ − ⌊low/w⌋ + 1, Σ derselben Schranke der Quell-Bars),
+  w = bin · tickRef (ein Bar hat höchstens so viele Level, wie seine Spanne Zeilen hat). Auf den echten Daten
+  (2 × 169 Tage) ergibt das dieselben `tiles`, Quelltabellen und `tileConfigVersion` wie die frühere exakte
+  Zählung; die Schranke liegt bei den gebinnten Tabellen bei 1,000–1,005 × tatsächlich, bei `fp_1m` 1,0–1,5 ×
+  (BTC Median 1,26). Sie wirkt nur auf Schätzungen (eher ein 422 zu früh, nie eines zu spät). Gezählt wurden
+  die Footprint-Tabellen früher beim Start über die ganze Historie (≈ 2,7 GB Seiten je Symbol): auf dem VPS
+  63 s bis „bereit"; jetzt ≈ 8 MB je Symbol (`apps/api/README.md`, Startzeit).
 - **Neuberechnung:** nach jeder Änderung einer Tagesversion (Statistik je Tag aus `bar_*`, im Speicher). Ändert
   sich ein n oder das Angebot, ändert sich `tileConfigVersion`; da `cfg` Teil der Kachel-URL ist, sind alle Caches
   für die neue Konfiguration getrennt.
@@ -288,7 +297,13 @@ Umgesetzt in `apps/api` (Katalog `src/catalog.ts`, Routen `src/routes/tiles.ts`)
 - **Aktualität von 304 und Cache-Treffern:** Der Katalog liest `data_day` alle `OF_API_POLL_MS` (Standard 1 s).
   Bei gesundem Katalog ist ein Versionswechsel daher spätestens nach `OF_API_POLL_MS` + Dauer einer
   Aktualisierung sichtbar (warm einige ms; nach einem Import zusätzlich die Neuberechnung der Statistik des
-  geänderten Tages, ≈ 0,1 s; beim Start ≈ 1 s für 167 Tage). Scheitert die Aktualisierung an einem
+  geänderten Tages, einige ms; beim Start ≈ 0,3 s für 2 × 169 Tage auf dem Mac). Mit
+  `OF_API_RECORDER_EVENTS_URL` (SSE-Feed des Recorders, `event: minute`) stößt jede festgeschriebene Minute
+  sofort eine Aktualisierung an; der Recorder erhöht `data_day.version` im selben Commit, die neue Minute ist
+  also ohne Warten auf die Abfrage sichtbar. Für den laufenden Tag heißt das: jede Minute eine neue Version
+  und damit eine neue `dataVersion`/ETag aller Antworten, die den Tag berühren (nicht final, `no-cache`,
+  Server-Cache nach Version getrennt) – der Client sieht neue Minuten, sobald er nach dem Ereignis erneut
+  anfragt (Revalidierung mit `If-None-Match` liefert dann 200 statt 304). Scheitert die Aktualisierung an einem
   Verbindungsverlust, antworten 304 und Cache-Treffer höchstens `OF_API_STALE_AFTER_MS` (Standard 30 s) lang
   auf dem letzten bekannten Stand; danach antworten alle Datenendpunkte und `/symbols` mit **503** +
   `Retry-After: 5` (jede solche Anfrage stößt sofort eine neue Aktualisierung an), bis eine wieder gelingt.
@@ -346,12 +361,13 @@ Konvertierung schon, wartet der Leser und liest danach mit altem Snapshot 0 Zeil
   spätere wartet auf den Leser. Ein Chunk, der erst nach der Katalogabfrage entsteht, ist nicht gesperrt (neue
   Chunks sind Rowstore; für ihn greift die Leerprüfung unten).
 - Verteidigung in der Tiefe: Bars ohne Level, Level ohne Bars und ungleiche Summen gelten als inkonsistent;
-  ebenso ein **leerer** Ausschnitt (je UTC-Tag; bei Profilen der ganze Zeitraum bzw. jeder Tag), der eine voll
-  überdeckte UTC-Stunde enthält, für die gespeichert ist, dass sie Minuten mit Trades hat. Maßstab ist die
-  Katalogstatistik „Minuten mit Trades je Tag und Stunde" (`bar_1m`), gezählt im gesperrten Snapshot ihrer
-  Tagesversion und nur verwendet, wenn diese Version der des Lese-Snapshots gleicht – keine Schätzung, keine
-  Schwelle. Echte Lücken (Börsenausfall, der unfertige Live-Tag, unvollständig importierte Tage) haben in ihren
-  Stunden 0 Minuten und bleiben gültige leere Antworten (200). Inkonsistent → Wiederholung mit neuem Snapshot →
+  ebenso ein **leerer** Ausschnitt (je UTC-Tag; bei Profilen der ganze Zeitraum bzw. jeder Tag), in dem eine
+  Minute beginnt, für die gespeichert ist, dass sie Trades hat. Maßstab ist die Katalogstatistik „gespeicherte
+  Minuten je Tag" (Bitmaske aus `bar_1m`), gelesen im gesperrten Snapshot ihrer Tagesversion und nur verwendet,
+  wenn diese Version der des Lese-Snapshots gleicht – keine Schätzung, keine Schwelle. Da Fenster an tf ≥ 1 min
+  ausgerichtet sind, gilt das auch für Fenster unter einer Stunde (z. B. 15 min). Echte Lücken (Börsenausfall,
+  der unfertige Live-Tag, unvollständig importierte Tage) haben keine gespeicherten Minuten und bleiben gültige
+  leere Antworten (200). Inkonsistent → Wiederholung mit neuem Snapshot →
   **503 + `Retry-After: 2`** (`no-store`, nicht gecacht). Betrifft es nur unveränderliche Tage, gilt es
   zusätzlich als Datenfehler: laut protokolliert, Health `degraded`, in `/quality` unter `apiDataErrors`; ohne
   Wiederholung verfällt die Meldung nach einer Stunde.

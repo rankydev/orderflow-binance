@@ -44,9 +44,19 @@ Auslieferung der Footprint-Kacheln), `OF_API_MAX_CELLS=60000`
 60 s): schließt die API eine Leerlaufverbindung früher als nginx, kann nginx sie gerade wiederverwenden und
 antwortet mit 502. Wird nginx anders eingestellt, diesen Wert entsprechend darüber setzen.
 
-Startzeit: Der Katalog berechnet beim Start die Tagesstatistik der ganzen Historie (1,0 s für 167 BTC-Tage auf
-dem Mac, linear mit der Zahl der Symbol-Tage; geschätzt ≈ 8 s für 1 384 Symbol-Tage, auf dem VPS mehr). Bis dahin
-antworten die Datenendpunkte mit 503 + `Retry-After`.
+`OF_API_RECORDER_EVENTS_URL` (Standard leer = aus): SSE-Feed des Recorders, z. B.
+`http://recorder:7701/events`; jedes `event: minute` stößt sofort eine Katalog-Aktualisierung an (sonst bis zu
+`OF_API_POLL_MS` später). Fällt der Feed aus, verbindet sich die API mit Backoff (1–30 s) neu; die Abfrage läuft
+unabhängig davon weiter. Zustand unter `/health` des Status-Listeners (`recorderEvents`).
+
+Startzeit (`node --env-file=.env apps/api/bench/catalog-start.ts`, nur lesend): Der Katalog liest beim Start
+`symbol`, `data_day` und je Symbol die Bar-Tabellen der ganzen Historie in einem Lauf je ≤ 366 Tage – 2 + 4 ·
+Symbole Abfragen (bis 1 Jahr je Symbol), nie eine Footprint-Tabelle. Mac, 2 × 169 Tage: 0,28–0,32 s, 10 Abfragen,
+≈ 8 MB Seiten je Symbol (bar_1m ≈ 45 KB je Symbol-Tag). Vorher (exakte Zählung aller Footprint-Tabellen, Läufe à
+31 Tage): 1,4 s warm und 62 Abfragen auf dem Mac, ≈ 2,7 GB Seiten je Symbol – auf dem VPS (DB-Container 2 GB
+inkl. Page-Cache, 512 MB shared_buffers) also überwiegend Plattenlesen: 63 s bis „bereit" beim Release
+2026-11-25. Der Test „Katalogstart" in `test/api.int.test.ts` hält die Zahl der Abfragen und den Verzicht auf
+Footprint-Tabellen fest. Bis der Katalog geladen ist, antworten die Datenendpunkte mit 503 + `Retry-After`.
 
 ## Datenbank: Rechte auf Datenbankebene (für das Deployment)
 
