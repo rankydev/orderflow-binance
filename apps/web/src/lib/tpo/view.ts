@@ -7,6 +7,7 @@
 //    60 s neu. Volumenprofil über /profiles/daily (gleiche Zeilengröße wie die TPOs).
 //  - Zeichnen nur in requestAnimationFrame, nur sichtbare Tage und Zeilen; Mausbewegung ohne Taste
 //    berechnet nur die Hover-Zeile (einmal je Frame), Zeilengröße/Bedarf erst am Gestenende.
+import { displayZone, sessionLabel } from '../time-format.ts';
 import {
   checkDailyProfiles,
   decodeTile,
@@ -1088,10 +1089,9 @@ function safeTfSec(tf: string): number {
   }
 }
 
+/** Sitzungstag: UTC-Datum als Name, Beginn in der Anzeigezone (time-format.ts sessionLabel). */
 function dayLabel(ms: number): string {
-  const d = new Date(ms);
-  const iso = d.toISOString();
-  return `${iso.slice(0, 10)} ab ${iso.slice(11, 16)}`;
+  return sessionLabel(ms, displayZone());
 }
 
 function niceStep(raw: number): number {

@@ -15,6 +15,7 @@ import {
   createChart,
   CrosshairMode,
   PriceScaleMode,
+  type TickMarkType,
   type IChartApi,
   type ISeriesApi,
   type Time,
@@ -28,6 +29,7 @@ import {
   timeoutSignal,
 } from './api.ts';
 import { exactDecimal } from './format.ts';
+import { displayZone, fmtShown, tickMarkLabel, zoneLabel } from './time-format.ts';
 import { GestureTracker } from './gesture.ts';
 import { MismatchRecovery, REFETCH_TIMEOUT_MS, RETRY_MS, tileConfigChanged } from './mismatch.ts';
 import {
@@ -235,7 +237,9 @@ export class ChartController {
         minBarSpacing: 0.1,
         rightOffset: 2,
         enableConflation: true,
+        ...timeScaleFormatters().timeScale,
       },
+      localization: timeScaleFormatters().localization,
       crosshair: { mode: CrosshairMode.Normal },
       kineticScroll: { mouse: false, touch: true },
     });
@@ -370,20 +374,20 @@ export class ChartController {
     const price = s.coordinateToPrice(p.y);
     if (price === null) return '';
     const unit = Math.round(price * this.rc.priceScale);
-    const time = new Date(p.t * 1000).toISOString().slice(0, 16).replace('T', ' ');
+    const time = `${fmtShown(p.t * 1000)} ${zoneLabel(p.t * 1000, displayZone())}`;
     // über einem gezeichneten Profil: dessen Zeile (exakte Werte)
     const prof = this.profile.hoverText(p.x, unit);
-    if (prof) return `${time} UTC · ${prof}`;
+    if (prof) return `${time} · ${prof}`;
     // N8: wo Kerzen gezeichnet werden, Kerzenwerte zeigen (keine Footprint-Werte aus dem Cache)
     const candles = this.mode === 'candle' || this.rc.stats.lod === 1;
     const hit = candles ? null : this.lookupBar(p.t);
     if (candles) {
       const it = this.items[indexAtOrBefore(this.items, p.t)];
-      if (!it || it.time !== p.t) return `${time} UTC`;
+      if (!it || it.time !== p.t) return `${time}`;
       const px2 = (u: number) => exactDecimal(u, this.sym.priceDecimals);
-      return `${time} UTC · O ${px2(it.o)} · H ${px2(it.h)} · L ${px2(it.l)} · C ${px2(it.c)}`;
+      return `${time} · O ${px2(it.o)} · H ${px2(it.h)} · L ${px2(it.l)} · C ${px2(it.c)}`;
     }
-    if (!hit) return `${time} UTC`;
+    if (!hit) return `${time}`;
     const [tile, bi, width] = hit;
     const row = Math.floor(unit / width);
     let lo = tile.levelOffset[bi]!;
@@ -400,10 +404,10 @@ export class ChartController {
     const q = (lots: number) => `${lots} Lots = ${exactDecimal(lots, qd)} ${base}`;
     const iv = `[${px(row * width)}, ${px((row + 1) * width)})`;
     if (lo >= tile.levelOffset[bi + 1]! || tile.row[lo] !== row)
-      return `${time} UTC · Zeile ${iv}: keine Trades`;
+      return `${time} · Zeile ${iv}: keine Trades`;
     const b = tile.buy[lo]!;
     const sl = tile.sell[lo]!;
-    return `${time} UTC · Zeile ${iv} · Bid (Verkäufer) ${q(sl)} · Ask (Käufer) ${q(b)} · Delta ${q(b - sl)}`;
+    return `${time} · Zeile ${iv} · Bid (Verkäufer) ${q(sl)} · Ask (Käufer) ${q(b)} · Delta ${q(b - sl)}`;
   }
 
   /** Kachel und Bar-Index zur Zeit t (aktuelle Zeilengröße, sonst die vorige), mit Zeilenbreite. */
@@ -773,6 +777,12 @@ export class ChartController {
   reevaluate(): void {
     this.initialView = false;
     this.evaluate();
+  }
+
+  /** Anzeigezone gewechselt (time-format.ts): Zeitachse/Fadenkreuz neu beschriften, Profile neu zeichnen. */
+  applyTimeZone(): void {
+    this.chart.applyOptions(timeScaleFormatters());
+    this.profile.redraw();
   }
 
   availableR(tf = this.tf): number[] {
@@ -1857,4 +1867,17 @@ export function noFootprintReason(a: {
 /** High/Low Ratio nur mit eingeschaltetem Footprint (W-1: keine Werte aus noch gehaltenen Kacheln). */
 export function ratioAllowed(footprintOff: boolean): boolean {
   return !footprintOff;
+}
+
+/** Zeitachse und Fadenkreuz in der Anzeigezone (Ortszeit oder UTC, time-format.ts). */
+function timeScaleFormatters() {
+  return {
+    timeScale: {
+      tickMarkFormatter: (t: Time, type: TickMarkType) =>
+        typeof t === 'number' ? tickMarkLabel(t, type, displayZone()) : null,
+    },
+    localization: {
+      timeFormatter: (t: Time) => (typeof t === 'number' ? fmtShown(t * 1000) : String(t)),
+    },
+  };
 }

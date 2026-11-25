@@ -6,6 +6,7 @@
 // LRU, Wiederholung/Backoff über eine eigene RequestQueue mit 2 parallelen Anfragen, die zurücksteht,
 // solange Kacheln/Bars laden (W-4), Fehler sichtbar, 422 → einmal mit suggestR, finale Tage gegen die
 // geladenen Bars geprüft.
+import { displayZone, fmtShown, sessionLabel, zoneLabel } from '../time-format.ts';
 import {
   checkDailyProfiles,
   checkRangeProfile,
@@ -879,8 +880,14 @@ export class ProfileLayer implements IPanePrimitive<Time> {
   summary(): RangeSummary | null {
     const s = this.host.sym();
     if (!s || !this.range) return null;
-    const fmt = (ms: number) => new Date(ms).toISOString().slice(0, 16).replace('T', ' ');
-    const range = `${fmt(this.range[0])} – ${fmt(this.range[1])} UTC`;
+    const [a, b] = this.range;
+    const za = zoneLabel(a, displayZone());
+    const zb = zoneLabel(b, displayZone());
+    // Zonenangabe einmal; nur wenn sie dazwischen wechselt (Sommerzeit), an beiden Enden
+    const range =
+      za === zb
+        ? `${fmtShown(a)} – ${fmtShown(b)} ${za}`
+        : `${fmtShown(a)} ${za} – ${fmtShown(b)} ${zb}`;
     const p = this.rangeProfile();
     if (!p)
       return {
@@ -938,9 +945,7 @@ export class ProfileLayer implements IPanePrimitive<Time> {
     const sl = p.sell[i]!;
     const q = qtyFormatter(s);
     const px = (u: number) => exactDecimal(u, s.priceDecimals);
-    const which = h.range
-      ? 'Bereichsprofil'
-      : `Tagesprofil ab ${new Date(p.from).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+    const which = h.range ? 'Bereichsprofil' : `Tagesprofil ${sessionLabel(p.from, displayZone())}`;
     const marks = [r === p.poc ? 'POC' : '', r === p.vah ? 'VAH' : '', r === p.val ? 'VAL' : '']
       .filter(Boolean)
       .join('/');

@@ -12,6 +12,16 @@
   } from './lib/footprint-options.ts';
   import { STAT_ROWS, type StatRow } from './lib/stats-grid.ts';
   import { ApiClient } from './lib/api.ts';
+  import {
+    browserZoneName,
+    fmtShown,
+    parseZoneSetting,
+    setDisplayZone,
+    zoneLabel,
+    zoneOf,
+    zoneSettingQuery,
+    type ZoneSetting,
+  } from './lib/time-format.ts';
   import { TpoView, type TpoReadout } from './lib/tpo/view.ts';
   import {
     parseTpoParams,
@@ -34,6 +44,11 @@
   let tf = $state(params.get('tf') ?? '1m');
   let timeframes = $state.raw<string[]>([]);
   let dataTo = $state(0);
+  // Zeitanzeige: Ortszeit (Standard) oder UTC (URL tz=utc); nur Anzeige, Daten bleiben UTC
+  const tzInit = parseZoneSetting(params);
+  setDisplayZone(tzInit);
+  let tzSet = $state<ZoneSetting>(tzInit);
+  const tzNow = $derived(zoneLabel(dataTo || Date.now(), zoneOf(tzSet)));
   const atParam = Number(params.get('at'));
   // Diagnosezeile: in der Entwicklung offen, sonst eingeklappt (für Fehlerberichte aufklappbar)
   let diagOpen = $state(import.meta.env.DEV || params.has('debug'));
@@ -283,14 +298,24 @@
   const stackOptions = $derived(withValue([2, 3, 4, 5, 6], fpo.imb.stack));
 
   function syncUrl(): void {
-    const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${footprintParamsQuery(fpo)}${profileParamsQuery(prof)}${tpoParamsQuery(view, tpo)}${params.has('debug') ? '&debug' : ''}`;
+    const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${footprintParamsQuery(fpo)}${profileParamsQuery(prof)}${tpoParamsQuery(view, tpo)}${zoneSettingQuery(tzSet)}${params.has('debug') ? '&debug' : ''}`;
     history.replaceState(null, '', q);
     document.title = `${sym} ${tf} · ${APP_TITLE}`;
   }
 
-  /** „Daten bis": letzte volle Minute vor dataTo (exklusiv), UTC. */
-  const fmtUtc = (ms: number) =>
-    ms > 0 ? new Date(ms - 60_000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '';
+  /** „Daten bis": letzte volle Minute vor dataTo (exklusiv), in der Anzeigezone mit Zonenangabe. */
+  const fmtDataTo = (ms: number, z: ZoneSetting) =>
+    ms > 0 ? `${fmtShown(ms - 60_000)} ${zoneLabel(ms - 60_000, zoneOf(z))}` : '';
+
+  function toggleZone(): void {
+    tzSet = tzSet === 'local' ? 'utc' : 'local';
+    setDisplayZone(tzSet);
+    ctl?.applyTimeZone();
+    if (ctl) summary = ctl.profile.summary();
+    tpoView?.schedule();
+    hover = '';
+    syncUrl();
+  }
 
   function chooseTf(v: string): void {
     if (!ready) return; // H3: vor init() keine Umschaltung
@@ -381,6 +406,18 @@
         onclick={() => setView('tpo')}
       >
         TPO
+      </button>
+    </div>
+    <div class="group" role="group" aria-label="Zeitanzeige">
+      <button
+        class="tz"
+        data-testid="tz-toggle"
+        title={tzSet === 'local'
+          ? `Zeiten in Ortszeit (${browserZoneName()}, ${tzNow}) – klicken für UTC. Tagesgrenzen der Profile/TPO bleiben UTC.`
+          : `Zeiten in UTC – klicken für Ortszeit (${browserZoneName()})`}
+        onclick={toggleZone}
+      >
+        {tzSet === 'local' ? `Ortszeit ${tzNow}` : 'UTC'}
       </button>
     </div>
     {#if view === 'chart'}
@@ -751,8 +788,8 @@
 
   <footer class="readout" data-testid="readout">
     {#if error}<span class="err">{error}</span>{/if}
-    {#if dataTo}<span class="datato" title="Ende der Daten (UTC)">
-        Daten bis {fmtUtc(dataTo)}
+    {#if dataTo}<span class="datato" title="Ende der Daten">
+        Daten bis {fmtDataTo(dataTo, tzSet)}
       </span>{/if}
     <button class="diag-toggle" aria-expanded={diagOpen} onclick={() => (diagOpen = !diagOpen)}>
       {diagOpen ? '▾' : '▸'} Diagnose
@@ -923,6 +960,10 @@
   }
   .datato {
     color: #8b949e;
+  }
+  .tz {
+    color: #8b949e;
+    font-size: 0.9em;
   }
   .sym-select {
     max-width: 9.5em;
