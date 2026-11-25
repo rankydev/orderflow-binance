@@ -89,7 +89,7 @@ Produktion (statisches Bundle, spricht `/api/v1` am **eigenen Ursprung** an, z. 
 `/api/` → API auf 127.0.0.1:8780):
 
 ```bash
-npm run build -w @orderflow/web                          # → apps/web/dist (≈ 330 kB JS, ≈ 113 kB gzip)
+npm run build -w @orderflow/web                          # → apps/web/dist (≈ 358 kB JS, ≈ 122 kB gzip)
 API_PROXY=http://127.0.0.1:8780 npx -w @orderflow/web vite preview   # Build lokal gegen die echte API prüfen
 API_PROXY=http://127.0.0.1:8780 npm run dev -w @orderflow/web        # Entwicklung gegen die echte API statt Fixtures
 ```
@@ -125,14 +125,26 @@ Paarverfahren des Kerns), Imbalance (Standard aus; diagonal, Faktor 300 %, Minde
 horizontal, Stacked ab 3 Zeilen mit Zone und Projektion bis zur ersten Berührung) – ganzzahlig, je Kachel einmal je
 Einstellung für die gezeichnete Zeilengröße berechnet. „Stats" blendet das Stats-Grid als zweite Pane ein (an den
 Bars ausgerichtet, Zeilen wählbar, K-Format, Schattierung z über die sichtbaren Bars, Text ab 30 px Bar-Abstand,
-darunter nur Farbe, unter 4 px aus). Zeilen ohne API-Spalte (Trades, Max/Min Δ, COT High/Low) zeigen „(API)" und
-keine Werte, bis `/bars` die `x.`-Spalten liefert. Tages-CVD: „–", wenn die Tagesgrenze (UTC + offsetH) nicht auf einer
+darunter nur Farbe, unter 4 px aus). Trades (Binance-Zählung), Max/Min Δ und COT High/Low kommen aus den Stats-Spalten der API
+(`stats=1`, ab dem ersten Einschalten des Grids für alle Bar-Anfragen der Sitzung); eine nicht gelieferte Spalte
+(z. B. `x.trades` bei 2h/4h/1d) zeigt „–" mit Hinweis, nie 0. Tages-CVD: „–", wenn die Tagesgrenze (UTC + offsetH) nicht auf einer
 Bar-Grenze liegt oder nach einem fehlenden Datenabschnitt bis zur nächsten Tagesgrenze; Minuten ohne Trades
 fehlen in den Daten (z. B. 2026-10-27), der CVD summiert die vorhandenen Bars. Werkzeugleiste: selten
 Gebrauchtes in „Footprint ▾" (Marken, Farbe, Imbalance-Einstellungen, Stats-Zeilen) und „Profil ▾" (Modus, VA,
 verlängern, Skala, Tagesbeginn, Profilzeile); Esc oder Klick daneben schließt. Standard: `FOOTPRINT_DEFAULTS` in
 `apps/web/src/lib/footprint-options.ts`. URL: `type=delta|bidask|volume|deltavol`, `fm=profile`, `poc=0`, `dpoc=1`,
 `bva=1`, `imb=1`, `imbr=<%>`, `imbd=<Lots>`, `imbz=1`, `imbh=1`, `imbs=<n>`, `sg=1`, `sgr=<Zeilen>`.
+
+**TPO (Market Profile, P6, §6.5/§7.4):** „TPO" in der Werkzeugleiste schaltet auf eine eigene Ansicht (eigenes
+Canvas; x = Tage in Spalten fester Breite, y = gemeinsame Preisskala): je Tag (Grenze UTC + offsetH wie die
+Volumenprofile) markiert jeder Block (Standard 30 min, wählbar 5 min…4 h) jede Preiszeile zwischen seinem Low und High;
+Buchstaben A–Z, a–z, danach von vorn (bei 5-min-Blöcken unterscheidet der Farbverlauf die Durchläufe), unter 9 px
+Zeilenhöhe Blöcke. POC und VA 70 % (Kern-Helfer, gleiche Regeln), VA kräftiger, außerhalb blasser, VAH/VAL-Linien, Initial
+Balance (erste 60 min) als Balken links, Single Prints orange, Open/Close-Striche, Volumenprofil rechts (gleiche
+Zeilengröße), Zusammenfassung je Tag (Range, VA, POC, TPO ↑/↓, IB, fehlende Blöcke). Quelle: die Bars des gröbsten
+angebotenen Zeitrahmens, der Blockgröße, Initial Balance und Tagesgrenze teilt (30-min-Blöcke: 30m-Bars), je Tag eine
+Anfrage, nur sichtbare Tage ± 1. Ziehen verschiebt Tage und Preis, Mausrad zoomt den Preis, Shift + Mausrad die
+Spaltenbreite. URL: `view=tpo`, `tb=<min>`, `tib=<min>`, `ts=1` (Split), `tvp=0` (ohne Volumenprofil), `tr=<Ticks>`.
 
 **Volumenprofil + Delta** (Vertrag: [`docs/PROFILE-API.md`](docs/PROFILE-API.md)): standardmäßig je sichtbarem Tag
 ein Profil ab dem Tagesbeginn nach rechts, unter Kerzen/Footprint gezeichnet (Pane-Primitive, kein DOM-Overlay).

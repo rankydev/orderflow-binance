@@ -722,6 +722,63 @@ async function main(): Promise<void> {
     }
   }
 
+  // ---------------------------------------------------------------- P6: TPO-Ansicht
+  // 10 und 60 Tage nebeneinander (Spaltenbreite = Breite / Tage), alle sichtbaren Tage geladen; dann über
+  // die Tage pannen und den Preis zoomen. Budgets: Frame-Arbeit p95 ≤ 16 ms, TPO-Zeichnen p95 ≤ 8 ms,
+  // keine Long Tasks.
+  if (process.env.PERF_ONLY !== 'profile') {
+    for (const days of [10, 60]) {
+      const name = `tpo_${days}d`;
+      await page.goto(`${URL0}?sym=BTCUSDT-SYN90&view=tpo&debug`);
+      await page.waitForFunction(() => (window as Any).__tpo?.readout().daysLoaded > 0, null, {
+        timeout: 20_000,
+      });
+      await page.evaluate((n: number) => {
+        const t = (window as Any).__tpo;
+        t.colW = (t.canvas.clientWidth - 70) / n;
+        t.evaluate();
+      }, days);
+      for (let i = 0; i < 100; i++) {
+        const r = await page.evaluate(() => (window as Any).__tpo.readout());
+        if (r.inFlight === 0 && r.daysLoaded >= days) break;
+        await page.waitForTimeout(150);
+      }
+      await idle(300);
+      const f0 = await page.evaluate(() => (window as Any).__tpo.stats.frames);
+      await scenario(name, async () => {
+        for (let i = 0; i < 3; i++) {
+          await drag(600, 30);
+          await drag(-600, 30);
+        }
+        await wheel(240, 3, 30);
+        await wheel(-240, 3, 30);
+        await idle(400);
+      });
+      const tpo = await page.evaluate((f: number) => {
+        const t = (window as Any).__tpo;
+        const out: number[] = [];
+        for (let i = Math.max(f, t.stats.frames - t.stats.drawMs.length); i < t.stats.frames; i++)
+          out.push(t.stats.drawMs[i % t.stats.drawMs.length]);
+        return { draw: out, readout: t.readout(), cells: t.stats.cells };
+      }, f0);
+      const draw = stats(tpo.draw);
+      results[name].tpoDraw = draw;
+      results[name].tpo = { ...tpo.readout, cells: tpo.cells };
+      console.log(name, 'tpo', JSON.stringify({ draw, ...results[name].tpo }));
+      check(
+        `${name}: Frame-Arbeit p95 ${results[name].frameWork.p95} ≤ 16 ms`,
+        results[name].frameWork.p95 <= 16,
+      );
+      check(`${name}: TPO-Zeichnen p95 ${draw.p95} ≤ 8 ms`, draw.p95 <= 8);
+      check(`${name}: keine Long Tasks`, results[name].longTasks === 0);
+      check(
+        `${name}: ${tpo.readout.daysVisible} Tage sichtbar`,
+        tpo.readout.daysVisible >= days - 1,
+      );
+      await page.screenshot({ path: join(OUT, `${name}.png`) });
+    }
+  }
+
   // ---------------------------------------------------------------- Volume Profile
   // Tagesprofile über 30 und ~150 Tage (herausgezoomt, 1h bzw. 4h – 4h nur, wenn angeboten; sonst 1h
   // über den ganzen Datenbereich), Pannen mit Profilen, Bereichsprofil über einen Monat. Budgets:

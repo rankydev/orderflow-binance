@@ -11,6 +11,14 @@
     type FootprintOptions,
   } from './lib/footprint-options.ts';
   import { STAT_ROWS, type StatRow } from './lib/stats-grid.ts';
+  import { ApiClient } from './lib/api.ts';
+  import { TpoView, type TpoReadout } from './lib/tpo/view.ts';
+  import {
+    parseTpoParams,
+    TPO_BLOCK_MINUTES,
+    tpoParamsQuery,
+    type TpoOptions,
+  } from './lib/tpo/model.ts';
   import {
     parseProfileParams,
     profileParamsQuery,
@@ -31,6 +39,12 @@
   let diagOpen = $state(import.meta.env.DEV || params.has('debug'));
   // Footprint-Typ, Marken, Stats-Grid (URL: type, fm, poc, dpoc, bva, imb*, sg, sgr)
   let fpo = $state<FootprintOptions>(parseFootprintParams(params));
+  // Ansicht: Chart (Kerzen/Footprint) oder TPO (eigenes Canvas; URL view=tpo, tb, tib, ts, tvp, tr)
+  const tpoInit = parseTpoParams(params);
+  let view = $state<'chart' | 'tpo'>(tpoInit.view);
+  let tpo = $state<TpoOptions>(tpoInit.tpo);
+  let tro = $state.raw<TpoReadout | null>(null);
+  let tpoView: TpoView | null = null;
   const type = $derived(fpo.type);
   // Zeilengröße: 'auto' oder Ticks (URL-Parameter r, z. B. r=50 = 5 USDT bei BTC)
   const rParam = params.get('r');
@@ -113,6 +127,7 @@
           refreshLists();
           ready = true;
           // Bereich aus der URL erst mit bekanntem Datenbereich setzen
+          if (view === 'tpo') showTpo();
           if (prof.range && !ctl!.profile.range) {
             if (!ctl!.profile.setRange(prof.range, prof.rangeNote)) readProfile();
           }
@@ -128,6 +143,7 @@
     timer = setInterval(() => {
       if (!ctl) return;
       ro = ctl.readout();
+      if (tpoView) tro = tpoView.readout();
       pro = ctl.profile.readout();
       // Auswahl, URL und Controller konsistent halten: angezeigt wird das wirksame R
       const eff = ro.rAuto ? 'auto' : String(ro.R);
@@ -139,6 +155,7 @@
   });
 
   onDestroy(() => {
+    tpoView?.destroy();
     if (timer) clearInterval(timer);
     if (retryTimer) clearTimeout(retryTimer);
     removeKey?.();
@@ -185,6 +202,41 @@
     prof = { ...prof, ...patch };
     applyProfile();
     applyFootprint(); // VA % und Tagesgrenze gelten auch für Bar-VA und Stats-CVD
+    if (tpoView) showTpo(); // Tagesgrenze und VA % gelten auch für TPO
+    syncUrl();
+  }
+  /** TPO-Ansicht anlegen (beim ersten Umschalten) und mit den Einstellungen versorgen. */
+  function showTpo(): void {
+    if (!ctl || !ready) return;
+    if (!tpoView) {
+      tpoView = new TpoView(el, {
+        api: new ApiClient(),
+        sym: () => ctl?.symbols.find((s) => s.name === sym) ?? null,
+        offsetH: () => prof.offsetH,
+      });
+      tpoView.onHover = (t) => (hover = t);
+      tpoView.onChange = () => {
+        if (tpoView) tro = tpoView.readout();
+      };
+      if (import.meta.env.DEV || params.has('debug'))
+        (window as unknown as { __tpo: TpoView }).__tpo = tpoView;
+      if (params.has('at') && Number.isFinite(atParam)) tpoView.centerOn(atParam * 1000);
+    }
+    tpoView.setOptions({ ...$state.snapshot(tpo), vaPct: prof.va } as TpoOptions);
+  }
+  function setView(v: 'chart' | 'tpo'): void {
+    view = v;
+    if (v === 'tpo') showTpo();
+    else {
+      tpoView?.destroy();
+      tpoView = null;
+      tro = null;
+    }
+    syncUrl();
+  }
+  function setTpo(patch: Partial<TpoOptions>): void {
+    tpo = { ...tpo, ...patch };
+    showTpo();
     syncUrl();
   }
   function applyFootprint(): void {
@@ -228,7 +280,7 @@
   const stackOptions = $derived(withValue([2, 3, 4, 5, 6], fpo.imb.stack));
 
   function syncUrl(): void {
-    const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${footprintParamsQuery(fpo)}${profileParamsQuery(prof)}${params.has('debug') ? '&debug' : ''}`;
+    const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${footprintParamsQuery(fpo)}${profileParamsQuery(prof)}${tpoParamsQuery(view, tpo)}${params.has('debug') ? '&debug' : ''}`;
     history.replaceState(null, '', q);
     document.title = `${sym} ${tf} · ${APP_TITLE}`;
   }
@@ -250,6 +302,7 @@
     ctl?.setSymbol(v);
     if (ctl) tf = ctl.readout().tf;
     readProfile(); // Bereich gehört zum alten Symbol
+    tpoView?.reset();
     prof = { ...prof, R: null };
     if (ctl) ctl.profile.manualR = null;
     refreshLists();
@@ -310,268 +363,355 @@
     {:else}
       <span class="sym">{sym}</span>
     {/if}
-    <div class="group" role="group" aria-label="Zeitrahmen">
-      {#each timeframes as t (t)}
-        <button class:active={tf === t} onclick={() => chooseTf(t)}>{t}</button>
-      {/each}
+    <div class="group" role="group" aria-label="Ansicht">
+      <button
+        class:active={view === 'chart'}
+        aria-pressed={view === 'chart'}
+        onclick={() => setView('chart')}
+      >
+        Chart
+      </button>
+      <button
+        class:active={view === 'tpo'}
+        aria-pressed={view === 'tpo'}
+        title="TPO (Market Profile): eigene Ansicht, ein Profil je Tag"
+        onclick={() => setView('tpo')}
+      >
+        TPO
+      </button>
     </div>
-    <div class="group" role="group" aria-label="Footprint-Typ">
-      {#each TYPES as [t, l] (t)}
-        <button class:active={type === t} aria-pressed={type === t} onclick={() => chooseType(t)}>
-          {l}
+    {#if view === 'chart'}
+      <div class="group" role="group" aria-label="Zeitrahmen">
+        {#each timeframes as t (t)}
+          <button class:active={tf === t} onclick={() => chooseTf(t)}>{t}</button>
+        {/each}
+      </div>
+      <div class="group" role="group" aria-label="Footprint-Typ">
+        {#each TYPES as [t, l] (t)}
+          <button class:active={type === t} aria-pressed={type === t} onclick={() => chooseType(t)}>
+            {l}
+          </button>
+        {/each}
+      </div>
+      <select
+        aria-label="Zeilengröße"
+        title="Zeilengröße des Footprints"
+        value={rMode}
+        onchange={(e) => chooseR(e.currentTarget.value)}
+      >
+        <option value="auto">R auto{ro && ro.rAuto ? ` (${ro.rLabel})` : ''}</option>
+        {#each rOptions as r (r)}<option value={String(r)}>R {label(r)}</option>{/each}
+      </select>
+      <div class="group" role="group" aria-label="Footprint-Marken">
+        <button
+          class:active={fpo.imbalance}
+          aria-pressed={fpo.imbalance}
+          title="Imbalances (Markierung am Zellrand) und Stacked Imbalances (Zone, nach rechts projiziert)"
+          onclick={() => setFp({ imbalance: !fpo.imbalance })}
+        >
+          Imbalance
         </button>
-      {/each}
-    </div>
-    <select
-      aria-label="Zeilengröße"
-      title="Zeilengröße des Footprints"
-      value={rMode}
-      onchange={(e) => chooseR(e.currentTarget.value)}
-    >
-      <option value="auto">R auto{ro && ro.rAuto ? ` (${ro.rLabel})` : ''}</option>
-      {#each rOptions as r (r)}<option value={String(r)}>R {label(r)}</option>{/each}
-    </select>
-    <div class="group" role="group" aria-label="Footprint-Marken">
-      <button
-        class:active={fpo.imbalance}
-        aria-pressed={fpo.imbalance}
-        title="Imbalances (Markierung am Zellrand) und Stacked Imbalances (Zone, nach rechts projiziert)"
-        onclick={() => setFp({ imbalance: !fpo.imbalance })}
-      >
-        Imbalance
-      </button>
-      <button
-        class:active={fpo.stats}
-        aria-pressed={fpo.stats}
-        title="Stats-Grid unter dem Chart (an den Bars ausgerichtet)"
-        onclick={() => setFp({ stats: !fpo.stats })}
-      >
-        Stats
-      </button>
-      <details class="menu">
-        <summary>Footprint ▾</summary>
-        <div class="panel">
-          <div class="group" role="group" aria-label="Marken je Bar">
-            <button
-              class:active={fpo.mode === 'profile'}
-              aria-pressed={fpo.mode === 'profile'}
-              title="Profil im Footprint: Balken je Zeile (Länge ∝ Wert / Maximum im Bar) statt gefärbter Box"
-              onclick={() => setFp({ mode: fpo.mode === 'profile' ? 'box' : 'profile' })}
-            >
-              Balken
-            </button>
-            <button
-              class:active={fpo.poc}
-              aria-pressed={fpo.poc}
-              title="POC je Bar (gelber Rahmen)"
-              onclick={() => setFp({ poc: !fpo.poc })}
-            >
-              POC
-            </button>
-            <button
-              class:active={fpo.deltaPoc}
-              aria-pressed={fpo.deltaPoc}
-              title="Delta-POC je Bar: Zeile mit größtem |Delta|, Rahmen türkis (+) bzw. orange (−)"
-              onclick={() => setFp({ deltaPoc: !fpo.deltaPoc })}
-            >
-              Δ-POC
-            </button>
-            <button
-              class:active={fpo.barVa}
-              aria-pressed={fpo.barVa}
-              title="Value Area je Bar (VA-% wie beim Profil) als schmaler Balken links der Spalte (ab 12 px Bar-Abstand)"
-              onclick={() => setFp({ barVa: !fpo.barVa })}
-            >
-              Bar-VA
-            </button>
-          </div>
-          <label>
-            Farbe
-            <select
-              aria-label="Farbmodus"
-              value={colorMode}
-              onchange={(e) => {
-                colorMode = e.currentTarget.value as ColorMode;
-                ctl?.setColorMode(colorMode);
-              }}
-            >
-              <option value="gradient">Verlauf</option>
-              <option value="fixed">fest</option>
-              <option value="off">aus</option>
-            </select>
-            <select
-              aria-label="Farbbereich"
-              value={colorScope}
-              onchange={(e) => {
-                colorScope = e.currentTarget.value as ColorScope;
-                ctl?.setColorScope(colorScope);
-              }}
-            >
-              <option value="visible">sichtbar</option>
-              <option value="bar">je Bar</option>
-            </select>
-          </label>
-          <b>Imbalance</b>
-          <label>
-            Faktor
-            <select
-              aria-label="Imbalance-Faktor"
-              value={String(fpo.imb.ratio)}
-              onchange={(e) => setImb({ ratio: Number(e.currentTarget.value) })}
-            >
-              {#each ratioOptions as r (r)}<option value={String(r)}>{r} %</option>{/each}
-            </select>
-          </label>
-          <label>
-            Mindestdifferenz
-            <select
-              aria-label="Imbalance-Mindestdifferenz"
-              value={String(fpo.imb.minDiff)}
-              onchange={(e) => setImb({ minDiff: Number(e.currentTarget.value) })}
-            >
-              {#each minDiffOptions as m (m)}<option value={String(m)}>
-                  {exactDecimal(m, symInfo?.qtyDecimals ?? 3)}
-                  {sym.replace(/USDT$/, '')}
-                </option>{/each}
-            </select>
-          </label>
-          <label>
-            Stacked ab
-            <select
-              aria-label="Stacked-Länge"
-              value={String(fpo.imb.stack)}
-              onchange={(e) => setImb({ stack: Number(e.currentTarget.value) })}
-            >
-              {#each stackOptions as n (n)}<option value={String(n)}>{n} Zeilen</option>{/each}
-            </select>
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={fpo.imb.includeZero}
-              onchange={(e) => setImb({ includeZero: e.currentTarget.checked })}
-            /> Gegenseite 0 zählt
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={fpo.imb.horizontal}
-              onchange={(e) => setImb({ horizontal: e.currentTarget.checked })}
-            /> horizontal (statt diagonal)
-          </label>
-          <b>Stats-Zeilen</b>
-          {#each STAT_ROWS as r (r.id)}
-            <label title={r.title}>
+        <button
+          class:active={fpo.stats}
+          aria-pressed={fpo.stats}
+          title="Stats-Grid unter dem Chart (an den Bars ausgerichtet)"
+          onclick={() => setFp({ stats: !fpo.stats })}
+        >
+          Stats
+        </button>
+        <details class="menu">
+          <summary>Footprint ▾</summary>
+          <div class="panel">
+            <div class="group" role="group" aria-label="Marken je Bar">
+              <button
+                class:active={fpo.mode === 'profile'}
+                aria-pressed={fpo.mode === 'profile'}
+                title="Profil im Footprint: Balken je Zeile (Länge ∝ Wert / Maximum im Bar) statt gefärbter Box"
+                onclick={() => setFp({ mode: fpo.mode === 'profile' ? 'box' : 'profile' })}
+              >
+                Balken
+              </button>
+              <button
+                class:active={fpo.poc}
+                aria-pressed={fpo.poc}
+                title="POC je Bar (gelber Rahmen)"
+                onclick={() => setFp({ poc: !fpo.poc })}
+              >
+                POC
+              </button>
+              <button
+                class:active={fpo.deltaPoc}
+                aria-pressed={fpo.deltaPoc}
+                title="Delta-POC je Bar: Zeile mit größtem |Delta|, Rahmen türkis (+) bzw. orange (−)"
+                onclick={() => setFp({ deltaPoc: !fpo.deltaPoc })}
+              >
+                Δ-POC
+              </button>
+              <button
+                class:active={fpo.barVa}
+                aria-pressed={fpo.barVa}
+                title="Value Area je Bar (VA-% wie beim Profil) als schmaler Balken links der Spalte (ab 12 px Bar-Abstand)"
+                onclick={() => setFp({ barVa: !fpo.barVa })}
+              >
+                Bar-VA
+              </button>
+            </div>
+            <label>
+              Farbe
+              <select
+                aria-label="Farbmodus"
+                value={colorMode}
+                onchange={(e) => {
+                  colorMode = e.currentTarget.value as ColorMode;
+                  ctl?.setColorMode(colorMode);
+                }}
+              >
+                <option value="gradient">Verlauf</option>
+                <option value="fixed">fest</option>
+                <option value="off">aus</option>
+              </select>
+              <select
+                aria-label="Farbbereich"
+                value={colorScope}
+                onchange={(e) => {
+                  colorScope = e.currentTarget.value as ColorScope;
+                  ctl?.setColorScope(colorScope);
+                }}
+              >
+                <option value="visible">sichtbar</option>
+                <option value="bar">je Bar</option>
+              </select>
+            </label>
+            <b>Imbalance</b>
+            <label>
+              Faktor
+              <select
+                aria-label="Imbalance-Faktor"
+                value={String(fpo.imb.ratio)}
+                onchange={(e) => setImb({ ratio: Number(e.currentTarget.value) })}
+              >
+                {#each ratioOptions as r (r)}<option value={String(r)}>{r} %</option>{/each}
+              </select>
+            </label>
+            <label>
+              Mindestdifferenz
+              <select
+                aria-label="Imbalance-Mindestdifferenz"
+                value={String(fpo.imb.minDiff)}
+                onchange={(e) => setImb({ minDiff: Number(e.currentTarget.value) })}
+              >
+                {#each minDiffOptions as m (m)}<option value={String(m)}>
+                    {exactDecimal(m, symInfo?.qtyDecimals ?? 3)}
+                    {sym.replace(/USDT$/, '')}
+                  </option>{/each}
+              </select>
+            </label>
+            <label>
+              Stacked ab
+              <select
+                aria-label="Stacked-Länge"
+                value={String(fpo.imb.stack)}
+                onchange={(e) => setImb({ stack: Number(e.currentTarget.value) })}
+              >
+                {#each stackOptions as n (n)}<option value={String(n)}>{n} Zeilen</option>{/each}
+              </select>
+            </label>
+            <label>
               <input
                 type="checkbox"
-                checked={fpo.statsRows.includes(r.id)}
-                onchange={() => toggleStatRow(r.id)}
-              />
-              {r.label}{r.column ? ` (API: ${r.column})` : ''}
+                checked={fpo.imb.includeZero}
+                onchange={(e) => setImb({ includeZero: e.currentTarget.checked })}
+              /> Gegenseite 0 zählt
             </label>
-          {/each}
-        </div>
-      </details>
-    </div>
-    <div class="group" role="group" aria-label="Volumenprofil">
-      {#each VIEWS as [v, t] (v)}
-        <button
-          class:active={prof.mode !== 'off' && prof.view === v}
-          aria-pressed={prof.mode !== 'off' && prof.view === v}
-          title={prof.mode === 'off'
-            ? `Volumenprofil einschalten (Tage) mit Ansicht ${t}`
-            : `Volumenprofil: Ansicht ${t}`}
-          onclick={() => setProf(prof.mode === 'off' ? { view: v, mode: 'daily' } : { view: v })}
-        >
-          {t}
-        </button>
-      {/each}
-      <button
-        class:active={pro?.selecting}
-        aria-pressed={pro?.selecting ?? false}
-        title="Zwei Klicks: Anfang und Ende (Bar-genau, auf Minuten); Esc bricht ab"
-        onclick={startSelect}
-      >
-        Bereich
-      </button>
-      {#if prof.range}<button title="Bereichsprofil entfernen" onclick={clearRange}>✕</button>{/if}
-      <details class="menu right">
-        <summary>Profil ▾</summary>
-        <div class="panel">
-          <select
-            aria-label="Profilmodus"
-            value={prof.mode}
-            onchange={(e) => setProf({ mode: e.currentTarget.value as ProfileMode })}
-          >
-            {#each MODES as [m, t] (m)}<option value={m}>Profil: {t}</option>{/each}
-          </select>
-          <div class="group" role="group" aria-label="Profiloptionen">
-            <button
-              class:active={prof.showVa}
-              aria-pressed={prof.showVa}
-              title="Value Area (Fläche + VAH/VAL)"
-              onclick={() => setProf({ showVa: !prof.showVa })}
-            >
-              VA
-            </button>
-            <button
-              class:active={prof.extend}
-              aria-pressed={prof.extend}
-              title="POC/VAH/VAL nach rechts verlängern, bis der Preis sie erreicht (naked)"
-              onclick={() => setProf({ extend: !prof.extend })}
-            >
-              verlängern
-            </button>
-            <button
-              class:active={prof.scale === 'common'}
-              aria-pressed={prof.scale === 'common'}
-              title="Tagesprofile: gemeinsame Skala über die sichtbaren Tage statt je Profil"
-              onclick={() => setProf({ scale: prof.scale === 'common' ? 'profile' : 'common' })}
-            >
-              gemeinsame Skala
-            </button>
+            <label>
+              <input
+                type="checkbox"
+                checked={fpo.imb.horizontal}
+                onchange={(e) => setImb({ horizontal: e.currentTarget.checked })}
+              /> horizontal (statt diagonal)
+            </label>
+            <b>Stats-Zeilen</b>
+            {#each STAT_ROWS as r (r.id)}
+              <label title={r.title}>
+                <input
+                  type="checkbox"
+                  checked={fpo.statsRows.includes(r.id)}
+                  onchange={() => toggleStatRow(r.id)}
+                />
+                {r.label}{r.column ? ` (API: ${r.column})` : ''}
+              </label>
+            {/each}
           </div>
-          <label>
-            VA
+        </details>
+      </div>
+      <div class="group" role="group" aria-label="Volumenprofil">
+        {#each VIEWS as [v, t] (v)}
+          <button
+            class:active={prof.mode !== 'off' && prof.view === v}
+            aria-pressed={prof.mode !== 'off' && prof.view === v}
+            title={prof.mode === 'off'
+              ? `Volumenprofil einschalten (Tage) mit Ansicht ${t}`
+              : `Volumenprofil: Ansicht ${t}`}
+            onclick={() => setProf(prof.mode === 'off' ? { view: v, mode: 'daily' } : { view: v })}
+          >
+            {t}
+          </button>
+        {/each}
+        <button
+          class:active={pro?.selecting}
+          aria-pressed={pro?.selecting ?? false}
+          title="Zwei Klicks: Anfang und Ende (Bar-genau, auf Minuten); Esc bricht ab"
+          onclick={startSelect}
+        >
+          Bereich
+        </button>
+        {#if prof.range}<button title="Bereichsprofil entfernen" onclick={clearRange}>
+            ✕
+          </button>{/if}
+        <details class="menu right">
+          <summary>Profil ▾</summary>
+          <div class="panel">
             <select
-              aria-label="Value-Area-Anteil"
-              value={String(prof.va)}
-              onchange={(e) => setProf({ va: Number(e.currentTarget.value) })}
+              aria-label="Profilmodus"
+              value={prof.mode}
+              onchange={(e) => setProf({ mode: e.currentTarget.value as ProfileMode })}
             >
-              {#each [60, 68, 70, 80, 90] as v (v)}<option value={String(v)}>{v} %</option>{/each}
+              {#each MODES as [m, t] (m)}<option value={m}>Profil: {t}</option>{/each}
             </select>
-          </label>
-          <label>
-            Tag ab
-            <select
-              aria-label="Tagesbeginn (UTC-Offset in Stunden)"
-              value={String(prof.offsetH)}
-              onchange={(e) => setProf({ offsetH: Number(e.currentTarget.value) })}
-            >
-              {#each OFFSETS as o (o)}<option value={String(o)}>
-                  {String((o + 24) % 24).padStart(2, '0')}:00 UTC
-                </option>{/each}
-            </select>
-          </label>
-          <label>
-            Profilzeile
-            <select
-              aria-label="Profil-Zeilengröße"
-              value={prof.R === null ? 'auto' : String(prof.R)}
-              onchange={(e) =>
-                setProf({
-                  R: e.currentTarget.value === 'auto' ? null : Number(e.currentTarget.value),
-                })}
-            >
-              <option value="auto">
-                Auto{pro && pro.rAuto && pro.rLabel ? ` (${pro.rLabel})` : ''}
-              </option>
-              {#each profLadder as r (r)}<option value={String(r)}>{label(r)}</option>{/each}
-            </select>
-          </label>
-        </div>
-      </details>
-    </div>
+            <div class="group" role="group" aria-label="Profiloptionen">
+              <button
+                class:active={prof.showVa}
+                aria-pressed={prof.showVa}
+                title="Value Area (Fläche + VAH/VAL)"
+                onclick={() => setProf({ showVa: !prof.showVa })}
+              >
+                VA
+              </button>
+              <button
+                class:active={prof.extend}
+                aria-pressed={prof.extend}
+                title="POC/VAH/VAL nach rechts verlängern, bis der Preis sie erreicht (naked)"
+                onclick={() => setProf({ extend: !prof.extend })}
+              >
+                verlängern
+              </button>
+              <button
+                class:active={prof.scale === 'common'}
+                aria-pressed={prof.scale === 'common'}
+                title="Tagesprofile: gemeinsame Skala über die sichtbaren Tage statt je Profil"
+                onclick={() => setProf({ scale: prof.scale === 'common' ? 'profile' : 'common' })}
+              >
+                gemeinsame Skala
+              </button>
+            </div>
+            <label>
+              VA
+              <select
+                aria-label="Value-Area-Anteil"
+                value={String(prof.va)}
+                onchange={(e) => setProf({ va: Number(e.currentTarget.value) })}
+              >
+                {#each [60, 68, 70, 80, 90] as v (v)}<option value={String(v)}>{v} %</option>{/each}
+              </select>
+            </label>
+            <label>
+              Tag ab
+              <select
+                aria-label="Tagesbeginn (UTC-Offset in Stunden)"
+                value={String(prof.offsetH)}
+                onchange={(e) => setProf({ offsetH: Number(e.currentTarget.value) })}
+              >
+                {#each OFFSETS as o (o)}<option value={String(o)}>
+                    {String((o + 24) % 24).padStart(2, '0')}:00 UTC
+                  </option>{/each}
+              </select>
+            </label>
+            <label>
+              Profilzeile
+              <select
+                aria-label="Profil-Zeilengröße"
+                value={prof.R === null ? 'auto' : String(prof.R)}
+                onchange={(e) =>
+                  setProf({
+                    R: e.currentTarget.value === 'auto' ? null : Number(e.currentTarget.value),
+                  })}
+              >
+                <option value="auto">
+                  Auto{pro && pro.rAuto && pro.rLabel ? ` (${pro.rLabel})` : ''}
+                </option>
+                {#each profLadder as r (r)}<option value={String(r)}>{label(r)}</option>{/each}
+              </select>
+            </label>
+          </div>
+        </details>
+      </div>
+    {:else}
+      <div class="group" role="group" aria-label="TPO">
+        <button
+          class:active={tpo.split}
+          aria-pressed={tpo.split}
+          title="Jeder Buchstabe in seiner eigenen Spalte (Spalte = Block)"
+          onclick={() => setTpo({ split: !tpo.split })}
+        >
+          Split
+        </button>
+        <button
+          class:active={tpo.volume}
+          aria-pressed={tpo.volume}
+          title="Volumenprofil rechts neben jedem TPO-Profil"
+          onclick={() => setTpo({ volume: !tpo.volume })}
+        >
+          Volumen
+        </button>
+        <details class="menu">
+          <summary>TPO ▾</summary>
+          <div class="panel">
+            <label>
+              Block
+              <select
+                aria-label="TPO-Blockgröße"
+                value={String(tpo.blockMin)}
+                onchange={(e) => setTpo({ blockMin: Number(e.currentTarget.value) })}
+              >
+                {#each TPO_BLOCK_MINUTES as m (m)}<option value={String(m)}>
+                    {m < 60 ? `${m} min` : `${m / 60} h`}
+                  </option>{/each}
+              </select>
+            </label>
+            <label>
+              Initial Balance
+              <select
+                aria-label="Initial Balance (Minuten)"
+                value={String(tpo.ibMin)}
+                onchange={(e) => setTpo({ ibMin: Number(e.currentTarget.value) })}
+              >
+                {#each [30, 60, 90, 120] as m (m)}<option value={String(m)}>{m} min</option>{/each}
+              </select>
+            </label>
+            <label>
+              Zeilengröße
+              <select
+                aria-label="TPO-Zeilengröße"
+                value={tpo.R === null ? 'auto' : String(tpo.R)}
+                onchange={(e) =>
+                  setTpo({
+                    R: e.currentTarget.value === 'auto' ? null : Number(e.currentTarget.value),
+                  })}
+              >
+                <option value="auto">Auto{tro && tro.rAuto ? ` (${tro.rLabel})` : ''}</option>
+                {#each profLadder as r (r)}<option value={String(r)}>{label(r)}</option>{/each}
+              </select>
+            </label>
+            <span class="hint-small">
+              Tagesbeginn und VA % wie beim Volumenprofil (Profil ▾ in der Chart-Ansicht). Blöcke
+              ohne Bars fehlen (Löcher); ein nur teilweise gefüllter Block (z. B. Loch 2026-10-27
+              00:02–00:30) ist aus den Quell-Bars nicht erkennbar und zählt mit den vorhandenen
+              Trades.
+            </span>
+          </div>
+        </details>
+      </div>
+    {/if}
   </header>
 
   <div class="chart" bind:this={el}>
@@ -606,7 +746,16 @@
     <button class="diag-toggle" aria-expanded={diagOpen} onclick={() => (diagOpen = !diagOpen)}>
       {diagOpen ? '▾' : '▸'} Diagnose
     </button>
-    {#if ro && !diagOpen}
+    {#if view === 'tpo' && tro}
+      <span class="compact" data-k="tpo">
+        TPO · Bars {tro.tf} · Zeile {tro.rLabel}{tro.rAuto ? ' (auto)' : ''} · {tro.lod ===
+        'letters'
+          ? 'Buchstaben'
+          : 'Blöcke'} · {tro.daysVisible} Tage sichtbar · Requests {tro.requests}
+        {#if tro.note}<span class="hint">· {tro.note}</span>{/if}
+        {#if tro.error}<span class="err">· {tro.error}</span>{/if}
+      </span>
+    {:else if ro && !diagOpen}
       <span class="compact">
         {ro.tf} · Zeile {ro.rLabel}{ro.rAuto ? ' (auto)' : ''} · L{ro.lod}
         {#if ro.hint}<span class="hint">· {ro.hint}</span>{/if}
@@ -716,6 +865,18 @@
   button.active {
     background: #2a3a55;
     border-color: #3d5a88;
+  }
+  .chart :global(.tpo-canvas) {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 4;
+    touch-action: none;
+  }
+  .hint-small {
+    color: #8b949e;
+    font-size: 11px;
   }
   .chart {
     flex: 1;
