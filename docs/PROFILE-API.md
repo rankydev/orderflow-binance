@@ -167,7 +167,9 @@ ohne Decoder. Gemessen (BTC, echte Daten, 2026-11-24): Oktober bei R = 100 (≈ 
   `issuesNext ≠ null`, `issuesFrom` in der Antwort ist der tatsächlich verwendete Beginn.
 - Immer `Cache-Control: no-cache`. `ETag` = Hash über die Parameter und einen Fingerabdruck **aller**
   ausgelieferten Qualitätsfelder je Tag (Zustand, Version, Quelle, Flags, `deep_check`, Zähler) – so ändert sich
-  die ETag auch ohne neue Datenversion (z. B. nach einer Tiefenprüfung). Wie bei den Kacheln: 304 ohne
+  die ETag auch ohne neue Datenversion (z. B. nach einer Tiefenprüfung). Die Issue-Minuten
+  (`data_minute_issue`) sind nicht Teil des Fingerabdrucks: das gilt nur, solange sie ausschließlich in der
+  Import-Transaktion entstehen, die auch `data_day` (Version, Zähler) ändert (heute der Fall). Wie bei den Kacheln: 304 ohne
   Datenabfrage, Server-Cache höchstens `OF_API_NONFINAL_TTL_MS` (10 s) lang, gleiche gleichzeitige Anfragen
   teilen eine Abfrage.
 - Farbband nach §4.9: grün `final_ok`; gelb `provisional`, `provisional_import_failed`, `importing`,

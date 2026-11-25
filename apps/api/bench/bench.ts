@@ -365,6 +365,33 @@ async function main(): Promise<void> {
     identicalNonFinalTileAgain: await flood(c.url, Array(300).fill(tileUrl)),
     identicalNonFinalDayProfile: await flood(c.url, Array(300).fill(dayProfile)),
   };
+  // Cache voller finaler Einträge (1 MB, Review Pass 3): der laufende Tag bleibt trotzdem im Cache
+  const small = await spawnApi({ OF_API_CACHE_MB: '1' });
+  const span1m = 1000 * 60_000;
+  for (let ci = 0; ci < 60; ci++) {
+    const f = s.dataFrom + ci * span1m * 2;
+    if (f + span1m >= lastDay) break;
+    await measure(
+      small.url,
+      `/api/v1/bars?sym=${SYM}&tf=1m&from=${Math.floor(f / span1m) * span1m}&to=${(Math.floor(f / span1m) + 1) * span1m}`,
+    );
+  }
+  const fullBefore = (
+    (await (await fetch(`${small.adminUrl}/health`)).json()) as { cache: unknown }
+  ).cache;
+  const fullCache = {
+    cacheAfterFinals: fullBefore,
+    newestTile: [
+      (await measure(small.url, tileUrl)).cache,
+      (await measure(small.url, tileUrl)).cache,
+      (await measure(small.url, tileUrl)).cache,
+    ],
+    flood: await flood(small.url, Array(300).fill(dayProfile)),
+    floodAgain: await flood(small.url, Array(300).fill(dayProfile)),
+    cacheAfter: ((await (await fetch(`${small.adminUrl}/health`)).json()) as { cache: unknown })
+      .cache,
+  };
+  await stop(small);
   const etag = (await measure(c.url, tileUrl)).etag!;
   const tileFinal = (await (await fetch(c.url + tileUrl)).headers.get('cache-control')) ?? '';
   const revalidate = await flood(c.url, Array(300).fill(tileUrl), { 'If-None-Match': etag });
@@ -391,7 +418,7 @@ async function main(): Promise<void> {
       cache: healthA.cache,
     },
     concurrent20: { ...summarize(conc), wallMs: wall.map(r1) },
-    flood: { ...floods, revalidate304: revalidate, newestTileCacheControl: tileFinal },
+    flood: { ...floods, revalidate304: revalidate, newestTileCacheControl: tileFinal, fullCache },
     groups: out,
   };
   await writeFile(join(here, 'results.json'), JSON.stringify(result, null, 2));

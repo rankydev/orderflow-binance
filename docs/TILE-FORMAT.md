@@ -132,13 +132,24 @@ angeboten nur, wenn 32 · m ≤ 60 000 und die Quellzeilengrenze je Kachel auch 
   sich ein n oder das Angebot, ändert sich `tileConfigVersion`; da `cfg` Teil der Kachel-URL ist, sind alle Caches
   für die neue Konfiguration getrennt.
 - **Veraltete `cfg`:** **409** + `{ error, tileConfigVersion }`; der Client lädt einmal `/symbols` neu.
-- **Was der Client bei einem 422 einer einzelnen Kachel tun soll (Empfehlung für den Web-Autor):** Heute markiert
-  der Client die Kachel als abgelehnt, zeichnet dort Kerzen und fragt nach 5 min erneut – das ist korrekt und
-  bleibt zulässig. Besser: bei `reason = "tile_cells_exceeded"` und `suggestR ≠ null` für **diesen Zeitraum**
-  die Kachel mit `suggestR` laden (eigene Kachelindizes, da n je R verschieden ist: Kacheln von `suggestR`, die
-  den Zeitraum der abgelehnten Kachel überdecken) und dort mit gröberen Zeilen zeichnen, mit einem Hinweis
-  („Zeilengröße hier vergröbert"); das globale R und Auto-R bleiben unverändert; die Ablehnung erst nach
-  REJECT_TTL erneut versuchen. Eine 422 ohne `reason` (Kombination nicht angeboten) bleibt endgültig.
+- **Antworten auf `/footprint`, die der Client unterscheiden muss (für den Web-Autor):**
+
+  | Status / Körper | Bedeutung | endgültig? | Empfehlung |
+  |---|---|---|---|
+  | 422 **ohne** `reason` | (tf, R) wird nicht angeboten | für diese `cfg` ja | nicht anfragen; nach `/symbols` richten |
+  | 422 `reason: "tile_cells_exceeded"` (`cells`, `limit`, `suggestR`) | diese eine Kachel hat > 60 000 Zellen | nein, nur für diese Kachel und den Datenstand | Zeitraum mit `suggestR` laden, s. u. |
+  | 422 `reason: "tile_source_rows_exceeded"` (`rowsEstimate`, `limit`, `suggestR`) | diese eine Kachel überschreitet die Quellzeilengrenze (ungewöhnlich schwerer laufender/neuer Tag) | nein, wie oben | wie oben |
+  | 409 + `tileConfigVersion` | `cfg` veraltet | – | `/symbols` neu laden (einmal je Welle) |
+  | 503 + `Retry-After` | Überlast, Import-Sperre, Datenbank weg, Versionsstand veraltet; auch von `/symbols` | nein | nach `Retry-After` wiederholen |
+
+  `suggestR` ist die nächstgröbere **angebotene** Zeilengröße desselben tf oder `null` (keine gröbere). Sie hat
+  ein eigenes n und damit eigene Kachelindizes: der Client lädt die Kacheln von `suggestR`, die den Zeitraum der
+  abgelehnten Kachel überdecken (`tileIndexAt(t, n_suggest, tfSec)` für Anfang und Ende), zeichnet diesen
+  Zeitraum mit den gröberen Zeilen und einem Hinweis („Zeilengröße hier vergröbert") und lässt das globale R und
+  Auto-R unverändert. Ist `suggestR` `null`, bleiben dort Kerzen. Abgelehnte Kacheln tragen
+  `Cache-Control: no-store` und keinen ETag: der Client muss Wiederholungen selbst drosseln (heute
+  REJECT_TTL = 5 min; das bleibt richtig). Das heutige Verhalten (Kachel abgelehnt, Kerzen, Wiederholung nach
+  5 min) ist zulässig, die Vergröberung die Empfehlung.
 
 Mit den Fixtures (Zuschlag 1,5): 0 Kacheln über 30 000, 0 abgelehnt; feinste angebotene Zeilen 1m: R = 10 Ticks.
 
@@ -268,7 +279,8 @@ Umgesetzt in `apps/api` (Katalog `src/catalog.ts`, Routen `src/routes/tiles.ts`)
 - **Server-Cache und Revalidierung (Review W1):** Die API prüft `If-None-Match` gegen die `dataVersion` aus ihrer
   Tagesversionstabelle (Katalog), **bevor** sie die Datenbank fragt: Treffer → 304 ohne Datenabfrage und ohne
   Platz im Gleichzeitigkeitslimit. Fehler (400/404/409/422) werden vorher entschieden; ein `If-None-Match`
-  ändert sie nie in ein 304. Auch nicht finale Antworten liegen im Server-Cache, unter ihrer `dataVersion`
+  ändert sie nie in ein 304. `If-None-Match: *` ergibt nur dann 304, wenn für diese Version eine erfolgreiche
+  Antwort im Server-Cache liegt (sonst wird gerechnet; eine abgelehnte Kachel bleibt 422). Auch nicht finale Antworten liegen im Server-Cache, unter ihrer `dataVersion`
   (fehlende Tage gehen als „-" ein), höchstens `OF_API_NONFINAL_TTL_MS` (Standard 10 s) lang und höchstens mit
   25 % der Cache-Größe (sie verdrängen keine finalen Einträge; abgelaufene werden beim Einfügen weggeräumt);
   gleichzeitige gleiche Anfragen teilen eine Berechnung. Der Browser bekommt für nicht finale Antworten weiterhin
@@ -276,10 +288,14 @@ Umgesetzt in `apps/api` (Katalog `src/catalog.ts`, Routen `src/routes/tiles.ts`)
 - **Aktualität von 304 und Cache-Treffern:** Der Katalog liest `data_day` alle `OF_API_POLL_MS` (Standard 1 s).
   Bei gesundem Katalog ist ein Versionswechsel daher spätestens nach `OF_API_POLL_MS` + Dauer einer
   Aktualisierung sichtbar (warm einige ms; nach einem Import zusätzlich die Neuberechnung der Statistik des
-  geänderten Tages, ≈ 0,1 s; beim Start ≈ 1 s für 167 Tage). Schlägt die Aktualisierung fehl (Datenbank weg),
-  antworten 304 und Cache-Treffer höchstens `OF_API_STALE_AFTER_MS` (Standard 30 s) lang auf dem letzten
-  bekannten Stand; danach antworten alle Datenendpunkte und `/symbols` mit **503** + `Retry-After: 5`, bis eine
-  Aktualisierung wieder gelingt. Eine berechnete Antwort trägt immer die `dataVersion` ihres eigenen Snapshots.
+  geänderten Tages, ≈ 0,1 s; beim Start ≈ 1 s für 167 Tage). Scheitert die Aktualisierung an einem
+  Verbindungsverlust, antworten 304 und Cache-Treffer höchstens `OF_API_STALE_AFTER_MS` (Standard 30 s) lang
+  auf dem letzten bekannten Stand; danach antworten alle Datenendpunkte und `/symbols` mit **503** +
+  `Retry-After: 5` (jede solche Anfrage stößt sofort eine neue Aktualisierung an), bis eine wieder gelingt.
+  Schließt die Aktualisierung gar nicht ab (hängende Verbindung; eigenes Zeitlimit max(10 s, 3 ·
+  Statement-Zeitlimit)), gilt dasselbe ab 3 · `OF_API_STALE_AFTER_MS`. Scheitert sie nur an Sperren oder
+  Zeitlimits eines laufenden Imports, bleibt der letzte Stand gültig (Daten ändern sich erst mit dessen Commit):
+  die API bedient weiter, Health meldet `degraded`. Eine berechnete Antwort trägt immer die `dataVersion` ihres eigenen Snapshots.
 - **Bestätigt für den Web-Client:** (1) `tileConfigVersion` bleibt eine sichere Ganzzahl (Hash < 2^47, derzeit
   14 Stellen); (2) eine Footprint-Kachel und `/bars` über denselben Zeitraum mit derselben Datenlage enthalten
   identische Bars mit identischem `buyQ + sellQ` je Bar (eine Funktion, ein Snapshot je Antwort); (3) `/bars`
