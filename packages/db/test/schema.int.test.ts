@@ -38,16 +38,17 @@ const P1_TABLES = [
   'recorder_quality',
 ];
 // KONZEPT §3.9: Chunk-Intervall und Columnstore-Frist je Hypertable
-// afterDays null = kein Columnstore (Jahres-Chunk-Tabellen, Migration 0006 / Review N5)
+// afterDays null = kein Columnstore (Jahres-Chunk-Tabellen, Migration 0006 / Review N5).
+// Policy-Frist 4 Tage seit Migration 0016 (Marge offener Chunks of_hot_margin() = 3 Tage + 1).
 const HYPERTABLES: Record<string, { chunkDays: number; afterDays: number | null }> = {
-  fp_1m: { chunkDays: 1, afterDays: 3 },
-  fp_1m_b10: { chunkDays: 7, afterDays: 3 },
-  fp_5m_b10: { chunkDays: 7, afterDays: 3 },
-  fp_15m_b100: { chunkDays: 30, afterDays: 3 },
-  fp_1h_b10: { chunkDays: 30, afterDays: 3 },
-  fp_1h_b100: { chunkDays: 30, afterDays: 3 },
-  bar_1m: { chunkDays: 30, afterDays: 3 },
-  kline_1m: { chunkDays: 30, afterDays: 3 },
+  fp_1m: { chunkDays: 1, afterDays: 4 },
+  fp_1m_b10: { chunkDays: 7, afterDays: 4 },
+  fp_5m_b10: { chunkDays: 7, afterDays: 4 },
+  fp_15m_b100: { chunkDays: 30, afterDays: 4 },
+  fp_1h_b10: { chunkDays: 30, afterDays: 4 },
+  fp_1h_b100: { chunkDays: 30, afterDays: 4 },
+  bar_1m: { chunkDays: 30, afterDays: 4 },
+  kline_1m: { chunkDays: 30, afterDays: 4 },
   fp_1d_b100: { chunkDays: 365, afterDays: null },
   fp_1d_b1000: { chunkDays: 365, afterDays: null },
   bar_1h: { chunkDays: 365, afterDays: null },

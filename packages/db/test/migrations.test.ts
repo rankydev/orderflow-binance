@@ -25,6 +25,7 @@ describe('Migrationsdateien im Repo', () => {
       '0013',
       '0014',
       '0015',
+      '0016',
     ]);
     for (const m of real) {
       expect(m.upSql.trim().length).toBeGreaterThan(0);
