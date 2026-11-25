@@ -46,6 +46,7 @@ import {
   generate,
   LAST_DAY,
   MINUTE_MS,
+  OUTLIER_MS,
   PROVISIONAL_DAY,
   seed,
   SYM_ID,
@@ -63,13 +64,38 @@ interface SymJson {
 }
 let admin: Sql;
 let data: Seeded;
-const apiPassword = process.env.OF_API_DB_PASSWORD?.trim() || randomBytes(18).toString('hex');
+/**
+ * Eigene Testrolle statt of_api (Review): Rollen gelten clusterweit; ein Test darf das Passwort der
+ * Rolle, mit der die Entwicklungs-API läuft, nie ändern. of_api_test bekommt in der Testdatenbank genau
+ * die Tabellenrechte und Rolleneinstellungen von of_api (aus den Migrationen) – sonst nichts.
+ */
+const TEST_ROLE = 'of_api_test';
+const apiPassword = randomBytes(18).toString('hex');
+/** Tabellen, die of_api lesen darf (Migrationen 0009/0010); jede neue Tabelle muss hier bewusst landen. */
+const API_READABLE = [
+  'bar_1d',
+  'bar_1h',
+  'bar_1m',
+  'data_day',
+  'data_minute_issue',
+  'fp_15m_b100',
+  'fp_1d_b100',
+  'fp_1d_b1000',
+  'fp_1h_b10',
+  'fp_1h_b100',
+  'fp_1m',
+  'fp_1m_b10',
+  'fp_5m_b10',
+  'kline_1m',
+  'symbol',
+  'symbol_tick_history',
+];
 
 function apiCfg(over: Partial<ApiConfig> = {}): ApiConfig {
   const c = parseApiConfig({
     ...process.env,
     OF_DB_NAME: testDb,
-    OF_API_DB_USER: 'of_api',
+    OF_API_DB_USER: TEST_ROLE,
     OF_API_DB_PASSWORD: apiPassword,
   });
   // Tests prüfen Quelle und Schätzung über die Diagnose-Header; Status-Listener nur wo nötig
@@ -166,9 +192,7 @@ beforeAll(async () => {
   await dropAndCreateDatabase(adminCfg);
   admin = connect(adminCfg);
   await migrateUp(admin);
-  // Rolle ist clusterweit: dasselbe Passwort wie die lokale .env (sonst ein zufälliges, z. B. in CI)
-  // nur der SCRAM-Verifier geht an den Server (W4a); jede API-Verbindung unten beweist, dass er gilt
-  await admin.unsafe(alterRolePasswordSql('of_api', apiPassword));
+  await mirrorApiRole(admin);
   data = generate();
   await seed(admin, data);
 }, 120_000);
@@ -176,6 +200,30 @@ beforeAll(async () => {
 afterAll(async () => {
   await admin?.end();
 });
+
+/** Legt of_api_test als Spiegel von of_api in der Testdatenbank an (Rechte + Rolleneinstellungen). */
+async function mirrorApiRole(sql: Sql): Promise<void> {
+  await sql.unsafe(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${TEST_ROLE}') THEN
+      CREATE ROLE ${TEST_ROLE} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+    END IF; END $$`);
+  // nur der SCRAM-Verifier geht an den Server (W4a); jede API-Verbindung unten beweist, dass er gilt
+  await sql.unsafe(alterRolePasswordSql(TEST_ROLE, apiPassword));
+  const [cfg] = await sql<{ rolconfig: string[] | null }[]>`
+    SELECT rolconfig FROM pg_roles WHERE rolname = 'of_api'`;
+  await sql.unsafe(`ALTER ROLE ${TEST_ROLE} RESET ALL`);
+  for (const kv of cfg!.rolconfig ?? []) {
+    const m = /^([a-z_]+)=([A-Za-z0-9_.]+)$/.exec(kv);
+    if (!m) throw new Error(`unerwartete Rolleneinstellung ${kv}`);
+    await sql.unsafe(`ALTER ROLE ${TEST_ROLE} SET ${m[1]} = '${m[2]}'`);
+  }
+  await sql.unsafe(`GRANT USAGE ON SCHEMA public TO ${TEST_ROLE}`);
+  const grants = await sql<{ t: string }[]>`
+    SELECT c.relname AS t FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm')
+       AND has_table_privilege('of_api', c.oid, 'SELECT')`;
+  for (const { t } of grants) await sql.unsafe(`GRANT SELECT ON "${t}" TO ${TEST_ROLE}`);
+}
 
 describe('Rolle of_api', () => {
   it('liest (auch Columnstore-Chunks), schreibt nie', async () => {
@@ -192,6 +240,32 @@ describe('Rolle of_api', () => {
       expect(wm!.work_mem).toBe('16MB');
       for (const t of ['raw_file', 'raw_day', 'schema_migrations', 'verify_run'])
         await expect(sql.unsafe(`SELECT 1 FROM ${t} LIMIT 1`), t).rejects.toThrow(/permission/);
+      const [rc] = await admin<
+        { c: string[] }[]
+      >`SELECT rolconfig AS c FROM pg_roles WHERE rolname = 'of_api'`;
+      expect(rc!.c).toEqual(
+        expect.arrayContaining(['work_mem=16MB', 'default_transaction_read_only=on']),
+      );
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('of_api liest genau die freigegebenen Tabellen (neue Tabellen müssen bewusst auf die Liste)', async () => {
+    // Migration 0009 vergibt Standardrechte: jede künftige Tabelle wäre für die API lesbar. Dieser Test
+    // schlägt fehl, bis die neue Tabelle hier (API_READABLE) eingetragen oder per REVOKE entzogen ist.
+    const rows = await admin<{ t: string }[]>`
+      SELECT c.relname AS t FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+         AND has_table_privilege('of_api', c.oid, 'SELECT') ORDER BY 1`;
+    expect(rows.map((r) => r.t)).toEqual([...API_READABLE].sort());
+  });
+
+  it('die Testrolle ist nicht of_api (Tests ändern kein Passwort der echten Rolle)', async () => {
+    const sql = createPool(apiCfg());
+    try {
+      const [u] = await sql`SELECT current_user AS u`;
+      expect(u!.u).toBe(TEST_ROLE);
     } finally {
       await sql.end();
     }
@@ -298,6 +372,7 @@ describe('Endpunkte gegen den Web-Client', () => {
 
   it('/footprint: jede angebotene (tf, R), jede Kachel: Client-Prüfung, = Referenz, = /bars', async () => {
     const sources = new Set<string>();
+    const rejected: { tf: string; R: number; k: number; suggestR: number | null }[] = [];
     let tiles = 0;
     for (const [tf, m] of Object.entries(sym.tiles)) {
       const tfSec = TIMEFRAMES[tf as keyof typeof TIMEFRAMES];
@@ -308,7 +383,20 @@ describe('Endpunkte gegen den Web-Client', () => {
         const store = new FootprintStore(3);
         for (let k = Math.floor(dataFrom / span); k * span < dataTo; k++) {
           const url = `/api/v1/footprint?sym=BTCUSDT&tf=${tf}&R=${R}&tile=${k}&cfg=${sym.tileConfigVersion}`;
-          const { res, buf } = await get(api, url);
+          const { res, buf, json } = await get(api, url);
+          const from0 = k * span;
+          const refCells = refLevels(tfSec, w, from0, from0 + span).length;
+          // Zell-Wächter: eine Kachel über 60 000 Zellen nie ausliefern, sondern einzeln 422
+          if (refCells > 60_000) {
+            expect(res.status, url).toBe(422);
+            expect(json()).toMatchObject({
+              reason: 'tile_cells_exceeded',
+              cells: refCells,
+              limit: 60_000,
+            });
+            rejected.push({ tf, R, k, suggestR: json().suggestR as number | null });
+            continue;
+          }
           expect(res.status, url).toBe(200);
           sources.add(res.headers.get('x-source')!);
           tiles++;
@@ -329,7 +417,7 @@ describe('Endpunkte gegen den Web-Client', () => {
             tile: { index: k, n },
             R,
           });
-          expect(dec.header.nLevels).toBeLessThanOrEqual(30_000);
+          expect(dec.header.nLevels).toBeLessThanOrEqual(60_000);
           // Level = Re-Binning von fp_1m
           const ref = refLevels(tfSec, w, from, to);
           expect(dec.header.nLevels).toBe(ref.length);
@@ -377,6 +465,15 @@ describe('Endpunkte gegen den Web-Client', () => {
       }
     }
     expect(tiles).toBeGreaterThan(100);
+    // die Ausreißer-Minuten (seed.ts) ergeben genau eine abgelehnte 1m-Kachel bei R = 1; Vorschlag R = 2
+    expect(rejected).toEqual([
+      {
+        tf: '1m',
+        R: 1,
+        k: Math.floor(OUTLIER_MS / (sym.tiles['1m']!['1']! * 60_000)),
+        suggestR: 2,
+      },
+    ]);
     expect([...sources].sort()).toEqual([...FP_TABLE_NAMES].sort());
   }, 120_000);
 
@@ -451,6 +548,11 @@ describe('Endpunkte gegen den Web-Client', () => {
         api,
         `/api/v1/profile?sym=BTCUSDT&from=${from}&to=${to}&R=${R}`,
       );
+      // über 60 000 Zeilen (Ausreißer-Minuten am provisorischen Tag bei R = 1) → 422 mit Vorschlag
+      if (refProfile(from, to, R * TICK).buy.length > 60_000) {
+        expect(res.status).toBe(422);
+        return;
+      }
       expect(res.status, `${from}-${to} R=${R}`).toBe(200);
       const body = json() as unknown as RangeProfileResponse;
       expect(checkRangeProfile(body)).toEqual([]);
@@ -575,6 +677,75 @@ describe('Endpunkte gegen den Web-Client', () => {
     expect(r409.json().tileConfigVersion).toBe(c);
   });
 
+  it('If-None-Match ändert keine Fehlerentscheidung: 409/422/400 statt 304', async () => {
+    const c = sym.tileConfigVersion;
+    const any = { 'If-None-Match': '*' };
+    const cases: [string, number][] = [
+      [`/api/v1/footprint?sym=BTCUSDT&tf=1m&R=50&tile=1&cfg=${c + 1}`, 409],
+      [`/api/v1/footprint?sym=BTCUSDT&tf=1m&R=7&tile=1&cfg=${c}`, 422],
+      [`/api/v1/footprint?sym=BTCUSDT&tf=1m&R=50&tile=1&cfg=${c}&x=1`, 400],
+      [`/api/v1/bars?sym=BTCUSDT&tf=5m&from=60000&to=600000`, 400],
+      [`/api/v1/profile?sym=BTCUSDT&from=${dataFrom}&to=${dataTo}&R=3`, 400],
+    ];
+    for (const [url, status] of cases)
+      expect((await get(api, url, { headers: any })).res.status, url).toBe(status);
+  });
+
+  it('304 auch für die gzip-Variante; HEAD liefert Kopfzeilen ohne Körper bzw. 304', async () => {
+    const url = `/api/v1/bars?sym=BTCUSDT&tf=1m&from=${(FIRST_DAY + 1) * DAY_MS}&to=${(FIRST_DAY + 1) * DAY_MS + 60_000_000}`;
+    const a = await get(api, url, { headers: { 'Accept-Encoding': 'gzip' } });
+    expect(a.res.status).toBe(200);
+    const etag = a.res.headers.get('etag')!;
+    expect(a.res.headers.get('vary')).toMatch(/Accept-Encoding/);
+    const g = await get(api, url, {
+      headers: { 'Accept-Encoding': 'gzip', 'If-None-Match': etag },
+    });
+    expect(g.res.status).toBe(304);
+    expect(g.res.headers.get('etag')).toBe(etag);
+    expect(g.buf.length).toBe(0);
+    const h = await fetch(api.url + url, { method: 'HEAD' });
+    expect(h.status).toBe(200);
+    expect(h.headers.get('etag')).toBe(etag);
+    expect(h.headers.get('content-type')).toBe('application/octet-stream');
+    expect((await h.arrayBuffer()).byteLength).toBe(0);
+    const h304 = await fetch(api.url + url, { method: 'HEAD', headers: { 'If-None-Match': etag } });
+    expect(h304.status).toBe(304);
+  });
+
+  it('/quality: gecacht und gebündelt, 304 vor der Datenabfrage, Issue-Seiten', async () => {
+    const url = `/api/v1/quality?sym=BTCUSDT&from=${dataFrom}&to=${dataTo}&shift=1`;
+    const a = await get(api, url);
+    expect(a.res.status).toBe(200);
+    expect(a.res.headers.get('cache-control')).toBe('no-cache');
+    const b = await get(api, url);
+    expect(b.res.headers.get('x-cache')).toBe('hit');
+    const etag = a.res.headers.get('etag')!;
+    const c = await get(api, url, { headers: { 'If-None-Match': etag } });
+    expect(c.res.status).toBe(304);
+    expect(c.res.headers.get('x-cache')).toBe('revalidated');
+    // deep_check ändert sich ohne neue Datenversion → neue ETag (Fingerabdruck der Qualitätsfelder)
+    const d = new Date(BAD_DAY * DAY_MS).toISOString().slice(0, 10);
+    await admin`UPDATE data_day SET deep_check = 'passed' WHERE sym_id = ${SYM_ID} AND day = ${d}::date`;
+    await sleep(400);
+    const e = await get(api, url, { headers: { 'If-None-Match': etag } });
+    expect(e.res.status).toBe(200);
+    expect(e.res.headers.get('etag')).not.toBe(etag);
+    expect((e.json().days as Record<string, unknown>[]).find((x) => x.day === d)!.deepCheck).toBe(
+      'passed',
+    );
+    await admin`UPDATE data_day SET deep_check = NULL WHERE sym_id = ${SYM_ID} AND day = ${d}::date`;
+    expect(e.json()).toMatchObject({ issuesNext: null, issuesTruncated: false });
+    // Seiten: ab der 2. Issue-Minute
+    const second = BAD_DAY * DAY_MS + 3 * MINUTE_MS;
+    const p2 = await get(api, `${url}&issuesFrom=${second}`);
+    expect((p2.json().issues as { ts: number }[]).every((x) => x.ts >= second)).toBe(true);
+    expect((p2.json().issues as unknown[]).length).toBe(3);
+    // höchstens 400 Tage je Anfrage
+    expect(
+      (await get(api, `/api/v1/quality?sym=BTCUSDT&from=0&to=${401 * DAY_MS}`)).res.status,
+    ).toBe(400);
+  });
+
   it('CORS für erlaubte Ursprünge (Standard: Loopback), sonst kein Header', async () => {
     const ok = await get(api, '/api/v1/symbols', { headers: { Origin: 'http://127.0.0.1:5174' } });
     expect(ok.res.headers.get('access-control-allow-origin')).toBe('http://127.0.0.1:5174');
@@ -614,6 +785,30 @@ describe('Betriebsschutz: Status-Listener, Diagnose-Header, CORS-Liste, Zeitgren
       expect(j).toHaveProperty('cache');
       // der öffentliche Port kennt den Detailpfad nicht
       expect((await get(api, '/health')).res.status).toBe(404);
+    } finally {
+      await api.close();
+    }
+  });
+
+  it('Katalog fällt länger als staleAfterMs aus → 503 statt 304/Cache-Treffer auf altem Stand', async () => {
+    const api = await start({ staleAfterMs: 1_000 });
+    try {
+      const url = `/api/v1/profile?sym=BTCUSDT&from=${dataFrom}&to=${dataFrom + DAY_MS}&R=100`;
+      const a = await get(api, url);
+      expect(a.res.status).toBe(200);
+      const cat = api.deps.catalog;
+      await cat.stop();
+      cat.lastError = 'connect ECONNREFUSED';
+      cat.lastRefresh = Date.now() - 500; // Ausfall kürzer als die Schwelle: weiter bedient
+      expect((await get(api, url)).res.headers.get('x-cache')).toBe('hit');
+      cat.lastRefresh = Date.now() - 5_000;
+      for (const h of [{}, { 'If-None-Match': a.res.headers.get('etag')! }]) {
+        const r = await get(api, url, { headers: h });
+        expect(r.res.status).toBe(503);
+        expect(r.res.headers.get('retry-after')).toBe('5');
+      }
+      expect((await get(api, '/api/v1/symbols')).res.status).toBe(503);
+      expect((await get(api, '/api/v1/health')).res.status).toBe(503);
     } finally {
       await api.close();
     }
@@ -818,6 +1013,32 @@ describe('Versionen, Unveränderlichkeit, Cache', () => {
     expect((await get(api, url)).res.headers.get('x-cache')).toBe('hit');
     await admin`UPDATE data_day SET edge_pending = false WHERE sym_id = ${SYM_ID} AND day = ${new Date(day * DAY_MS).toISOString().slice(0, 10)}::date`;
     await waitCatalog();
+  });
+
+  it('Ausreißer-Kachel: 422 mit Grund und Vorschlag, gecacht, no-store; cfg stabil bei neuer Version des Tages', async () => {
+    const s0 = ((await get(api, '/api/v1/symbols')).json().symbols as SymJson[])[0]!;
+    const n = s0.tiles['1m']!['1']!;
+    const k = Math.floor(OUTLIER_MS / (n * 60_000));
+    const u = (kk: number) =>
+      `/api/v1/footprint?sym=BTCUSDT&tf=1m&R=1&tile=${kk}&cfg=${s0.tileConfigVersion}`;
+    const bad = await get(api, u(k));
+    expect(bad.res.status).toBe(422);
+    expect(bad.res.headers.get('cache-control')).toBe('no-store');
+    expect(bad.res.headers.get('etag')).toBeNull();
+    expect(bad.json()).toMatchObject({ reason: 'tile_cells_exceeded', limit: 60_000, suggestR: 2 });
+    expect((await get(api, u(k))).res.headers.get('x-cache')).toBe('hit'); // keine zweite Abfrage
+    for (const kk of [k - 1, k + 1]) expect((await get(api, u(kk))).res.status).toBe(200);
+    // auch mit If-None-Match nie 304 für die abgelehnte Kachel
+    const inm = await get(api, u(k), { headers: { 'If-None-Match': '"x"' } });
+    expect(inm.res.status).toBe(422);
+    // neue Version des (nicht finalen) Ausreißer-Tages: Angebot und cfg unverändert
+    const d = new Date(PROVISIONAL_DAY * DAY_MS).toISOString().slice(0, 10);
+    await admin`UPDATE data_day SET version = version + 1 WHERE sym_id = ${SYM_ID} AND day = ${d}::date`;
+    await waitCatalog();
+    const s1 = ((await get(api, '/api/v1/symbols')).json().symbols as SymJson[])[0]!;
+    expect(s1.tileConfigVersion).toBe(s0.tileConfigVersion);
+    expect(s1.tiles).toEqual(s0.tiles);
+    expect((await get(api, u(k))).res.status).toBe(422);
   });
 
   it('geänderte Kachelkonfiguration → 409 auf alte cfg; Rücknahme und Neustart liefern dieselbe cfg', async () => {

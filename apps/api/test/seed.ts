@@ -25,6 +25,14 @@ export const MINUTE_MS = 60_000;
 /** Tag mit Zustand final_bad (trotzdem unveränderlich) und Tag provisional (nicht unveränderlich). */
 export const BAD_DAY = 20_728;
 export const PROVISIONAL_DAY = 20_730;
+/**
+ * Ausreißer am provisorischen Tag: zwei aufeinanderfolgende Minuten mit je OUTLIER_ROWS Trades auf
+ * denselben, je einen Tick auseinanderliegenden Preisen. Eine 1m-Kachel bei R = 1 hat damit über
+ * 60 000 Zellen (Zell-Wächter → 422 für genau diese Kachel), ein Profil bei R = 1 nur ≈ 31 000 Zeilen.
+ */
+export const OUTLIER_MINUTE = 600;
+export const OUTLIER_ROWS = 31_000;
+export const OUTLIER_MS = PROVISIONAL_DAY * 86_400_000 + OUTLIER_MINUTE * 60_000;
 
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
@@ -49,6 +57,22 @@ function dayTrades(day: number, rnd: () => number, state: { a: number; tid: numb
   const out: AggTrade[] = [];
   const t0 = day * DAY_MS;
   for (let m = 0; m < 1440; m++) {
+    if (day === PROVISIONAL_DAY && (m === OUTLIER_MINUTE || m === OUTLIER_MINUTE + 1)) {
+      // zu Minutenbeginn, vor den übrigen Trades der Minute (Zeit nicht fallend)
+      for (let j = 0; j < OUTLIER_ROWS; j++) {
+        const T0 = t0 + m * MINUTE_MS;
+        out.push({
+          a: state.a++,
+          px: state.px + j * TICK,
+          q: 1,
+          f: state.tid,
+          l: state.tid,
+          T: T0,
+          m: j % 2 === 0,
+        });
+        state.tid++;
+      }
+    }
     if (rnd() < 0.2) continue; // Minuten ohne Trades
     const k = 1 + Math.floor(rnd() * 4);
     let T = t0 + m * MINUTE_MS + Math.floor(rnd() * 1000);

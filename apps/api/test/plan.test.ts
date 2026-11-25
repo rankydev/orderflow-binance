@@ -4,7 +4,15 @@ import { chooseFpSource, fpTableGrid, ladder, type FpTableName } from '@orderflo
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import { ResponseCache } from '../src/cache.ts';
-import { computeTiles, configVersion, runs, TILE_LADDER, TIMEFRAME_LIST } from '../src/catalog.ts';
+import {
+  coarserOffered,
+  computeTiles,
+  configVersion,
+  referenceRows,
+  runs,
+  TILE_LADDER,
+  TIMEFRAME_LIST,
+} from '../src/catalog.ts';
 import { HttpError } from '../src/errors.ts';
 import { Limiter } from '../src/limiter.ts';
 import {
@@ -154,6 +162,7 @@ describe('computeTiles (TILE-FORMAT.md Kachellänge)', () => {
     const s = {
       tickRefUnits: 10,
       tickUnits: 10,
+      days: new Map(),
       stats: new Map([[1, stats({ '1m': 999 }, rows)]]),
     };
     const { tiles } = computeTiles(s, 1_500_000);
@@ -173,6 +182,7 @@ describe('computeTiles (TILE-FORMAT.md Kachellänge)', () => {
     const s = {
       tickRefUnits: 10,
       tickUnits: 10,
+      days: new Map(),
       stats: new Map([[1, stats({ '1d': 3000 }, rows)]]),
     };
     const { tiles, src } = computeTiles(s, 1_500_000);
@@ -182,13 +192,80 @@ describe('computeTiles (TILE-FORMAT.md Kachellänge)', () => {
   });
 
   it('R unter dem aktuellen Tick wird nicht angeboten', () => {
-    const s = { tickRefUnits: 10, tickUnits: 100, stats: new Map([[1, stats({}, rows)]]) };
+    const s = {
+      tickRefUnits: 10,
+      tickUnits: 100,
+      days: new Map(),
+      stats: new Map([[1, stats({}, rows)]]),
+    };
     const { tiles } = computeTiles(s, 1_500_000);
     for (const m of Object.values(tiles)) {
       expect(m['1']).toBeUndefined();
       expect(m['5']).toBeUndefined();
     }
     expect(tiles['1m']!['10']).toBeDefined();
+  });
+
+  /** N Tage mit 1m-Spanne `base`, davon einzelne mit eigener Spanne; Tage < finalBelow sind final. */
+  function history(n: number, base: number, special: Record<number, number> = {}, finalBelow = n) {
+    const st = new Map<number, never>();
+    const days = new Map<number, { immutable: boolean }>();
+    for (let d = 0; d < n; d++) {
+      st.set(d, stats({ '1m': special[d] ?? base }, rows));
+      days.set(d, { immutable: d < finalBelow });
+    }
+    return { tickRefUnits: 10, tickUnits: 10, days, stats: st } as never;
+  }
+
+  it('P95 der Tagesmaxima: ein Ausreißer-Tag unter 167 entfernt keine feine Zeilengröße', () => {
+    // wie die echten Daten 1m R = 10: ein Tag mit 2 966 Zeilen, sonst ≤ 1 249 (Spanne in Ticks)
+    const h = history(167, 12_000, { 50: 29_650 });
+    expect(referenceRows(h, '1m', TILE_LADDER.indexOf(10))).toBe(1_201);
+    expect(computeTiles(h, 1_500_000).tiles['1m']!['10']).toBe(32);
+    // mit dem Maximum (alte Regel) wäre R = 10 nicht angeboten: 32 · ceil(1,5 · 2 966) > 60 000
+    expect(Math.ceil(1.5 * 2_966) * 32).toBeGreaterThan(60_000);
+  });
+
+  it('P95 = (⌊N/20⌋+1)-größter Wert; bei < 20 Tagen das Maximum', () => {
+    const i = TILE_LADDER.indexOf(1);
+    expect(referenceRows(history(19, 100, { 3: 900 }), '1m', i)).toBe(901);
+    expect(referenceRows(history(20, 100, { 3: 900 }), '1m', i)).toBe(101);
+    expect(referenceRows(history(40, 100, { 3: 900, 4: 800 }), '1m', i)).toBe(101);
+    expect(referenceRows(history(40, 100, { 3: 900, 4: 800, 5: 700 }), '1m', i)).toBe(701);
+  });
+
+  it('nicht finale Tage zählen nicht (kein Wechsel von tiles im Tagesverlauf)', () => {
+    // 30 finale Tage, ein laufender Tag mit riesigen Bars: Angebot und cfg wie ohne ihn
+    const calm = history(30, 900, {}, 30);
+    const withWild = history(31, 900, { 30: 90_000 }, 30);
+    const a = computeTiles(calm, 1_500_000).tiles;
+    const b = computeTiles(withWild, 1_500_000).tiles;
+    expect(b).toEqual(a);
+    expect(configVersion(b)).toBe(configVersion(a));
+    // ohne einen einzigen finalen Tag zählen alle Tage
+    expect(referenceRows(history(3, 900, { 2: 90_000 }, 0), '1m', 0)).toBe(90_001);
+  });
+
+  it('Stabilität: ein zusätzlicher Tag verschiebt den Referenzwert höchstens um einen Rang', () => {
+    // 59 Tage mit absteigenden Spannen; Referenz ist der 3.-größte Wert (⌊59/20⌋ + 1)
+    const sp: Record<number, number> = {};
+    for (let d = 0; d < 59; d++) sp[d] = 2000 - d * 10;
+    const before = referenceRows(history(59, 0, sp), '1m', 0);
+    for (const extra of [5000, 1995, 10]) {
+      const after = referenceRows(history(60, 0, { ...sp, 59: extra }), '1m', 0);
+      const ranks = Object.values(sp)
+        .map((x) => x + 1)
+        .sort((a, b) => b - a);
+      const k = ranks.indexOf(before);
+      expect([ranks[k - 1], before, ranks[k + 1], extra + 1]).toContain(after);
+    }
+  });
+
+  it('nächstgröbere angebotene Zeilengröße als Vorschlag', () => {
+    const t = { '1m': { '10': 32, '20': 32, '50': 64 } };
+    expect(coarserOffered(t, '1m', 10)).toBe(20);
+    expect(coarserOffered(t, '1m', 50)).toBeNull();
+    expect(coarserOffered(t, '5m', 10)).toBeNull();
   });
 
   it('tileConfigVersion: deterministisch, sichere Ganzzahl, ändert sich mit jedem n', () => {
