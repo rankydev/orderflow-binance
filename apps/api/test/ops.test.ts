@@ -10,7 +10,7 @@ import { HttpError } from '../src/errors.ts';
 import { parseApiConfig } from '../src/config.ts';
 import { isConnectionLoss, type Sql } from '../src/db.ts';
 import { cacheControl } from '../src/http.ts';
-import { alterRolePasswordSql, scramSha256Verifier } from '../src/scram.ts';
+import { alterRolePasswordSql, scramSha256Verifier } from '@orderflow/db';
 
 const env = { OF_DB_PASSWORD: 'admin-secret', OF_API_DB_PASSWORD: 'api-secret-0123456789' };
 

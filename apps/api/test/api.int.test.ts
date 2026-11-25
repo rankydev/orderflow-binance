@@ -25,7 +25,13 @@ import {
   type FpTableName,
   type RangeProfileResponse,
 } from '@orderflow/core';
-import { connect, dropAndCreateDatabase, migrateUp, type Sql } from '@orderflow/db';
+import {
+  alterRolePasswordSql,
+  connect,
+  dropAndCreateDatabase,
+  migrateUp,
+  type Sql,
+} from '@orderflow/db';
 import { randomBytes } from 'node:crypto';
 import { createConnection, createServer, type AddressInfo, type Socket } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -35,7 +41,6 @@ import { BarStore } from '../../web/src/lib/bar-store.ts';
 import { FootprintStore } from '../../web/src/lib/footprint-store.ts';
 import { parseApiConfig, type ApiConfig } from '../src/config.ts';
 import { createPool, readTx } from '../src/db.ts';
-import { alterRolePasswordSql } from '../src/scram.ts';
 import { startApi, type RunningApi } from '../src/main.ts';
 import { FP_TABLE_NAMES } from '../src/plan.ts';
 import { chunkLockList, queryLevels, tsLit } from '../src/queries.ts';
@@ -298,6 +303,13 @@ describe('Rolle of_api', () => {
         >`SELECT has_table_privilege('of_api', ${t}, ${p}) AS ok`;
         expect(x!.ok, `${p} ${t}`).toBe(false);
       }
+    // Recorder-Objekte (Migrationen 0013–0016): keine Konvertierung, keine Mitgliedschaft
+    const [fn] = await admin<{ ok: boolean }[]>`
+      SELECT has_function_privilege('of_api', 'of_recompress_chunk(regclass)', 'EXECUTE') AS ok`;
+    expect(fn!.ok, 'EXECUTE of_recompress_chunk').toBe(false);
+    const [mb] = await admin<{ ok: boolean }[]>`
+      SELECT pg_has_role('of_api', 'of_recorder', 'MEMBER') AS ok`;
+    expect(mb!.ok, 'of_api Mitglied von of_recorder').toBe(false);
   });
 
   it('die Testrolle ist nicht of_api (Tests ändern kein Passwort der echten Rolle)', async () => {

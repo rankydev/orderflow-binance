@@ -2,8 +2,7 @@
 // Admin-Rolle (OF_DB_USER). Betriebswerkzeug wie die Migrationen, nicht Teil der API; gibt das
 // Passwort nie aus.  Aufruf: npm run role:password -w @orderflow/api
 import { parseConfig } from '@orderflow/core';
-import { connect } from '@orderflow/db';
-import { alterRolePasswordSql } from '../scram.ts';
+import { alterRolePasswordSql, connect } from '@orderflow/db';
 
 async function main(): Promise<number> {
   const admin = parseConfig(process.env);

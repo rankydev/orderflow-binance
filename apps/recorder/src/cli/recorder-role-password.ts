@@ -3,9 +3,8 @@
 // Passwort liegt auf dem Server in einer 0600-Datei, gesendet wird nur der clientseitig berechnete
 // SCRAM-Verifier, ausgegeben wird es nie). Aufruf: npm run role:password -w @orderflow/recorder
 import { parseConfig } from '@orderflow/core';
-import { connect } from '@orderflow/db';
-// eine Implementierung des SCRAM-Verifiers für beide Rollen (liegt im selben Image)
-import { alterRolePasswordSql } from '../../../api/src/scram.ts';
+// eine Implementierung des SCRAM-Verifiers für beide Rollen (packages/db)
+import { alterRolePasswordSql, connect } from '@orderflow/db';
 
 async function main(): Promise<number> {
   const admin = parseConfig(process.env);
