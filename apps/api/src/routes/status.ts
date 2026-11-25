@@ -40,6 +40,8 @@ function health(deps: Deps): { state: 'healthy' | 'degraded' | 'unhealthy'; reas
       if (age > deps.cfg.staleAfterMs) bad = true;
     }
   }
+  for (const e of cat.dataErrors.slice(-5))
+    reasons.push(`Datenfehler ${e.sym ?? ''} ${e.message} (${new Date(e.at).toISOString()})`);
   return { state: bad ? 'unhealthy' : reasons.length > 0 ? 'degraded' : 'healthy', reasons };
 }
 
@@ -88,7 +90,15 @@ export function registerStatusRoutes(app: FastifyInstance, deps: Deps): void {
     if (to <= from) throw badRequest('to muss größer als from sein');
     const [d0, d1] = coveredDays(from, to);
     if (d1 - d0 + 1 > MAX_QUALITY_DAYS) throw badRequest(`höchstens ${MAX_QUALITY_DAYS} Tage`);
-    const parts = ['quality', s.name, withShift ? 1 : 0, issuesFrom];
+    // apiDataErrors gehören zur Antwort: Anzahl und jüngster Zeitpunkt gehen in die Version ein
+    const de = deps.catalog.dataErrors;
+    const parts = [
+      'quality',
+      s.name,
+      withShift ? 1 : 0,
+      issuesFrom,
+      `de${de.length}:${de.at(-1)?.at ?? 0}`,
+    ];
     const fpNow = (d: number) => s.days.get(d)?.quality;
     // Qualität ist nie final (kann sich ändern, solange ein Tag nicht neu importiert wird): Browser
     // no-cache, Server-Cache höchstens nonFinalTtlMs, Schlüssel = Fingerabdruck aller Qualitätsfelder.
@@ -120,6 +130,15 @@ export function registerStatusRoutes(app: FastifyInstance, deps: Deps): void {
           issuesFrom: lo,
           issuesNext: issues.next,
           issuesTruncated: issues.next !== null,
+          // Datenfehler, die die API seit ihrem Start auf unveränderlichen Tagen dieses Bereichs fand
+          apiDataErrors: deps.catalog.dataErrors
+            .filter((e) => e.sym === s.name && (e.d1 ?? d1) >= d0 && (e.d0 ?? d0) <= d1)
+            .map((e) => ({
+              at: e.at,
+              message: e.message,
+              from: e.d0 === undefined ? null : formatDay(e.d0),
+              to: e.d1 === undefined ? null : formatDay(e.d1),
+            })),
         }),
       );
       return makeResponse(body, 'application/json', version, false, true);

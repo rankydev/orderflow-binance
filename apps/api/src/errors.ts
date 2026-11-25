@@ -6,7 +6,7 @@ export class HttpError extends Error {
   /** Sekunden für Retry-After (nur 503/429). */
   readonly retryAfter: number | null;
   /** Ursache eines 503 (intern, nicht im Antwortkörper): Verbindungsverlust, Sperre, Zeitlimit … */
-  readonly kind: 'connection' | 'lock' | 'timeout' | 'overload' | null;
+  readonly kind: 'connection' | 'lock' | 'timeout' | 'overload' | 'inconsistent' | null;
   constructor(
     status: number,
     message: string,

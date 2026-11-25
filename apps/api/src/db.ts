@@ -90,6 +90,22 @@ export const pgCode = (e: unknown): string | undefined =>
     ? String((e as { code: unknown }).code)
     : undefined;
 
+/**
+ * Daten eines Snapshots passen nicht zusammen (Bar ohne Level, Level ohne Bar, Summen ungleich).
+ * `immutable`: alle betroffenen Tage sind unveränderlich (dann ist es ein echter Datenfehler, kein
+ * Übergangszustand). readTx wiederholt mit neuem Snapshot, danach 503 (nie 500, nie gecacht).
+ */
+export class DataInconsistency extends Error {
+  readonly immutable: boolean;
+  readonly detail: Record<string, unknown>;
+  constructor(message: string, immutable: boolean, detail: Record<string, unknown> = {}) {
+    super(message);
+    this.name = 'DataInconsistency';
+    this.immutable = immutable;
+    this.detail = detail;
+  }
+}
+
 export interface ReadStats {
   queries: number;
   attempts: number;
@@ -128,6 +144,8 @@ export interface ReadOptions {
   lockRetries: number;
   /** Basis des Backoffs (ms) bei Sperrwartezeit: base, 3·base, 9·base … */
   backoffMs?: number;
+  /** Wiederholungen bei DataInconsistency (Standard 2). */
+  inconsistencyRetries?: number;
 }
 
 /**
@@ -150,6 +168,21 @@ export async function readTx<T>(
       return { value, stats };
     } catch (e) {
       if (opt.signal.aborted) throw new HttpError(499, 'Client hat abgebrochen');
+      if (e instanceof DataInconsistency) {
+        // Übergangszustand (Import/Recorder mitten im Ersatz) → mit neuem Snapshot erneut versuchen
+        if (attempt < (opt.inconsistencyRetries ?? 2)) {
+          await new Promise((r) => setTimeout(r, base * (attempt + 1)));
+          continue;
+        }
+        throw Object.assign(
+          busy(
+            'Daten werden gerade geschrieben (inkonsistenter Stand), bitte gleich erneut',
+            2,
+            'inconsistent',
+          ),
+          { cause: e },
+        );
+      }
       const code = pgCode(e);
       if (code === '55P03') {
         if (attempt < opt.lockRetries) {

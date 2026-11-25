@@ -1,6 +1,6 @@
 // Synthetische Testdaten für die API-Integrationstests: deterministische aggTrades je Tag → dieselben
 // Aggregate wie der Importer (packages/core: aggregateDay, computeFpRollups, computeBarRollups) →
-// Testdatenbank "<OF_DB_NAME>_test" (als Admin-Rolle, nie die Entwicklungsdatenbank).
+// Testdatenbank "<OF_DB_NAME>_test_api" (als Admin-Rolle, nie die Entwicklungsdatenbank).
 // Enthält Minuten ohne Trades, breite Bars, große Trades (Tagesnotional > 2^53) und Columnstore-Chunks.
 import {
   aggregateDay,

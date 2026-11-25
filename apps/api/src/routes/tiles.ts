@@ -15,7 +15,15 @@ import { badRequest, HttpError, unprocessable } from '../errors.ts';
 import { etagOfBody, makeResponse, send, acceptsGzip } from '../http.ts';
 import { checkRange, MAX_TIME_MS, Params, SYMBOL_RE } from '../params.ts';
 import { barTableFor, coveredDays, estimateRows } from '../plan.ts';
-import { queryBars, queryLevels, readDays, type BarRows, type LevelRows } from '../queries.ts';
+import { allImmutable, checkTile } from '../consistency.ts';
+import {
+  lockSnapshot,
+  queryBars,
+  queryLevels,
+  readDays,
+  type BarRows,
+  type LevelRows,
+} from '../queries.ts';
 import { versionOf } from '../versions.ts';
 
 export const SYMBOLS_SCHEMA = 2;
@@ -132,6 +140,7 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     const key = `bars|${s.name}|${tf}|${from}|${to}`;
     return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
       const { days, bars } = await guardedRead(deps, ctx, async (tx) => {
+        await lockSnapshot(tx, s.symId, [{ table, from, to }]);
         const days = await readDays(tx, s.symId, d0, d1);
         const bars = await queryBars(tx, s.symId, table, tfSec, from, to);
         return { days, bars };
@@ -203,6 +212,10 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     const width = R * s.tickRefUnits;
     return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
       const { days, bars, levels } = await guardedRead(deps, ctx, async (tx) => {
+        await lockSnapshot(tx, s.symId, [
+          { table: barTable, from, to },
+          { table, from, to },
+        ]);
         const days = await readDays(tx, s.symId, d0, d1);
         const bars = await queryBars(tx, s.symId, barTable, tfSec, from, to);
         const levels = await queryLevels(
@@ -215,6 +228,7 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
           from,
           to,
         );
+        checkTile(bars, levels, allImmutable(days, d0, d1), { sym: s.name, d0, d1, tf, R, tile });
         return { days, bars, levels };
       });
       const ver = versionOf(parts, d0, d1, (d) => days.get(d));

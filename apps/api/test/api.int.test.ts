@@ -1,4 +1,4 @@
-// Integrationstests der API gegen "<OF_DB_NAME>_test" (`npm run db:up && npm run test:db`), mit
+// Integrationstests der API gegen "<OF_DB_NAME>_test_api" (`npm run db:up && npm run test:db`), mit
 // synthetischen Daten (seed.ts) und der nur lesenden Rolle of_api. Die Entwicklungsdatenbank wird nie
 // berührt. Beweist:
 //  - /symbols, /bars, /footprint sind für den Web-Client gültig (dessen eigene Prüfungen: checkSymbolsResponse,
@@ -38,7 +38,7 @@ import { createPool, readTx } from '../src/db.ts';
 import { alterRolePasswordSql } from '../src/scram.ts';
 import { startApi, type RunningApi } from '../src/main.ts';
 import { FP_TABLE_NAMES } from '../src/plan.ts';
-import { queryLevels } from '../src/queries.ts';
+import { lockSnapshot, queryLevels, readDays, tsLit } from '../src/queries.ts';
 import {
   BAD_DAY,
   DAY_MS,
@@ -55,7 +55,9 @@ import {
 } from './seed.ts';
 
 const base = parseConfig(process.env).db;
-const testDb = `${base.database}_test`;
+// Eigene Testdatenbank der API-Suite: andere Pakete (Importer, Recorder) setzen "<OF_DB_NAME>_test" in
+// ihren Integrationstests neu auf – parallel laufende Suiten würden sich sonst gegenseitig stören.
+const testDb = `${base.database}_test_api`;
 const adminCfg: DbConfig = { ...base, database: testDb };
 const HOUR = 3_600_000;
 interface SymJson {
@@ -1310,6 +1312,142 @@ describe('Sperren, Abbruch, Überlast', () => {
       expect((await get(api, profileUrl(6))).res.status).toBe(200);
     } finally {
       await release().catch(() => {});
+      await api.close();
+    }
+  });
+});
+
+describe('Inkonsistente Snapshots (Review Pass 4: „Bar ohne Level")', () => {
+  let locker: Sql;
+  beforeAll(() => {
+    locker = connect(adminCfg);
+  });
+  afterAll(async () => locker?.end());
+
+  it('Ursache: convert_to_rowstore leert einen Chunk für ältere Snapshots; lockSnapshot verhindert es', async () => {
+    const sql = createPool(apiCfg());
+    const day = FIRST_DAY; // fp_1m dieses Tages liegt im Columnstore (seed.ts)
+    const range = { table: 'fp_1m' as const, from: day * DAY_MS, to: (day + 1) * DAY_MS };
+    const count = `SELECT count(*)::int AS n FROM fp_1m WHERE sym_id = ${SYM_ID}
+                     AND ts >= ${tsLit(range.from)} AND ts < ${tsLit(range.to)}`;
+    const [{ c }] = (await admin<{ c: string }[]>`
+      SELECT format('%I.%I', chunk_schema, chunk_name) AS c FROM timescaledb_information.chunks
+       WHERE hypertable_name = 'fp_1m' AND range_start = ${new Date(range.from)} AND is_compressed`) as unknown as [
+      { c: string },
+    ];
+    const [{ n: total }] = (await admin.unsafe<{ n: number }[]>(count)) as unknown as [
+      { n: number },
+    ];
+    const ac = new AbortController();
+    try {
+      // ohne Sperr-Präludium: Snapshot vor der Konvertierung → der Chunk erscheint leer (Kontrolle)
+      const { value: without } = await readTx(
+        sql,
+        { signal: ac.signal, lockRetries: 0 },
+        async (tx) => {
+          await readDays(tx, SYM_ID, day, day);
+          await locker.unsafe(`CALL convert_to_rowstore('${c}'::regclass)`);
+          return (await tx.rows(count))[0]![0];
+        },
+      );
+      expect(without).toBe(0);
+      await locker.unsafe(`CALL convert_to_columnstore('${c}'::regclass)`);
+      // mit Präludium: die Konvertierung wartet (hier: Zeitlimit), der Leser sieht alles
+      const { value: withLock } = await readTx(
+        sql,
+        { signal: ac.signal, lockRetries: 0 },
+        async (tx) => {
+          await lockSnapshot(tx, SYM_ID, [range]);
+          await readDays(tx, SYM_ID, day, day);
+          await expect(
+            locker.begin(async (t) => {
+              await t`SET LOCAL lock_timeout = '500ms'`;
+              await t.unsafe(`CALL convert_to_rowstore('${c}'::regclass)`);
+            }),
+          ).rejects.toThrow(/lock timeout/);
+          return (await tx.rows(count))[0]![0];
+        },
+      );
+      expect(withLock).toBe(total);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  /** Entfernt die fp_1m_b10-Zeilen einer Minute (Bar ohne Level) und gibt die Wiederherstellung zurück. */
+  async function dropLevels(minuteMs: number): Promise<() => Promise<void>> {
+    const fp = data.fp.fp_1m_b10;
+    const rows: string[] = [];
+    for (let i = 0; i < fp.n; i++)
+      if (fp.ts[i] === minuteMs)
+        rows.push(
+          `(${SYM_ID}, ${tsLit(minuteMs)}, ${fp.px[i]}, ${fp.buyQ[i]}, ${fp.sellQ[i]}, ${fp.buyA[i]}, ${fp.sellA[i]})`,
+        );
+    expect(rows.length).toBeGreaterThan(0);
+    await admin.unsafe(
+      `DELETE FROM fp_1m_b10 WHERE sym_id = ${SYM_ID} AND ts = ${tsLit(minuteMs)}`,
+    );
+    return async () => {
+      await admin.unsafe(`INSERT INTO fp_1m_b10 VALUES ${rows.join(', ')}`);
+    };
+  }
+  const minuteOf = (day: number) =>
+    data.bars1m.find((b) => b.ts >= day * DAY_MS + 600 * MINUTE_MS && b.ts < (day + 1) * DAY_MS)!
+      .ts;
+
+  it('nicht unveränderlicher Tag: 503 + Retry-After, nicht gecacht, kein Datenfehler gemeldet', async () => {
+    const api = await start();
+    const m = minuteOf(PROVISIONAL_DAY);
+    const restore = await dropLevels(m);
+    try {
+      const s = ((await get(api, '/api/v1/symbols')).json().symbols as SymJson[])[0]!;
+      const n = s.tiles['1m']!['10']!;
+      const url = `/api/v1/footprint?sym=BTCUSDT&tf=1m&R=10&tile=${Math.floor(m / (n * 60_000))}&cfg=${s.tileConfigVersion}`;
+      for (let i = 0; i < 2; i++) {
+        const r = await get(api, url);
+        expect(r.res.status).toBe(503);
+        expect(r.res.headers.get('retry-after')).toBe('2');
+        expect(r.res.headers.get('cache-control')).toBe('no-store');
+        expect(r.json().error).toMatch(/inkonsistent/);
+      }
+      expect(api.deps.catalog.dataErrors).toEqual([]);
+    } finally {
+      await restore();
+      await api.close();
+    }
+  });
+
+  it('unveränderlicher Tag: 503, laut gemeldet (Health degraded, /quality apiDataErrors), auch für Profile', async () => {
+    const api = await start();
+    const day = FIRST_DAY + 1;
+    const m = minuteOf(day);
+    const restore = await dropLevels(m);
+    try {
+      const s = ((await get(api, '/api/v1/symbols')).json().symbols as SymJson[])[0]!;
+      const n = s.tiles['1m']!['10']!;
+      const tile = await get(
+        api,
+        `/api/v1/footprint?sym=BTCUSDT&tf=1m&R=10&tile=${Math.floor(m / (n * 60_000))}&cfg=${s.tileConfigVersion}`,
+      );
+      expect(tile.res.status).toBe(503);
+      // Profil über drei Minuten (nur fp_1m_b10): Summen ungleich → ebenfalls 503
+      const prof = await get(
+        api,
+        `/api/v1/profile?sym=BTCUSDT&from=${m}&to=${m + 3 * MINUTE_MS}&R=10`,
+      );
+      expect(prof.res.status).toBe(503);
+      expect(api.deps.catalog.dataErrors.length).toBeGreaterThan(0);
+      const h = await get(api, '/api/v1/health');
+      expect([h.res.status, h.json().status]).toEqual([200, 'degraded']);
+      const q = await get(
+        api,
+        `/api/v1/quality?sym=BTCUSDT&from=${day * DAY_MS}&to=${(day + 1) * DAY_MS}`,
+      );
+      const errs = q.json().apiDataErrors as { from: string; message: string }[];
+      expect(errs.length).toBeGreaterThan(0);
+      expect(errs[0]!.message).toMatch(/ohne Level|Summen/);
+    } finally {
+      await restore();
       await api.close();
     }
   });

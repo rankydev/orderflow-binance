@@ -42,6 +42,38 @@ function dateLit(day: number): string {
   return `(DATE '1970-01-01' + ${day})`;
 }
 
+/** Zeitbereich einer Hypertable, den eine Anfrage liest. */
+export interface ReadRange {
+  table: FpTableName | BarTable | 'kline_1m';
+  from: number;
+  to: number;
+}
+
+/**
+ * Muss die ERSTE Anweisung einer Lesetransaktion sein: plant eine leere Abfrage über alle Bereiche,
+ * die die Anfrage lesen wird. Beim Planen sperrt Timescale die betroffenen Chunks (ACCESS SHARE, bis
+ * Transaktionsende); erst danach entsteht der REPEATABLE-READ-Snapshot. Grund (nachgewiesen, Review
+ * Pass 4): `convert_to_rowstore` (Dekomprimieren vor einem Tagesersatz) ist für einen Leser mit
+ * älterem Snapshot nicht MVCC-sicher – er sieht den Chunk danach leer (Bar ohne Level, 500). Mit den
+ * Sperren wartet die Konvertierung, bis der Leser fertig ist, und kein Chunk ändert sich im Snapshot.
+ */
+export async function lockSnapshot(tx: ReadTx, symId: number, ranges: ReadRange[]): Promise<void> {
+  if (ranges.length === 0) {
+    await tx.rows('SELECT 1');
+    return;
+  }
+  const parts = ranges.map((r) => {
+    const t =
+      r.table === 'kline_1m'
+        ? 'kline_1m'
+        : FP_SET.has(r.table)
+          ? fpTable(r.table)
+          : barTable(r.table);
+    return `(SELECT 1 FROM ${t} WHERE sym_id = $1 AND ts >= ${tsLit(r.from)} AND ts < ${tsLit(r.to)} LIMIT 0)`;
+  });
+  await tx.rows(parts.join(' UNION ALL '), [symId]);
+}
+
 export interface DaySnap {
   day: number;
   state: string;

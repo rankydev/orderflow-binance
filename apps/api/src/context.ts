@@ -2,7 +2,7 @@
 import type { ResponseCache } from './cache.ts';
 import type { Catalog, SymbolState } from './catalog.ts';
 import type { ApiConfig } from './config.ts';
-import { readTx, type ReadStats, type ReadTx, type Sql } from './db.ts';
+import { DataInconsistency, readTx, type ReadStats, type ReadTx, type Sql } from './db.ts';
 import { HttpError, notFound } from './errors.ts';
 import type { Limiter } from './limiter.ts';
 
@@ -94,6 +94,13 @@ export async function guardedRead<T>(
     );
     ctx.db = stats;
     return value;
+  } catch (e) {
+    // Datenfehler auf unveränderlichen Tagen (Inkonsistenz auch nach neuen Snapshots): laut melden
+    const cause = (e as { cause?: unknown }).cause;
+    if (e instanceof HttpError && e.kind === 'inconsistent' && cause instanceof DataInconsistency) {
+      if (cause.immutable) deps.catalog.reportDataError(cause.message, cause.detail);
+    }
+    throw e;
   } finally {
     release();
   }

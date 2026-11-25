@@ -37,6 +37,7 @@ import {
   type Segment,
 } from '../plan.ts';
 import {
+  lockSnapshot,
   queryProfileBars,
   queryProfileLevels,
   readDays,
@@ -45,6 +46,7 @@ import {
 } from '../queries.ts';
 import { serveVersioned } from '../respond.ts';
 import { versionOf } from '../versions.ts';
+import { allImmutable, checkProfile } from '../consistency.ts';
 
 /** Größte Zeilengröße eines Profils in Ticks. */
 export const PROFILE_MAX_R = 1_000_000;
@@ -205,6 +207,7 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
     return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
       const w = R * s.tickRefUnits;
       const { days, bars, levels } = await guardedRead(deps, ctx, async (tx) => {
+        await lockSnapshot(tx, s.symId, [...plan.segs, ...plan.barSegs]);
         const days = await readDays(tx, s.symId, d0, d1);
         const bars = await queryProfileBars(tx, s.symId, plan.barSegs, null);
         const b = bars[0];
@@ -222,6 +225,7 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
         const levels = b
           ? await queryProfileLevels(tx, s.symId, plan.segs, w, s.tickRefUnits, null)
           : [];
+        checkProfile(bars, levels, allImmutable(days, d0, d1), { sym: s.name, d0, d1, R });
         return { days, bars, levels };
       });
       const ver = versionOf(parts, d0, d1, (d) => days.get(d));
@@ -275,6 +279,7 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
       const cellsOf = (bars: ProfileBarRow[], x: number) =>
         bars.reduce((a, b) => a + rowOf(b.high, x) - rowOf(b.low, x) + 1, 0);
       const { days, bars, levels } = await guardedRead(deps, ctx, async (tx) => {
+        await lockSnapshot(tx, s.symId, [...plan.segs, ...plan.barSegs]);
         const days = await readDays(tx, s.symId, d0, d1);
         const bars = await queryProfileBars(tx, s.symId, plan.barSegs, off);
         const cells = cellsOf(bars, w);
@@ -289,6 +294,7 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
           bars.length > 0
             ? await queryProfileLevels(tx, s.symId, plan.segs, w, s.tickRefUnits, off)
             : [];
+        checkProfile(bars, levels, allImmutable(days, d0, d1), { sym: s.name, d0, d1, R });
         return { days, bars, levels };
       });
       const ver = versionOf(parts, d0, d1, (d) => days.get(d));

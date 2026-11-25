@@ -17,7 +17,8 @@ npm start -w @orderflow/api             # http://127.0.0.1:8780, Status-Listener
 Web-App gegen die API (zweiter Vite-Server): `cd apps/web && VITE_API_BASE=http://127.0.0.1:8780 npx vite --port
 5174 --strictPort`. Im Betrieb liegt die API hinter nginx unter `/api/v1` auf demselben Ursprung (kein CORS).
 
-Tests: `npm test` (Unit), `npm run test:db` (Integration gegen `<OF_DB_NAME>_test`). Benchmark:
+Tests: `npm test` (Unit), `npm run test:db` (Integration gegen eine eigene Datenbank `<OF_DB_NAME>_test_api`, damit parallel laufende
+Suiten anderer Pakete auf `<OF_DB_NAME>_test` sie nicht stören). Benchmark:
 `npm run bench -w @orderflow/api`. Browser-Prüfung: `apps/api/bench/browser-check.ts`.
 
 ## Ports und Health

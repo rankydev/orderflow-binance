@@ -23,7 +23,7 @@ import {
   type Timeframe,
 } from '@orderflow/core';
 import { int, readTx, type ReadTx, type Sql } from './db.ts';
-import { QUALITY_FP_SQL, tsLit } from './queries.ts';
+import { lockSnapshot, QUALITY_FP_SQL, readDays, tsLit } from './queries.ts';
 import { BAR_TABLES, barTableFor, FP_TABLE_NAMES, type BarTable, type RowsOn } from './plan.ts';
 import { DAY_MS, SYMBOL_RE } from './params.ts';
 
@@ -118,6 +118,12 @@ export class Catalog extends EventEmitter {
   lastError: string | null = null;
   /** Fehlschläge in Folge (Backoff, gedrosselte Warnung). */
   failures = 0;
+  /**
+   * Datenfehler, die Anfragen auf unveränderlichen Tagen gefunden haben (Bars ohne Level, Summen
+   * ungleich – trotz neuer Snapshots). Höchstens 100, jüngste zuletzt; in Health und /quality gemeldet.
+   */
+  readonly dataErrors: { at: number; message: string; sym?: string; d0?: number; d1?: number }[] =
+    [];
   /** Art des letzten Fehlers: nur 'connection' (und Hänger) machen den Versionsstand unbrauchbar. */
   lastErrorKind: 'connection' | 'lock' | 'timeout' | 'other' | null = null;
   private lastWarnAt = -Infinity;
@@ -138,6 +144,26 @@ export class Catalog extends EventEmitter {
 
   symbol(name: string): SymbolState | undefined {
     return this.syms.get(name);
+  }
+
+  reportDataError(message: string, detail: Record<string, unknown>): void {
+    const e = {
+      at: Date.now(),
+      message,
+      ...(typeof detail.sym === 'string' ? { sym: detail.sym } : {}),
+      ...(typeof detail.d0 === 'number' ? { d0: detail.d0 } : {}),
+      ...(typeof detail.d1 === 'number' ? { d1: detail.d1 } : {}),
+    };
+    const dup = this.dataErrors.find((x) => x.message === e.message && x.sym === e.sym);
+    if (dup) dup.at = e.at;
+    else {
+      this.dataErrors.push(e);
+      if (this.dataErrors.length > 100) this.dataErrors.shift();
+    }
+    this.opt.log('error', 'DATENFEHLER auf unveränderlichen Tagen (Anfrage mit 503 beantwortet)', {
+      ...detail,
+      err: message,
+    });
   }
 
   /** Startet die laufende Aktualisierung (erste sofort). */
@@ -223,6 +249,7 @@ export class Catalog extends EventEmitter {
       { signal: this.ac.signal, lockRetries: this.opt.lockRetries },
       (tx) => this.load(tx),
     );
+    await this.updateStats(next);
     const events: DayChanged[] = [];
     for (const s of next.values()) {
       const old = this.syms.get(s.name);
@@ -294,12 +321,40 @@ export class Catalog extends EventEmitter {
         quality: String(r[6]),
       });
     }
+    return out;
+  }
+
+  /**
+   * Statistik der geänderten Tage, je Lauf in einer EIGENEN Lesetransaktion: zuerst die Chunks sperren
+   * (lockSnapshot), dann die Tagesversionen und die Statistik aus demselben Snapshot. In der
+   * Transaktion, die data_day schon gelesen hat, könnte ein danach dekomprimierter Chunk leer
+   * erscheinen (Review Pass 4) und eine falsche Statistik unter einer gültigen Version landen.
+   */
+  private async updateStats(out: Map<string, SymbolState>): Promise<void> {
     for (const s of out.values()) {
       for (const d of s.stats.keys()) if (!s.days.get(d)?.hasData) s.stats.delete(d);
       const todo = [...s.days.values()]
         .filter((i) => i.hasData && s.stats.get(i.day)?.version !== i.version)
         .map((i) => i.day);
-      for (const [a, b] of runs(todo, 31)) await this.computeStats(tx, s, a, b);
+      for (const [a, b] of runs(todo, 31)) {
+        await readTx(
+          this.sql,
+          { signal: this.ac.signal, lockRetries: this.opt.lockRetries },
+          async (tx) => {
+            await lockSnapshot(
+              tx,
+              s.symId,
+              [...FP_TABLE_NAMES, ...BAR_TABLES].map((table) => ({
+                table,
+                from: a * DAY_MS,
+                to: (b + 1) * DAY_MS,
+              })),
+            );
+            const snap = await readDays(tx, s.symId, a, b);
+            await this.computeStats(tx, s, a, b, snap);
+          },
+        );
+      }
       for (const d of s.refStats.keys()) if (!s.days.get(d)?.hasData) s.refStats.delete(d);
       for (const [d, st] of s.stats) {
         const info = s.days.get(d);
@@ -307,11 +362,16 @@ export class Catalog extends EventEmitter {
       }
       finalize(s, this.opt.maxSourceRows);
     }
-    return out;
   }
 
   /** Statistik der Tage [d0, d1] (inklusive) eines Symbols in einer Abfrage je Art. */
-  private async computeStats(tx: ReadTx, s: SymbolState, d0: number, d1: number): Promise<void> {
+  private async computeStats(
+    tx: ReadTx,
+    s: SymbolState,
+    d0: number,
+    d1: number,
+    snap: Map<number, { version: number }>,
+  ): Promise<void> {
     const A = tsLit(d0 * DAY_MS);
     const B = tsLit((d1 + 1) * DAY_MS);
     const widths = TILE_LADDER.map((R) => R * s.tickRefUnits);
@@ -321,7 +381,10 @@ export class Catalog extends EventEmitter {
     for (let d = d0; d <= d1; d++) {
       const info = s.days.get(d);
       if (!info?.hasData) continue;
-      fresh.set(d, { version: info.version, maxRows: new Map(), rows: new Map() });
+      // Version aus dem Snapshot der Statistik (kann neuer sein als die des Katalogs; dann rechnet
+      // die nächste Aktualisierung den Tag nicht erneut, weil Statistik und Version zusammenpassen)
+      const v = snap.get(d)?.version ?? info.version;
+      fresh.set(d, { version: v, maxRows: new Map(), rows: new Map() });
     }
     const parts: string[] = [];
     for (const tf of TIMEFRAME_LIST) {
