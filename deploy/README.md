@@ -255,6 +255,45 @@ CONNECTION_TIMEOUT_MS/ADMIN_PORT/DIAG_HEADERS/NONFINAL_TTL_MS/MAX_CONNECTIONS/MA
   `Retry-After: 1`); 96 gemischte Anfragen über 6 Verbindungen alle 200; API-Log bei `warn` leer;
   API 151 MiB.
 
+## Recorder auf dem VPS (vorbereitet, Rollout erst nach der lokalen Abnahme)
+
+- **Dienst:** `recorder` in `compose.prod.yml` (Profil `recorder`: `up -d` ohne Profil startet ihn
+  nie; gestartet nur über `deploy/recorder.sh start`). Gleiches Image wie API/Werkzeuge
+  (`api.Dockerfile` kopiert jetzt `apps/recorder/src`), läuft als UID 10001 mit nur lesendem
+  Wurzeldateisystem, `tmpfs /tmp`, beschreibbar nur `/data` = `/var/lib/orderflow-binance/data`
+  (Spool `live/`, Rohdaten-Cache `raw/` mit Markierung, 14 Tage). DB-Zugang ausschließlich als
+  `of_recorder` (`OF_RECORDER_DB_USER/PASSWORD`, Passwort aus `/etc/orderflow-binance/recorder.env`,
+  0600, auf dem Server erzeugt; gesetzt von `release.sh` mit `recorder-role-password.ts`).
+  Health/Ereignisse auf `0.0.0.0:7701` **nur im Compose-Netz**, kein Host-Port; Monitor per
+  `docker exec`. `mem_limit 1g` (gemessen ≈ 550 MB Spitze; lokal 314–344 MB beim Nachholen),
+  `cpus 1.0`, `oom_score_adj 700` (vor DB/API), `stop_grace_period 120s`, `restart:
+unless-stopped`, Health-Startphase 2,5 h (REST-Nachholen: ≈ 7 Daten-Minuten je Symbol und Minute bei 600 Gewicht/min, gemessen lokal). REST-Budget 600/min (25 %, PulseBot
+  teilt die IP).
+- **Werkzeuge:** Dienst `importer` (Profil `ops`, of_admin, `/data` beschreibbar) für
+  `repair-open-chunks` und das Nachholen (`download` + `import`); `bin/recorder-ctl.sh` auf dem
+  Server bündelt die Schritte (`prepare`, `hot`, `repair-dry`, `repair` mit Sperre gegen parallele
+  Admin-/psql-/Dump-Sitzungen, `require-zero`, `report`, `catchup-range`, `start`, `health`,
+  `stop`), `deploy/recorder.sh` ruft sie vom Mac auf. Ablauf: RUNBOOK „Recorder-Rollout".
+- **Produktionsmarker:** `install-server.sh` und jeder Restore (`post-restore.sql`) setzen
+  `COMMENT ON DATABASE orderflow IS 'orderflow:production'` (das Migrationswerkzeug verweigert dann
+  `reset`/`down`); Härtungsprüfung verlangt `prodmarker|true` (nur Ziel, nie die Mac-DB).
+- **Lokal Ende-zu-Ende geprüft** (Wegwerf-Container, amd64-Image aus `git archive` + deploy-Stand):
+  Schema 0012 mit offenem komprimiertem Chunk → Release-Pfad (`up 0013…0016`, Härtung OK,
+  Passwörter beider Rollen) → `hot` (1) → `repair-dry` → `repair` (Sperre 10 ms) → `require-zero`
+  (0) → Digests/Zeilen unverändert; Sperre gegen parallele psql-Sitzung greift; Importer lädt und
+  importiert im nur lesenden Container (BTCUSDT 2026-11-24: Download 12 s, Import 7 s,
+  `final_ok`, `db=match`); Recorder startet als `of_recorder`, holt per REST nach (≈ 14
+  Daten-Minuten je Minute mit einem Symbol im Rückstand, ≈ 7 je Symbol mit zweien) und finalisiert ETHUSDT 2026-11-24 selbst (Download in `/data`);
+  alte API ba55a90 gegen Schema 0016: alle Endpunkte 200.
+- **API-Umschalten ohne Ausfall (bewertet, nicht gebaut):** Der veröffentlichte Port
+  `127.0.0.1:8780` gehört genau einem Container; ein Container bekommt einen Port nur beim
+  Anlegen, und nginx darf nicht angefasst werden. Ohne Ausfall ginge es nur mit einem kleinen
+  Weiterleiter im Compose-Projekt, der `127.0.0.1:8780` dauerhaft hält und zwischen zwei
+  API-Diensten (`api_a`/`api_b`) nach deren Health umschaltet (z. B. HAProxy-Container mit
+  Health-Checks; release.sh startet den jeweils freien Dienst, wartet auf „Katalog geladen",
+  stoppt dann den alten). Machbar, aber eine zusätzliche Komponente im Anfragepfad; empfohlen erst,
+  wenn die Startzeit der API nach der laufenden Verbesserung noch deutlich über ≈ 10 s liegt.
+
 ## Web-Release 2026-11-25, 14:43 UTC (ausgeführt)
 
 Release `20261125T144233Z-0749081bfb` (Inhalt Commit 0749081: Kerzen-Schalter, TPO-Interaktion;

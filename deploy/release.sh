@@ -91,9 +91,31 @@ else
     if [ "$MIGRATE" != 1 ]; then say "ausstehende Migrationen – erneut mit --migrate (nach Prüfung)"; exit 1; fi
     say "Migrationen anwenden"
     OF_RELEASE=$ID $C run --rm -T ops node packages/db/src/cli.ts up </dev/null
+    # Härtung nach jeder Migration erneut (idempotent): neue Rollen/Rechte (z. B. 0013 of_recorder)
+    say "Härtung erneut (sql/harden-db.sql)"
+    h=$(docker exec -i orderflow-db psql -X -At -v ON_ERROR_STOP=1 -U of_admin -d orderflow < "$R/sql/harden-db.sql")
+    printf '%s\n' "$h" >&2
+    { printf '%s\n' "$h" | grep -qx 'dbpriv|orderflow|of_api_connect=true|of_api_temp=false|of_api_create=false' \
+      && ! printf '%s\n' "$h" | grep -E '^dbpriv\|' | grep -v '^dbpriv|orderflow|' | grep -q 'connect=true' \
+      && ! printf '%s\n' "$h" | grep -q '_temp=true' \
+      && ! printf '%s\n' "$h" | grep -q '_create=true' \
+      && printf '%s\n' "$h" | grep -q '^public_connect|false|public_temp|false|' \
+      && printf '%s\n' "$h" | grep -qx 'prodmarker|true'; } \
+      || { say "Härtung nach den Migrationen nicht wie erwartet – API bleibt auf dem alten Release"; exit 1; }
   fi
   say "Passwort der Rolle of_api aus api.env setzen"
   OF_RELEASE=$ID $C run --rm -T ops node apps/api/src/cli/api-role-password.ts </dev/null
+  # Rolle of_recorder (ab 0013): Passwort aus recorder.env mit dem Werkzeug des Recorders
+  # (e938c31, sendet nur den SCRAM-Verifier).
+  if [ -f /etc/orderflow-binance/recorder.env ] \
+     && [ "$(docker exec orderflow-db psql -X -At -U of_admin -d orderflow -c "SELECT count(*) FROM pg_roles WHERE rolname = 'of_recorder'" </dev/null)" = 1 ]; then
+    say "Passwort der Rolle of_recorder aus recorder.env setzen"
+    if OF_RELEASE=$ID $C run --rm -T ops test -f apps/recorder/src/cli/recorder-role-password.ts </dev/null; then
+      OF_RELEASE=$ID $C run --rm -T ops node apps/recorder/src/cli/recorder-role-password.ts </dev/null
+    else
+      say "Release enthält das Werkzeug recorder-role-password nicht – Passwort von of_recorder NICHT gesetzt"
+    fi
+  fi
 fi
 
 printf 'OF_RELEASE=%s\n' "$ID" > "$R/.env.new" && mv -f "$R/.env.new" "$R/.env"
@@ -110,6 +132,12 @@ if ! $C up -d --wait --wait-timeout 120 api </dev/null; then
   exit 1
 fi
 ln -sfn "releases/$ID" "$R/current.new" && mv -Tf "$R/current.new" "$R/current"
+# Läuft der Recorder bereits, bekommt er dasselbe Release (startet neu: Spool + REST ab letzter ID).
+# Gestartet wird er hier nie erstmals – das ist recorder.sh start.
+if [ "$(docker inspect -f '{{.State.Running}}' orderflow-recorder 2>/dev/null)" = true ]; then
+  say "Recorder läuft – auf $ID umstellen"
+  $C --profile recorder up -d recorder </dev/null
+fi
 say "current → $(readlink "$R/current")"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8780/api/v1/symbols)

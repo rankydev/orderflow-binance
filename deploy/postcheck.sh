@@ -51,6 +51,19 @@ set -euo pipefail
 docker ps --filter name='^orderflow-' --format '  {{.Names}} {{.Status}} {{.Ports}}'
 # Kein Port von uns außerhalb von 127.0.0.1
 ! docker ps --filter name='^orderflow-' --format '{{.Ports}}' | tr ',' '\n' | grep -v '^ *$' | grep -vq '127.0.0.1:'
+# Erwartete eigene Container: db und api laufen; der Recorder nur, wenn er angelegt wurde – dann
+# muss er laufen und healthy sein, und er veröffentlicht keinen Port
+for c in orderflow-db orderflow-api; do
+  [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = true ] || { echo "  $c läuft nicht"; exit 1; }
+done
+if docker inspect orderflow-recorder >/dev/null 2>&1; then
+  st=$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' orderflow-recorder)
+  echo "  orderflow-recorder: $st"
+  [ "$st" = "running healthy" ] || [ "$st" = "exited " ] || { echo "  Recorder weder healthy noch bewusst angehalten"; exit 1; }
+  [ -z "$(docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{if $b}}{{$p}} {{end}}{{end}}' orderflow-recorder)" ] || { echo "  Recorder veröffentlicht einen Port"; exit 1; }
+fi
+# Recorder-Health/Ereignisse (7701) nur im Compose-Netz – auf dem Host lauscht niemand darauf
+! ss -ltnH | awk '{print $4}' | grep -qE ':7701$' || { echo "  Port 7701 lauscht auf dem Host"; exit 1; }
 systemctl is-active orderflow-monitor.timer >/dev/null && journalctl -u orderflow-monitor.service -n 1 --no-pager -o cat || echo "  Monitor-Timer noch nicht aktiv"
 EOF
 if [ "$bad" != 0 ]; then

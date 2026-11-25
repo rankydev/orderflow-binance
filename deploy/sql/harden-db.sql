@@ -19,6 +19,9 @@ $$;
 -- Wartungsdatenbanken: keine Verbindung für Anwendungsrollen (CREATE DATABASE als Superuser geht weiter)
 REVOKE CONNECT, TEMPORARY ON DATABASE postgres FROM PUBLIC;
 REVOKE CONNECT, TEMPORARY ON DATABASE template1 FROM PUBLIC;
+-- Produktionsmarker vorhanden (harte Zielprüfung; transfer-db.sh und release.sh verlangen true)
+SELECT 'prodmarker|' || coalesce(shobj_description(oid, 'pg_database') LIKE '%orderflow:production%', false)
+  FROM pg_database WHERE datname = current_database();
 -- Kontrolle: of_api/of_recorder nur mit orderflow verbindbar, nirgends TEMP oder CREATE
 SELECT 'dbpriv|' || d.datname || '|' || r.rolname || '_connect='
        || has_database_privilege(r.oid, d.datname, 'CONNECT')

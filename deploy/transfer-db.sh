@@ -146,6 +146,7 @@ grep -qx 'dbpriv|orderflow|of_api_connect=true|of_api_temp=false|of_api_create=f
   && ! grep -q '_temp=true' "$WORK/harden.txt" \
   && ! grep -q '_create=true' "$WORK/harden.txt" \
   && grep -q '^public_connect|false|public_temp|false|' "$WORK/harden.txt" \
+  && grep -qx 'prodmarker|true' "$WORK/harden.txt" \
   || die "Härtung nicht wie erwartet (siehe oben)"
 if [ "$KEEP" = 0 ]; then
   remote "$REMOTE_DIR" <<'EOF'

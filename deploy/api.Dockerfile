@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
-# Laufzeit-Image für die Node-Prozesse auf dem VPS: API (Standard-Kommando) sowie die
-# Betriebswerkzeuge Migrationen (packages/db/src/cli.ts) und API-Rollenpasswort. Später kommen
-# Importer und Recorder in dasselbe Image (eigene Compose-Dienste), ohne Umbau.
+# Laufzeit-Image für alle Node-Prozesse auf dem VPS: API (Standard-Kommando), Recorder
+# (apps/recorder, eigener Compose-Dienst), Importer und die Betriebswerkzeuge (Migrationen,
+# Rollenpasswörter, repair-open-chunks) – ein Release liefert alles mit einer Commit-ID.
 #
 # Gebaut auf dem Mac für linux/amd64 (deploy/build-release.sh), per `docker save` übertragen;
 # auf dem VPS wird nichts gebaut und nichts aus einer Registry gezogen außer diesem Basis-Image.
@@ -44,9 +44,11 @@ COPY apps/api/package.json apps/api/
 COPY apps/api/src apps/api/src
 COPY apps/importer/package.json apps/importer/
 COPY apps/importer/src apps/importer/src
+COPY apps/recorder/package.json apps/recorder/
+COPY apps/recorder/src apps/recorder/src
 # Eigene, auf dem Host nicht vergebene UID (nicht 1000 = „ubuntu" auf dem VPS); Dateien gehören root
 # und sind nur lesbar, der Container läuft zusätzlich mit read_only-Dateisystem (Compose).
 USER 10001:10001
 EXPOSE 8780
-# API; Werkzeuge per `docker compose run --rm ops node packages/db/src/cli.ts status` usw.
+# API; Recorder per Compose-Dienst `recorder`; Werkzeuge per `docker compose run --rm ops …`
 CMD ["node", "apps/api/src/main.ts"]

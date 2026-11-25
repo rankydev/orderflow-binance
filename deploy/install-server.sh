@@ -35,7 +35,7 @@ install -d -m 755 -o root -g root "$R" "$R/bin" "$R/sql" "$R/releases" /var/www/
 install -d -m 700 -o root -g root "$E" "$V" "$V/transfer"
 install -m 644 "$STAGE/compose.prod.yml" "$R/compose.prod.yml"
 install -m 644 "$STAGE"/sql/*.sql "$R/sql/"
-install -m 755 "$STAGE/bin/restore-db.sh" "$STAGE/bin/orderflow-monitor" "$STAGE/bin/hot-chunks.sh" "$R/bin/"
+install -m 755 "$STAGE/bin/restore-db.sh" "$STAGE/bin/orderflow-monitor" "$STAGE/bin/hot-chunks.sh" "$STAGE/bin/recorder-ctl.sh" "$R/bin/"
 [ -f "$R/.env" ] || printf 'OF_RELEASE=none\n' > "$R/.env"
 chmod 644 "$R/.env"
 
@@ -50,7 +50,13 @@ if [ ! -f "$E/api.env" ]; then
   printf 'OF_API_DB_PASSWORD=%s\n' "$(gen)" > "$E/api.env"
   echo "api.env erzeugt"
 fi
-chmod 600 "$E/db.env" "$E/api.env"
+if [ ! -f "$E/recorder.env" ]; then
+  # Passwort der Rolle of_recorder (Migration 0013); gesetzt wird es von release.sh nach den
+  # Migrationen, gelesen vom Recorder-Container
+  printf 'OF_RECORDER_DB_PASSWORD=%s\n' "$(gen)" > "$E/recorder.env"
+  echo "recorder.env erzeugt"
+fi
+chmod 600 "$E/db.env" "$E/api.env" "$E/recorder.env"
 
 # systemd-Units (nur eigene Dateien)
 install -m 644 "$STAGE/systemd/orderflow-monitor.service" "$STAGE/systemd/orderflow-monitor.timer" /etc/systemd/system/
@@ -61,6 +67,8 @@ C="docker compose -p orderflow-binance -f $R/compose.prod.yml --env-file $R/.env
 $C config -q </dev/null
 $C pull -q db </dev/null
 $C up -d --wait db </dev/null
+# Produktionsmarker: reset/down des Migrationswerkzeugs verweigern diese Datenbank (guard.ts)
+docker exec orderflow-db psql -X -q -U of_admin -d orderflow -c "COMMENT ON DATABASE orderflow IS 'orderflow:production'" </dev/null
 docker exec orderflow-db psql -X -At -U of_admin -d orderflow -c "SELECT 'db ok: ' || version()" -c "SELECT 'timescaledb ' || extversion FROM pg_extension WHERE extname='timescaledb'"
 if [ "$MON" = 1 ]; then
   systemctl enable --now orderflow-monitor.timer

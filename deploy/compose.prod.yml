@@ -131,6 +131,9 @@ services:
       OF_API_ADMIN_PORT: '8781'
       # Diagnose-Header (X-Source, X-Rows-Estimate, Server-Timing) in Produktion aus
       OF_API_DIAG_HEADERS: '0'
+      # Minuten-Ereignisse des Recorders (SSE) nur über das Compose-Netz; ohne laufenden Recorder
+      # verbindet die API mit Backoff (1–30 s) neu, die Abfrage läuft unabhängig weiter
+      OF_API_RECORDER_EVENTS_URL: http://recorder:7701/events
       # Antwort-Cache nicht-finaler Antworten (Standard 10 s) und Verbindungsgrenzen der API
       OF_API_NONFINAL_TTL_MS: '10000'
       OF_API_MAX_CONNECTIONS: '256'
@@ -180,6 +183,8 @@ services:
     env_file:
       - /etc/orderflow-binance/db.env # OF_DB_PASSWORD (Admin/Migrationsrolle)
       - /etc/orderflow-binance/api.env # OF_API_DB_PASSWORD (nur für api-role-password)
+      - path: /etc/orderflow-binance/recorder.env # OF_RECORDER_DB_PASSWORD (Rollenpasswort setzen)
+        required: false
     environment:
       OF_DB_HOST: db
       OF_DB_PORT: '5432'
@@ -192,6 +197,111 @@ services:
     security_opt: ['no-new-privileges:true']
     mem_limit: 512m
     command: ['node', 'packages/db/src/cli.ts', 'status']
+    logging: *logging
+
+  # Importer/Wartung mit beschreibbarem Datenverzeichnis (Profil „ops", startet nie von selbst):
+  #   … run --rm importer node apps/importer/src/main.ts repair-open-chunks --dry-run
+  #   … run --rm importer node apps/importer/src/main.ts import --symbol BTCUSDT --day … --db --online
+  # Läuft als of_admin (Eigentümer: Rowstore-Wandlung, Import); Rohdateien unter /data.
+  importer:
+    image: orderflow-api:${OF_RELEASE:?OF_RELEASE in /opt/orderflow-binance/.env setzen}
+    profiles: [ops]
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - /etc/orderflow-binance/db.env # OF_DB_PASSWORD (Admin)
+    environment:
+      OF_DB_HOST: db
+      OF_DB_PORT: '5432'
+      OF_DB_USER: of_admin
+      OF_DB_NAME: orderflow
+      OF_DATA_DIR: /data
+      OF_LOG_LEVEL: info
+    volumes:
+      - /var/lib/orderflow-binance/data:/data
+    networks: [internal]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    mem_limit: 1200m
+    memswap_limit: 1200m
+    cpus: 1.0
+    oom_score_adj: 700
+    command: ['node', 'apps/importer/src/main.ts', 'repair-open-chunks', '--dry-run']
+    logging: *logging
+
+  # Recorder (Live-Daten, KONZEPT §4.2): Profil „recorder" – `up -d` ohne Profil startet ihn nie;
+  # gestartet nur ausdrücklich über deploy/recorder.sh start (bin/recorder-ctl.sh).
+  recorder:
+    image: orderflow-api:${OF_RELEASE:?OF_RELEASE in /opt/orderflow-binance/.env setzen}
+    container_name: orderflow-recorder
+    profiles: [recorder]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - /etc/orderflow-binance/recorder.env # OF_RECORDER_DB_PASSWORD (Rolle of_recorder)
+    environment:
+      OF_DB_HOST: db
+      OF_DB_PORT: '5432'
+      OF_DB_NAME: orderflow
+      # eigene Rolle (e938c31): nie Admin-Zugangsdaten; Passwort aus recorder.env
+      OF_RECORDER_DB_USER: of_recorder
+      OF_DATA_DIR: /data
+      OF_RECORDER_SYMBOLS: BTCUSDT,ETHUSDT
+      # Rohdateien-Fenster 14 Tage (KONZEPT §2.3); verlangt die Markierung
+      # /data/raw/binance-vision/.of-recorder-raw-cache (legt recorder-ctl.sh prepare an)
+      OF_RAW_KEEP_DAYS: '14'
+      OF_SPOOL_KEEP_DAYS: '7'
+      OF_SPOOL_MIN_FREE_GB: '5'
+      # REST-Budget: PulseBot teilt sich die IP noch → 25 % von 2400 (KONZEPT §4.2)
+      OF_REST_WEIGHT_PER_MIN: '600'
+      # Health/Ereignisse: im Container auf allen Schnittstellen, aber KEIN Host-Port – erreichbar
+      # nur im Compose-Netz orderflow-binance_net (API-Feed später) und per docker exec (Monitor)
+      OF_RECORDER_HTTP_HOST: 0.0.0.0
+      OF_RECORDER_HTTP_PORT: '7701'
+      OF_RECORDER_FINALISE: '1'
+      OF_LOG_LEVEL: info
+    volumes:
+      - /var/lib/orderflow-binance/data:/data
+    networks: [internal]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    init: true
+    # Speicher: gemessen ≈ 550 MB RSS Spitze (Nachholen + Finalisierung im Prozess); 1 GB lässt
+    # ≈ 80 % Reserve. Summe der Limits DB 2 GB + API 0,6 GB + Recorder 1 GB = 3,6 GB bei ≈ 4,6 GB
+    # verfügbar; tatsächlich belegt (gemessen) DB 1,2 GiB, API 0,17 GiB.
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 1.0
+    pids_limit: 100
+    # Bei globalem Speichermangel zuerst der Recorder (Neustart billig: Spool + REST ab letzter ID)
+    oom_score_adj: 700
+    # Sauberes Beenden: offene Minuten schreiben, Spool schließen; eine laufende Finalisierung mit
+    # Sperrversuchen kann ≈ 40 s je Chunk dauern
+    stop_grace_period: 120s
+    command: ['node', 'apps/recorder/src/main.ts', 'run']
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:7701/health').then(r=>process.exit(r.status===200?0:1),()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      # Start: Spool-Wiedergabe + REST-Nachholen seit dem letzten gespeicherten Trade. Gemessen
+      # (lokal, OF_REST_WEIGHT_PER_MIN=600, beide Symbole gleichzeitig): ≈ 30 REST-Anfragen/min ≈ 7
+      # Daten-Minuten je Symbol und Minute → 8 h Rückstand ≈ 70 min. „healthy" verlangt frische
+      # Trades aller Symbole; bis dahin zählt die Startphase (2,5 h) nicht als Fehlschlag.
+      start_period: 9000s
     logging: *logging
 
 networks:

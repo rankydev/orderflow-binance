@@ -42,7 +42,7 @@ PostgreSQL 17 + TimescaleDB Community (Image `timescale/timescaledb:2.31.2-pg17`
 npm run db:up        # startet den Container und wartet auf "healthy"
 npm run db:migrate   # wendet ausstehende Migrationen an (idempotent)
 npm run db:status    # zeigt angewendet/ausstehend
-npm run db:rollback  # rollt die letzte Migration zurück (db:rollback -- 3 | all)
+npm run db:rollback -- --yes  # letzte Migration zurück (-- 3 --yes | all --yes; mit Tagesdaten zusätzlich --destroy-data; nie auf einer Datenbank mit Produktionsmarker)
 npm run db:reset     # Datenbank löschen, neu anlegen, alles migrieren (nur lokal)
 npm run db:psql      # psql in der Datenbank
 npm run db:down      # Container stoppen (Daten bleiben)
