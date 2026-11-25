@@ -199,6 +199,68 @@ describe('Abnahme 1: Lücke außerhalb des REST-Fensters (K1, W1)', () => {
   });
 });
 
+describe('Erster Start mit letztem finalem Tag außerhalb des REST-Fensters (Review)', () => {
+  // REST: fromId älter als der heutige Tagesanfang → 400 (zu alt); ab heute lückenlos
+  const today = rows(0, 500, 8000); // heute 00:00–08:19, IDs 8000…8999
+  const rest: RestSource = {
+    aggTrades: async (_s, fromId, limit) => {
+      if (fromId < 8000) throw new RestError(400, -4166, 'Binance 400 -4166 zu alt');
+      const i = today.findIndex((r) => r.a >= fromId);
+      return i < 0 ? [] : today.slice(i, i + limit);
+    },
+    aggTradesByTime: async (_s, startTime, endTime, limit) =>
+      today.filter((r) => r.T >= startTime && r.T <= endTime).slice(0, limit),
+    klines: async () => [],
+  };
+
+  it('heute wird vollständig geschrieben, nur die Tage davor sind Lücke und eingefroren', async () => {
+    const f = make({
+      final: { day: DAY - 3, lastAggId: 100 }, // letzter finaler Tag vorgestern-1: Lücke > 48 h
+      rest,
+      now: () => D0 + 505 * MINUTE_MS,
+    });
+    await f.rec.start();
+    const s = f.rec.sym.get('BTCUSDT')!;
+    const live1 = rows(500, 3, 9000); // Stream ab 08:20
+    f.rec.handle(
+      s,
+      live1.map((r) => toItem(r, BTC, false)),
+      true,
+    );
+    while (await f.rec.catchUpOnce(s)) {
+      /* nachholen */
+    }
+    // nur die zwei Tage vor heute: eingefroren und als Lücke vermerkt; heute nicht
+    expect(f.frozen.map(([d]) => d)).toEqual([DAY - 2, DAY - 1]);
+    expect(f.gaps).toEqual([[(DAY - 2) * DAY_MS, D0]]);
+    expect(s.gapsAbandoned).toBe(1);
+    expect(s.feed.gapOpen()).toBe(false);
+    f.rec.completeMinutes(s, D0 + 503 * MINUTE_MS + 2000);
+    await f.rec.drain();
+    const mins = f.written.filter((d) => d.day === DAY).map((d) => d.minute);
+    expect(mins).toEqual(Array.from({ length: 503 }, (_, i) => i)); // 00:00 bis 08:22 lückenlos
+    await f.rec.stop();
+  });
+
+  it('ohne Zeitabfrage (oder wenn der Tagesanfang nicht bestimmbar ist): bisheriges Verhalten', async () => {
+    const f = make({
+      final: { day: DAY - 3, lastAggId: 100 },
+      rest: { aggTrades: rest.aggTrades, klines: rest.klines },
+      now: () => D0 + 505 * MINUTE_MS,
+    });
+    await f.rec.start();
+    const s = f.rec.sym.get('BTCUSDT')!;
+    f.rec.handle(
+      s,
+      rows(500, 3, 9000).map((r) => toItem(r, BTC, false)),
+      true,
+    );
+    await f.rec.catchUpOnce(s);
+    expect(f.frozen.map(([d]) => d)).toContain(DAY);
+    await f.rec.stop();
+  });
+});
+
 describe('Abnahme 2: zweimal Absturz an einem abgeschnittenen Frame (W2)', () => {
   it('Wiedergabe liefert alle IDs ohne REST', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'acc2-'));

@@ -92,6 +92,13 @@ export class WeightBudget {
 
 export interface RestSource {
   aggTrades(symbol: string, fromId: number, limit: number): Promise<RawAgg[]>;
+  /** Erste Trades ab einem Zeitpunkt (startTime..endTime, höchstens 1 h); für den Tagesanfang. */
+  aggTradesByTime?(
+    symbol: string,
+    startTime: number,
+    endTime: number,
+    limit: number,
+  ): Promise<RawAgg[]>;
   klines(symbol: string, startTime: number, limit: number): Promise<Kline[]>;
 }
 
@@ -163,6 +170,18 @@ export class BinanceRest implements RestSource {
   async aggTrades(symbol: string, fromId: number, limit: number): Promise<RawAgg[]> {
     return (await this.get(
       `/fapi/v1/aggTrades?symbol=${symbol}&fromId=${fromId}&limit=${limit}`,
+      20,
+    )) as RawAgg[];
+  }
+
+  async aggTradesByTime(
+    symbol: string,
+    startTime: number,
+    endTime: number,
+    limit: number,
+  ): Promise<RawAgg[]> {
+    return (await this.get(
+      `/fapi/v1/aggTrades?symbol=${symbol}&startTime=${startTime}&endTime=${endTime}&limit=${limit}`,
       20,
     )) as RawAgg[];
   }

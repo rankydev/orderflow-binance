@@ -101,6 +101,17 @@ export class SymbolFeed {
     }
   }
 
+  /**
+   * Erwartete ID auf `id` setzen (Anfang des heutigen Tages, wenn der Rest der Lücke außerhalb des
+   * REST-Fensters liegt); liefert die übersprungene Spanne.
+   */
+  jumpTo(id: number): { from: number; to: number } | null {
+    if (this.expected === null || id <= this.expected) return null;
+    const r = { from: this.expected, to: id - 1 };
+    this.expected = id;
+    return r;
+  }
+
   /** Lücke ist per REST nicht füllbar (älter als 48 h): auf die erste gepufferte ID springen. */
   abandonGap(): { from: number; to: number } | null {
     const to = this.bufferedFrom();

@@ -417,7 +417,10 @@ export class Recorder {
       rows = await this.o.rest.aggTrades(s.spec.name, from, 1000);
     } catch (e) {
       if (e instanceof RestError && e.status === 400) {
-        // z. B. älter als 48 h: nicht füllbar → Lücke aufgeben, betroffene Tage einfrieren
+        // z. B. älter als 48 h. Liegt der Anfang vor heute: ab dem ersten Trade des heutigen Tages
+        // weiter nachholen (heute wird vollständig), nur die Tage davor gelten als Lücke. Sonst (oder
+        // wenn der Tagesanfang nicht bestimmbar ist) Lücke aufgeben, betroffene Tage einfrieren.
+        if (await this.skipToToday(s, String(e))) return true;
         await this.abandonGapNow(s, String(e));
         return true;
       }
@@ -431,6 +434,49 @@ export class Recorder {
       rows.map((r) => toItem(r, s.spec, true)),
       true,
     );
+    return true;
+  }
+
+  /**
+   * Sicherheitsnetz für den ersten Start mit altem letzten finalen Tag (Review): der Teil der Lücke
+   * vor dem heutigen Tag liegt außerhalb des REST-Fensters. Erste ID von heute per startTime
+   * bestimmen, dorthin springen und ab dort per fromId nachholen; nur die Tage davor (höchstens
+   * MAX_GAP_MS) einfrieren und als Lücke vermerken. Normalweg bleibt: Importer bis gestern vor dem
+   * Start (RUNBOOK).
+   */
+  async skipToToday(s: SymbolState, why: string): Promise<boolean> {
+    const rest = this.o.rest;
+    if (!rest.aggTradesByTime) return false;
+    const now = this.o.now();
+    const today0 = now - (now % DAY_MS);
+    let fromMs = s.feed.lastT > 0 ? s.feed.lastT : s.final ? (s.final.day + 1) * DAY_MS : today0;
+    if (fromMs >= today0) return false;
+    const first = await rest
+      .aggTradesByTime(s.spec.name, today0, today0 + 3_600_000 - 1, 1)
+      .catch(() => null);
+    const id = first?.[0]?.a;
+    if (id === undefined) return false;
+    const gap = s.feed.jumpTo(id);
+    if (!gap) return false;
+    s.gapsAbandoned++;
+    if (today0 - fromMs > MAX_GAP_MS) fromMs = today0 - MAX_GAP_MS;
+    this.o.log('gap before today not fillable, catching up today from its first trade', {
+      symbol: s.spec.name,
+      fromId: gap.from,
+      toId: gap.to,
+      todayFirstId: id,
+      fromMs,
+      toMs: today0,
+      why,
+    });
+    for (let d = dayIndex(fromMs); d < dayIndex(today0); d++) {
+      this.freeze(s, d, `nicht füllbare Lücke aggId ${gap.from}…${gap.to} (vor heute)`);
+    }
+    await this.o.sink
+      .markGap(s.spec, fromMs, today0)
+      .catch((e: unknown) =>
+        this.o.log('mark gap failed', { symbol: s.spec.name, error: String(e) }),
+      );
     return true;
   }
 
