@@ -771,8 +771,9 @@ describe('Re-Import eines historischen Tages ohne --backfill (Review W6)', () =>
   });
 });
 
-describe('Erstkompression gealterter Chunks durch die Policy (Review-Frage)', () => {
-  it('wartet auf Lock-first-Leser; ältere Snapshots (auch ohne Sperre) sehen den Chunk unverändert', async () => {
+describe('Erstkompression gealterter Chunks durch die Policy (Review-Frage, H1)', () => {
+  it('wartet auf Lock-first-Leser; ein älterer Snapshot ohne Sperre sieht nach der Kompression dieselben Daten (auch über den sym_id-Pfad der API)', async () => {
+    await run(new PostgresWriter(cfg, BTC), '2026-09-08', '2026-09-08', false); // auch einzeln lauffähig
     const [{ c }] = (await sql`
       SELECT format('%I.%I', chunk_schema, chunk_name) AS c FROM timescaledb_information.chunks
        WHERE hypertable_name = 'fp_1m' AND range_start = '2026-09-08 00:00:00+00'`) as unknown as [
@@ -780,37 +781,60 @@ describe('Erstkompression gealterter Chunks durch die Policy (Review-Frage)', ()
     ];
     const [job] = await sql`
       SELECT job_id FROM timescaledb_information.jobs WHERE proc_name = 'policy_compression' AND hypertable_name = 'fp_1m'`;
-    const cnt = async (tx: Sql) =>
-      (
-        await tx`SELECT count(*)::int AS n, sum(buy_q)::text AS q FROM fp_1m WHERE ts >= '2026-09-08' AND ts < '2026-09-09'`
-      )[0]!;
-    const want = await cnt(sql);
+    // zwei Lesarten: ganzer Tag ohne Filter, und wie die API (sym_id + schmaler Zeitraum → Segment-
+    // und Index-Pfad des Columnstores)
+    const read = async (tx: Sql) => {
+      const [a] =
+        await tx`SELECT count(*)::int AS n, sum(buy_q)::text AS q FROM fp_1m WHERE ts >= '2026-09-08' AND ts < '2026-09-09'`;
+      const api = await tx`
+        SELECT ts, px, buy_q::text AS b, sell_q::text AS s FROM fp_1m
+         WHERE sym_id = ${BTC.symId} AND ts >= '2026-09-08 12:00:00+00' AND ts < '2026-09-08 12:15:00+00'
+         ORDER BY ts, px`;
+      return {
+        all: a,
+        api: api.map((r) => `${(r.ts as Date).toISOString()}|${r.px}|${r.b}|${r.s}`),
+      };
+    };
+    const want = await read(sql);
+    expect(want.api.length).toBeGreaterThan(0);
+    const status = async () =>
+      (await sql`SELECT status FROM _timescaledb_catalog.chunk WHERE relid = ${c}::regclass`)[0]!
+        .status as number;
     const reader = connect(cfg);
+    const runner = connect(cfg);
     try {
       for (const lockFirst of [true, false]) {
         await sql.unsafe(`CALL convert_to_rowstore('${c}'::regclass, if_columnstore => true)`);
-        let jobMs = 0;
-        let job_: Promise<void> = Promise.resolve();
+        expect(await status()).toBe(0);
+        let jobMs = -1;
+        let jobDone: Promise<void> = Promise.resolve();
         const seen = await reader.begin('isolation level repeatable read read only', async (tx) => {
           if (lockFirst) await tx.unsafe(`LOCK TABLE ${c} IN ACCESS SHARE MODE`);
           else await tx`SELECT count(*) FROM symbol`; // Snapshot steht, Chunk ungesperrt
           const t0 = performance.now();
-          job_ = sql.unsafe(`CALL run_job(${job!.job_id as number})`).then(() => {
+          jobDone = runner.unsafe(`CALL run_job(${job!.job_id as number})`).then(() => {
             jobMs = performance.now() - t0;
           });
-          await sleep(800);
-          return cnt(tx as unknown as Sql);
+          if (lockFirst) {
+            // der Job muss auf unsere Sperre warten: nach 800 ms noch nicht fertig
+            await sleep(800);
+            expect(jobMs).toBe(-1);
+            expect(await status()).toBe(0);
+          } else {
+            // erst lesen, wenn die Kompression nachweislich festgeschrieben ist (zweite Verbindung)
+            await jobDone;
+            expect(await status()).toBe(1);
+          }
+          return read(tx as unknown as Sql);
         });
-        await job_;
+        await jobDone;
         expect(seen, `lockFirst=${lockFirst}`).toEqual(want);
-        const [st] =
-          await sql`SELECT status FROM _timescaledb_catalog.chunk WHERE relid = ${c}::regclass`;
-        expect(st!.status).toBe(1);
-        if (lockFirst) expect(jobMs).toBeGreaterThan(700); // hat auf den Leser gewartet
+        expect(await status()).toBe(1);
         console.log(`Erstkompression lockFirst=${lockFirst}: Job ${Math.round(jobMs)} ms`);
       }
     } finally {
       await reader.end();
+      await runner.end();
     }
   });
 });
