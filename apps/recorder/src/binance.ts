@@ -122,15 +122,23 @@ export class BinanceRest implements RestSource {
   requests = 0;
   weight = 0;
 
-  constructor(base: string, budget: WeightBudget, spec: (s: string) => SymbolSpec) {
+  private readonly fetchFn: typeof fetch;
+
+  constructor(
+    base: string,
+    budget: WeightBudget,
+    spec: (s: string) => SymbolSpec,
+    fetchFn: typeof fetch = (u, i) => fetch(u, i),
+  ) {
     this.base = base;
     this.budget = budget;
     this.spec = spec;
+    this.fetchFn = fetchFn;
   }
 
   private async get(path: string, w: number): Promise<unknown> {
     await this.budget.take(w);
-    const r = await fetch(this.base + path, { signal: AbortSignal.timeout(30_000) });
+    const r = await this.fetchFn(this.base + path, { signal: AbortSignal.timeout(30_000) });
     this.requests++;
     this.weight += w;
     const used = Number(r.headers.get('x-mbx-used-weight-1m'));

@@ -153,6 +153,7 @@ export async function replayDay(o: {
         return w.writeMinute(s, d);
       },
       markGap: async () => {},
+      markFrozen: async () => {},
       writeKlineChecks: async () => {},
     };
   } else {
@@ -166,6 +167,7 @@ export async function replayDay(o: {
         return 'written';
       },
       markGap: async () => {},
+      markFrozen: async () => {},
       writeKlineChecks: async () => {},
     };
   }

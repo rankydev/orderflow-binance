@@ -4,12 +4,24 @@
 // Konfiguration über Umgebungsvariablen (OF_DB_* wie überall, dazu):
 //   OF_RECORDER_SYMBOLS      Symbole, Komma-getrennt (Standard BTCUSDT,ETHUSDT)
 //   OF_SPOOL_DIR             Spool-Verzeichnis (Standard <OF_DATA_DIR>/live, §3.1)
-//   OF_SPOOL_KEEP_DAYS       Spool-Tage nach Finalisierung behalten (Standard 7)
-//   OF_SPOOL_MIN_FREE_GB     Unter diesem freien Platz meldet Health „unhealthy" (Standard 5)
+//   OF_SPOOL_KEEP_DAYS       Spool-Tage behalten, gezählt ab heute, unabhängig von der Finalisierung (Standard 7)
+//   OF_SPOOL_MIN_FREE_GB     darunter: Spoolen gestoppt (DB-Schreiben läuft weiter), Health unhealthy (Standard 5)
+//   OF_RAW_KEEP_DAYS         >0: geladene Tagesdateien finaler Tage älter als so viele Tage löschen
+//                            (VPS 14, §2.3; Mac 0 = nie, dort ist das Archiv die Quelle der Wahrheit)
 //   OF_REST_WEIGHT_PER_MIN   eigenes REST-Gewichtsbudget (Standard 1200 = 50 % von 2400, §4.2)
 //   OF_BINANCE_WS_BASE / OF_BINANCE_REST_BASE   Endpunkte (Standard Binance USDⓈ-M, /market)
 //   OF_RECORDER_HTTP_PORT    lokaler Health-/Ereignis-Port auf 127.0.0.1 (Standard 7701, 0 = aus)
 //   OF_RECORDER_FINALISE     tägliche Finalisierung im Prozess (Standard 1)
+//
+// Betrieb (Review-Hinweise):
+//  - Speicher: Recorder ≈ 0,2–0,35 GB (gemessen, Nachholen zweier Symbole); die Finalisierung im
+//    Prozess importiert einen ganzen Tag (≈ +0,5 GB Spitze) → systemd MemoryMax ≥ 1,2 GB.
+//  - Watchdog: WATCHDOG=1 nur bei Trades jünger als 30 s; bei einem Binance-Ausfall startet systemd
+//    den Recorder daher wiederholt neu (gewollt, §2.5). Ein Neustart ist billig: Spool-Wiedergabe
+//    (abgeschnittene Frames werden gekürzt) + REST ab der letzten ID.
+//  - Ruhiger Markt: nur dann entscheidet die lokale Uhr den Minutenabschluss (nach einer REST-Probe);
+//    die Uhr muss per NTP stimmen. Health zeigt eventLagMs (Uhr − Ereigniszeit E der letzten
+//    Nachricht); dauerhaft > 3 000 ms → Uhr prüfen.
 import { DAY_MS, dayIndex, formatDay, getSymbol, parseConfig, parseDay } from '@orderflow/core';
 import { execFile } from 'node:child_process';
 import { createServer, type ServerResponse } from 'node:http';
@@ -20,7 +32,7 @@ import { finaliseDay, nextAttempt } from './finalize.ts';
 import { LiveWriter } from './livewriter.ts';
 import { Recorder } from './recorder.ts';
 import { replayDay } from './replay.ts';
-import { freeBytes, pruneSpool } from './spool.ts';
+import { freeBytes, pruneRaw } from './spool.ts';
 import type { SocketLike } from './ws.ts';
 
 type Env = Record<string, string | undefined>;
@@ -31,6 +43,7 @@ export interface RecorderConfig {
   dataDir: string;
   keepDays: number;
   minFreeBytes: number;
+  rawKeepDays: number;
   weightPerMin: number;
   wsBase: string;
   restBase: string;
@@ -60,6 +73,7 @@ export function recorderConfig(env: Env): RecorderConfig {
     spoolDir: env.OF_SPOOL_DIR ?? join(dataDir, 'live'),
     keepDays: num('OF_SPOOL_KEEP_DAYS', 7),
     minFreeBytes: num('OF_SPOOL_MIN_FREE_GB', 5) * 1024 ** 3,
+    rawKeepDays: num('OF_RAW_KEEP_DAYS', 0),
     weightPerMin,
     wsBase: env.OF_BINANCE_WS_BASE ?? DEFAULT_WS_BASE,
     restBase: env.OF_BINANCE_REST_BASE ?? DEFAULT_REST_BASE,
@@ -94,6 +108,9 @@ async function run(): Promise<number> {
     sink: writer,
     spoolDir: cfg.spoolDir,
     log: logLine,
+    freeBytes: () => freeBytes(cfg.spoolDir),
+    minFreeBytes: cfg.minFreeBytes,
+    spoolKeepDays: cfg.keepDays,
     onMinuteCommitted: (symbol, ms) => {
       // lokaler Ereignis-Feed für die API (§4.2 „Minute M committed")
       const ev = `event: minute\ndata: ${JSON.stringify({ symbol, ts: ms })}\n\n`;
@@ -102,6 +119,7 @@ async function run(): Promise<number> {
   });
   await rec.start();
   let lastFinalised: Record<string, string | null> = {};
+  let rawPrunedFiles = 0;
   const attempts = new Map<string, number>();
   const health = () => {
     const now = Date.now();
@@ -125,6 +143,8 @@ async function run(): Promise<number> {
             ? new Date(s.lastCommittedMinute).toISOString()
             : null,
           spoolLagMs: s.spool?.oldestUnflushed ? now - s.spool.oldestUnflushed : 0,
+          eventLagMs: s.eventLagMs,
+          frozenDays: rec.frozenDays(s),
           lastFinalisedDay: lastFinalised[name] ?? null,
         },
       ]),
@@ -133,7 +153,11 @@ async function run(): Promise<number> {
       (x) => x.lastTradeAgeMs !== null && x.lastTradeAgeMs < 120_000,
     );
     return {
-      healthy: fresh && free >= cfg.minFreeBytes && rec.stream?.connected === true,
+      healthy:
+        fresh && free >= cfg.minFreeBytes && rec.stream?.connected === true && rec.spoolEnabled,
+      spoolEnabled: rec.spoolEnabled,
+      spoolPrunedDays: rec.spoolPruned.length,
+      rawPrunedFiles,
       wsConnected: rec.stream?.connected ?? false,
       wsReconnects: rec.stream?.reconnects ?? 0,
       wsRotations: rec.stream?.rotations ?? 0,
@@ -230,7 +254,17 @@ async function run(): Promise<number> {
           if (st.final) rec.markFinal(name, st.final);
           lastFinalised = { ...lastFinalised, [name]: formatDay(d) };
           logLine('finalised', { symbol: name, day: formatDay(d) });
-          pruneSpool(cfg.spoolDir, name, (day) => parseDay(day) > d - cfg.keepDays);
+          if (cfg.rawKeepDays > 0) {
+            const finalDay = rec.sym.get(name)!.final?.day ?? -1;
+            const gone = pruneRaw(
+              cfg.dataDir,
+              name,
+              dayIndex(Date.now()) - cfg.rawKeepDays,
+              (x) => x <= finalDay,
+            );
+            rawPrunedFiles += gone.length;
+            if (gone.length) logLine('raw files pruned', { symbol: name, files: gone.length });
+          }
         } catch (e) {
           logLine('finalise failed', { symbol: name, day: formatDay(d), error: String(e) });
           break;

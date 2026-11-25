@@ -71,6 +71,7 @@ function setup(rows: RawAgg[], spoolDir: string | null = null, budget?: WeightBu
       return 'written';
     },
     markGap: async () => {},
+    markFrozen: async () => {},
     writeKlineChecks: async () => {},
   };
   const rec = new Recorder({

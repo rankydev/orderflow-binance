@@ -77,6 +77,12 @@ export class SymbolFeed {
     return this.buffer.size > 0;
   }
 
+  /** Erste gepufferte Nachricht (der erste Trade nach der Lücke) oder null. */
+  firstBuffered(): FeedItem | null {
+    const id = this.bufferedFrom();
+    return id === null ? null : this.buffer.get(id)!;
+  }
+
   /** Kleinste gepufferte ID (Ende der Lücke) oder null. */
   bufferedFrom(): number | null {
     let m: number | null = null;

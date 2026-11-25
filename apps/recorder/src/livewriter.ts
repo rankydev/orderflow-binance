@@ -126,7 +126,7 @@ export class LiveWriter {
   /** Letzter finaler Tag des Symbols (Startpunkt der Kette) und provisorische Tage danach. */
   async startState(spec: SymbolSpec): Promise<{
     final: StoredFinal | null;
-    provisional: { day: number; state: string; liveUntil: number | null }[];
+    provisional: { day: number; state: string; liveUntil: number | null; frozen: string | null }[];
   }> {
     const n = (v: unknown) => safeNumber(v, 'data_day');
     const [f] = await this.db`
@@ -141,7 +141,7 @@ export class LiveWriter {
         }
       : null;
     const prov = await this.db`
-      SELECT day::text AS day, state, live_until FROM data_day
+      SELECT day::text AS day, state, live_until, live_frozen FROM data_day
        WHERE sym_id = ${spec.symId} AND state NOT IN ('final_ok', 'final_bad')
          AND day > ${final ? formatDay(final.day) : '1970-01-01'}::date ORDER BY day`;
     return {
@@ -150,6 +150,7 @@ export class LiveWriter {
         day: Date.parse(`${p.day as string}T00:00:00Z`) / DAY_MS,
         state: p.state as string,
         liveUntil: p.live_until ? (p.live_until as Date).getTime() : null,
+        frozen: (p.live_frozen as string | null) ?? null,
       })),
     };
   }
@@ -218,14 +219,34 @@ export class LiveWriter {
     return res;
   }
 
-  /** Minuten einer nicht füllbaren Lücke als `gap` vermerken (§4.2; werden nicht geschrieben). */
+  /**
+   * Minuten einer nicht füllbaren Lücke als `gap` vermerken (§4.2; werden nicht geschrieben).
+   * Begrenzt auf 3 Tage (≤ 4 321 Zeilen) – ein falscher Anfang (z. B. 0) kann keinen Speicherlauf auslösen.
+   */
   async markGap(spec: SymbolSpec, fromMs: number, toMs: number): Promise<void> {
+    if (!(toMs >= fromMs) || toMs - fromMs > 3 * DAY_MS) {
+      throw new Error(`markGap: unplausibler Bereich ${fromMs}…${toMs}`);
+    }
     const rows = [];
     for (let t = fromMs - (fromMs % MINUTE_MS); t <= toMs; t += MINUTE_MS) {
       rows.push({ sym_id: spec.symId, ts: new Date(t), kind: 'gap' });
     }
     if (rows.length === 0) return;
     await this.db`INSERT INTO data_minute_issue ${this.db(rows)} ON CONFLICT DO NOTHING`;
+  }
+
+  /** Grund, warum ein Tag nicht weiter live geschrieben wird (data_day.live_frozen; nur provisorische Tage). */
+  async markFrozen(spec: SymbolSpec, day: number, reason: string): Promise<void> {
+    const ds = formatDay(day);
+    await this.db.begin(async (tx) => {
+      await this.ensureLock(tx);
+      await tx`
+        INSERT INTO data_day (sym_id, day, state, source, version, live_frozen)
+        VALUES (${spec.symId}, ${ds}::date, 'provisional', 'live', 1, ${reason})
+        ON CONFLICT (sym_id, day) DO UPDATE SET live_frozen = EXCLUDED.live_frozen,
+               version = data_day.version + 1
+         WHERE data_day.state NOT IN ('final_ok', 'final_bad')`;
+    });
   }
 
   async writeKlineChecks(

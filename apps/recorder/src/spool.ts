@@ -15,6 +15,8 @@ import {
   rmSync,
   statfsSync,
   writeSync,
+  existsSync,
+  truncateSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { zstdCompressSync, zstdDecompressSync } from 'node:zlib';
@@ -37,6 +39,8 @@ export class SpoolWriter {
   oldestUnflushed = 0;
   flushes = 0;
   bytes = 0;
+  /** Beim Öffnen gekürzte Dateien (abgeschnittener Frame aus einem Absturz). */
+  truncatedOnOpen = 0;
 
   constructor(dir: string, symbol: string) {
     this.dir = dir;
@@ -72,9 +76,21 @@ export class SpoolWriter {
     const [day, hour] = key.split('/') as [string, string];
     const d = join(this.dir, this.symbol, day);
     mkdirSync(d, { recursive: true });
+    const path = join(d, `${hour}.csv.zst`);
+    // Nach einem Absturz kann die Datei mit einem abgeschnittenen Frame enden: vor dem Anhängen auf
+    // das Ende des letzten vollständigen Frames kürzen, sonst wären alle später angehängten Frames
+    // für den Leser verloren (er hört am ersten defekten Frame auf). Review W2.
+    if (existsSync(path)) {
+      const buf = readFileSync(path);
+      const { rest } = zstdFrames(buf);
+      if (rest > 0) {
+        truncateSync(path, buf.length - rest);
+        this.truncatedOnOpen++;
+      }
+    }
     this.open = {
       key,
-      fd: openSync(join(d, `${hour}.csv.zst`), 'a'),
+      fd: openSync(path, 'a'),
       restFd: openSync(join(d, `${hour}.rest`), 'a'),
     };
     return this.open;
@@ -227,4 +243,40 @@ export function freeBytes(dir: string): number {
   mkdirSync(dir, { recursive: true });
   const s = statfsSync(dir);
   return s.bavail * s.bsize;
+}
+
+/**
+ * Aufbewahrung der heruntergeladenen Tagesdateien (VPS: kurzes rollierendes Fenster, KONZEPT §2.3;
+ * das Mac-Archiv ist die Quelle der Wahrheit). Löscht daily aggTrades- und 1m-Kline-Dateien samt
+ * .CHECKSUM eines Symbols, deren Tag vor `oldestKeep` liegt und für den `isFinal(day)` gilt.
+ */
+export function pruneRaw(
+  dataDir: string,
+  symbol: string,
+  oldestKeep: number,
+  isFinal: (day: number) => boolean,
+): string[] {
+  const out: string[] = [];
+  const dirs = [
+    join(dataDir, 'raw/binance-vision/futures/um/daily/aggTrades', symbol),
+    join(dataDir, 'raw/binance-vision/futures/um/daily/klines', symbol, '1m'),
+  ];
+  for (const dir of dirs) {
+    let files: string[];
+    try {
+      files = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      const m = /(\d{4}-\d{2}-\d{2})\.zip(\.CHECKSUM)?$/.exec(f);
+      if (!m) continue;
+      const day = Date.parse(`${m[1]}T00:00:00Z`) / 86_400_000;
+      if (day < oldestKeep && isFinal(day)) {
+        rmSync(join(dir, f), { force: true });
+        out.push(f);
+      }
+    }
+  }
+  return out;
 }

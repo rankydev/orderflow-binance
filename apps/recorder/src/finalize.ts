@@ -44,16 +44,21 @@ export async function compareLiveDay(sql: Sql, data: DayData): Promise<QualityRe
   const symId = data.spec.symId;
   const from = new Date(data.day * DAY_MS);
   const to = new Date((data.day + 1) * DAY_MS);
-  // live: je Minute SHA256 über die fp_1m-Zeilen und den bar_1m-Text (ohne source/check_state)
-  const liveFp = await sql.unsafe(
-    `SELECT ts, encode(sha256(convert_to(string_agg(ROW(sym_id, ts, px, buy_q, sell_q, buy_a, sell_a)::text, E'\\n' ORDER BY px), 'UTF8')), 'hex') AS h
-       FROM fp_1m WHERE sym_id = $1 AND ts >= $2 AND ts < $3 GROUP BY ts`,
-    [symId, from, to],
-  );
-  const liveBar = await sql.unsafe(
-    `SELECT ts, ${BAR_ROW} AS t FROM bar_1m WHERE sym_id = $1 AND ts >= $2 AND ts < $3`,
-    [symId, from, to],
-  );
+  // live: je Minute SHA256 über die fp_1m-Zeilen und den bar_1m-Text (ohne source/check_state);
+  // Zeittext in UTC unabhängig von der Sitzung (SET LOCAL)
+  const [liveFp, liveBar] = await sql.begin(async (tx) => {
+    await tx`SET LOCAL timezone = 'UTC'`;
+    const a = await tx.unsafe(
+      `SELECT ts, encode(sha256(convert_to(string_agg(ROW(sym_id, ts, px, buy_q, sell_q, buy_a, sell_a)::text, E'\\n' ORDER BY px), 'UTF8')), 'hex') AS h
+         FROM fp_1m WHERE sym_id = $1 AND ts >= $2 AND ts < $3 GROUP BY ts`,
+      [symId, from, to],
+    );
+    const b = await tx.unsafe(
+      `SELECT ts, ${BAR_ROW} AS t FROM bar_1m WHERE sym_id = $1 AND ts >= $2 AND ts < $3`,
+      [symId, from, to],
+    );
+    return [a, b] as const;
+  });
   const lf = new Map<number, string>(liveFp.map((r) => [(r.ts as Date).getTime(), r.h as string]));
   const lb = new Map<number, string>(liveBar.map((r) => [(r.ts as Date).getTime(), r.t as string]));
   // offiziell: gleiche Textform

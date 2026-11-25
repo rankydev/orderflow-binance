@@ -8,6 +8,7 @@ import {
   formatDay,
   getSymbol,
   LiveDay,
+  parseDay,
   MINUTE_MS,
   reconcileDay,
   type Kline,
@@ -17,17 +18,19 @@ import {
 import { RestError, toItem, type RestSource } from './binance.ts';
 import { SymbolFeed, type FeedItem } from './feed.ts';
 import type { LiveWriter, MinuteWriteResult, StoredFinal } from './livewriter.ts';
-import { readSpoolDay, SpoolWriter } from './spool.ts';
+import { pruneSpool, readSpoolDay, SpoolWriter } from './spool.ts';
 import { StreamClient, type SocketFactory } from './ws.ts';
 
 /** Schnittstelle des DB-Schreibers (LiveWriter oder Test-Double). */
 export interface LiveSink {
   startState(spec: SymbolSpec): Promise<{
     final: StoredFinal | null;
-    provisional: { day: number; state: string; liveUntil: number | null }[];
+    provisional: { day: number; state: string; liveUntil: number | null; frozen?: string | null }[];
   }>;
   writeMinute(spec: SymbolSpec, d: MinuteDelta): Promise<MinuteWriteResult>;
   markGap(spec: SymbolSpec, fromMs: number, toMs: number): Promise<void>;
+  /** Tag wird nicht weiter live geschrieben: Grund für Leser sichtbar machen (data_day.live_frozen). */
+  markFrozen(spec: SymbolSpec, day: number, reason: string): Promise<void>;
   writeKlineChecks(rows: Parameters<LiveWriter['writeKlineChecks']>[0]): Promise<void>;
 }
 
@@ -49,6 +52,28 @@ export interface RecorderOptions {
   klineCheck?: boolean;
   /** Ausführung von Hintergrundschleifen (Tests: aus, dann `pump()` von Hand). */
   autoLoops?: boolean;
+  /** Freier Platz des Spool-Verzeichnisses (Bytes); darunter wird nicht mehr gespoolt (DB-Schreiben läuft weiter). */
+  freeBytes?: (() => number) | null;
+  minFreeBytes?: number;
+  /** Spool-Tage länger als so viele Tage vor heute werden gelöscht – unabhängig von der Finalisierung. */
+  spoolKeepDays?: number;
+  /** Schreibversuche einer Minute bei dauerhaftem Fehler, bevor der Tag eingefroren wird. */
+  maxPermanentFailures?: number;
+}
+
+/** Maximale Länge einer als `gap` vermerkten Lücke (REST-Fenster 48 h + Reserve). */
+export const MAX_GAP_MS = 3 * DAY_MS;
+
+/**
+ * Vorübergehender DB-Fehler (Verbindung, Überlast, Abbruch, Deadlock, Sperrzeit) → später erneut;
+ * alles andere (Daten-, Constraint-, Syntaxfehler, Programmfehler) gilt als dauerhaft.
+ */
+export function isTransientDbError(e: unknown): boolean {
+  const code = String((e as { code?: unknown })?.code ?? '');
+  if (/^(08|53|57|40)/.test(code) || code === '55P03') return true;
+  if (/^(CONNECTION_|CONNECT_TIMEOUT|ECONN|ETIMEDOUT|EPIPE|ENOTFOUND|EHOSTUNREACH)/.test(code))
+    return true;
+  return false;
 }
 
 interface DayInfo {
@@ -75,6 +100,8 @@ export interface SymbolState {
   lastCommittedMinute: number | null;
   unwritten: number;
   wsLastMsg: number;
+  /** Uhrzeit minus Ereigniszeit E der letzten Stream-Nachricht (Uhrversatz + Latenz). */
+  eventLagMs: number | null;
 }
 
 export class Recorder {
@@ -88,6 +115,13 @@ export class Recorder {
   private stopped = false;
   private timers: NodeJS.Timeout[] = [];
   writeErrors = 0;
+  /** Spoolen aktiv (false unterhalb der Plattengrenze). */
+  spoolEnabled = true;
+  freeSpoolBytes: number | null = null;
+  spoolPruned: string[] = [];
+  private attempts = new Map<string, number>();
+  private lastDiskCheck = 0;
+  private lastRetention = 0;
 
   constructor(o: RecorderOptions) {
     this.o = {
@@ -96,6 +130,10 @@ export class Recorder {
       quietProbeMs: 5000,
       klineCheck: true,
       autoLoops: true,
+      freeBytes: null,
+      minFreeBytes: 5 * 1024 ** 3,
+      spoolKeepDays: 7,
+      maxPermanentFailures: 5,
       ...o,
     };
   }
@@ -118,12 +156,14 @@ export class Recorder {
         lastCommittedMinute: null,
         unwritten: 0,
         wsLastMsg: 0,
+        eventLagMs: null,
       };
       this.sym.set(name, s);
       for (const p of st.provisional) {
         const di = this.ensureDay(s, p.day);
         if (di) {
           if (p.state !== 'provisional') di.frozen = `Zustand ${p.state}`;
+          else if (p.frozen) di.frozen = p.frozen; // eingefroren bleibt eingefroren (Neustart)
           di.skipBefore = p.liveUntil ?? 0;
         }
       }
@@ -192,6 +232,8 @@ export class Recorder {
     const s = this.sym.get(m.s);
     if (!s) return;
     s.wsLastMsg = this.o.now();
+    const E = (data as { E?: number }).E;
+    if (typeof E === 'number') s.eventLagMs = s.wsLastMsg - E;
     let it: FeedItem;
     try {
       it = toItem(m, s.spec, false);
@@ -219,23 +261,34 @@ export class Recorder {
     return di;
   }
 
+  /**
+   * Tag nicht mehr live schreiben (die offizielle Datei ersetzt ihn später) und den Grund in der
+   * DB sichtbar machen. Bereits finale Tage bleiben unberührt.
+   */
+  freeze(s: SymbolState, day: number, reason: string): void {
+    const di = this.ensureDay(s, day);
+    if (!di || di.frozen) return;
+    di.frozen = reason;
+    this.o.log('day frozen', { symbol: s.spec.name, day: formatDay(day), reason });
+    this.o.sink
+      .markFrozen(s.spec, day, reason)
+      .catch((e: unknown) =>
+        this.o.log('mark frozen failed', { symbol: s.spec.name, error: String(e) }),
+      );
+  }
+
   /** Nachrichten in den Feed; lückenlose Folge spoolen, aggregieren, Minuten abschließen. */
   handle(s: SymbolState, items: FeedItem[], spool: boolean): void {
     const out = s.feed.push(items);
     if (out.length === 0) return;
-    if (spool) s.spool?.append(out, this.o.now());
+    if (spool && this.spoolEnabled) s.spool?.append(out, this.o.now());
     for (const it of out) {
       const di = this.ensureDay(s, dayIndex(it.trade.T));
       if (!di || di.frozen) continue;
       try {
         di.live.add(it.trade, it.viaRest);
       } catch (e) {
-        di.frozen = `Aggregationsfehler: ${String(e)}`;
-        this.o.log('day frozen', {
-          symbol: s.spec.name,
-          day: formatDay(di.live.day),
-          reason: di.frozen,
-        });
+        this.freeze(s, di.live.day, `Aggregationsfehler: ${String(e)}`);
       }
     }
     this.completeMinutes(s, s.feed.lastT);
@@ -286,23 +339,42 @@ export class Recorder {
           continue;
         }
         let res: MinuteWriteResult;
+        const key = `${job.spec.name}|${job.d.day}|${job.d.minute}`;
         try {
           res = await this.o.sink.writeMinute(job.spec, job.d);
         } catch (e) {
           this.writeErrors++;
-          this.o.log('db write failed, retry', { symbol: job.spec.name, error: String(e) });
+          if (isTransientDbError(e)) {
+            this.o.log('db write failed (transient), retry', {
+              symbol: job.spec.name,
+              error: String(e),
+            });
+          } else {
+            const n = (this.attempts.get(key) ?? 0) + 1;
+            this.attempts.set(key, n);
+            this.o.log('db write failed (permanent)', {
+              symbol: job.spec.name,
+              attempt: n,
+              error: String(e),
+            });
+            if (n >= this.o.maxPermanentFailures) {
+              // eine dauerhaft scheiternde Minute darf nicht alle folgenden blockieren
+              this.queue.shift();
+              s.unwritten--;
+              this.attempts.delete(key);
+              this.freeze(s, job.d.day, `Schreibfehler Minute ${job.d.minute}: ${String(e)}`);
+              continue;
+            }
+          }
           await new Promise((r) => setTimeout(r, 2000));
           if (this.stopped) return;
           continue;
         }
+        this.attempts.delete(key);
         this.queue.shift();
         s.unwritten--;
         if (res === 'not_provisional') {
-          if (di) di.frozen = 'Tag nicht mehr provisional';
-          this.o.log('day not provisional, stop writing', {
-            symbol: job.spec.name,
-            day: formatDay(job.d.day),
-          });
+          this.freeze(s, job.d.day, 'Tag nicht mehr provisional');
           continue;
         }
         const ms = job.d.day * DAY_MS + job.d.minute * MINUTE_MS;
@@ -342,8 +414,7 @@ export class Recorder {
     } catch (e) {
       if (e instanceof RestError && e.status === 400) {
         // z. B. älter als 48 h: nicht füllbar → Lücke aufgeben, betroffene Tage einfrieren
-        const gap = s.feed.abandonGap();
-        if (gap) await this.abandon(s, gap, String(e));
+        await this.abandonGapNow(s, String(e));
         return true;
       }
       throw e;
@@ -359,23 +430,54 @@ export class Recorder {
     return true;
   }
 
-  private async abandon(
+  /**
+   * Nicht füllbare Lücke (REST-Fenster überschritten). Grenzen aus den Trades: von T des letzten
+   * ausgegebenen Trades (sonst Ende des letzten finalen Tages) bis T des ersten Trades nach der
+   * Lücke; höchstens MAX_GAP_MS. Jeder berührte Tag wird eingefroren (auch der Tag nach Mitternacht,
+   * dem die Trades vor der Lücke fehlen) und die Minuten der Lücke als `gap` vermerkt.
+   */
+  async abandonGapNow(
     s: SymbolState,
-    gap: { from: number; to: number },
     why: string,
-  ): Promise<void> {
+  ): Promise<{ fromMs: number; toMs: number } | null> {
+    const after = s.feed.firstBuffered();
+    const gap = s.feed.abandonGap();
+    if (!gap) return null;
     s.gapsAbandoned++;
-    const t0 = s.feed.lastT;
-    this.o.log('gap not fillable', { symbol: s.spec.name, fromId: gap.from, toId: gap.to, why });
-    // Der Tag mit der Lücke wird nicht weiter geschrieben (die offizielle Datei ersetzt ihn).
-    const di = s.days.get(dayIndex(t0 || this.o.now()));
-    if (di) di.frozen = `nicht füllbare Lücke ${gap.from}…${gap.to}`;
-    await this.o.sink.markGap(s.spec, t0, this.o.now()).catch(() => {});
+    const toMs = after ? after.trade.T : this.o.now();
+    let fromMs =
+      s.feed.lastT > 0
+        ? s.feed.lastT
+        : s.final
+          ? (s.final.day + 1) * DAY_MS
+          : toMs - (toMs % DAY_MS);
+    if (toMs - fromMs > MAX_GAP_MS) {
+      this.o.log('gap longer than bound, truncated', { symbol: s.spec.name, fromMs, toMs });
+      fromMs = toMs - MAX_GAP_MS;
+    }
+    this.o.log('gap not fillable', {
+      symbol: s.spec.name,
+      fromId: gap.from,
+      toId: gap.to,
+      fromMs,
+      toMs,
+      why,
+    });
+    for (let d = dayIndex(fromMs); d <= dayIndex(toMs); d++) {
+      this.freeze(s, d, `nicht füllbare Lücke aggId ${gap.from}…${gap.to}`);
+    }
+    await this.o.sink
+      .markGap(s.spec, fromMs, toMs)
+      .catch((e: unknown) =>
+        this.o.log('mark gap failed', { symbol: s.spec.name, error: String(e) }),
+      );
+    return { fromMs, toMs };
   }
 
   /** Sekündlich: ruhiger Markt (Uhr + REST-Probe), Spool-Flush. */
   async tick(): Promise<void> {
     const now = this.o.now();
+    this.diskAndRetention(now);
     for (const s of this.sym.values()) {
       s.spool?.flush();
       if (s.feed.gapOpen() || s.feed.expected === null) continue;
@@ -400,6 +502,50 @@ export class Recorder {
         }
       }
     }
+  }
+
+  /**
+   * Plattenwächter (alle 10 s) und Spool-Aufbewahrung (stündlich, unabhängig von der Finalisierung):
+   * unterhalb von minFreeBytes wird nicht mehr gespoolt (Minuten werden weiter geschrieben; nach einem
+   * Absturz holt REST nach), oberhalb von 1,2 × wieder.
+   */
+  diskAndRetention(now: number): void {
+    if (this.o.freeBytes && now - this.lastDiskCheck >= 10_000) {
+      this.lastDiskCheck = now;
+      const free = this.o.freeBytes();
+      this.freeSpoolBytes = free;
+      if (this.spoolEnabled && free < this.o.minFreeBytes) {
+        this.spoolEnabled = false;
+        for (const s of this.sym.values()) s.spool?.flush();
+        this.o.log('low disk: spooling stopped', { freeBytes: free });
+      } else if (!this.spoolEnabled && free > this.o.minFreeBytes * 1.2) {
+        this.spoolEnabled = true;
+        this.o.log('disk ok: spooling resumed', { freeBytes: free });
+      }
+    }
+    if (this.o.spoolDir && now - this.lastRetention >= 3600_000) {
+      this.lastRetention = now;
+      const oldest = dayIndex(now) - this.o.spoolKeepDays;
+      for (const name of this.sym.keys()) {
+        const gone = pruneSpool(this.o.spoolDir, name, (d) => parseDay(d) >= oldest);
+        if (gone.length) {
+          this.spoolPruned.push(...gone.map((d) => `${name} ${d}`));
+          this.o.log('spool pruned', { symbol: name, days: gone });
+        }
+      }
+    }
+  }
+
+  /** Länge der Schreibwarteschlange (Tests, Health). */
+  queueLength(): number {
+    return this.queue.length;
+  }
+
+  /** Eingefrorene Tage je Symbol (für Health/Monitor). */
+  frozenDays(s: SymbolState): { day: string; reason: string }[] {
+    return [...s.days.entries()]
+      .filter(([, di]) => di.frozen)
+      .map(([d, di]) => ({ day: formatDay(d), reason: di.frozen! }));
   }
 
   /** Kline-Abgleich der abgeschlossenen Minuten (§4.6 auf dem Tag bis jetzt; nicht blockierend). */

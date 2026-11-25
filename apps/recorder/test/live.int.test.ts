@@ -109,3 +109,53 @@ describe('Recorder ↔ Datenbank', () => {
     await a.close();
   });
 });
+
+describe('Recorder-Rolle und eingefrorene Tage (Abnahme 8, W5)', () => {
+  it('of_recorder: Schreibrechte nur auf Daten-/Status-Tabellen, kein DDL', async () => {
+    const priv = async (t: string, p: string) =>
+      (await sql`SELECT has_table_privilege('of_recorder', ${t}, ${p}) AS ok`)[0]!.ok as boolean;
+    for (const t of [
+      'fp_1m',
+      'bar_1d',
+      'data_day',
+      'ingest_status',
+      'live_kline_check',
+      'recorder_quality',
+      'raw_file',
+    ]) {
+      expect(await priv(t, 'INSERT'), t).toBe(true);
+    }
+    expect(await priv('schema_migrations', 'INSERT')).toBe(false);
+    expect(await priv('verify_run', 'INSERT')).toBe(false);
+    expect(await priv('symbol', 'UPDATE')).toBe(false);
+    const [c] = await sql`SELECT has_schema_privilege('of_recorder', 'public', 'CREATE') AS ok`;
+    expect(c!.ok).toBe(false);
+    // unter der Rolle: Schreiben einer Status-Zeile geht, DDL nicht
+    await sql
+      .begin(async (tx) => {
+        await tx`SET LOCAL ROLE of_recorder`;
+        await tx`INSERT INTO ingest_status (component, sym_id) VALUES ('role-test', 1)
+               ON CONFLICT (component, sym_id) DO NOTHING`;
+        await expect(tx`CREATE TABLE of_recorder_probe (x int)`).rejects.toThrow(
+          /permission denied/,
+        );
+      })
+      .catch((e: unknown) => {
+        if (!String(e).includes('permission denied')) throw e;
+      });
+  });
+
+  it('markFrozen macht den Grund in data_day sichtbar, nur für nicht finale Tage', async () => {
+    const w = new LiveWriter(cfg);
+    await w.open();
+    await w.markFrozen(BTC, parseDay('2026-09-12'), 'nicht füllbare Lücke (Test)');
+    await w.markFrozen(BTC, parseDay('2026-09-10'), 'darf finalen Tag nicht ändern');
+    await w.close();
+    const rows = await sql`SELECT day::text AS day, state, live_frozen, immutable FROM data_day
+                            WHERE day IN ('2026-09-10', '2026-09-12') ORDER BY day`;
+    expect(rows.map((r) => [r.day, r.state, r.live_frozen, r.immutable])).toEqual([
+      ['2026-09-10', 'final_ok', null, true],
+      ['2026-09-12', 'provisional', 'nicht füllbare Lücke (Test)', false],
+    ]);
+  });
+});
