@@ -92,7 +92,8 @@ export function priceAxisDrag(
 
 /**
  * Preisbereich um die Mitte mit Faktor f skalieren, Spanne auf [minSpan, maxSpan] begrenzt (W-4: sonst
- * schrumpft sie gegen 0 → Division durch 0 in der Preisabbildung und der Zeilengröße).
+ * schrumpft sie gegen 0 → Division durch 0 in der Preisabbildung und der Zeilengröße). Die Unterkante
+ * bleibt ≥ 0 (keine negativen Preise an der Achse); der Bereich wird dann nach oben verschoben.
  */
 export function scalePriceSpan(
   pTop: number,
@@ -103,7 +104,12 @@ export function scalePriceSpan(
 ): [number, number] {
   const mid = (pTop + pBot) / 2;
   const span = Math.min(maxSpan, Math.max(minSpan, (pTop - pBot) * f));
-  return [mid + span / 2, mid - span / 2];
+  return floorPriceRange(mid + span / 2, mid - span / 2);
+}
+
+/** Preise sind ≥ 0: liegt die Unterkante unter 0, den Bereich nach oben schieben (Spanne bleibt). */
+export function floorPriceRange(pTop: number, pBot: number): [number, number] {
+  return pBot >= 0 ? [pTop, pBot] : [pTop - pBot, 0];
 }
 
 /** Grenzen der Preisspanne: ≥ 20 Ticks, ≤ 20 × Datenspanne der sichtbaren Tage (mind. 20 Ticks). */

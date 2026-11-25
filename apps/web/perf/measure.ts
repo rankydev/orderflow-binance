@@ -1005,8 +1005,11 @@ async function main(): Promise<void> {
     results.heapAfterPanSyn1m,
     results.heapAfterLongRange,
     results.heapEnd,
-    'errors',
-    errors.length,
+    'pageErrors',
+    pageErrors.length,
+    JSON.stringify(pageErrors),
+    'expected422Ignored',
+    errors.length - pageErrors.length,
   );
   await browser.close();
   if (failures.length > 0) process.exitCode = 1;

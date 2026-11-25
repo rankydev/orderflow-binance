@@ -3,6 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   clampScroll,
+  floorPriceRange,
   normalizeWheel,
   pinchStep,
   priceAxisDrag,
@@ -17,7 +18,13 @@ import {
   zoomColumnsAt,
 } from '../src/lib/tpo/interaction.ts';
 import { RATIO_OFF_NOTE, ratioNotes } from '../src/lib/stats-grid.ts';
-import { candleHint } from '../src/lib/controller.ts';
+import { PriceScaleMode } from 'lightweight-charts';
+import {
+  candleHint,
+  FOOTPRINT_OFF_NOTE,
+  noFootprintReason,
+  ratioAllowed,
+} from '../src/lib/controller.ts';
 import { CANDLE_WINDOW_BARS } from '../src/lib/bar-store.ts';
 
 describe('W-1: Footprint aus → High/Low Ratio leer', () => {
@@ -125,5 +132,60 @@ describe('W-5: zwei Zeiger', () => {
   it('Finger fast übereinander (< 10 px): kein Zoom (keine Division durch ~0)', () => {
     expect(pinchStep({ x: 100 }, { x: 105 }, { x: 100 }, { x: 400 }).f).toBe(1);
     expect(pinchStep({ x: 100 }, { x: 400 }, { x: 200 }, { x: 201 }).f).toBe(1);
+  });
+});
+
+describe('Folgeprüfung c47aef6: Preisunterkante ≥ 0', () => {
+  it('obere Spannengrenze: Unterkante bleibt 0, Spanne bleibt, Bereich nach oben verschoben', () => {
+    // Datenspanne 748 870 Einheiten, Mitte bei ~5,9 Mio.: 20 × Spanne würde unter 0 reichen
+    const [lo, hi] = priceSpanLimits(10, 748_870);
+    const [t, b] = priceAxisDrag(6_306_482, 5_467_728, 8000, lo, hi);
+    expect(b).toBe(0);
+    expect(t - b).toBeCloseTo(hi, 6);
+  });
+  it('innerhalb von ≥ 0 unverändert; Verschieben unter 0 hält an der 0', () => {
+    expect(floorPriceRange(500, 100)).toEqual([500, 100]);
+    expect(floorPriceRange(300, -200)).toEqual([500, 0]);
+    expect(scalePriceSpan(100, 0, 4, 0, Infinity)).toEqual([400, 0]); // Mitte 50, Spanne 400
+  });
+});
+
+describe('Folgeprüfung c47aef6: Gründe ohne Footprint, Ratio-Sperre', () => {
+  const base = {
+    footprintOff: false,
+    rs: [1, 2],
+    tf: '1m',
+    scaleMode: PriceScaleMode.Normal,
+    blocked: '',
+  };
+  it('möglich: leerer Grund', () => {
+    expect(noFootprintReason(base)).toBe('');
+  });
+  it('Schalter „nur Kerzen" vor allen anderen Gründen', () => {
+    expect(
+      noFootprintReason({
+        ...base,
+        footprintOff: true,
+        rs: [],
+        scaleMode: PriceScaleMode.Logarithmic,
+        blocked: 'x',
+      }),
+    ).toBe(FOOTPRINT_OFF_NOTE);
+  });
+  it('keine Zeilengröße, nicht lineare Skala, Sperre – in dieser Reihenfolge', () => {
+    expect(noFootprintReason({ ...base, rs: [], blocked: 'x' })).toBe(
+      'kein Footprint für 1m (keine Zeilengröße angeboten)',
+    );
+    expect(
+      noFootprintReason({ ...base, scaleMode: PriceScaleMode.Logarithmic, blocked: 'x' }),
+    ).toBe('Preisskala nicht linear – nur Kerzen');
+    expect(noFootprintReason({ ...base, scaleMode: PriceScaleMode.Percentage })).toBe(
+      'Preisskala nicht linear – nur Kerzen',
+    );
+    expect(noFootprintReason({ ...base, blocked: 'gesperrt' })).toBe('gesperrt');
+  });
+  it('High/Low Ratio nur mit Footprint', () => {
+    expect(ratioAllowed(true)).toBe(false);
+    expect(ratioAllowed(false)).toBe(true);
   });
 });

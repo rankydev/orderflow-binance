@@ -32,6 +32,7 @@ import type { SymbolInfo } from '../types.ts';
 import { GestureTracker } from '../gesture.ts';
 import {
   clampScroll,
+  floorPriceRange,
   normalizeWheel,
   pinchStep,
   priceAxisDrag,
@@ -495,8 +496,7 @@ export class TpoView {
     // freier Raum rechts nach dem letzten Tag wie auf der Chart-Seite (scrollBounds)
     this.scrollPx = clampScroll(this.scrollPx + dx, b[1] - b[0] + 1, this.colW, this.plotW());
     const upp = (this.pTop - this.pBot) / this.plotH();
-    this.pTop += dy * upp;
-    this.pBot += dy * upp;
+    [this.pTop, this.pBot] = floorPriceRange(this.pTop + dy * upp, this.pBot + dy * upp);
     this.schedule();
   }
 
@@ -511,8 +511,7 @@ export class TpoView {
     const span = this.pTop - this.pBot;
     f = Math.min(hi / span, Math.max(lo / span, f));
     const u = this.pTop - ((yCss - HEADER_H) / this.plotH()) * (this.pTop - this.pBot);
-    this.pTop = u + (this.pTop - u) * f;
-    this.pBot = u + (this.pBot - u) * f;
+    [this.pTop, this.pBot] = floorPriceRange(u + (this.pTop - u) * f, u + (this.pBot - u) * f);
     this.schedule();
   }
 

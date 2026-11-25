@@ -288,7 +288,7 @@ export class ChartController {
     // Stats-Grid: High/Low Ratio aus den Leveln der gezeichneten Zeilengröße
     this.statsCtx.hlRatio = (t) => {
       // W-1: bei „nur Kerzen" keine Ratios aus noch gehaltenen Kacheln
-      if (this.footprintOff) return null;
+      if (!ratioAllowed(this.footprintOff)) return null;
       const hit = this.lookupBar(t);
       if (!hit) return null;
       const [tile, bi, w] = hit;
@@ -665,8 +665,9 @@ export class ChartController {
     if (o.footprint === this.footprintOff) {
       this.footprintOff = !o.footprint;
       if (this.footprintOff) {
-        // Gehaltene Kacheln bleiben bewusst im Cache (sofortige Rückkehr ohne Neuladen); sie werden wie
-        // bisher beim Symbol-/Zeitrahmenwechsel und über das LRU-Zellbudget (≤ 2 Mio. Zellen) freigegeben.
+        // Gehaltene Kacheln bleiben bewusst im Cache (sofortige Rückkehr ohne Neuladen). Freigegeben werden
+        // sie nur beim Symbolwechsel oder einer neuen Kachelkonfiguration (neuer Kachelspeicher), sonst über das LRU-Zellbudget (≤ 2 Mio.
+        // Zellen); ein Zeitrahmenwechsel gibt sie nicht frei, sie altern dort über das LRU aus.
         this.fpQueue.cancelAll();
         this.wantedFp.clear();
       }
@@ -1205,13 +1206,13 @@ export class ChartController {
     const rs = this.availableR();
     // Gründe, warum kein Footprint möglich ist (nicht zoombedingt) – sichtbar in der Anzeige (A)
     const scaleMode = this.chart.priceScale('right').options().mode;
-    this.noFootprint = this.footprintOff
-      ? FOOTPRINT_OFF_NOTE
-      : rs.length === 0
-        ? `kein Footprint für ${this.tf} (keine Zeilengröße angeboten)`
-        : scaleMode !== PriceScaleMode.Normal
-          ? 'Preisskala nicht linear – nur Kerzen'
-          : this.blocked;
+    this.noFootprint = noFootprintReason({
+      footprintOff: this.footprintOff,
+      rs,
+      tf: this.tf,
+      scaleMode,
+      blocked: this.blocked,
+    });
     if (this.noFootprint) {
       this.setMode('candle');
       // kein alter Footprint-Hinweis; der Hinweis zu sehr vielen Bars gilt auch für Kerzen
@@ -1834,4 +1835,26 @@ export function candleHint(visibleBars: number): string {
   return visibleBars > CANDLE_WINDOW_BARS
     ? `Mehr als ${CANDLE_WINDOW_BARS} Bars sichtbar – größeren Zeitrahmen wählen`
     : '';
+}
+
+/**
+ * Warum kein Footprint möglich ist (nicht zoombedingt), '' = möglich. Reihenfolge: Schalter „nur Kerzen",
+ * keine Zeilengröße für den Zeitrahmen, nicht lineare Preisskala, sonst die Sperre (blocked, ggf. '').
+ */
+export function noFootprintReason(a: {
+  footprintOff: boolean;
+  rs: readonly number[];
+  tf: string;
+  scaleMode: PriceScaleMode;
+  blocked: string;
+}): string {
+  if (a.footprintOff) return FOOTPRINT_OFF_NOTE;
+  if (a.rs.length === 0) return `kein Footprint für ${a.tf} (keine Zeilengröße angeboten)`;
+  if (a.scaleMode !== PriceScaleMode.Normal) return 'Preisskala nicht linear – nur Kerzen';
+  return a.blocked;
+}
+
+/** High/Low Ratio nur mit eingeschaltetem Footprint (W-1: keine Werte aus noch gehaltenen Kacheln). */
+export function ratioAllowed(footprintOff: boolean): boolean {
+  return !footprintOff;
 }
