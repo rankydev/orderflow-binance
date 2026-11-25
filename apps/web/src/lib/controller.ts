@@ -74,6 +74,7 @@ import {
   CVD_UNALIGNED_NOTE,
   cvdAligned,
   highLowRatio,
+  ratioNotes,
   STATS_BOTTOM_PX,
   STATS_ROW_PX,
   StatsContext,
@@ -286,6 +287,8 @@ export class ChartController {
     this.chart.panes()[0]!.attachPrimitive(this.profile);
     // Stats-Grid: High/Low Ratio aus den Leveln der gezeichneten Zeilengröße
     this.statsCtx.hlRatio = (t) => {
+      // W-1: bei „nur Kerzen" keine Ratios aus noch gehaltenen Kacheln
+      if (this.footprintOff) return null;
       const hit = this.lookupBar(t);
       if (!hit) return null;
       const [tile, bi, w] = hit;
@@ -662,10 +665,13 @@ export class ChartController {
     if (o.footprint === this.footprintOff) {
       this.footprintOff = !o.footprint;
       if (this.footprintOff) {
+        // Gehaltene Kacheln bleiben bewusst im Cache (sofortige Rückkehr ohne Neuladen); sie werden wie
+        // bisher beim Symbol-/Zeitrahmenwechsel und über das LRU-Zellbudget (≤ 2 Mio. Zellen) freigegeben.
         this.fpQueue.cancelAll();
         this.wantedFp.clear();
       }
       this.evaluate();
+      this.refreshStats();
     }
     rc.mode = o.mode;
     rc.showPoc = o.poc;
@@ -726,8 +732,9 @@ export class ChartController {
     this.statsCtx.notes = {
       ...this.statsCtx.missingNotes(this.barsStats, this.bars.badColumns),
       ...(cvdAligned(offsetH, this.tfSec) ? {} : { cvd: CVD_UNALIGNED_NOTE }),
+      ...ratioNotes(this.footprintOff),
     };
-    this.statsCtx.rowSize = rowLabel(this.R, this.sym);
+    this.statsCtx.rowSize = this.footprintOff ? '' : rowLabel(this.R, this.sym);
     this.statsSeries.applyOptions({});
   }
 
@@ -1093,7 +1100,8 @@ export class ChartController {
     if (!n) return;
     const series = `${this.sym.name}|${this.tf}|${r}`;
     if (r !== this.R) this.counters.rChanges++;
-    this.statsCtx.rowSize = rowLabel(r, this.sym); // Ratios/Imbalances gelten für die gezeichnete Größe
+    // Ratios/Imbalances gelten für die gezeichnete Größe (bei „nur Kerzen" keine)
+    this.statsCtx.rowSize = this.footprintOff ? '' : rowLabel(r, this.sym);
     // W6: bis die sichtbaren Kacheln der neuen Größe da sind, zeichnet der Renderer fehlende Bars mit
     // der bisherigen Größe (gleicher tf) statt als Kerzen.
     if (this.rc.series !== series && this.rc.series.startsWith(`${this.sym.name}|${this.tf}|`)) {
@@ -1206,6 +1214,9 @@ export class ChartController {
           : this.blocked;
     if (this.noFootprint) {
       this.setMode('candle');
+      // kein alter Footprint-Hinweis; der Hinweis zu sehr vielen Bars gilt auch für Kerzen
+      const lr0 = this.logicalRange();
+      this.hint = candleHint(lr0 ? lr0.to - lr0.from : 0);
       this.ensureWindow();
       return;
     }
@@ -1248,8 +1259,8 @@ export class ChartController {
         this.hint = this.hint ? `${this.manualNote}; ${this.hint}` : this.manualNote;
       // K1/§7.3: mehr sichtbare Bars als das Kerzen-Fenster fasst → Hinweis statt leerer Fläche
       const lr = this.logicalRange();
-      if (lr && lr.to - lr.from > CANDLE_WINDOW_BARS)
-        this.hint = `Mehr als ${CANDLE_WINDOW_BARS} Bars sichtbar – größeren Zeitrahmen wählen`;
+      const ch = candleHint(lr ? lr.to - lr.from : 0);
+      if (ch) this.hint = ch;
       const fp = wantsFootprintMode(this.mode === 'footprint', { bs, rh, vc });
       this.setMode(fp ? 'footprint' : 'candle');
     }
@@ -1816,4 +1827,11 @@ export function tileRejectReason(body: string | undefined): string {
   } catch {
     return '';
   }
+}
+
+/** K1/§7.3: Hinweis, wenn mehr Bars sichtbar sind, als das Kerzen-Fenster fasst ('' sonst). */
+export function candleHint(visibleBars: number): string {
+  return visibleBars > CANDLE_WINDOW_BARS
+    ? `Mehr als ${CANDLE_WINDOW_BARS} Bars sichtbar – größeren Zeitrahmen wählen`
+    : '';
 }

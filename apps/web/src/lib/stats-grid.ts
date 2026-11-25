@@ -129,6 +129,14 @@ export const STAT_ROWS: readonly StatRowDef[] = [
   },
 ];
 
+/** Hinweis der Ratio-Zeilen bei ausgeschaltetem Footprint (keine Level, W-1). */
+export const RATIO_OFF_NOTE = '– (Footprint aus)';
+
+/** Hinweise der Ratio-Zeilen: bei „nur Kerzen" statt Werten (auch nicht aus noch gehaltenen Kacheln). */
+export function ratioNotes(footprintOff: boolean): Partial<Record<StatRow, string>> {
+  return footprintOff ? { hiRatio: RATIO_OFF_NOTE, loRatio: RATIO_OFF_NOTE } : {};
+}
+
 /** Standard: Volume, Delta, Delta %, CVD (ruhig; weitere Zeilen per Schalter). */
 export const STATS_DEFAULT_ROWS: readonly StatRow[] = ['vol', 'delta', 'deltaPct', 'cvd'];
 

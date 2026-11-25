@@ -32,8 +32,12 @@ import type { SymbolInfo } from '../types.ts';
 import { GestureTracker } from '../gesture.ts';
 import {
   clampScroll,
+  normalizeWheel,
+  pinchStep,
   priceAxisDrag,
+  priceSpanLimits,
   wheelIntent,
+  wheelPan,
   wheelZoomFactor,
   zoomColumnsAt,
 } from './interaction.ts';
@@ -157,7 +161,11 @@ export class TpoView {
   private readonly vpQueue: RequestQueue;
   private frameReq = 0;
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
-  private drag: { x: number; y: number } | null = null;
+  private drag: { x: number; y: number; id: number } | null = null;
+  /** aktive Zeiger (Maus/Finger) für Ziehen und Zwei-Finger-Pinch (W-5) */
+  private readonly pointers = new Map<number, { x: number; y: number }>();
+  /** Spanne der zuletzt eingepassten Daten (price_unit) für die Grenzen der Preisskalierung (W-4) */
+  private dataSpan = 0;
   private axisDrag = false;
   private hoverPos: { x: number; y: number } | null = null;
   private hoverReq = 0;
@@ -248,30 +256,60 @@ export class TpoView {
     };
     on('pointerdown', (e) => {
       const r = this.canvas.getBoundingClientRect();
-      // Ziehen auf der Preisachse (rechts) skaliert den Preis, in der Fläche wird verschoben
-      this.axisDrag = e.clientX - r.left > this.plotW();
-      this.drag = { x: e.clientX, y: e.clientY };
+      const pos = { x: e.clientX - r.left, y: e.clientY - r.top };
+      try {
+        this.canvas.setPointerCapture(e.pointerId);
+      } catch {
+        // Zeiger schon wieder weg (oder synthetisch): ohne Capture weiter, statt die Geste abzubrechen
+      }
+      // verlorene pointerups (Watchdog hat das Halten beendet): alte Zeiger vergessen
+      if (!this.tracker.held) this.pointers.clear();
+      // W-5: höchstens zwei Zeiger; der zweite startet einen Pinch, weitere werden ignoriert
+      if (this.pointers.size >= 2) return;
+      this.pointers.set(e.pointerId, pos);
       this.tracker.pointerDown();
-      this.canvas.setPointerCapture(e.pointerId);
+      if (this.pointers.size === 2) {
+        this.drag = null; // vom Ziehen zum Pinch: nicht springen
+        return;
+      }
+      // Ziehen auf der Preisachse (rechts) skaliert den Preis, in der Fläche wird verschoben
+      this.axisDrag = pos.x > this.plotW();
+      this.drag = { x: e.clientX, y: e.clientY, id: e.pointerId };
     });
     on('pointermove', (e) => {
-      if (this.drag) {
+      const known = this.pointers.get(e.pointerId);
+      if (known && this.pointers.size === 2) {
+        // Zwei-Finger-Pinch: Spaltenbreite um die Mitte
+        const r = this.canvas.getBoundingClientRect();
+        const now = { x: e.clientX - r.left, y: e.clientY - r.top };
+        const [ida, idb] = [...this.pointers.keys()];
+        const other = this.pointers.get(e.pointerId === ida ? idb! : ida!)!;
+        const st = pinchStep(known, other, now, other);
+        this.pointers.set(e.pointerId, now);
+        this.tracker.pointerMove(e.buttons || 1);
+        if (st.f !== 1) this.zoomColumns(st.f, st.x);
+        return;
+      }
+      if (this.drag && e.pointerId === this.drag.id) {
         // verlorenes pointerup: keine Taste mehr gedrückt → Ziehen beenden
         if (e.buttons === 0) {
           this.drag = null;
+          this.pointers.delete(e.pointerId);
           this.tracker.pointerUp();
           return;
         }
         const dx = e.clientX - this.drag.x;
         const dy = e.clientY - this.drag.y;
-        this.drag = { x: e.clientX, y: e.clientY };
+        this.drag = { x: e.clientX, y: e.clientY, id: e.pointerId };
         this.tracker.pointerMove(e.buttons);
         if (this.axisDrag) {
-          [this.pTop, this.pBot] = priceAxisDrag(this.pTop, this.pBot, dy);
+          const [lo, hi] = this.spanLimits();
+          [this.pTop, this.pBot] = priceAxisDrag(this.pTop, this.pBot, dy, lo, hi);
           this.schedule();
         } else this.pan(dx, dy);
         return;
       }
+      if (this.drag || this.pointers.size > 0) return; // fremder Zeiger während einer Geste
       const r = this.canvas.getBoundingClientRect();
       this.hoverPos = { x: e.clientX - r.left, y: e.clientY - r.top };
       if (!this.hoverReq)
@@ -280,9 +318,12 @@ export class TpoView {
           this.onHover?.(this.hoverText());
         });
     });
-    const up = () => {
-      this.drag = null;
-      this.tracker.pointerUp();
+    const up = (e?: PointerEvent) => {
+      if (e) this.pointers.delete(e.pointerId);
+      else this.pointers.clear();
+      // nach einem Pinch nicht mit dem verbleibenden Finger weiterziehen (kein Sprung)
+      if (!e || this.drag?.id === e.pointerId || this.pointers.size === 0) this.drag = null;
+      if (this.pointers.size === 0) this.tracker.pointerUp();
     };
     on('pointerup', up);
     on('pointercancel', up);
@@ -308,11 +349,13 @@ export class TpoView {
         e.preventDefault();
         const r = this.canvas.getBoundingClientRect();
         // wie die Chart-Seite: Rad/Pinch zoomt die Zeitachse (Spaltenbreite) um den Zeiger, waagrechtes
-        // Scrollen (Touchpad, Shift) verschiebt die Tage
-        if (wheelIntent(e) === 'pan') {
-          const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
-          this.pan(-d, 0);
-        } else this.zoomColumns(wheelZoomFactor(e.deltaY, e.ctrlKey), e.clientX - r.left);
+        // Scrollen (Touchpad, Shift) verschiebt die Tage; Deltas in Pixel (W-3: deltaMode Zeilen/Seiten)
+        const n = normalizeWheel(e, this.H || window.innerHeight);
+        const ev = { deltaX: n.deltaX, deltaY: n.deltaY, ctrlKey: e.ctrlKey, shiftKey: e.shiftKey };
+        if (wheelIntent(ev) === 'pan') {
+          const d = Math.abs(n.deltaX) > Math.abs(n.deltaY) ? n.deltaX : n.deltaY;
+          this.pan(wheelPan(d, this.plotW()), 0);
+        } else this.zoomColumns(wheelZoomFactor(n.deltaY, e.ctrlKey), e.clientX - r.left);
         this.tracker.wheel();
       },
       false,
@@ -440,6 +483,9 @@ export class TpoView {
     this.H = r.height;
     this.canvas.width = Math.round(r.width * dpr);
     this.canvas.height = Math.round(r.height * dpr);
+    // W-2: neue Breite → Verschiebung wieder in die Grenzen (sonst sind keine Tage sichtbar)
+    const b = this.dayBounds();
+    if (b) this.scrollPx = clampScroll(this.scrollPx, b[1] - b[0] + 1, this.colW, this.plotW());
     this.evaluate();
   }
 
@@ -454,7 +500,16 @@ export class TpoView {
     this.schedule();
   }
 
+  /** W-4: Grenzen der Preisspanne (≥ 20 Ticks, ≤ 20 × Datenspanne). */
+  private spanLimits(): [number, number] {
+    const s = this.host.sym();
+    return priceSpanLimits(s?.tickUnits ?? 1, this.dataSpan || this.pTop - this.pBot);
+  }
+
   zoomPrice(f: number, yCss: number): void {
+    const [lo, hi] = this.spanLimits();
+    const span = this.pTop - this.pBot;
+    f = Math.min(hi / span, Math.max(lo / span, f));
     const u = this.pTop - ((yCss - HEADER_H) / this.plotH()) * (this.pTop - this.pBot);
     this.pTop = u + (this.pTop - u) * f;
     this.pBot = u + (this.pBot - u) * f;
@@ -703,6 +758,7 @@ export class TpoView {
     }
     if (lo === Infinity) return;
     const m = (hi - lo) * 0.06 + s.tickRefUnits;
+    this.dataSpan = hi - lo;
     this.pTop = hi + m;
     this.pBot = lo - m;
     this.fitted = true;

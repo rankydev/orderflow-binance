@@ -50,17 +50,79 @@ export function wheelIntent(e: {
   return 'zoom';
 }
 
-/** Zoomfaktor der Spaltenbreite aus deltaY (nach oben = größer, wie die Chart-Seite). */
+/**
+ * Rad-Deltas in Pixel (W-3): deltaMode 1 = Zeilen (Firefox-Mausrad) → × 16 px, 2 = Seiten → × Höhe der
+ * Ansicht; 0 = Pixel bleibt.
+ */
+export function normalizeWheel(
+  e: { deltaX: number; deltaY: number; deltaMode: number },
+  pageH: number,
+): { deltaX: number; deltaY: number } {
+  const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? pageH : 1;
+  return { deltaX: e.deltaX * k, deltaY: e.deltaY * k };
+}
+
+/**
+ * Zoomfaktor der Spaltenbreite aus deltaY in Pixel (nach oben = größer, wie die Chart-Seite); je Ereignis
+ * auf [1/2, 2] begrenzt (sehr große Deltas springen sonst ins Extreme).
+ */
 export function wheelZoomFactor(deltaY: number, ctrlKey: boolean): number {
-  return Math.exp(-deltaY * (ctrlKey ? 0.01 : 0.002));
+  const f = Math.exp(-deltaY * (ctrlKey ? 0.01 : 0.002));
+  return Math.min(2, Math.max(0.5, f));
+}
+
+/** Waagrechte Verschiebung je Radereignis (px), begrenzt auf ± eine Zeichenflächenbreite. */
+export function wheelPan(delta: number, plotW: number): number {
+  return Math.max(-plotW, Math.min(plotW, -delta));
 }
 
 /**
  * Ziehen auf der Preisachse: nach oben = Preisbereich kleiner (Zeilen höher), um die Mitte; dy in px.
  * Liefert den neuen Bereich [top, bottom].
  */
-export function priceAxisDrag(pTop: number, pBot: number, dy: number): [number, number] {
-  const f = Math.exp(dy * 0.004);
+export function priceAxisDrag(
+  pTop: number,
+  pBot: number,
+  dy: number,
+  minSpan = 0,
+  maxSpan = Infinity,
+): [number, number] {
+  return scalePriceSpan(pTop, pBot, Math.exp(dy * 0.004), minSpan, maxSpan);
+}
+
+/**
+ * Preisbereich um die Mitte mit Faktor f skalieren, Spanne auf [minSpan, maxSpan] begrenzt (W-4: sonst
+ * schrumpft sie gegen 0 → Division durch 0 in der Preisabbildung und der Zeilengröße).
+ */
+export function scalePriceSpan(
+  pTop: number,
+  pBot: number,
+  f: number,
+  minSpan: number,
+  maxSpan: number,
+): [number, number] {
   const mid = (pTop + pBot) / 2;
-  return [mid + (pTop - mid) * f, mid + (pBot - mid) * f];
+  const span = Math.min(maxSpan, Math.max(minSpan, (pTop - pBot) * f));
+  return [mid + span / 2, mid - span / 2];
+}
+
+/** Grenzen der Preisspanne: ≥ 20 Ticks, ≤ 20 × Datenspanne der sichtbaren Tage (mind. 20 Ticks). */
+export function priceSpanLimits(tickUnits: number, dataSpan: number): [number, number] {
+  const lo = 20 * tickUnits;
+  return [lo, Math.max(lo, 20 * dataSpan)];
+}
+
+/**
+ * Zwei-Finger-Pinch (W-5): Faktor aus dem waagrechten Abstand der beiden Zeiger vorher/nachher (mind.
+ * 10 px, sonst 1) und der Anker in der Mitte.
+ */
+export function pinchStep(
+  a0: { x: number },
+  b0: { x: number },
+  a1: { x: number },
+  b1: { x: number },
+): { f: number; x: number } {
+  const d0 = Math.abs(a0.x - b0.x);
+  const d1 = Math.abs(a1.x - b1.x);
+  return { f: d0 >= 10 && d1 >= 10 ? d1 / d0 : 1, x: (a1.x + b1.x) / 2 };
 }
