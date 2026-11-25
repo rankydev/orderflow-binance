@@ -481,6 +481,9 @@ export class Importer {
     // anderen letzten aggId des Vortags klassifiziert wurde, wird in diesem Lauf mitgerechnet; ohne
     // Quelldateien wird er als veraltet (stale) markiert. Weiter als bis zur ersten unveränderten
     // Folgeminute ohne Kandidat reicht die Wirkung praktisch nie, daher endet die Kaskade dort.
+    // Obergrenze der Kaskade. Ein Tag jenseits davon (Tag 8) ist trotzdem nicht stillschweigend
+    // inkonsistent: der schreibende Lauf markiert jeden gespeicherten Folgetag mit geänderten
+    // Vortagseingaben in derselben Transaktion als stale (H-b), der nächste Lauf rechnet ihn neu.
     const MAX_CASCADE = 7;
     for (let k = 1; ; k++) {
       if (k > MAX_CASCADE) {

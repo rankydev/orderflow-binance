@@ -305,8 +305,20 @@ export class PostgresWriter implements DayWriter {
          -- nur Chunks mit unkomprimierten Zeilen: nicht komprimiert, oder teilweise (Status-Bit 8
          -- nach DML auf einem Columnstore-Chunk, in 2.31 auf orderflow_test geprüft; is_compressed
          -- bleibt dabei true). Bereits vollständig komprimierte Chunks nicht erneut anfassen.
+         -- Eingefrorene (Bit 4) und OSM-Chunks (Tiered Storage) nie anfassen.
          AND (NOT c.is_compressed OR (k.status & 8) <> 0)
+         AND (k.status & 4) = 0 AND NOT k.osm_chunk
        ORDER BY c.range_start`;
+    // Unbekannte Status-Bits melden (bekannt in 2.31: 1 komprimiert, 2 ungeordnet, 4 eingefroren,
+    // 8 teilweise); eine neue Bedeutung soll auffallen, statt still falsch behandelt zu werden.
+    const odd = await this.db`
+      SELECT relid::regclass::text AS c, status FROM _timescaledb_catalog.chunk
+       WHERE (status & ~15) <> 0`;
+    for (const o of odd) {
+      this.opt.log?.(
+        `WARNUNG: Chunk ${o.c as string} hat unbekannte Status-Bits ${o.status as number}`,
+      );
+    }
     for (const c of chunks) {
       await this.db.unsafe(
         'CALL convert_to_columnstore($1::regclass, if_not_columnstore => true, recompress => true)',
