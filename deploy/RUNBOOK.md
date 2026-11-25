@@ -193,7 +193,7 @@ CSP-Fehler, Kacheln laden, kein 429 beim Schwenken).
 | CPU (2 vCPU geteilt)                                           | `cpus` 1.5 / 1.0, parallele Worker begrenzt; Prüfbericht/Restore sind kurz                                                                     |
 | Offene Ports (UFW aus)                                         | alle Docker-Ports an 127.0.0.1; Postcheck prüft das                                                                                            |
 | nginx-Reload trifft alle Sites                                 | vorher immer `nginx -t`, bei Fehler eigene Dateien zurück und kein Reload; kein Neustart; Master-PID im Postcheck                              |
-| Standardserver kippt                                           | kein `default_server`, kein server-Block in conf.d, Dateiname sortiert nach genius; Postcheck prüft unbekannten Host                           |
+| Standardserver kippt                                           | kein `default_server`, kein server-Block in conf.d, Symlink `zz-orderflow.rankyhub.com` sortiert zuletzt; Postcheck prüft unbekannten Host                           |
 | HTTP/2 oder Socket-Optionen ändern Nachbarn                    | bewusst nicht gesetzt (Entscheidung offen)                                                                                                     |
 | certbot fasst andere Zertifikate an                            | nur `certonly --cert-name orderflow…`, Webroot, Deploy-Hook in der eigenen Renewal-Datei; Postcheck vergleicht Renewal-Dateien und Ablaufdaten |
 | Docker-Namenskonflikte                                         | eigener Projektname, Präfix `orderflow-` für Container/Netz/Volume; Preflight prüft                                                            |

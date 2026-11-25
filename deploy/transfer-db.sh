@@ -109,17 +109,19 @@ cd "$1" && sha256sum --quiet -c SHA256SUMS && echo "SHA256SUMS ok ($(wc -l < SHA
 EOF
 log "Upload + Prüfung: $(( $(date +%s) - t0 )) s"
 
+# Quellbericht abwarten und den Snapshot der Mac-DB sofort freigeben (nicht erst nach dem Restore)
+wait "$SRC_PID" || { cat "$WORK/report-source.err" >&2; die "Prüfbericht der Quelle fehlgeschlagen"; }
+release_snapshot
+trap - EXIT
+# Planungszustand der Anwendungs-Jobs (wie restore-db.sh am Ende für das Ziel)
+src_psql -c "SELECT 'jobsched|' || job_id || '|' || scheduled FROM timescaledb_information.jobs WHERE job_id >= 1000 ORDER BY job_id" >> "$WORK/report-source.txt"
+
 log "5/7 Restore auf dem Server (Ziel muss leer sein${REPLACE:+, --replace})"
 remote "$SRV_ROOT" "/transfer/$NAME" "$REPLACE" <<'EOF' > "$WORK/report-target.txt"
 set -euo pipefail
 "$1/bin/restore-db.sh" --container orderflow-db --dump "$2" --sql-dir "$1/sql" $3
 EOF
 
-wait "$SRC_PID" || { cat "$WORK/report-source.err" >&2; die "Prüfbericht der Quelle fehlgeschlagen"; }
-release_snapshot
-trap - EXIT
-# Planungszustand der Anwendungs-Jobs (wie restore-db.sh am Ende für das Ziel)
-src_psql -c "SELECT 'jobsched|' || job_id || '|' || scheduled FROM timescaledb_information.jobs WHERE job_id >= 1000 ORDER BY job_id" >> "$WORK/report-source.txt"
 
 log "6/7 Vergleich Quelle ↔ Ziel (Pflicht)"
 if ! diff <(grep -v '^info|' "$WORK/report-source.txt") <(grep -v '^info|' "$WORK/report-target.txt") > "$WORK/report.diff"; then

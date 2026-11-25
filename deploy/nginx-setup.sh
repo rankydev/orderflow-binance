@@ -80,6 +80,15 @@ undo() {
   nginx -t || true
   exit 1
 }
+# Konto-Prüfung vor jeder Änderung an nginx (nur nötig, solange das Zertifikat fehlt)
+if [ ! -f "$CERT" ]; then
+  # Vorhandenes Let's-Encrypt-Konto des Servers (keine neue Registrierung, keine neuen AGB): das
+  # Konto, das die Renewal-Dateien der Nachbarn nutzen – ausdrücklich per --account (mit mehreren
+  # Konten fragte certbot sonst nach und brach mit --non-interactive ab).
+  acct=$(sed -n 's/^account = //p' /etc/letsencrypt/renewal/*.conf | sort -u)
+  [ "$(printf '%s\n' "$acct" | grep -c .)" = 1 ] || { say "Renewal-Dateien nutzen nicht genau ein Konto: $acct"; exit 1; }
+  [ -d "/etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory/$acct" ] || { say "Konto $acct fehlt"; exit 1; }
+fi
 install -m 644 "$S/orderflow-binance-http.conf" /etc/nginx/conf.d/orderflow-binance.conf
 install -m 644 "$S/orderflow-binance-headers.conf" /etc/nginx/snippets/orderflow-binance-headers.conf
 install -m 644 "$S/orderflow-binance-proxy.conf" /etc/nginx/snippets/orderflow-binance-proxy.conf
@@ -98,12 +107,6 @@ if [ ! -f "$CERT" ]; then
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://orderflow.rankyhub.com/.well-known/acme-challenge/$probe")
   rm -f "/var/www/orderflow-acme/.well-known/acme-challenge/$probe"
   [ "$code" = 200 ] || { say "Challenge-Pfad liefert $code statt 200"; exit 1; }
-  # Vorhandenes Let's-Encrypt-Konto des Servers (keine neue Registrierung, keine neuen AGB): das
-  # Konto, das die Renewal-Dateien der Nachbarn nutzen – ausdrücklich per --account (mit mehreren
-  # Konten fragte certbot sonst nach und brach mit --non-interactive ab).
-  acct=$(sed -n 's/^account = //p' /etc/letsencrypt/renewal/*.conf | sort -u)
-  [ "$(printf '%s\n' "$acct" | grep -c .)" = 1 ] || { say "Renewal-Dateien nutzen nicht genau ein Konto: $acct"; exit 1; }
-  [ -d "/etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory/$acct" ] || { say "Konto $acct fehlt"; exit 1; }
   # deploy-hook nur für diese Lineage (steht in renewal/orderflow.rankyhub.com.conf)
   certbot certonly --account "$acct" --webroot -w /var/www/orderflow-acme -d orderflow.rankyhub.com \
     --cert-name orderflow.rankyhub.com --non-interactive --keep-until-expiring \

@@ -13,6 +13,10 @@ for c in orderflow-db orderflow-api; do
   h=$(health "$c")
   [ "$h" = healthy ] || reasons+=("$c: $h")
 done
+# Columnstore-Policies (Jobs ≥ 1000) müssen geplant sein (restore-db.sh pausiert sie nur kurz)
+off=$(docker exec orderflow-db psql -X -At -U of_admin -d orderflow -c "SELECT string_agg(job_id::text, ',') FROM timescaledb_information.jobs WHERE job_id >= 1000 AND NOT scheduled" 2>/dev/null) \
+  || off="query failed"
+[ -z "$off" ] || reasons+=("policy jobs not scheduled: $off")
 # Detail-Health der API (Loopback-Listener im Container; PRÜFEN nach API-Review: Port/Pfad)
 if ! docker exec orderflow-api node -e "fetch('http://127.0.0.1:8781/health').then(r=>process.exit(r.status===200?0:1),()=>process.exit(1))" 2>/dev/null; then
   reasons+=("api health != 200")

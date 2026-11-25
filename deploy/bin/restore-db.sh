@@ -79,9 +79,11 @@ say "pg_restore fertig in $(( $(date +%s) - t0 )) s"
 # Columnstore-Policies bis nach dem Prüfbericht anhalten (noch im Restore-Modus, also bevor der
 # Scheduler startet): ein Job zwischen Restore und Bericht änderte sonst chunks|-Zeilen.
 paused=$(psql_c -d "$DB" -c "SELECT string_agg(id::text, ' ' ORDER BY id) FROM _timescaledb_config.bgw_job WHERE id >= 1000 AND scheduled")
-for j in $paused; do psql_c -d "$DB" -c "SELECT alter_job($j, scheduled => false)" >/dev/null; done
-resume() { for j in $paused; do psql_c -d "$DB" -c "SELECT alter_job($j, scheduled => true)" >/dev/null; done; }
+# Trap VOR der Schleife: scheitert ein alter_job mittendrin, werden die bereits angehaltenen Jobs
+# beim Abbruch wieder eingeschaltet (|| true: jeden Job versuchen).
+resume() { for j in $paused; do psql_c -d "$DB" -c "SELECT alter_job($j, scheduled => true)" >/dev/null || true; done; }
 trap resume EXIT
+for j in $paused; do psql_c -d "$DB" -c "SELECT alter_job($j, scheduled => false)" >/dev/null; done
 say "Policies angehalten: ${paused:-keine}"
 psql_c -d "$DB" < "$SQL_DIR/post-restore.sql" >/dev/null
 say "ANALYZE"
