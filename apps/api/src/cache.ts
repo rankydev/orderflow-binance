@@ -83,36 +83,30 @@ export class ResponseCache {
     for (const [k, v] of this.tmp) if (ResponseCache.expired(v, now)) this.drop(this.tmp, k, v);
   }
 
+  /**
+   * Feste Aufteilung (Review W-1 Pass 3): nicht finale Einträge haben einen eigenen Bereich
+   * (nonFinalShare · maxBytes), finale den Rest. Jeder Bereich verdrängt nur seine eigenen ältesten
+   * Einträge – ein Cache voller finaler Kacheln lässt also immer Platz für den laufenden Tag.
+   */
   set(key: string, e: CachedResponse): void {
     const sz = ResponseCache.size(e);
-    if (sz > this.maxBytes / 4) return; // einzelne Riesenantworten verdrängen nicht den ganzen Cache
     for (const m of [this.fin, this.tmp]) {
       const old = m.get(key);
       if (old) this.drop(m, key, old);
     }
     this.sweep();
     const temporary = e.expiresAt != null;
-    if (temporary) {
-      if (sz > this.maxBytes * this.nonFinalShare) return;
-      this.tmp.set(key, e);
-      this.tmpBytes += sz;
-      // Anteil begrenzen: älteste nicht finale zuerst
-      for (const [k, v] of this.tmp) {
-        if (this.tmpBytes <= this.maxBytes * this.nonFinalShare) break;
-        this.drop(this.tmp, k, v);
-      }
-    } else {
-      this.fin.set(key, e);
-      this.finBytes += sz;
-    }
-    // Gesamtgrenze: erst nicht finale, dann finale verdrängen
-    for (const [k, v] of this.tmp) {
-      if (this.finBytes + this.tmpBytes <= this.maxBytes) break;
-      this.drop(this.tmp, k, v);
-    }
-    for (const [k, v] of this.fin) {
-      if (this.finBytes + this.tmpBytes <= this.maxBytes) break;
-      this.drop(this.fin, k, v);
+    const tmpBudget = this.maxBytes * this.nonFinalShare;
+    const finBudget = this.maxBytes - tmpBudget;
+    const m = temporary ? this.tmp : this.fin;
+    const budget = temporary ? tmpBudget : finBudget;
+    if (sz > budget / 4) return; // einzelne Riesenantworten verdrängen nicht den ganzen Bereich
+    m.set(key, e);
+    if (temporary) this.tmpBytes += sz;
+    else this.finBytes += sz;
+    for (const [k, v] of m) {
+      if ((temporary ? this.tmpBytes : this.finBytes) <= budget) break;
+      this.drop(m, k, v);
     }
   }
 

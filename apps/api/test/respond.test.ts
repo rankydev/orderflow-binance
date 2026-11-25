@@ -198,6 +198,36 @@ describe('ResponseCache: final und nicht final getrennt', () => {
     expect(c.has('t0')).toBe(false);
   });
 
+  it('Cache voller finaler Einträge: ein nicht finaler Eintrag bleibt und ist ein Treffer (Review W-1)', () => {
+    // Nachstellung des Befunds: 1 MB, 98 finale à 10 kB, dann 20 nicht finale → vorher 0 gespeichert
+    const c = new ResponseCache(1_000_000);
+    for (let i = 0; i < 98; i++) c.set(`f${i}`, e(10_000, null));
+    for (let i = 0; i < 20; i++) c.set(`t${i}`, e(5_000, 60_000));
+    expect(c.stats().nonFinalEntries).toBe(20);
+    expect(c.get('t19')).toBeDefined();
+    expect(c.get('t0')).toBeDefined();
+    expect(c.stats().bytes).toBeLessThanOrEqual(1_000_000);
+    // finale verdrängen nur finale
+    for (let i = 98; i < 200; i++) c.set(`f${i}`, e(10_000, null));
+    expect(c.stats().nonFinalEntries).toBe(20);
+    expect(c.get('t5')).toBeDefined();
+  });
+
+  it('serveVersioned: bei vollem finalem Bereich kommt der laufende Tag beim zweiten Mal aus dem Cache', async () => {
+    const d = deps();
+    for (let i = 0; i < 200; i++) d.cache.set(`f${i}`, { ...e(10_000, null) });
+    let calls = 0;
+    const compute = async () => {
+      calls++;
+      return resp('N');
+    };
+    await serveVersioned(d, req(), rep(), 'newest', { dataVersion: 'N', final: false }, compute);
+    const q = req();
+    await serveVersioned(d, q, rep(), 'newest', { dataVersion: 'N', final: false }, compute);
+    expect(calls).toBe(1);
+    expect(q.ctx.cache).toBe('hit');
+  });
+
   it('abgelaufene nicht finale Einträge werden beim Einfügen weggeräumt', () => {
     const c = new ResponseCache(1_000_000);
     c.set('old', e(1_000, -1));

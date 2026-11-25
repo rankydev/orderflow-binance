@@ -337,7 +337,7 @@ describe('versionOf', () => {
 
 describe('ResponseCache', () => {
   it('LRU mit Byte-Grenze; Riesenantworten werden nicht gecacht', () => {
-    const c = new ResponseCache(10_000);
+    const c = new ResponseCache(13_334); // finaler Bereich 10 000 B (75 %);
     const e = (n: number) => ({
       body: Buffer.alloc(n),
       gzip: null,
