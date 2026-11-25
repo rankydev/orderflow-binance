@@ -1,4 +1,5 @@
 import { isLocalHost, type DbConfig } from '@orderflow/core';
+import { isProductionDatabase, PRODUCTION_MARKER } from './guard.ts';
 import { connect, type Sql } from './connection.ts';
 import {
   loadMigrations,
@@ -116,6 +117,10 @@ export async function dropAndCreateDatabase(cfg: DbConfig): Promise<void> {
   }
   const admin = connect(cfg, 'postgres');
   try {
+    if (await isProductionDatabase(admin, cfg.database))
+      throw new Error(
+        `reset verweigert: Datenbank "${cfg.database}" trägt den Produktionsmarker (${PRODUCTION_MARKER})`,
+      );
     await admin`DROP DATABASE IF EXISTS ${admin(cfg.database)} WITH (FORCE)`;
     await admin`CREATE DATABASE ${admin(cfg.database)}`;
   } finally {

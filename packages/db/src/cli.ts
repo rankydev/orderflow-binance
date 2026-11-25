@@ -1,6 +1,10 @@
-// Aufruf: node --env-file-if-exists=.env packages/db/src/cli.ts <up|down [n|all]|status|reset --yes>
+// Aufruf: node --env-file-if-exists=.env packages/db/src/cli.ts
+//   <up | status | reset --yes | down [n|all] --yes [--destroy-data]>
+// reset und down verweigern eine Datenbank mit Produktionsmarker (guard.ts); down verlangt immer
+// --yes und bei vorhandenen Tagesdaten (data_day) zusätzlich --destroy-data.
 import { isLocalHost, parseConfig } from '@orderflow/core';
 import { connect } from './connection.ts';
+import { isProductionDatabase, PRODUCTION_MARKER } from './guard.ts';
 import {
   dropAndCreateDatabase,
   ensureDatabase,
@@ -12,11 +16,13 @@ import {
 const log = (m: string) => console.log(m);
 
 async function main(argv: string[]): Promise<number> {
-  const [cmd, arg] = argv;
+  const [cmd, ...rest] = argv;
+  const flags = new Set(rest.filter((a) => a.startsWith('--')));
+  const arg = rest.find((a) => !a.startsWith('--'));
   const cfg = parseConfig(process.env);
 
   if (cmd === 'reset') {
-    if (arg !== '--yes') {
+    if (!flags.has('--yes')) {
       console.error(
         'reset löscht die Datenbank "' +
           cfg.db.database +
@@ -30,7 +36,9 @@ async function main(argv: string[]): Promise<number> {
     // Lokal legt das Werkzeug eine fehlende Datenbank an; auf fremden Hosts nie.
     if (isLocalHost(cfg.db.host)) await ensureDatabase(cfg.db);
   } else {
-    console.error('Verwendung: cli.ts <up | down [n|all] | status | reset --yes>');
+    console.error(
+      'Verwendung: cli.ts <up | status | reset --yes | down [n|all] --yes [--destroy-data]>',
+    );
     return 1;
   }
 
@@ -39,6 +47,26 @@ async function main(argv: string[]): Promise<number> {
     if (cmd === 'reset' || cmd === 'up') {
       await migrateUp(sql, undefined, log);
     } else if (cmd === 'down') {
+      if (!flags.has('--yes')) {
+        console.error('down entfernt Tabellen/Spalten. Zum Bestätigen: down [n|all] --yes');
+        return 1;
+      }
+      if (await isProductionDatabase(sql, cfg.db.database)) {
+        console.error(
+          `down verweigert: Datenbank "${cfg.db.database}" trägt den Produktionsmarker (${PRODUCTION_MARKER})`,
+        );
+        return 1;
+      }
+      const [dd] = await sql`SELECT to_regclass('public.data_day') IS NOT NULL AS t`;
+      if (dd!.t && !flags.has('--destroy-data')) {
+        const [n] = await sql`SELECT EXISTS (SELECT 1 FROM data_day) AS any`;
+        if (n!.any) {
+          console.error(
+            'down verweigert: data_day enthält Tage. Nur mit --destroy-data (Daten gehen verloren).',
+          );
+          return 1;
+        }
+      }
       const steps = arg === 'all' ? 'all' : arg === undefined ? 1 : Number(arg);
       if (steps !== 'all' && (!Number.isInteger(steps) || steps < 1)) {
         console.error('down erwartet eine positive Zahl oder "all"');
