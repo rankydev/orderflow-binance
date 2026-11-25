@@ -46,6 +46,7 @@ import {
   generate,
   LAST_DAY,
   MINUTE_MS,
+  klineTrades,
   OUTLIER_MS,
   PROVISIONAL_DAY,
   seed,
@@ -1450,5 +1451,120 @@ describe('Inkonsistente Snapshots (Review Pass 4: „Bar ohne Level")', () => {
       await restore();
       await api.close();
     }
+  });
+});
+
+describe('Stats-Spalten (x.trades, x.maxDelta, x.minDelta, x.cotHigh, x.cotLow)', () => {
+  let api: RunningApi;
+  beforeAll(async () => {
+    api = await start();
+  });
+  afterAll(async () => api?.close());
+
+  /** Brute Force je Bar aus bar_1m (unabhängig von composeBars formuliert, KONZEPT §3.5). */
+  function brute(tfSec: number, from: number, to: number) {
+    const out = new Map<
+      number,
+      { trades: number; maxD: number; minD: number; cotH: number; cotL: number }
+    >();
+    const groups = new Map<number, Bar[]>();
+    for (const b of data.bars1m) {
+      if (b.ts < from || b.ts >= to) continue;
+      const k = b.ts - (b.ts % (tfSec * 1000));
+      (groups.get(k) ?? groups.set(k, []).get(k)!).push(b);
+    }
+    for (const [k, ms] of groups) {
+      let p = 0;
+      let maxD = -Infinity;
+      let minD = Infinity;
+      const low = Math.min(...ms.map((m) => m.low));
+      const high = Math.max(...ms.map((m) => m.high));
+      const d = ms.map((m) => m.buyQ - m.sellQ);
+      ms.forEach((m, i) => {
+        maxD = Math.max(maxD, p + m.runMax);
+        minD = Math.min(minD, p + m.runMin);
+        p += d[i]!;
+      });
+      const jl = ms.findIndex((m) => m.low === low);
+      const jh = ms.findIndex((m) => m.high === high);
+      const after = (j: number) => d.slice(j + 1).reduce((a, b) => a + b, 0);
+      out.set(k / 1000, {
+        trades: ms.reduce((a, m) => a + klineTrades(m), 0),
+        maxD,
+        minD,
+        cotH: ms[jl]!.dFromLow + after(jl),
+        cotL: ms[jh]!.dFromHigh + after(jh),
+      });
+    }
+    return out;
+  }
+
+  it('/bars?stats=1: jede Spalte = Brute Force aus bar_1m, für jeden Zeitrahmen', async () => {
+    let checked = 0;
+    for (const [tf, tfSec] of Object.entries(TIMEFRAMES)) {
+      const span = 1000 * tfSec * 1000;
+      for (let c = Math.floor(dataFrom / span); c * span < dataTo; c++) {
+        const from = c * span;
+        const to = from + span;
+        const r = await get(api, `/api/v1/bars?sym=BTCUSDT&tf=${tf}&from=${from}&to=${to}&stats=1`);
+        expect(r.res.status, `${tf} ${c}`).toBe(200);
+        const dec = decodeTile(r.buf);
+        const x = dec.extra!;
+        const ref = brute(tfSec, from, to);
+        expect(dec.header.nBars).toBe(ref.size);
+        const withTrades = 'x.trades' in x;
+        // x.trades nur, wo billig (≤ 100 000 geschätzte kline-Zeilen, Schätzung aus den Tagen mit
+        // Daten): die 6 Testtage liegen überall darunter
+        expect(withTrades, tf).toBe(true);
+        for (let i = 0; i < dec.header.nBars; i++) {
+          const e = ref.get(dec.bars.time[i]!)!;
+          expect(
+            [x['x.maxDelta']![i], x['x.minDelta']![i], x['x.cotHigh']![i], x['x.cotLow']![i]],
+            `${tf} t=${dec.bars.time[i]}`,
+          ).toEqual([e.maxD, e.minD, e.cotH, e.cotL]);
+          if (withTrades) expect(x['x.trades']![i]).toBe(e.trades);
+          checked++;
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(9_000);
+  }, 120_000);
+
+  it('Footprint ?stats=1: gleiche Spalten wie /bars; ohne stats keine x.-Spalten (bestehende Clients)', async () => {
+    const s = ((await get(api, '/api/v1/symbols')).json().symbols as SymJson[])[0]!;
+    for (const [tf, R] of [
+      ['1m', '10'],
+      ['5m', '100'],
+      ['1h', '1000'],
+      ['1d', '1000'],
+    ] as const) {
+      const n = s.tiles[tf]![R]!;
+      const tfSec = TIMEFRAMES[tf];
+      const k = Math.floor((dataFrom + DAY_MS) / (n * tfSec * 1000));
+      const base = `/api/v1/footprint?sym=BTCUSDT&tf=${tf}&R=${R}&tile=${k}&cfg=${s.tileConfigVersion}`;
+      const plain = decodeTile((await get(api, base)).buf);
+      expect(plain.extra).toBeUndefined();
+      const st = await get(api, `${base}&stats=1`);
+      expect(st.res.status).toBe(200);
+      const dec = decodeTile(st.buf);
+      expect(dec.header.dataVersion).not.toBe(plain.header.dataVersion);
+      expect(Array.from(dec.bars.time)).toEqual(Array.from(plain.bars.time));
+      const ref = brute(tfSec, dec.header.from, dec.header.to);
+      for (let i = 0; i < dec.header.nBars; i++) {
+        const e = ref.get(dec.bars.time[i]!)!;
+        expect([
+          dec.extra!['x.maxDelta']![i],
+          dec.extra!['x.cotHigh']![i],
+          dec.extra!['x.cotLow']![i],
+        ]).toEqual([e.maxD, e.cotH, e.cotL]);
+      }
+      // Größe: 36 B je Bar zusätzlich (4 × f64 + i32), Level unverändert
+      expect(st.buf.length - (await get(api, base)).buf.length).toBeLessThanOrEqual(
+        dec.header.nBars * 40 + 256,
+      );
+    }
+    expect(
+      (await get(api, `/api/v1/bars?sym=BTCUSDT&tf=1m&from=0&to=60000&stats=2`)).res.status,
+    ).toBe(400);
   });
 });

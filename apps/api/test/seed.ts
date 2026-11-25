@@ -127,6 +127,11 @@ export function generate(): Seeded {
 
 const iso = (ms: number) => new Date(ms).toISOString();
 
+/** Trade-Anzahl der Kline einer Minute (synthetisch, deterministisch, ≠ aggTrade-Anzahl). */
+export function klineTrades(b: Bar): number {
+  return b.buyA + b.sellA + ((b.ts / 60_000) % 7);
+}
+
 function fpJson(t: FpTable): string {
   const rows: string[] = [];
   for (let i = 0; i < t.n; i++)
@@ -184,6 +189,26 @@ export async function seed(admin: Sql, s: Seeded): Promise<void> {
       [barJson(bars, t === 'bar_1m')],
     );
   }
+  // Kline-Referenz (Binance-Trade-Anzahl je Minute) für x.trades: je Bar-Minute eine Zeile
+  await admin.unsafe(
+    `INSERT INTO kline_1m SELECT * FROM json_populate_recordset(NULL::kline_1m, ($1::text)::json)`,
+    [
+      JSON.stringify(
+        s.bars1m.map((b) => ({
+          sym_id: SYM_ID,
+          ts: iso(b.ts),
+          open_px: b.open,
+          high_px: b.high,
+          low_px: b.low,
+          close_px: b.close,
+          vol: b.buyQ + b.sellQ,
+          taker_buy: b.buyQ,
+          trades: klineTrades(b),
+          quote_vol_n: b.notional.toString(),
+        })),
+      ),
+    ],
+  );
   for (let d = FIRST_DAY; d <= LAST_DAY; d++) {
     const state = d === BAD_DAY ? 'final_bad' : d === PROVISIONAL_DAY ? 'provisional' : 'final_ok';
     const day = iso(d * DAY_MS).slice(0, 10);

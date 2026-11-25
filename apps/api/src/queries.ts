@@ -164,6 +164,71 @@ export async function queryBars(
   return out;
 }
 
+/** Teilbar einer Bar-Tabelle mit den Komposita-Komponenten (KONZEPT §3.5), Eingabe für composeBars. */
+export interface SubBar {
+  ts: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  buyQ: number;
+  sellQ: number;
+  buyA: number;
+  sellA: number;
+  runMax: number;
+  runMin: number;
+  dFromLow: number;
+  dFromHigh: number;
+}
+
+/** Zeilen einer Bar-Tabelle in [from, to), nach ts, mit run_max/run_min/d_from_low/d_from_high. */
+export async function querySubBars(
+  tx: ReadTx,
+  symId: number,
+  table: BarTable,
+  from: number,
+  to: number,
+): Promise<SubBar[]> {
+  const t = barTable(table);
+  const rows = await tx.rows(
+    `SELECT extract(epoch from ts)::int8 * 1000, open_px, high_px, low_px, close_px, buy_q, sell_q,
+            buy_a, sell_a, run_max, run_min, d_from_low, d_from_high
+       FROM ${t} WHERE sym_id = $1 AND ts >= ${tsLit(from)} AND ts < ${tsLit(to)} ORDER BY ts`,
+    [symId],
+  );
+  return rows.map((r) => ({
+    ts: int(r[0]),
+    open: int(r[1]),
+    high: int(r[2]),
+    low: int(r[3]),
+    close: int(r[4]),
+    buyQ: int(r[5]),
+    sellQ: int(r[6]),
+    buyA: int(r[7]),
+    sellA: int(r[8]),
+    runMax: int(r[9]),
+    runMin: int(r[10]),
+    dFromLow: int(r[11]),
+    dFromHigh: int(r[12]),
+  }));
+}
+
+/** Σ kline_1m.trades je Bar-Beginn (s) des Zeitrahmens tfSec in [from, to). */
+export async function queryTrades(
+  tx: ReadTx,
+  symId: number,
+  tfSec: number,
+  from: number,
+  to: number,
+): Promise<Map<number, number>> {
+  const rows = await tx.rows(
+    `SELECT extract(epoch from time_bucket(${intervalLit(tfSec)}, ts))::int8, sum(trades)::int8
+       FROM kline_1m WHERE sym_id = $1 AND ts >= ${tsLit(from)} AND ts < ${tsLit(to)} GROUP BY 1`,
+    [symId],
+  );
+  return new Map(rows.map((r) => [int(r[0]), int(r[1])]));
+}
+
 export interface LevelRows {
   /** Bar-Beginn (s) je Level, aufsteigend; innerhalb eines Bars Zeilen aufsteigend. */
   time: number[];

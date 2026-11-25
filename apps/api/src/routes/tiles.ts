@@ -16,14 +16,19 @@ import { etagOfBody, makeResponse, send, acceptsGzip } from '../http.ts';
 import { checkRange, MAX_TIME_MS, Params, SYMBOL_RE } from '../params.ts';
 import { barTableFor, coveredDays, estimateRows } from '../plan.ts';
 import { allImmutable, checkTile } from '../consistency.ts';
+import type { ReadTx } from '../db.ts';
+import type { BarTable } from '../plan.ts';
 import {
   lockSnapshot,
   queryBars,
   queryLevels,
+  querySubBars,
+  queryTrades,
   readDays,
   type BarRows,
   type LevelRows,
 } from '../queries.ts';
+import { statsColumns, TRADES_MAX_ROWS } from '../stats.ts';
 import { versionOf } from '../versions.ts';
 
 export const SYMBOLS_SCHEMA = 2;
@@ -87,6 +92,28 @@ export function levelColumns(bars: BarRows, lv: LevelRows): LevelColumns {
   };
 }
 
+/** x.trades nur, wenn die kline_1m-Zeilen des Zeitraums billig sind (Schätzung wie bar_1m). */
+function tradesCheap(s: SymbolState, from: number, to: number): boolean {
+  return estimateRows('bar_1m', from, to, rowsOnFor(s)) <= TRADES_MAX_ROWS;
+}
+
+/** Stats-Spalten (stats.ts) aus den Teilbars derselben Bar-Tabelle, im selben Snapshot. */
+async function readStats(
+  tx: ReadTx,
+  symId: number,
+  table: BarTable,
+  tfSec: number,
+  from: number,
+  to: number,
+  bars: BarRows,
+  trades: boolean,
+  o: { immutable: boolean; where: Record<string, unknown> },
+): Promise<Record<string, Int32Array | Float64Array>> {
+  const sub = await querySubBars(tx, symId, table, from, to);
+  const tr = trades ? await queryTrades(tx, symId, tfSec, from, to) : null;
+  return statsColumns(bars, sub, tfSec, tr, o.immutable, o.where);
+}
+
 /** Sicht ohne Kopie. */
 const asBuffer = (u8: Uint8Array) => Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength);
 
@@ -122,6 +149,7 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     const tf = p.tf();
     const from = p.int('from', 0, MAX_TIME_MS);
     const to = p.int('to', 0, MAX_TIME_MS);
+    const withStats = p.int('stats', 0, 1, 0) === 1;
     p.done();
     const s = requireSymbol(deps, symName);
     const tfSec = TIMEFRAMES[tf];
@@ -129,7 +157,7 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     if ((to - from) / (tfSec * 1000) > MAX_BARS_PER_REQUEST)
       throw badRequest(`höchstens ${MAX_BARS_PER_REQUEST} Bars je Anfrage`);
     const [d0, d1] = coveredDays(from, to);
-    const parts = ['bars', s.name, tf, from, to];
+    const parts = ['bars', s.name, tf, from, to, withStats ? 'stats' : ''];
     const pre = versionOf(parts, d0, d1, (d) => s.days.get(d));
     const table = barTableFor(tfSec / 60);
     req.ctx.src = table;
@@ -137,13 +165,23 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     req.ctx.rowsEstimate = est;
     if (est > deps.cfg.maxSourceRows)
       throw unprocessable(`Bereich zu groß (≈ ${est} Quellzeilen > ${deps.cfg.maxSourceRows})`);
-    const key = `bars|${s.name}|${tf}|${from}|${to}`;
+    const key = `bars|${s.name}|${tf}|${from}|${to}|${withStats ? 1 : 0}`;
+    const trades = withStats && tradesCheap(s, from, to);
     return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
-      const { days, bars } = await guardedRead(deps, ctx, async (tx) => {
-        await lockSnapshot(tx, s.symId, [{ table, from, to }]);
+      const { days, bars, extra } = await guardedRead(deps, ctx, async (tx) => {
+        await lockSnapshot(tx, s.symId, [
+          { table, from, to },
+          ...(trades ? [{ table: 'kline_1m' as const, from, to }] : []),
+        ]);
         const days = await readDays(tx, s.symId, d0, d1);
         const bars = await queryBars(tx, s.symId, table, tfSec, from, to);
-        return { days, bars };
+        const extra = withStats
+          ? await readStats(tx, s.symId, table, tfSec, from, to, bars, trades, {
+              immutable: allImmutable(days, d0, d1),
+              where: { sym: s.name, d0, d1, tf },
+            })
+          : undefined;
+        return { days, bars, extra };
       });
       const ver = versionOf(parts, d0, d1, (d) => days.get(d));
       if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
@@ -157,7 +195,9 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
         dataVersion: ver.dataVersion,
         final: ver.final,
       };
-      const body = asBuffer(encodeTile({ meta, bars: barColumns(bars) }));
+      const body = asBuffer(
+        encodeTile({ meta, bars: barColumns(bars), ...(extra ? { extra } : {}) }),
+      );
       return makeResponse(body, BIN, ver.dataVersion, ver.final, true);
     });
   });
@@ -169,6 +209,7 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     const R = p.int('R', 1, 1_000_000_000);
     const tile = p.int('tile', 0, 2 ** 31);
     const cfgV = p.int('cfg', 0, Number.MAX_SAFE_INTEGER);
+    const withStats = p.int('stats', 0, 1, 0) === 1;
     p.done();
     const s = requireSymbol(deps, symName);
     if (cfgV !== s.tileConfigVersion) {
@@ -190,9 +231,9 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     const to = from + span;
     if (to > MAX_TIME_MS) throw badRequest('Kachel außerhalb des Formats');
     const [d0, d1] = coveredDays(from, to);
-    const parts = ['fp', s.name, tf, R, n, tile, s.tileConfigVersion];
+    const parts = ['fp', s.name, tf, R, n, tile, s.tileConfigVersion, withStats ? 'stats' : ''];
     const pre = versionOf(parts, d0, d1, (d) => s.days.get(d));
-    const key = `fp|${s.name}|${tf}|${R}|${tile}|${s.tileConfigVersion}`;
+    const key = `fp|${s.name}|${tf}|${R}|${tile}|${s.tileConfigVersion}|${withStats ? 1 : 0}`;
     req.ctx.src = table;
     const barTable = barTableFor(tfSec / 60);
     const rowsOn = rowsOnFor(s);
@@ -211,10 +252,12 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     }
     const width = R * s.tickRefUnits;
     return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
-      const { days, bars, levels } = await guardedRead(deps, ctx, async (tx) => {
+      const trades = withStats && tradesCheap(s, from, to);
+      const { days, bars, levels, extra } = await guardedRead(deps, ctx, async (tx) => {
         await lockSnapshot(tx, s.symId, [
           { table: barTable, from, to },
           { table, from, to },
+          ...(trades ? [{ table: 'kline_1m' as const, from, to }] : []),
         ]);
         const days = await readDays(tx, s.symId, d0, d1);
         const bars = await queryBars(tx, s.symId, barTable, tfSec, from, to);
@@ -228,8 +271,15 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
           from,
           to,
         );
-        checkTile(bars, levels, allImmutable(days, d0, d1), { sym: s.name, d0, d1, tf, R, tile });
-        return { days, bars, levels };
+        const immutable = allImmutable(days, d0, d1);
+        checkTile(bars, levels, immutable, { sym: s.name, d0, d1, tf, R, tile });
+        const extra = withStats
+          ? await readStats(tx, s.symId, barTable, tfSec, from, to, bars, trades, {
+              immutable,
+              where: { sym: s.name, d0, d1, tf, R, tile },
+            })
+          : undefined;
+        return { days, bars, levels, extra };
       });
       const ver = versionOf(parts, d0, d1, (d) => days.get(d));
       if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
@@ -266,7 +316,12 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
         final: ver.final,
       };
       const body = asBuffer(
-        encodeTile({ meta, bars: barColumns(bars), levels: levelColumns(bars, levels) }),
+        encodeTile({
+          meta,
+          bars: barColumns(bars),
+          levels: levelColumns(bars, levels),
+          ...(extra ? { extra } : {}),
+        }),
       );
       return makeResponse(body, BIN, ver.dataVersion, ver.final, true);
     });
