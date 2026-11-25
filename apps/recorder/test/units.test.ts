@@ -70,7 +70,9 @@ describe('WeightBudget', () => {
     expect(now).toBe(60_000);
     b.serverUsed = 2400; // andere Prozesse derselben IP
     expect(b.waitFor(20)).toBeGreaterThan(0);
-    b.serverUsed = 0;
+    // der Serverzähler gilt nur in seiner Kalenderminute (sonst würde ein alter Stand ewig blockieren)
+    now += 60_000;
+    expect(b.waitFor(20)).toBe(0);
     b.block(5000);
     expect(b.waitFor(1)).toBe(5000);
   });

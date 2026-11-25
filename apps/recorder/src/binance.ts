@@ -31,7 +31,9 @@ export class WeightBudget {
   private readonly perMinute: number;
   private readonly spent: { t: number; w: number }[] = [];
   private blockedUntil = 0;
-  serverUsed = 0;
+  /** Zuletzt vom Server gemeldetes Gewicht (X-MBX-USED-WEIGHT-1M) und seine Minute. */
+  private serverUsedValue = 0;
+  private serverUsedMinute = -1;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
 
@@ -43,6 +45,16 @@ export class WeightBudget {
     this.perMinute = perMinute;
     this.now = now;
     this.sleep = sleep;
+  }
+
+  /** Servergewicht der laufenden Minute (der Zähler gilt je Kalenderminute; danach 0). */
+  get serverUsed(): number {
+    return Math.floor(this.now() / 60_000) === this.serverUsedMinute ? this.serverUsedValue : 0;
+  }
+
+  set serverUsed(v: number) {
+    this.serverUsedValue = v;
+    this.serverUsedMinute = Math.floor(this.now() / 60_000);
   }
 
   used(): number {

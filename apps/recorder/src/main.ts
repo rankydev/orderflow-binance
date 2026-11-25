@@ -283,7 +283,12 @@ async function replay(argv: string[]): Promise<number> {
 
 export async function main(argv: string[]): Promise<number> {
   const [cmd, ...rest] = argv;
-  if (cmd === 'run') return run();
+  if (cmd === 'run') {
+    const code = await run();
+    // Hintergrundschleifen (z. B. eine im Gewichtsbudget wartende REST-Anfrage) nicht abwarten:
+    // Schreiber, Spool und Lock sind zu diesem Zeitpunkt geordnet geschlossen.
+    process.exit(code);
+  }
   if (cmd === 'replay') return replay(rest);
   console.error('Verwendung: main.ts run | replay --symbol S --day D [--db]');
   return 2;
