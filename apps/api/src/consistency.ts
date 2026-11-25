@@ -77,3 +77,51 @@ export function checkProfile(
       where,
     );
 }
+
+/** Ab so vielen erwarteten Minuten mit Trades gilt ein leerer Ausschnitt als unmöglich. */
+export const EMPTY_SUSPICIOUS_MINUTES = 60;
+
+/**
+ * Verteidigung in der Tiefe (Review Pass 5): Ein Snapshot, in dem ein Chunk leer erscheint, sieht in
+ * sich konsistent aus (keine Bars UND keine Level). Je überdecktem UTC-Tag mit gespeicherten Minuten
+ * (Katalogstatistik bar_1m-Zeilen des Tages) wird die erwartete Zahl Minuten mit Trades im Ausschnitt
+ * geschätzt (Dichte × Länge); ist sie ≥ 60 und der Ausschnitt enthält keine einzige Bar, ist der
+ * Snapshot unbrauchbar → DataInconsistency (Wiederholung, dann 503; nie leer ausgeliefert/gecacht).
+ * Echte Lücken (z. B. 2026-10-27 00:02–00:30, 28 min) liegen unter der Schwelle.
+ */
+export function checkCoverage(
+  barStartsMs: ArrayLike<number>,
+  from: number,
+  to: number,
+  minutesOn: (day: number) => number | undefined,
+  immutable: boolean,
+  where: Record<string, unknown>,
+  /** true: der ganze Zeitraum als ein Ausschnitt (Profile); sonst je UTC-Tag. */
+  whole = false,
+): void {
+  const DAY = 86_400_000;
+  const parts: [number, number, number][] = []; // [a, b, erwartete Minuten mit Trades]
+  for (let d = Math.floor(from / DAY); d * DAY < to; d++) {
+    const a = Math.max(from, d * DAY);
+    const b = Math.min(to, (d + 1) * DAY);
+    const e = ((minutesOn(d) ?? 0) / 1440) * ((b - a) / 60_000);
+    if (whole && parts.length > 0) {
+      parts[0]![1] = b;
+      parts[0]![2] += e;
+    } else parts.push([a, b, e]);
+  }
+  for (const [a, b, expected] of parts) {
+    if (expected < EMPTY_SUSPICIOUS_MINUTES) continue;
+    let any = false;
+    for (let i = 0; i < barStartsMs.length && !any; i++) {
+      const t = barStartsMs[i]!;
+      if (t >= a && t < b) any = true;
+    }
+    if (!any)
+      throw new DataInconsistency(
+        `Ausschnitt ${new Date(a).toISOString()}…${new Date(b).toISOString()} leer, erwartet ≈ ${Math.round(expected)} Minuten mit Trades`,
+        immutable,
+        where,
+      );
+  }
+}

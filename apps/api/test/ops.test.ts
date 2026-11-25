@@ -195,3 +195,29 @@ describe('Aktualität des Versionsstands (Review Pass 3)', () => {
     expect(cat.lastErrorKind).toBe('lock');
   });
 });
+
+describe('Datenfehler verfallen nach einer Stunde ohne Wiederholung', () => {
+  it('Health erholt sich ohne Neustart', () => {
+    const cat = new Catalog({} as Sql, {
+      pollMs: 1000,
+      lockRetries: 0,
+      maxSourceRows: 1,
+      log: () => {},
+    });
+    const real = Date.now;
+    try {
+      let now = 1_000_000_000_000;
+      Date.now = () => now;
+      cat.reportDataError('Bar t=1 ohne Level', { sym: 'BTCUSDT', d0: 1, d1: 1 });
+      expect(cat.dataErrors.length).toBe(1);
+      now += 59 * 60_000;
+      cat.reportDataError('Bar t=1 ohne Level', { sym: 'BTCUSDT', d0: 1, d1: 1 }); // Wiederholung
+      now += 59 * 60_000;
+      expect(cat.dataErrors.length).toBe(1);
+      now += 2 * 60_000;
+      expect(cat.dataErrors.length).toBe(0);
+    } finally {
+      Date.now = real;
+    }
+  });
+});

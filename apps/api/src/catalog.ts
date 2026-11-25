@@ -23,7 +23,7 @@ import {
   type Timeframe,
 } from '@orderflow/core';
 import { int, readTx, type ReadTx, type Sql } from './db.ts';
-import { lockSnapshot, QUALITY_FP_SQL, readDays, tsLit } from './queries.ts';
+import { chunkLockList, QUALITY_FP_SQL, readDays, tsLit } from './queries.ts';
 import { BAR_TABLES, barTableFor, FP_TABLE_NAMES, type BarTable, type RowsOn } from './plan.ts';
 import { DAY_MS, SYMBOL_RE } from './params.ts';
 
@@ -98,6 +98,14 @@ export interface CatalogOptions {
   log: (level: 'info' | 'warn' | 'error', msg: string, obj?: Record<string, unknown>) => void;
 }
 
+export interface DataError {
+  at: number;
+  message: string;
+  sym?: string;
+  d0?: number;
+  d1?: number;
+}
+
 /** Ereignis-Naht für die Live-Phase (P2, Invalidierung per WS): 'dayChanged' {sym, day, version}. */
 export interface DayChanged {
   sym: string;
@@ -122,8 +130,17 @@ export class Catalog extends EventEmitter {
    * Datenfehler, die Anfragen auf unveränderlichen Tagen gefunden haben (Bars ohne Level, Summen
    * ungleich – trotz neuer Snapshots). Höchstens 100, jüngste zuletzt; in Health und /quality gemeldet.
    */
-  readonly dataErrors: { at: number; message: string; sym?: string; d0?: number; d1?: number }[] =
-    [];
+  private readonly dataErrorList: DataError[] = [];
+  /** Wie lange ein Datenfehler ohne Wiederholung gemeldet bleibt (dann erholt sich Health). */
+  static readonly DATA_ERROR_TTL_MS = 3_600_000;
+
+  /** Datenfehler der letzten Stunde (ohne Wiederholung verfallen sie; kein Neustart nötig). */
+  get dataErrors(): readonly DataError[] {
+    const limit = Date.now() - Catalog.DATA_ERROR_TTL_MS;
+    while (this.dataErrorList.length > 0 && this.dataErrorList[0]!.at < limit)
+      this.dataErrorList.shift();
+    return this.dataErrorList;
+  }
   /** Art des letzten Fehlers: nur 'connection' (und Hänger) machen den Versionsstand unbrauchbar. */
   lastErrorKind: 'connection' | 'lock' | 'timeout' | 'other' | null = null;
   private lastWarnAt = -Infinity;
@@ -154,12 +171,11 @@ export class Catalog extends EventEmitter {
       ...(typeof detail.d0 === 'number' ? { d0: detail.d0 } : {}),
       ...(typeof detail.d1 === 'number' ? { d1: detail.d1 } : {}),
     };
-    const dup = this.dataErrors.find((x) => x.message === e.message && x.sym === e.sym);
-    if (dup) dup.at = e.at;
-    else {
-      this.dataErrors.push(e);
-      if (this.dataErrors.length > 100) this.dataErrors.shift();
-    }
+    // jüngste zuletzt (Verfall von vorn): eine Wiederholung rückt ans Ende
+    const i = this.dataErrorList.findIndex((x) => x.message === e.message && x.sym === e.sym);
+    if (i >= 0) this.dataErrorList.splice(i, 1);
+    this.dataErrorList.push(e);
+    if (this.dataErrorList.length > 100) this.dataErrorList.shift();
     this.opt.log('error', 'DATENFEHLER auf unveränderlichen Tagen (Anfrage mit 503 beantwortet)', {
       ...detail,
       err: message,
@@ -326,7 +342,7 @@ export class Catalog extends EventEmitter {
 
   /**
    * Statistik der geänderten Tage, je Lauf in einer EIGENEN Lesetransaktion: zuerst die Chunks sperren
-   * (lockSnapshot), dann die Tagesversionen und die Statistik aus demselben Snapshot. In der
+   * (LOCK TABLE vor dem Snapshot, queries.ts chunkLockList), dann die Tagesversionen und die Statistik aus demselben Snapshot. In der
    * Transaktion, die data_day schon gelesen hat, könnte ein danach dekomprimierter Chunk leer
    * erscheinen (Review Pass 4) und eine falsche Statistik unter einer gültigen Version landen.
    */
@@ -337,19 +353,19 @@ export class Catalog extends EventEmitter {
         .filter((i) => i.hasData && s.stats.get(i.day)?.version !== i.version)
         .map((i) => i.day);
       for (const [a, b] of runs(todo, 31)) {
+        const ranges = [...FP_TABLE_NAMES, ...BAR_TABLES].map((table) => ({
+          table,
+          from: a * DAY_MS,
+          to: (b + 1) * DAY_MS,
+        }));
         await readTx(
           this.sql,
-          { signal: this.ac.signal, lockRetries: this.opt.lockRetries },
+          {
+            signal: this.ac.signal,
+            lockRetries: this.opt.lockRetries,
+            prelock: () => chunkLockList(this.sql, ranges),
+          },
           async (tx) => {
-            await lockSnapshot(
-              tx,
-              s.symId,
-              [...FP_TABLE_NAMES, ...BAR_TABLES].map((table) => ({
-                table,
-                from: a * DAY_MS,
-                to: (b + 1) * DAY_MS,
-              })),
-            );
             const snap = await readDays(tx, s.symId, a, b);
             await this.computeStats(tx, s, a, b, snap);
           },

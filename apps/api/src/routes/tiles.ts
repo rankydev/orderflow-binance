@@ -15,11 +15,10 @@ import { badRequest, HttpError, unprocessable } from '../errors.ts';
 import { etagOfBody, makeResponse, send, acceptsGzip } from '../http.ts';
 import { checkRange, MAX_TIME_MS, Params, SYMBOL_RE } from '../params.ts';
 import { barTableFor, coveredDays, estimateRows } from '../plan.ts';
-import { allImmutable, checkTile } from '../consistency.ts';
+import { allImmutable, checkCoverage, checkTile } from '../consistency.ts';
 import type { ReadTx } from '../db.ts';
 import type { BarTable } from '../plan.ts';
 import {
-  lockSnapshot,
   queryBars,
   queryLevels,
   querySubBars,
@@ -187,28 +186,42 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     const pre = versionOf(parts, d0, d1, (d) => s.days.get(d));
     const table = barTableFor(tfSec / 60);
     req.ctx.src = table;
-    const est = estimateRows(table, from, to, rowsOnFor(s));
+    const rowsOn = rowsOnFor(s);
+    const est = estimateRows(table, from, to, rowsOn);
     req.ctx.rowsEstimate = est;
     if (est > deps.cfg.maxSourceRows)
       throw unprocessable(`Bereich zu groß (≈ ${est} Quellzeilen > ${deps.cfg.maxSourceRows})`);
     const key = `bars|${s.name}|${tf}|${from}|${to}|${withStats ? 1 : 0}`;
     const trades = withStats && tradesCheap(s, from, to);
     return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
-      const { days, bars, extra } = await guardedRead(deps, ctx, async (tx) => {
-        await lockSnapshot(tx, s.symId, [
-          { table, from, to },
-          ...(trades ? [{ table: 'kline_1m' as const, from, to }] : []),
-        ]);
-        const days = await readDays(tx, s.symId, d0, d1);
-        const bars = await queryBars(tx, s.symId, table, tfSec, from, to);
-        const extra = withStats
-          ? await readStats(tx, s.symId, table, tfSec, from, to, bars, trades, {
-              immutable: allImmutable(days, d0, d1),
-              where: { sym: s.name, d0, d1, tf },
-            })
-          : undefined;
-        return { days, bars, extra };
-      });
+      const lock = [
+        { table, from, to },
+        ...(trades ? [{ table: 'kline_1m' as const, from, to }] : []),
+      ];
+      const { days, bars, extra } = await guardedRead(
+        deps,
+        ctx,
+        async (tx) => {
+          const days = await readDays(tx, s.symId, d0, d1);
+          const bars = await queryBars(tx, s.symId, table, tfSec, from, to);
+          checkCoverage(
+            bars.time.map((t) => t * 1000),
+            from,
+            to,
+            (d) => rowsOn('bar_1m', d),
+            allImmutable(days, d0, d1),
+            { sym: s.name, d0, d1, tf },
+          );
+          const extra = withStats
+            ? await readStats(tx, s.symId, table, tfSec, from, to, bars, trades, {
+                immutable: allImmutable(days, d0, d1),
+                where: { sym: s.name, d0, d1, tf },
+              })
+            : undefined;
+          return { days, bars, extra };
+        },
+        lock,
+      );
       const ver = versionOf(parts, d0, d1, (d) => days.get(d));
       if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
       const meta: TileMeta = {
@@ -279,34 +292,47 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
     const width = R * s.tickRefUnits;
     return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
       const trades = withStats && tradesCheap(s, from, to);
-      const { days, bars, levels, extra } = await guardedRead(deps, ctx, async (tx) => {
-        await lockSnapshot(tx, s.symId, [
-          { table: barTable, from, to },
-          { table, from, to },
-          ...(trades ? [{ table: 'kline_1m' as const, from, to }] : []),
-        ]);
-        const days = await readDays(tx, s.symId, d0, d1);
-        const bars = await queryBars(tx, s.symId, barTable, tfSec, from, to);
-        const levels = await queryLevels(
-          tx,
-          s.symId,
-          table,
-          tfSec,
-          width,
-          s.tickRefUnits,
-          from,
-          to,
-        );
-        const immutable = allImmutable(days, d0, d1);
-        checkTile(bars, levels, immutable, { sym: s.name, d0, d1, tf, R, tile });
-        const extra = withStats
-          ? await readStats(tx, s.symId, barTable, tfSec, from, to, bars, trades, {
-              immutable,
-              where: { sym: s.name, d0, d1, tf, R, tile },
-            })
-          : undefined;
-        return { days, bars, levels, extra };
-      });
+      const lock = [
+        { table: barTable, from, to },
+        { table, from, to },
+        ...(trades ? [{ table: 'kline_1m' as const, from, to }] : []),
+      ];
+      const { days, bars, levels, extra } = await guardedRead(
+        deps,
+        ctx,
+        async (tx) => {
+          const days = await readDays(tx, s.symId, d0, d1);
+          const bars = await queryBars(tx, s.symId, barTable, tfSec, from, to);
+          checkCoverage(
+            bars.time.map((t) => t * 1000),
+            from,
+            to,
+            (d) => rowsOn('bar_1m', d),
+            allImmutable(days, d0, d1),
+            { sym: s.name, d0, d1, tf, R, tile },
+          );
+          const levels = await queryLevels(
+            tx,
+            s.symId,
+            table,
+            tfSec,
+            width,
+            s.tickRefUnits,
+            from,
+            to,
+          );
+          const immutable = allImmutable(days, d0, d1);
+          checkTile(bars, levels, immutable, { sym: s.name, d0, d1, tf, R, tile });
+          const extra = withStats
+            ? await readStats(tx, s.symId, barTable, tfSec, from, to, bars, trades, {
+                immutable,
+                where: { sym: s.name, d0, d1, tf, R, tile },
+              })
+            : undefined;
+          return { days, bars, levels, extra };
+        },
+        lock,
+      );
       const ver = versionOf(parts, d0, d1, (d) => days.get(d));
       if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
       // Zell-Wächter (TILE-FORMAT.md): eine Kachel über 60 000 Zellen wird nie ausgeliefert, sondern

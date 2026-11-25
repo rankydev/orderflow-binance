@@ -1,7 +1,7 @@
 // Konsistenzprüfung eines Snapshots: Bar ohne Level, Level ohne Bar, Summen ungleich → DataInconsistency
 // (nie ein 500); readTx wiederholt sie mit neuem Snapshot und meldet danach 503.
 import { describe, expect, it } from 'vitest';
-import { checkProfile, checkTile } from '../src/consistency.ts';
+import { checkCoverage, checkProfile, checkTile } from '../src/consistency.ts';
 import { DataInconsistency, readTx, type Sql } from '../src/db.ts';
 import { HttpError } from '../src/errors.ts';
 
@@ -73,5 +73,26 @@ describe('checkTile / checkProfile', () => {
     expect((err as HttpError).status).toBe(503);
     expect((err as HttpError).kind).toBe('inconsistent');
     expect((err as { cause: DataInconsistency }).cause.immutable).toBe(true);
+  });
+});
+
+describe('checkCoverage (leerer Ausschnitt, obwohl der Tag Daten hat)', () => {
+  const D = 86_400_000;
+  const full = () => 1440; // jede Minute mit Trades
+  it('leer bei erwarteten ≥ 60 Minuten → DataInconsistency; echte kurze Lücken und Tage ohne Daten nicht', () => {
+    expect(() => checkCoverage([], 0, 2 * 3_600_000, full, true, {})).toThrow(/leer/);
+    expect(() => checkCoverage([60_000], 0, 2 * 3_600_000, full, true, {})).not.toThrow();
+    // 28-Minuten-Lücke wie 2026-10-27: unter der Schwelle
+    expect(() => checkCoverage([], 0, 28 * 60_000, full, true, {})).not.toThrow();
+    // Tag ohne Statistik (keine Daten) bzw. dünner Tag
+    expect(() => checkCoverage([], 0, D, () => undefined, true, {})).not.toThrow();
+    expect(() => checkCoverage([], 0, D, () => 30, true, {})).not.toThrow();
+    // je Tag: Daten nur am zweiten Tag vorhanden → der erste darf leer sein, der zweite nicht
+    expect(() =>
+      checkCoverage([D + 5], 0, 2 * D, (d) => (d === 0 ? undefined : 1440), true, {}),
+    ).not.toThrow();
+    expect(() => checkCoverage([5], 0, 2 * D, full, true, {})).toThrow(/leer/);
+    // ganzer Zeitraum als ein Ausschnitt (Profile)
+    expect(() => checkCoverage([5], 0, 2 * D, full, true, {}, true)).not.toThrow();
   });
 });

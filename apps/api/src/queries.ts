@@ -3,7 +3,7 @@
 // Parameter. Mengen kommen als int8 (Text) und werden mit int() auf sichere Ganzzahlen geprüft;
 // Notional nur als Text → BigInt.
 import { fpTableGrid, type FpTableName } from '@orderflow/core';
-import { bigintOf, int, type ReadTx, type Row } from './db.ts';
+import { bigintOf, int, type ReadTx, type Row, type Sql } from './db.ts';
 import {
   BAR_TABLES,
   barTableMinutes,
@@ -50,28 +50,35 @@ export interface ReadRange {
 }
 
 /**
- * Muss die ERSTE Anweisung einer Lesetransaktion sein: plant eine leere Abfrage über alle Bereiche,
- * die die Anfrage lesen wird. Beim Planen sperrt Timescale die betroffenen Chunks (ACCESS SHARE, bis
- * Transaktionsende); erst danach entsteht der REPEATABLE-READ-Snapshot. Grund (nachgewiesen, Review
- * Pass 4): `convert_to_rowstore` (Dekomprimieren vor einem Tagesersatz) ist für einen Leser mit
- * älterem Snapshot nicht MVCC-sicher – er sieht den Chunk danach leer (Bar ohne Level, 500). Mit den
- * Sperren wartet die Konvertierung, bis der Leser fertig ist, und kein Chunk ändert sich im Snapshot.
+ * Chunk-Sperren vor dem Snapshot (Review Pass 4/5). Nachgewiesen (TimescaleDB 2.31, PG 17):
+ * `convert_to_rowstore` ist für einen Leser mit älterem Snapshot nicht MVCC-sicher – er sieht den
+ * Chunk danach leer. Eine REPEATABLE-READ-Transaktion nimmt ihren Snapshot mit der ersten Abfrage,
+ * also VOR dem Planen, in dem Timescale die Chunks sperrt; eine leere Abfrage als „Präludium" schließt
+ * die Lücke daher nicht (läuft eine Konvertierung schon, wartet der Leser auf die Sperre und liest
+ * danach mit altem Snapshot einen leeren Chunk). `LOCK TABLE` ist eine Utility-Anweisung und nimmt
+ * keinen Snapshot: als erste Anweisung der Transaktion gesperrt, entsteht der Snapshot erst danach.
+ * Gesperrt werden nur die Chunks im gelesenen Zeitraum (ein LOCK auf die Hypertable sperrte alle ihre
+ * Chunks – bei voller Historie Hunderte Sperren je Anfrage). Die Namen liefert eine Katalogabfrage
+ * außerhalb der Transaktion (autocommit), gequotet per format('%I.%I').
  */
-export async function lockSnapshot(tx: ReadTx, symId: number, ranges: ReadRange[]): Promise<void> {
-  if (ranges.length === 0) {
-    await tx.rows('SELECT 1');
-    return;
-  }
-  const parts = ranges.map((r) => {
+export async function chunkLockList(sql: Sql, ranges: ReadRange[]): Promise<string[]> {
+  if (ranges.length === 0) return [];
+  const conds = ranges.map((r) => {
     const t =
       r.table === 'kline_1m'
         ? 'kline_1m'
         : FP_SET.has(r.table)
           ? fpTable(r.table)
           : barTable(r.table);
-    return `(SELECT 1 FROM ${t} WHERE sym_id = $1 AND ts >= ${tsLit(r.from)} AND ts < ${tsLit(r.to)} LIMIT 0)`;
+    return `(hypertable_name = '${t}' AND range_end > ${tsLit(r.from)} AND range_start < ${tsLit(r.to)})`;
   });
-  await tx.rows(parts.join(' UNION ALL '), [symId]);
+  const rows = await sql
+    .unsafe(
+      `SELECT DISTINCT format('%I.%I', chunk_schema, chunk_name) FROM timescaledb_information.chunks
+      WHERE hypertable_schema = 'public' AND (${conds.join(' OR ')}) ORDER BY 1`,
+    )
+    .values();
+  return rows.map((r) => String(r[0]));
 }
 
 export interface DaySnap {

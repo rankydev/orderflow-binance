@@ -106,6 +106,14 @@ export class DataInconsistency extends Error {
   }
 }
 
+/** LOCK-Anweisung für Chunks (Namen aus format('%I.%I'), zusätzlich geprüft); null = nichts zu sperren. */
+export function lockStatementFor(chunks: string[]): string | null {
+  for (const c of chunks)
+    if (!/^"?[A-Za-z_][A-Za-z0-9_]*"?\."?[A-Za-z_][A-Za-z0-9_]*"?$/.test(c))
+      throw new Error(`Chunkname ${c} unerwartet`);
+  return chunks.length > 0 ? `LOCK TABLE ${chunks.join(', ')} IN ACCESS SHARE MODE` : null;
+}
+
 export interface ReadStats {
   queries: number;
   attempts: number;
@@ -146,6 +154,11 @@ export interface ReadOptions {
   backoffMs?: number;
   /** Wiederholungen bei DataInconsistency (Standard 2). */
   inconsistencyRetries?: number;
+  /**
+   * Liefert die Chunks, die vor dem Snapshot gesperrt werden (queries.ts chunkLockList). Wird je
+   * Versuch außerhalb der Transaktion aufgerufen; die Sperre ist die erste Anweisung der Transaktion.
+   */
+  prelock?: () => Promise<string[]>;
 }
 
 /**
@@ -162,9 +175,14 @@ export async function readTx<T>(
   for (let attempt = 0; ; attempt++) {
     stats.attempts = attempt + 1;
     try {
-      const value = (await sql.begin('isolation level repeatable read read only', (tx) =>
-        fn(new ReadTx(tx, opt.signal, stats)),
-      )) as T;
+      const chunks = opt.prelock ? await opt.prelock() : [];
+      const value = (await sql.begin('isolation level repeatable read read only', async (tx) => {
+        // LOCK nimmt keinen Snapshot: erst sperren, dann entsteht der Snapshot mit der ersten Abfrage
+        const rtx = new ReadTx(tx, opt.signal, stats);
+        const lock = lockStatementFor(chunks);
+        if (lock) await rtx.rows(lock); // abbrechbar wie jede Abfrage (Client-Abbruch während des Wartens)
+        return fn(rtx);
+      })) as T;
       return { value, stats };
     } catch (e) {
       if (opt.signal.aborted) throw new HttpError(499, 'Client hat abgebrochen');
@@ -184,6 +202,8 @@ export async function readTx<T>(
         );
       }
       const code = pgCode(e);
+      // Chunk zwischen Katalogabfrage und LOCK entfernt/ersetzt → neue Liste, neuer Versuch
+      if (code === '42P01' && opt.prelock && attempt < 3) continue;
       if (code === '55P03') {
         if (attempt < opt.lockRetries) {
           await new Promise((r) => setTimeout(r, base * 3 ** attempt));

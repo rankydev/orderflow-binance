@@ -5,6 +5,7 @@ import type { ApiConfig } from './config.ts';
 import { DataInconsistency, readTx, type ReadStats, type ReadTx, type Sql } from './db.ts';
 import { HttpError, notFound } from './errors.ts';
 import type { Limiter } from './limiter.ts';
+import { chunkLockList, type ReadRange } from './queries.ts';
 
 export interface Deps {
   cfg: ApiConfig;
@@ -84,12 +85,17 @@ export async function guardedRead<T>(
   deps: Deps,
   ctx: ReqCtx,
   fn: (tx: ReadTx) => Promise<T>,
+  lock: ReadRange[] = [],
 ): Promise<T> {
   const release = await deps.limiter.acquire(ctx.ac.signal);
   try {
     const { value, stats } = await readTx(
       deps.sql,
-      { signal: ctx.ac.signal, lockRetries: deps.cfg.lockRetries },
+      {
+        signal: ctx.ac.signal,
+        lockRetries: deps.cfg.lockRetries,
+        ...(lock.length > 0 ? { prelock: () => chunkLockList(deps.sql, lock) } : {}),
+      },
       fn,
     );
     ctx.db = stats;

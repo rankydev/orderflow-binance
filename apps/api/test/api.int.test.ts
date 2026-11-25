@@ -38,7 +38,7 @@ import { createPool, readTx } from '../src/db.ts';
 import { alterRolePasswordSql } from '../src/scram.ts';
 import { startApi, type RunningApi } from '../src/main.ts';
 import { FP_TABLE_NAMES } from '../src/plan.ts';
-import { lockSnapshot, queryLevels, readDays, tsLit } from '../src/queries.ts';
+import { chunkLockList, queryLevels, tsLit } from '../src/queries.ts';
 import {
   BAD_DAY,
   DAY_MS,
@@ -1332,53 +1332,109 @@ describe('Inkonsistente Snapshots (Review Pass 4: „Bar ohne Level")', () => {
   });
   afterAll(async () => locker?.end());
 
-  it('Ursache: convert_to_rowstore leert einen Chunk für ältere Snapshots; lockSnapshot verhindert es', async () => {
-    const sql = createPool(apiCfg());
+  /** Chunk von `table`, der den Tag `day` enthält. */
+  async function chunkOf(table: string, day: number): Promise<string> {
+    const rows = await admin<{ c: string }[]>`
+      SELECT format('%I.%I', chunk_schema, chunk_name) AS c FROM timescaledb_information.chunks
+       WHERE hypertable_name = ${table} AND range_start <= ${new Date(day * DAY_MS)}
+         AND range_end > ${new Date(day * DAY_MS)}`;
+    return rows[0]!.c;
+  }
+
+  /**
+   * Startet `convert_to_rowstore` der Chunks in einer offenen Transaktion (hält die Sperren) und
+   * committed erst auf commit(); danach wieder in den Columnstore.
+   */
+  async function conversionInProgress(chunks: string[]) {
+    let commit!: () => void;
+    const go = new Promise<void>((r) => (commit = r));
+    let started!: () => void;
+    const begun = new Promise<void>((r) => (started = r));
+    const done = locker.begin(async (tx) => {
+      for (const c of chunks) await tx.unsafe(`CALL convert_to_rowstore('${c}'::regclass)`);
+      started();
+      await go;
+    });
+    await begun;
+    return {
+      commit: async () => {
+        commit();
+        await done;
+      },
+      recompress: async () => {
+        for (const c of chunks)
+          await locker.unsafe(`CALL convert_to_columnstore('${c}'::regclass)`);
+      },
+    };
+  }
+
+  it('Ursache und Fix: Konvertierung läuft schon, wenn der Leser kommt (Snapshot vor/nach der Sperre)', async () => {
+    const sql = createPool(apiCfg({ lockTimeoutMs: 20_000 }));
     const day = FIRST_DAY; // fp_1m dieses Tages liegt im Columnstore (seed.ts)
     const range = { table: 'fp_1m' as const, from: day * DAY_MS, to: (day + 1) * DAY_MS };
     const count = `SELECT count(*)::int AS n FROM fp_1m WHERE sym_id = ${SYM_ID}
                      AND ts >= ${tsLit(range.from)} AND ts < ${tsLit(range.to)}`;
-    const [{ c }] = (await admin<{ c: string }[]>`
-      SELECT format('%I.%I', chunk_schema, chunk_name) AS c FROM timescaledb_information.chunks
-       WHERE hypertable_name = 'fp_1m' AND range_start = ${new Date(range.from)} AND is_compressed`) as unknown as [
-      { c: string },
-    ];
-    const [{ n: total }] = (await admin.unsafe<{ n: number }[]>(count)) as unknown as [
-      { n: number },
-    ];
+    const [{ n: total }] = (await admin.unsafe(count)) as unknown as [{ n: number }];
+    const c = await chunkOf('fp_1m', day);
     const ac = new AbortController();
+    const run = async (opts: { prelock?: () => Promise<string[]> }, first: string) => {
+      const conv = await conversionInProgress([c]);
+      const reader = readTx(sql, { signal: ac.signal, lockRetries: 0, ...opts }, async (tx) => {
+        await tx.rows(first); // blockiert, solange die Konvertierung ihre Sperre hält
+        return (await tx.rows(count))[0]![0];
+      });
+      await sleep(300);
+      await conv.commit();
+      const n = (await reader).value;
+      await conv.recompress();
+      return n;
+    };
     try {
-      // ohne Sperr-Präludium: Snapshot vor der Konvertierung → der Chunk erscheint leer (Kontrolle)
-      const { value: without } = await readTx(
-        sql,
-        { signal: ac.signal, lockRetries: 0 },
-        async (tx) => {
-          await readDays(tx, SYM_ID, day, day);
-          await locker.unsafe(`CALL convert_to_rowstore('${c}'::regclass)`);
-          return (await tx.rows(count))[0]![0];
-        },
-      );
-      expect(without).toBe(0);
-      await locker.unsafe(`CALL convert_to_columnstore('${c}'::regclass)`);
-      // mit Präludium: die Konvertierung wartet (hier: Zeitlimit), der Leser sieht alles
-      const { value: withLock } = await readTx(
-        sql,
-        { signal: ac.signal, lockRetries: 0 },
-        async (tx) => {
-          await lockSnapshot(tx, SYM_ID, [range]);
-          await readDays(tx, SYM_ID, day, day);
-          await expect(
-            locker.begin(async (t) => {
-              await t`SET LOCAL lock_timeout = '500ms'`;
-              await t.unsafe(`CALL convert_to_rowstore('${c}'::regclass)`);
-            }),
-          ).rejects.toThrow(/lock timeout/);
-          return (await tx.rows(count))[0]![0];
-        },
-      );
-      expect(withLock).toBe(total);
+      // bisheriges Präludium (SELECT … LIMIT 0): Snapshot VOR dem Warten → Chunk leer (der Befund)
+      expect(
+        await run(
+          {},
+          `(SELECT 1 FROM fp_1m WHERE ts >= ${tsLit(range.from)} AND ts < ${tsLit(range.to)} LIMIT 0)`,
+        ),
+      ).toBe(0);
+      // Fix: LOCK TABLE der Chunks als erste Anweisung (kein Snapshot), Snapshot erst danach
+      expect(await run({ prelock: () => chunkLockList(sql, [range]) }, 'SELECT 1')).toBe(total);
     } finally {
       await sql.end();
+    }
+  });
+
+  it('Kachel und /bars während einer laufenden Konvertierung beider Seiten: richtige Daten oder 503, nie leer', async () => {
+    const api = await start({ lockTimeoutMs: 20_000 });
+    const day = FIRST_DAY + 1;
+    try {
+      const s = ((await get(api, '/api/v1/symbols')).json().symbols as SymJson[])[0]!;
+      const n = s.tiles['1m']!['10']!;
+      const m = day * DAY_MS + 9 * 3_600_000;
+      const k = Math.floor(m / (n * 60_000));
+      const tileUrl = `/api/v1/footprint?sym=BTCUSDT&tf=1m&R=10&tile=${k}&cfg=${s.tileConfigVersion}`;
+      const barsFrom = Math.floor(m / 60_000_000) * 60_000_000;
+      const barsUrl = `/api/v1/bars?sym=BTCUSDT&tf=1m&from=${barsFrom}&to=${barsFrom + 60_000_000}`;
+      const conv = await conversionInProgress([
+        await chunkOf('bar_1m', day),
+        await chunkOf('fp_1m_b10', day),
+      ]);
+      const pending = [get(api, tileUrl), get(api, barsUrl)];
+      await sleep(300);
+      await conv.commit();
+      const [tile, bars] = await Promise.all(pending);
+      await conv.recompress();
+      for (const r of [tile!, bars!]) {
+        expect([200, 503]).toContain(r.res.status);
+        if (r.res.status !== 200) continue;
+        const dec = decodeTile(r.buf);
+        const ref = refBars(60, dec.header.from, dec.header.to);
+        expect(dec.header.nBars).toBe(ref.length);
+        expect(dec.header.nBars).toBeGreaterThan(0);
+      }
+      expect(tile!.res.status).toBe(200);
+    } finally {
+      await api.close();
     }
   });
 

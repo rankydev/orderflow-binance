@@ -37,7 +37,6 @@ import {
   type Segment,
 } from '../plan.ts';
 import {
-  lockSnapshot,
   queryProfileBars,
   queryProfileLevels,
   readDays,
@@ -46,7 +45,7 @@ import {
 } from '../queries.ts';
 import { serveVersioned } from '../respond.ts';
 import { versionOf } from '../versions.ts';
-import { allImmutable, checkProfile } from '../consistency.ts';
+import { allImmutable, checkCoverage, checkProfile } from '../consistency.ts';
 
 /** Größte Zeilengröße eines Profils in Ticks. */
 export const PROFILE_MAX_R = 1_000_000;
@@ -217,31 +216,40 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
     const key = `profile|${parts.join('|')}`;
     return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
       const w = R * s.tickRefUnits;
-      const { days, bars, levels } = await guardedRead(deps, ctx, async (tx) => {
-        await lockSnapshot(tx, s.symId, [...plan.segs, ...plan.barSegs]);
-        const days = await readDays(tx, s.symId, d0, d1);
-        const bars = await queryProfileBars(tx, s.symId, plan.barSegs, null);
-        const b = bars[0];
-        if (b) {
-          const cells = rowOf(b.high, w) - rowOf(b.low, w) + 1;
-          if (cells > deps.cfg.maxCells) {
-            throw unprocessable(`${cells} Zeilen > ${deps.cfg.maxCells}; gröberes R wählen`, {
-              reason: 'profile_rows',
-              rows: cells,
-              limit: deps.cfg.maxCells,
-              suggestR: suggestR(deps, s, R, from, to, false, (r) => {
-                const x = r * s.tickRefUnits;
-                return rowOf(b.high, x) - rowOf(b.low, x) + 1;
-              }),
-            });
+      const { days, bars, levels } = await guardedRead(
+        deps,
+        ctx,
+        async (tx) => {
+          const days = await readDays(tx, s.symId, d0, d1);
+          const bars = await queryProfileBars(tx, s.symId, plan.barSegs, null);
+          const b = bars[0];
+          if (b) {
+            const cells = rowOf(b.high, w) - rowOf(b.low, w) + 1;
+            if (cells > deps.cfg.maxCells) {
+              throw unprocessable(`${cells} Zeilen > ${deps.cfg.maxCells}; gröberes R wählen`, {
+                reason: 'profile_rows',
+                rows: cells,
+                limit: deps.cfg.maxCells,
+                suggestR: suggestR(deps, s, R, from, to, false, (r) => {
+                  const x = r * s.tickRefUnits;
+                  return rowOf(b.high, x) - rowOf(b.low, x) + 1;
+                }),
+              });
+            }
           }
-        }
-        const levels = b
-          ? await queryProfileLevels(tx, s.symId, plan.segs, w, s.tickRefUnits, null)
-          : [];
-        checkProfile(bars, levels, allImmutable(days, d0, d1), { sym: s.name, d0, d1, R });
-        return { days, bars, levels };
-      });
+          const levels = b
+            ? await queryProfileLevels(tx, s.symId, plan.segs, w, s.tickRefUnits, null)
+            : [];
+          const imm = allImmutable(days, d0, d1);
+          const where = { sym: s.name, d0, d1, R };
+          checkProfile(bars, levels, imm, where);
+          // ein leeres Range-Profil über einem Zeitraum, der Trades haben müsste → Snapshot unbrauchbar
+          const minutesOn = (d: number) => rowsOnFor(s)('bar_1m', d);
+          checkCoverage(bars.length > 0 ? [from] : [], from, to, minutesOn, imm, where, true);
+          return { days, bars, levels };
+        },
+        [...plan.segs, ...plan.barSegs],
+      );
       const ver = versionOf(parts, d0, d1, (d) => days.get(d));
       if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
       const out: RangeProfileResponse = {
@@ -295,28 +303,41 @@ export function registerProfileRoutes(app: FastifyInstance, deps: Deps): void {
       const w = R * s.tickRefUnits;
       const cellsOf = (bars: ProfileBarRow[], x: number) =>
         bars.reduce((a, b) => a + rowOf(b.high, x) - rowOf(b.low, x) + 1, 0);
-      const { days, bars, levels } = await guardedRead(deps, ctx, async (tx) => {
-        await lockSnapshot(tx, s.symId, [...plan.segs, ...plan.barSegs]);
-        const days = await readDays(tx, s.symId, d0, d1);
-        const bars = await queryProfileBars(tx, s.symId, plan.barSegs, off);
-        const cells = cellsOf(bars, w);
-        if (cells > deps.cfg.maxCells) {
-          throw unprocessable(`${cells} Zeilen > ${deps.cfg.maxCells}; gröberes R wählen`, {
-            reason: 'profile_rows',
-            rows: cells,
-            limit: deps.cfg.maxCells,
-            suggestR: suggestR(deps, s, R, from, to, true, (r) =>
-              cellsOf(bars, r * s.tickRefUnits),
-            ),
-          });
-        }
-        const levels =
-          bars.length > 0
-            ? await queryProfileLevels(tx, s.symId, plan.segs, w, s.tickRefUnits, off)
-            : [];
-        checkProfile(bars, levels, allImmutable(days, d0, d1), { sym: s.name, d0, d1, R });
-        return { days, bars, levels };
-      });
+      const { days, bars, levels } = await guardedRead(
+        deps,
+        ctx,
+        async (tx) => {
+          const days = await readDays(tx, s.symId, d0, d1);
+          const bars = await queryProfileBars(tx, s.symId, plan.barSegs, off);
+          const cells = cellsOf(bars, w);
+          if (cells > deps.cfg.maxCells) {
+            throw unprocessable(`${cells} Zeilen > ${deps.cfg.maxCells}; gröberes R wählen`, {
+              reason: 'profile_rows',
+              rows: cells,
+              limit: deps.cfg.maxCells,
+              suggestR: suggestR(deps, s, R, from, to, true, (r) =>
+                cellsOf(bars, r * s.tickRefUnits),
+              ),
+            });
+          }
+          const levels =
+            bars.length > 0
+              ? await queryProfileLevels(tx, s.symId, plan.segs, w, s.tickRefUnits, off)
+              : [];
+          const imm = allImmutable(days, d0, d1);
+          const where = { sym: s.name, d0, d1, R };
+          checkProfile(bars, levels, imm, where);
+          // je Tagesprofil: ein leerer Tag, der Trades haben müsste → Snapshot unbrauchbar
+          const minutesOn = (d: number) => rowsOnFor(s)('bar_1m', d);
+          const have = new Set(bars.map((b) => b.day));
+          for (let a = from; a < to; a += DAY_MS) {
+            if (!have.has(Math.floor((a - off) / DAY_MS)))
+              checkCoverage([], a, a + DAY_MS, minutesOn, imm, where, true);
+          }
+          return { days, bars, levels };
+        },
+        [...plan.segs, ...plan.barSegs],
+      );
       const ver = versionOf(parts, d0, d1, (d) => days.get(d));
       if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
       const out: DailyProfile[] = [];
