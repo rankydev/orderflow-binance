@@ -154,6 +154,9 @@ export function decimateByCell(
   return [...best.values()].sort((a, b) => a - b);
 }
 
+/** Spielraum der Trefferprüfung über den Radius (px). */
+export const HIT_SLACK = 2;
+
 /** Eimerraster für die Trefferprüfung (CSS-px): jeder Kreis in allen Zellen seiner Hülle. */
 export class HitGrid {
   readonly cell: number;
@@ -190,8 +193,9 @@ export class HitGrid {
     this.ys.push(y);
     this.rs.push(r);
     const c = this.cell;
-    for (let cx = Math.floor((x - r) / c); cx <= Math.floor((x + r) / c); cx++)
-      for (let cy = Math.floor((y - r) / c); cy <= Math.floor((y + r) / c); cy++) {
+    const R = r + HIT_SLACK; // Zellen inkl. Spielraum der Abfrage
+    for (let cx = Math.floor((x - R) / c); cx <= Math.floor((x + R) / c); cx++)
+      for (let cy = Math.floor((y - R) / c); cy <= Math.floor((y + R) / c); cy++) {
         const key = HitGrid.key(cx, cy);
         const l = this.cells.get(key);
         if (l) l.push(k);
@@ -203,7 +207,7 @@ export class HitGrid {
    * Marker unter (x, y) mit `slack` px Spielraum über den Radius: der mit dem nächsten Mittelpunkt,
    * bei Gleichstand der zuletzt gezeichnete (oben liegende). id oder null.
    */
-  query(x: number, y: number, slack = 2): number | null {
+  query(x: number, y: number, slack = HIT_SLACK): number | null {
     if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
     const l = this.cells.get(HitGrid.key(Math.floor(x / this.cell), Math.floor(y / this.cell)));
     if (!l) return null;
@@ -295,6 +299,9 @@ export interface CoverageSummary {
   reasons: CoverageReason[];
   /** höchste Untergrenze der partial-Tage (Notional) */
   partialFloorN: number | null;
+  /** sichtbare Zeit (ms) je Bandart bzw. insgesamt: „ganz" vs. „in Teilen" */
+  ms: Record<BandKind, number>;
+  visibleMs: number;
 }
 
 /** Wie viele UTC-Tage im sichtbaren Bereich [visFrom, visTo) (ms) welche Bandart haben. */
@@ -312,11 +319,13 @@ export function coverageSummary(
   };
   const reasons: CoverageReason[] = [];
   let partialFloorN: number | null = null;
+  const ms: Record<BandKind, number> = { none: 0, partial: 0, toomany: 0, failed: 0 };
   for (const b of bands) {
     const a = Math.max(b.from, visFrom);
     const e = Math.min(b.to, visTo);
     if (e <= a) continue;
     for (let d = day(a); d <= day(e - 1); d++) sets[b.kind].add(d);
+    ms[b.kind] += e - a;
     if (b.kind === 'none') for (const r of b.reasons) if (!reasons.includes(r)) reasons.push(r);
     if (b.kind === 'partial' && b.floorN !== null)
       partialFloorN = Math.max(partialFloorN ?? 0, b.floorN);
@@ -329,6 +338,8 @@ export function coverageSummary(
     failedDays: sets.failed.size,
     reasons,
     partialFloorN,
+    ms,
+    visibleMs: Math.max(0, visTo - visFrom),
   };
 }
 
@@ -353,22 +364,25 @@ export function reasonText(r: CoverageReason | string): string {
 /** Legenden-Hinweis zur Abdeckung ('' = alles sichtbare abgedeckt). */
 export function coverageNote(s: CoverageSummary, notionalDecimals: number): string {
   const parts: string[] = [];
-  const of = (n: number) =>
-    n >= s.visibleDays ? 'im sichtbaren Bereich' : `in ${n} von ${s.visibleDays} Tagen`;
+  // ganz (Zeitanteil) → „im sichtbaren Bereich"; sonst Tage mit Anteil, bei allen Tagen „in Teilen"
+  const where = (k: BandKind, n: number, pre = 'in') =>
+    s.ms[k] >= s.visibleMs
+      ? 'im sichtbaren Bereich'
+      : n >= s.visibleDays
+        ? 'in Teilen des sichtbaren Bereichs'
+        : `${pre} ${n} von ${s.visibleDays} Tagen`;
+  const of = (n: number, k: BandKind = 'none') => where(k, n);
   if (s.noneDays > 0)
     parts.push(
       `keine Big-Trade-Daten ${of(s.noneDays)}${s.reasons.length ? ` (${s.reasons.map(reasonText).join(', ')})` : ''}`,
     );
   if (s.partialDays > 0) {
-    const floor = fmtUsdtCompact(Math.ceil((s.partialFloorN ?? 0) / 10 ** notionalDecimals));
-    const where =
-      s.partialDays >= s.visibleDays
-        ? 'im sichtbaren Bereich'
-        : `an ${s.partialDays} von ${s.visibleDays} Tagen`;
-    parts.push(`${where} Big Trades erst ab ${floor} gespeichert`);
+    const floor = fmtUsdtCompact(Math.ceil((s.partialFloorN ?? 0) / 10 ** notionalDecimals), true);
+    parts.push(`${where('partial', s.partialDays, 'an')} Big Trades erst ab ${floor} gespeichert`);
   }
-  if (s.toomanyDays > 0) parts.push(`zu viele Orders ${of(s.toomanyDays)} – nicht geladen`);
-  if (s.failedDays > 0) parts.push(`nicht ladbar ${of(s.failedDays)}`);
+  if (s.toomanyDays > 0)
+    parts.push(`zu viele Orders ${of(s.toomanyDays, 'toomany')} – nicht geladen`);
+  if (s.failedDays > 0) parts.push(`nicht ladbar ${of(s.failedDays, 'failed')}`);
   return parts.join(' · ');
 }
 
@@ -376,12 +390,22 @@ export function coverageNote(s: CoverageSummary, notionalDecimals: number): stri
 
 const nf = new Intl.NumberFormat('de-DE', { maximumFractionDigits: 2 });
 
-/** Kurzform einer Schwelle in USDT: „500 k $", „1 Mio. $", „2,5 Mio. $", „1 Mrd. $". */
-export function fmtUsdtCompact(usdt: number): string {
-  if (usdt >= 1e9) return `${nf.format(usdt / 1e9)} Mrd. $`;
-  if (usdt >= 1e6) return `${nf.format(usdt / 1e6)} Mio. $`;
-  if (usdt >= 1e3) return `${nf.format(usdt / 1e3)} k $`;
-  return `${nf.format(usdt)} $`;
+/**
+ * Kurzform einer Schwelle in USDT: „500 k $", „1 Mio. $", „2,5 Mio. $", „1 Mrd. $". exact: verlöre die
+ * Kurzform Stellen (z. B. 1 234 567), stattdessen der volle Wert („1 234 567 $").
+ */
+export function fmtUsdtCompact(usdt: number, exact = false): string {
+  const [u, name] =
+    usdt >= 1e9
+      ? [1e9, 'Mrd. ']
+      : usdt >= 1e6
+        ? [1e6, 'Mio. ']
+        : usdt >= 1e3
+          ? [1e3, 'k ']
+          : [1, ''];
+  if (exact && Math.round((usdt / u) * 100) * (u / 100) !== usdt)
+    return `${groupThousands(String(usdt))} $`;
+  return `${nf.format(usdt / u)} ${name}$`.replace('  ', ' ');
 }
 
 /** Ganzzahl mit schmalen Leerzeichen als Tausendertrennung: 1234567 → „1 234 567". */
@@ -399,8 +423,9 @@ export function fmtNotionalUsdt(notional: number, notionalDecimals: number): str
 /** Kurzlabel am Marker: „2,4 M", „850 k". */
 export function fmtNotionalShort(notional: number, notionalDecimals: number): string {
   const usdt = notional / 10 ** notionalDecimals;
-  if (usdt >= 1e9) return `${nf.format(Math.round(usdt / 1e8) / 10)} Mrd`;
-  if (usdt >= 1e6) return `${nf.format(Math.round(usdt / 1e5) / 10)} M`;
+  // erst runden, dann die Einheit wählen (999 960 → „1 M", nicht „1000 k")
+  if (Math.round(usdt / 1e8) >= 10) return `${nf.format(Math.round(usdt / 1e8) / 10)} Mrd`;
+  if (Math.round(usdt / 1e5) >= 10) return `${nf.format(Math.round(usdt / 1e5) / 10)} M`;
   return `${Math.round(usdt / 1e3)} k`;
 }
 

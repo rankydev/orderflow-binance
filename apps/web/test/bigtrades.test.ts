@@ -184,6 +184,10 @@ describe('Trefferraster', () => {
     expect(g.query(201, 51)).toBe(1);
     expect(g.query(200, 55)).toBe(1); // 5 px ≤ r 3 + Spielraum 2
     expect(g.query(200, 56)).toBeNull(); // 6 px > 5
+    // Spielraum über eine Zellgrenze hinweg (Kreis endet bei x = 31, Zeiger in der Nachbarzelle)
+    const e = new HitGrid(32);
+    e.add(3, 28, 10, 3);
+    expect(e.query(32.5, 10)).toBe(3);
   });
   it('Vorrang: nächster Mittelpunkt, bei Gleichstand der zuletzt gezeichnete', () => {
     const g = new HitGrid(32);
@@ -295,6 +299,16 @@ describe('Abdeckung → Bänder und Legende', () => {
     expect(clipSpans(spans, T + D / 2, T + D)).toHaveLength(1);
   });
 
+  it('eine Lückenminute in jedem sichtbaren Tag: „in Teilen", nicht „im sichtbaren Bereich"', () => {
+    const bands = coverageBands([span(T + 600_000, T + 660_000, 'none', null, 'gap')], MIN);
+    expect(coverageNote(coverageSummary(bands, T, T + 3_600_000), 5)).toBe(
+      'keine Big-Trade-Daten in Teilen des sichtbaren Bereichs (Lücke der Aufzeichnung)',
+    );
+    expect(coverageNote(coverageSummary(bands, T + 600_000, T + 660_000), 5)).toBe(
+      'keine Big-Trade-Daten im sichtbaren Bereich (Lücke der Aufzeichnung)',
+    );
+  });
+
   it('partial mit Untergrenze in USDT; Tage am Rand des sichtbaren Bereichs zählen', () => {
     const bands = coverageBands([span(T, T + 2 * D, 'partial', 2 * MIN, 'floor_above')], MIN);
     const s = coverageSummary(bands, T + D - 1, T + 3 * D);
@@ -310,6 +324,11 @@ describe('Texte exakt', () => {
     expect(fmtUsdtCompact(1_000_000)).toBe('1 Mio. $');
     expect(fmtUsdtCompact(2_500_000)).toBe('2,5 Mio. $');
     expect(fmtUsdtCompact(1_000_000_000)).toBe('1 Mrd. $');
+    // exakt: keine abgerundete Untergrenze
+    expect(fmtUsdtCompact(1_234_567)).toBe('1,23 Mio. $');
+    expect(fmtUsdtCompact(1_234_567, true)).toBe('1\u202f234\u202f567 $');
+    expect(fmtUsdtCompact(2_500_000, true)).toBe('2,5 Mio. $');
+    expect(fmtUsdtCompact(500, true)).toBe('500 $');
   });
   it('Notional auf ganze USDT half-up, gruppiert; Kurzlabel', () => {
     expect(fmtNotionalUsdt(123_456_789_049_999, 5)).toBe('1 234 567 890 USDT');
@@ -317,6 +336,7 @@ describe('Texte exakt', () => {
     expect(fmtNotionalUsdt(50_000_049_999, 5)).toBe('500 000 USDT');
     expect(fmtNotionalShort(240_000_000_000, 5)).toBe('2,4 M');
     expect(fmtNotionalShort(85_000_000_000, 5)).toBe('850 k');
+    expect(fmtNotionalShort(99_996_000_000, 5)).toBe('1 M'); // nicht „1000 k"
   });
   it('VWAP = notional / qty mit priceDecimals + 1 Stellen, exakt gerundet', () => {
     // 3 Fills: 97 000.00 × 1.000, 97 001.00 × 1.000, 97 001.50 × 1.000 (price_unit 0.01, qty_unit 0.001)

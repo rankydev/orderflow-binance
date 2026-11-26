@@ -407,6 +407,8 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     this.cache.delete(key);
     this.cache.set(key, e);
     this.rejected.delete(key);
+    // eine frühere Meldung gilt nicht mehr, sobald keine sichtbare Ablehnung „failed" übrig ist
+    if (![...this.rejected.values()].some((r) => r.kind === 'failed')) this.error = '';
     while (this.cache.size > BIGTRADES_CACHE_ENTRIES) {
       const first = this.cache.keys().next().value as string;
       this.cache.delete(first);
@@ -585,8 +587,12 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     ctx.font = `${Math.round(10 * vpr)}px system-ui, sans-serif`;
     ctx.textBaseline = 'bottom';
     for (const b of this.bands) {
-      const xa = (xm.x0 + logicalOfSec(items, b.from / 1000, tfSec) * xm.bs - xm.bs / 2) * hpr;
-      const xb = (xm.x0 + logicalOfSec(items, b.to / 1000, tfSec) * xm.bs - xm.bs / 2) * hpr;
+      // an Bar-Grenzen nach außen runden: eine Lücke mitten in einem Bar markiert den ganzen Bar
+      const tfMs = tfSec * 1000;
+      const f = Math.floor(b.from / tfMs) * tfSec;
+      const t = Math.ceil(b.to / tfMs) * tfSec;
+      const xa = (xm.x0 + logicalOfSec(items, f, tfSec) * xm.bs - xm.bs / 2) * hpr;
+      const xb = (xm.x0 + logicalOfSec(items, t, tfSec) * xm.bs - xm.bs / 2) * hpr;
       const a = Math.max(0, Math.round(xa));
       const z = Math.min(W, Math.round(xb));
       if (z <= a) continue;

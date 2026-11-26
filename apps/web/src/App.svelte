@@ -150,7 +150,9 @@
     ctl.onSymbols = () => {
       refreshLists();
       // Untergrenze kann sich mit /symbols ändern: Schwelle nie darunter (Wert sonst unverändert)
-      if (btFloor !== null && btMin !== null && btMin < btFloor) setBtMin(btFloor);
+      // Big Trades für das Symbol neu verfügbar oder entfallen: Schwelle neu bestimmen
+      if ((btFloor === null) !== (btMin === null)) resolveBt(sym, false);
+      else if (btFloor !== null && btMin !== null && btMin < btFloor) setBtMin(btFloor);
     };
     ctl.bigTrades.onChange = () => {
       if (ctl) bro = ctl.bigTrades.readout();
@@ -365,7 +367,10 @@
   }
 
   function syncUrl(): void {
-    const bt = bigTradesParamsQuery({ on: btOn, min: btMin ?? btInit.min }, btFloor);
+    const bt = bigTradesParamsQuery(
+      { on: btOn, min: ready ? btMin : (btMin ?? btInit.min) },
+      btFloor,
+    );
     const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${footprintParamsQuery(fpo)}${profileParamsQuery(prof)}${bt}${tpoParamsQuery(view, tpo)}${zoneSettingQuery(tzSet)}${params.has('debug') ? '&debug' : ''}`;
     history.replaceState(null, '', q);
     document.title = `${sym} ${tf} · ${APP_TITLE}`;
