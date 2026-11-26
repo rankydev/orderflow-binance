@@ -70,7 +70,7 @@ Darstellung ohne Gleitkommadrift: USDT = `notional / 10^notionalDecimals`, Menge
 
 Lückenlose Zerlegung von `[from, to)`, gleiche Nachbarabschnitte zusammengefasst. **Granularität: Minute.**
 Grenzen liegen an UTC-Tagen, an den Rändern der Anfrage und – innerhalb eines Tages – an Minutengrenzen
-(Aufzeichnungsbereich eines Live-Tages, gap/missing-Minuten).
+(Aufzeichnungsbereich eines Live-Tages, gap/missing/mismatch-Minuten).
 
 | `status` | `reason` | Bedeutung | Zeilen |
 |---|---|---|---|
@@ -83,15 +83,31 @@ Grenzen liegen an UTC-Tagen, an den Rändern der Anfrage und – innerhalb eines
 | `none` | `not_recorded` | Live-Tag vor dem Beginn der Aufzeichnung | keine |
 | `none` | `pending` | Live-Tag ab `live_until`: noch nicht geschrieben (auch die Zukunft des laufenden Tages) | keine |
 | `none` | `gap` | nicht füllbare Lücke des Recorders (`data_minute_issue` kind `gap`) | keine |
+| `none` | `mismatch` | Volumen/Taker-Buy der Minute weicht von der Kline ab, nicht durch Randverschiebung erklärt (kind `mismatch`) | keine |
+| `none` | `too_many_holes` | Tag mit mehr als 120 Lückenminuten (gap/missing/mismatch) bzw. über 4 000 je Anfrage: ganzer Tag ohne Daten gemeldet | keine |
 | `none` | `source_missing` | Minute mit Kline-Trades, aber ohne aggTrades in der Binance-Datei (kind `missing`, `final_bad`-Tage) | keine |
 
 **Live-Tage** (`data_day.source` ≠ `vision`): `orders_n` NOT NULL heißt nur „Speicher des Recorders = bar_1m
 des Tages", nicht „Tag lückenlos". Aufgezeichnet gilt `[recordedFrom, live_until)`: `recordedFrom` = Tagesbeginn,
 wenn die erste aggId des Tages genau an die letzte des Vortags anschließt (`first_agg_id = Vortag.last_agg_id + 1`),
 sonst das **Ende** der ersten gespeicherten bar_1m-Minute (sie kann angeschnitten sein). Davor `not_recorded`,
-ab `live_until` `pending`; darin gap-Minuten. Tage aus Binance-Dateien decken den ganzen Tag; dort werden nur
-`missing`-Minuten ausgenommen (`mismatch`-Minuten bleiben `ok`: die aggTrades sind vorhanden, nur die Summe weicht
-von der Kline ab). Ein laufender Neuimport (`importing` mit vorherigem Zustand) liefert die alten Daten,
+ab `live_until` `pending`; darin gap-Minuten. Tage aus Binance-Dateien decken den ganzen Tag; ausgenommen werden
+dort `missing`- und `mismatch`-Minuten (je Minute gilt gap vor missing vor mismatch).
+
+**`mismatch` (Entscheidung 2026-11-26: konservativ).** Bedeutung im Abgleich (KONZEPT §4.6,
+`packages/core/src/classifier/reconcile.ts`): je Minute D = unser − Kline für Volumen q und Taker-Buy b, Übertrag
+s(m) = s(m−1) + D(m); `mismatch` = weder `exact` noch durch eine von Randkandidaten gedeckte Verschiebung erklärbar
+(`shift`). Es gibt keine OHLC-Komponente und keine Unterarten; gespeichert sind `d_q`, `d_b` (D) in
+`data_minute_issue`. Ursache in der Historie meist fehlende Tail-Fills (D < 0): Orders der Minute können zu klein
+oder unvollständig sein – daher keine Zeilen. Möglicher späterer Rückgriff (nicht umgesetzt): eine Minute mit
+D_q ≥ 0 und D_b ≥ 0 hat mindestens das Kline-Volumen, Big Orders fehlen dort nicht nachweislich; sie dürfte als
+`partial` (Grund z. B. `excess_volume`) gemeldet werden, nie als `ok`. `shift`-Minuten bleiben `ok` (die Menge ist
+vollständig, nur an der Minutengrenze verschoben).
+
+**Grenze der Lückenminuten:** höchstens 120 je Tag und 4 000 je Anfrage werden minutengenau gemeldet; ein Tag
+darüber wird ganz `none`/`too_many_holes` (Tage in aufsteigender Reihenfolge, bis das Budget erschöpft ist) – die
+Zahl der Abschnitte und die Headergröße bleiben beschränkt (≲ 2 · 4 000 + 3 je Tag), ohne Lücken als `ok`
+auszugeben. Gemessen: BTC 2 836 mismatch + 47 missing in 692 Tagen, im Mittel ≈ 4 je betroffenem Tag. Ein laufender Neuimport (`importing` mit vorherigem Zustand) liefert die alten Daten,
 `final = false`.
 
 Zeilen gibt es **nur** in `ok`/`partial`-Abschnitten (gespeicherte Zeilen eines `none`-Abschnitts werden nicht
@@ -126,11 +142,12 @@ behandelt sie als „keine Daten".
 ### Caching und Versionen
 
 `ETag` = `dataVersion` (Hash über die Versionen der überdeckten Tage, Parameter, `maxRows` und eine
-Endpunkt-Build-Version, je Tag zusätzlich die Zahl der gap/missing-Minuten – `markGap` des Recorders erhöht
+Endpunkt-Build-Version, ab dem **Vortag** von `from` (dessen `last_agg_id` bestimmt den Aufzeichnungsbeginn eines
+Live-Tages), je Tag zusätzlich die Zahl der gap/missing/mismatch-Minuten – `markGap` des Recorders erhöht
 `data_day.version` nicht; gelesen im selben Snapshot wie die Zeilen; Orderfelder und `live_until` ändern sich nur
 zusammen mit `data_day.version`). `RESPONSE_BUILD_VERSION` bleibt unverändert (neuer Schlüsselraum, bestehende
 ETags unberührt). **`final`** = jeder Abschnitt `ok` und unveränderlich (kein `none`, kein `partial`, keine
-gap/missing-Minute an einem überdeckten Tag): dann `Cache-Control: public, max-age=604800`, sonst `no-cache` –
+gap/missing/mismatch-Minute an einem überdeckten Tag): dann `Cache-Control: public, max-age=604800`, sonst `no-cache` –
 ein `digest_v1`- oder `partial`-Tag ist unveränderlich, kann aber mit einem Neuimport Order-Daten bzw. eine
 andere Untergrenze bekommen und liegt deshalb nicht eine Woche im Browser.
 304 vor der Datenabfrage, Server-Cache, gebündelte gleiche Anfragen und Live-Tag (jede Minute neue Version)
@@ -166,3 +183,6 @@ Orders. Bei dieser Verteilung gehen an der Untergrenze 1m/5m/15m-Abschnitte durc
   `gap`, `source_missing`; Live-Tage nur im Aufzeichnungsbereich `ok`; `final` (und der Wochen-Cache) nicht mehr
   bei `partial` oder gap/missing-Minuten; feinere Stufen der Schätzung (weniger unnötige 422); `decodeBigTrades`
   nimmt unbekannte `none`-Gründe an. Header-Felder, Spalten, Parameter und Fehlerformen unverändert.
+- **2026-11-26 (zweites Review):** `mismatch`-Minuten `none` (Grund `mismatch`), Tag mit solchen Minuten nicht
+  `final`; neuer Grund `too_many_holes` (Grenze 120 je Tag / 4 000 je Anfrage); Vortag in der `dataVersion`;
+  Build-Version 2 (alle ETags dieses Endpunkts neu). Header, Spalten, Parameter unverändert.

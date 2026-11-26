@@ -279,6 +279,24 @@ describe('Big-Trades-Format', () => {
     expect(() => decodeBigTrades(u8)).toThrow(/bar passt nicht/);
   });
 
+  it('Gründe mismatch und too_many_holes', () => {
+    const cov: CoverageSpan[] = [
+      { from: D0, to: D0 + 60_000, status: 'none', reason: 'mismatch', floorN: null, final: true },
+      { from: D0 + 60_000, to: D0 + DAY, status: 'ok', reason: null, floorN: MIN_N, final: true },
+      {
+        from: D0 + DAY,
+        to: D0 + 2 * DAY,
+        status: 'none',
+        reason: 'too_many_holes',
+        floorN: null,
+        final: true,
+      },
+    ];
+    expect(decodeBigTrades(encodeBigTrades(data([], { final: false }, cov))).meta.coverage).toEqual(
+      cov,
+    );
+  });
+
   it('Minutenabschnitte (Live, Lücken); Decoder nimmt künftige none-Gründe an', () => {
     const M = 60_000;
     const cov: CoverageSpan[] = [

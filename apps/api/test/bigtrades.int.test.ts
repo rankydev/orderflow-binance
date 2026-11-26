@@ -25,6 +25,7 @@ import { BIG_LADDER_USDT } from '../src/bigtrades-plan.ts';
 import { parseApiConfig, type ApiConfig } from '../src/config.ts';
 import { startApi, type RunningApi } from '../src/main.ts';
 import {
+  BIG_HOLES_PER_DAY,
   BIGTRADES_MAX_MATCHED_ROWS,
   BIGTRADES_MAX_ROWS,
   BIGTRADES_MAX_SOURCE_ROWS,
@@ -47,6 +48,8 @@ const PX = 9_000_000; // 90 000 USDT
 const ETH_UNIT = 1_000_000; // ETH: 0,001 · 0,001 = 10^-6 USDT
 const ETH_FLOOR = 250_000 * ETH_UNIT;
 const ETH_PX = 3_000_000; // 3 000 USDT
+/** Tag 15: mehr Lückenminuten als BIG_HOLES_PER_DAY → ganzer Tag too_many_holes. */
+const HOLEY = 15;
 const at = (off: number, h = 0, m = 0) => (D + off) * DAY + h * HOUR + m * MIN;
 
 interface DayFix {
@@ -99,6 +102,7 @@ const DAYS: DayFix[] = [
   // Neuimport läuft (alte Daten sichtbar) bzw. erstmals im Import (noch keine Daten)
   { off: 11, state: 'importing', dv: 2, ordersN: 1000, floor: FLOOR, before: 'final_ok' },
   { off: 12, state: 'importing', dv: null, ordersN: null, floor: null, orders: 0 },
+  { off: HOLEY, state: 'final_bad', dv: 2, ordersN: 1000, floor: FLOOR },
 ];
 
 interface Order {
@@ -149,6 +153,9 @@ const stored = new Map<number, Order[]>();
 let ethOrders: Order[] = [];
 /** Minuten ohne Order-Daten (data_minute_issue). */
 const MISSING = [at(3, 1, 40), at(3, 1, 41)];
+/** mismatch-Minute an Tag 3 (dazu eine mismatch-Zeile auf MISSING[0]: dort gilt missing). */
+const MISMATCH = at(3, 3);
+
 const GAPS = [at(10, 12, 0), at(10, 12, 1)];
 
 function apiCfg(over: Partial<ApiConfig> = {}): ApiConfig {
@@ -280,6 +287,12 @@ beforeAll(async () => {
   );
   for (const [ts, kind] of [
     ...MISSING.map((t) => [t, 'missing'] as const),
+    [MISSING[0]!, 'mismatch'] as const,
+    [MISMATCH, 'mismatch'] as const,
+    ...Array.from(
+      { length: BIG_HOLES_PER_DAY + 1 },
+      (_, i) => [at(HOLEY, 0, 2 * i), 'mismatch'] as const,
+    ),
     ...GAPS.map((t) => [t, 'gap'] as const),
   ])
     await admin`INSERT INTO data_minute_issue (sym_id, ts, kind) VALUES (1, ${new Date(ts)}, ${kind})`;
@@ -325,6 +338,15 @@ const partial = (from: number, to: number): CoverageSpan => ({
   floorN: 2 * FLOOR,
   final: true,
 });
+
+/** Tag 3 bis `end`: Lückenminuten missing (vor mismatch) und mismatch, dazwischen `c`. */
+const day3 = (c: (a: number, b: number) => CoverageSpan, end: number): CoverageSpan[] => [
+  c(at(3), MISSING[0]!),
+  none(MISSING[0]!, MISSING[1]! + MIN, 'source_missing', true),
+  c(MISSING[1]! + MIN, MISMATCH),
+  none(MISMATCH, MISMATCH + MIN, 'mismatch', true),
+  c(MISMATCH + MIN, end),
+];
 
 describe('/bigtrades', () => {
   it('of_api darf big_order, data_minute_issue, bar_1m lesen, nicht schreiben; Columnstore', async () => {
@@ -436,9 +458,7 @@ describe('/bigtrades', () => {
     expect(d.meta.coverage).toEqual([
       ok(at(0), at(2), true),
       none(at(2), at(3), 'digest_v1', true),
-      partial(at(3), MISSING[0]!),
-      { ...none(MISSING[0]!, MISSING[1]! + MIN, 'source_missing', true) },
-      partial(MISSING[1]! + MIN, at(4)),
+      ...day3(partial, at(4)),
       none(at(4), at(5), 'no_day', false),
       none(at(5), at(6), 'no_floor', true),
       // Live-Tag 6 schließt an Tag 5 an: ab 00:00 aufgezeichnet, bis live_until 20:00
@@ -455,6 +475,7 @@ describe('/bigtrades', () => {
       [at(6, 20), at(7)],
       [at(7), at(8)],
       [MISSING[0]!, MISSING[1]! + MIN],
+      [MISMATCH, MISMATCH + MIN],
     ] as const) {
       expect(
         [...stored.values()].flat().some((o) => o.ts >= a && o.ts < b),
@@ -466,9 +487,7 @@ describe('/bigtrades', () => {
     const d3 = await get(url(at(3), at(4), 1_000_000, '1d'));
     expect(d3.res.headers.get('cache-control')).toBe('no-cache');
     expect(d3.decode().meta.coverage).toEqual([
-      ok(at(3), MISSING[0]!, true, 2 * FLOOR),
-      none(MISSING[0]!, MISSING[1]! + MIN, 'source_missing', true),
-      ok(MISSING[1]! + MIN, at(4), true, 2 * FLOOR),
+      ...day3((a, b) => ok(a, b, true, 2 * FLOOR), at(4)),
     ]);
     // nur ein Tag ohne Order-Daten bzw. partial: unveränderlich, aber nicht final
     for (const p of [url(at(2), at(3), 500_000, '1d'), url(at(3), at(4), 500_000, '1d')]) {
@@ -506,9 +525,7 @@ describe('/bigtrades', () => {
     expect(d.meta.coverage).toEqual([
       ok(from, at(2), true),
       none(at(2), at(3), 'digest_v1', true),
-      partial(at(3), MISSING[0]!),
-      none(MISSING[0]!, MISSING[1]! + MIN, 'source_missing', true),
-      partial(MISSING[1]! + MIN, to),
+      ...day3(partial, to),
     ]);
     expect(rowsOf(d)).toEqual(expected(from, to, FLOOR, inCoverage(d.meta.coverage)));
   });
@@ -736,5 +753,30 @@ describe('/bigtrades', () => {
     } finally {
       await admin`UPDATE data_day SET stale = false WHERE sym_id = 1 AND day = ${dayStr(1)}::date`;
     }
+  });
+
+  it('mehr Lückenminuten als die Grenze: ganzer Tag none too_many_holes, keine Zeilen, kein 500', async () => {
+    const r = await get(url(at(HOLEY), at(HOLEY + 1), 500_000));
+    expect(r.res.status).toBe(200);
+    const d = r.decode();
+    expect(d.meta.coverage).toEqual([none(at(HOLEY), at(HOLEY + 1), 'too_many_holes', true)]);
+    expect(stored.get(HOLEY)!.length).toBeGreaterThan(0);
+    expect(d.header.n).toBe(0);
+    expect(d.meta.final).toBe(false);
+  });
+
+  it('Import des Vortags (Anschluss der aggIds) ändert ETag und Aufzeichnungsbeginn', async () => {
+    const p = url(at(10), at(11), 500_000);
+    const a = await get(p);
+    const etag = a.res.headers.get('etag')!;
+    expect(a.decode().meta.coverage[0]!.reason).toBe('not_recorded');
+    // Tag 9 neu importiert: letzte aggId schließt jetzt an Tag 10 an (Tag 10 selbst unverändert)
+    await admin`UPDATE data_day SET last_agg_id = 10499999, version = version + 1
+                 WHERE sym_id = 1 AND day = ${dayStr(9)}::date`;
+    await waitFor(
+      async () => (await get(p, { headers: { 'If-None-Match': etag } })).res.status === 200,
+    );
+    const b = (await get(p)).decode();
+    expect(b.meta.coverage[0]).toEqual(ok(at(10), GAPS[0]!, false));
   });
 });

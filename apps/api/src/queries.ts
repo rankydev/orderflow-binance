@@ -494,11 +494,12 @@ export async function queryIssues(
 // ---------------------------------------------------------------- Big Trades (GET /api/v1/bigtrades)
 
 /**
- * Anzahl der gap/missing-Minuten eines data_day-Tages (Alias d), über den Primärschlüssel von
- * data_minute_issue. Für Version und `final` von /bigtrades (markGap ändert data_day.version nicht).
+ * Anzahl der Minuten mit gap/missing/mismatch eines data_day-Tages (Alias d), über den
+ * Primärschlüssel von data_minute_issue. Für Version, `final` und die Grenze der Lückenminuten von
+ * /bigtrades (markGap ändert data_day.version nicht).
  */
-export const HOLES_SQL = `(SELECT count(*)::int FROM data_minute_issue i
-   WHERE i.sym_id = d.sym_id AND i.kind IN ('gap', 'missing')
+export const HOLES_SQL = `(SELECT count(DISTINCT i.ts)::int FROM data_minute_issue i
+   WHERE i.sym_id = d.sym_id AND i.kind IN ('gap', 'missing', 'mismatch')
      AND i.ts >= d.day::timestamp AT TIME ZONE 'UTC'
      AND i.ts < (d.day + 1)::timestamp AT TIME ZONE 'UTC')`;
 
@@ -554,20 +555,30 @@ export async function readOrderDays(
   return m;
 }
 
-/** gap/missing-Minuten (Beginn in ms) in [from, to), aufsteigend; missing → source_missing. */
+/**
+ * Lückenminuten (Beginn in ms) der Tage `days`, aufsteigend: gap vor missing (→ source_missing) vor
+ * mismatch je Minute.
+ */
 export async function queryHoleMinutes(
   tx: ReadTx,
   symId: number,
-  from: number,
-  to: number,
-): Promise<{ ts: number; reason: 'gap' | 'source_missing' }[]> {
+  days: number[],
+): Promise<{ ts: number; reason: 'gap' | 'source_missing' | 'mismatch' }[]> {
+  if (days.length === 0) return [];
+  const where = days
+    .map((d) => `(ts >= ${tsLit(d * DAY_MS)} AND ts < ${tsLit((d + 1) * DAY_MS)})`)
+    .join(' OR ');
   const rows = await tx.rows(
-    `SELECT (extract(epoch FROM ts) * 1000)::int8, bool_or(kind = 'gap') FROM data_minute_issue
-      WHERE sym_id = $1 AND kind IN ('gap', 'missing') AND ts >= ${tsLit(from)} AND ts < ${tsLit(to)}
+    `SELECT (extract(epoch FROM ts) * 1000)::int8, bool_or(kind = 'gap'), bool_or(kind = 'missing')
+       FROM data_minute_issue
+      WHERE sym_id = $1 AND kind IN ('gap', 'missing', 'mismatch') AND (${where})
       GROUP BY 1 ORDER BY 1`,
     [symId],
   );
-  return rows.map((r) => ({ ts: int(r[0]), reason: r[1] === true ? 'gap' : 'source_missing' }));
+  return rows.map((r) => ({
+    ts: int(r[0]),
+    reason: r[1] === true ? 'gap' : r[2] === true ? 'source_missing' : 'mismatch',
+  }));
 }
 
 /** Erste gespeicherte Minute (ms) je Tag in bar_1m, für die Tage `days`. */

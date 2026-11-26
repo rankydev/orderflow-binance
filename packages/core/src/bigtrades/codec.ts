@@ -30,7 +30,9 @@ export type CoverageStatus = 'ok' | 'partial' | 'none';
  * no_floor (ohne Untergrenze geschrieben: keine big orders gebildet), unknown_totals (laufender Tag,
  * Vollständigkeit der Order-Daten nicht nachgewiesen), not_recorded (Live-Tag vor dem Beginn der
  * Aufzeichnung), pending (Live-Tag nach live_until: noch nicht geschrieben, auch die Zukunft), gap
- * (nicht füllbare Lücke des Recorders), source_missing (Minute ohne aggTrades in der Binance-Datei).
+ * (nicht füllbare Lücke des Recorders), source_missing (Minute ohne aggTrades in der Binance-Datei),
+ * mismatch (Volumen weicht von der Kline ab, nicht durch Randverschiebung erklärt), too_many_holes
+ * (Tag mit zu vielen solchen Minuten: ganz ohne Daten gemeldet).
  */
 export type CoverageReason =
   | 'floor_above'
@@ -41,7 +43,9 @@ export type CoverageReason =
   | 'not_recorded'
   | 'pending'
   | 'gap'
-  | 'source_missing';
+  | 'source_missing'
+  | 'mismatch'
+  | 'too_many_holes';
 
 export interface CoverageSpan {
   /** [from, to) in ms UTC, an Minutengrenzen (UTC-Tage, Live-Bereich, Lückenminuten) bzw. den Rändern der Anfrage. */
@@ -159,6 +163,8 @@ const NONE_REASONS: readonly CoverageReason[] = [
   'pending',
   'gap',
   'source_missing',
+  'mismatch',
+  'too_many_holes',
 ];
 
 const LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;

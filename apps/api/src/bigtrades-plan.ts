@@ -15,8 +15,11 @@
 //     Tagesbeginn, wenn die erste aggId des Tages an die letzte des Vortags anschließt, sonst das Ende
 //     der ersten gespeicherten Minute (die erste Minute kann angeschnitten sein). Davor `not_recorded`,
 //     danach `pending` (noch nicht geschrieben – auch die Zukunft).
-//   - Minuten aus data_minute_issue: `gap` (nicht füllbare Lücke des Recorders) und `missing`
-//     (→ `source_missing`: Klines zeigen Trades, die aggTrades-Datei hat keine; final_bad-Tage).
+//   - Minuten aus data_minute_issue: `gap` (nicht füllbare Lücke des Recorders), `missing`
+//     (→ `source_missing`: Klines zeigen Trades, die aggTrades-Datei hat keine) und `mismatch`
+//     (Volumen weicht von der Kline ab, nicht durch Randverschiebung erklärt; final_bad-Tage).
+//     Mehr als BIG_HOLES_PER_DAY solche Minuten an einem Tag (oder über BIG_HOLES_TOTAL je Anfrage):
+//     der ganze Tag `too_many_holes` (Grenze der Abschnittszahl, nie Informationsverlust).
 // Zeilen gibt es nur in ok/partial-Abschnitten.
 import type { CoverageReason, CoverageSpan, CoverageStatus } from '@orderflow/core';
 import { DAY_MS, MINUTE_MS } from './params.ts';
@@ -28,8 +31,10 @@ export interface OrderDay {
   digestVersion: number | null;
   ordersKnown: boolean;
   floorN: number | null;
-  /** Anzahl Minuten mit gap/missing (data_minute_issue); Teil von Version und `final`. */
+  /** Anzahl Minuten mit gap/missing/mismatch (data_minute_issue); Teil von Version und `final`. */
   holes?: number;
+  /** Nur im Lese-Snapshot: mehr Lückenminuten als die Grenze → ganzer Tag none too_many_holes. */
+  tooManyHoles?: boolean;
   /**
    * Nur im Lese-Snapshot: Live-Tag (source ≠ 'vision') mit aufgezeichnetem Bereich
    * [recordedFrom, recordedTo) in ms. Fehlt = Tag aus einer Binance-Datei (ganzer Tag).
@@ -40,7 +45,7 @@ export interface OrderDay {
 /** Minute (Beginn, ms) ohne Order-Daten aus data_minute_issue. */
 export interface HoleMinute {
   ts: number;
-  reason: 'gap' | 'source_missing';
+  reason: 'gap' | 'source_missing' | 'mismatch';
 }
 
 export interface DayCoverage {
@@ -61,6 +66,7 @@ export function dayCoverage(d: OrderDay | null | undefined, minN: number): DayCo
   if (d.digestVersion === 1) return none('digest_v1');
   if (!d.ordersKnown) return none('unknown_totals');
   if (d.floorN === null) return none('no_floor');
+  if (d.tooManyHoles) return none('too_many_holes');
   return d.floorN > minN
     ? { status: 'partial', reason: 'floor_above', floorN: d.floorN, final: d.immutable }
     : { status: 'ok', reason: null, floorN: d.floorN, final: d.immutable };

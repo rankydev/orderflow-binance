@@ -187,6 +187,40 @@ describe('coveragePlan', () => {
   });
 });
 
+describe('mismatch und Grenze der Lückenminuten', () => {
+  it('mismatch-Minute none, Tag mit zu vielen Lückenminuten ganz none too_many_holes', () => {
+    const p = coveragePlan(5 * DAY, 6 * DAY, FLOOR, () => ({ ...ok, holes: 1 }), [
+      { ts: 5 * DAY + 7 * MIN, reason: 'mismatch' },
+    ]);
+    expect(p.spans.map((x) => [x.from - 5 * DAY, x.status, x.reason])).toEqual([
+      [0, 'ok', null],
+      [7 * MIN, 'none', 'mismatch'],
+      [8 * MIN, 'ok', null],
+    ]);
+    expect(p.final).toBe(false);
+    const q = coveragePlan(5 * DAY, 6 * DAY, FLOOR, () => ({
+      ...ok,
+      holes: 500,
+      tooManyHoles: true,
+    }));
+    expect(q.spans).toEqual([
+      {
+        from: 5 * DAY,
+        to: 6 * DAY,
+        status: 'none',
+        reason: 'too_many_holes',
+        floorN: null,
+        final: true,
+      },
+    ]);
+    expect(q.ranges).toEqual([]);
+    // ein Tag ohne Order-Daten behält seinen Grund
+    expect(dayCoverage({ ...ok, digestVersion: 1, tooManyHoles: true }, FLOOR).reason).toBe(
+      'digest_v1',
+    );
+  });
+});
+
 describe('Stufenstatistik', () => {
   const idx = (u: number) => BIG_LADDER_USDT.indexOf(u);
   // Index i: [L[i−1], L[i]); Index 0 < 100 000 USDT

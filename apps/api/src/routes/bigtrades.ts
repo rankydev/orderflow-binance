@@ -53,7 +53,16 @@ export const BIGTRADES_MAX_MATCHED_ROWS = 150_000;
 /** Größte Schwelle in USDT (keine Order erreicht sie; hält minN < 2^53). */
 export const BIGTRADES_MAX_MIN_USDT = 1_000_000_000;
 /** Version des Antwortaufbaus dieses Endpunkts (Teil der dataVersion). */
-export const BIGTRADES_BUILD_VERSION = 1;
+export const BIGTRADES_BUILD_VERSION = 2;
+/**
+ * Grenzen der Lückenminuten (gap/missing/mismatch), damit Abschnitte und Header beschränkt bleiben:
+ * je Tag höchstens BIG_HOLES_PER_DAY, je Anfrage BIG_HOLES_TOTAL; darüber wird der ganze Tag `none`
+ * mit Grund too_many_holes (keine Zeilen) – nie ein 500 und nie eine Lücke als `ok`. Gemessen
+ * (KONZEPT §4.11): BTC 2 836 mismatch + 47 missing in 692 Tagen, d. h. ≈ 4 je Tag mit Abweichung;
+ * Header ≤ ≈ 2 · BIG_HOLES_TOTAL Abschnitte (≈ 100 B je Abschnitt).
+ */
+export const BIG_HOLES_PER_DAY = 120;
+export const BIG_HOLES_TOTAL = 4_000;
 
 if (BIGTRADES_MAX_ROWS < 4 * BIGTRADES_MAX_BARS) throw new Error('BIGTRADES_MAX_ROWS zu klein');
 
@@ -103,9 +112,10 @@ export function registerBigTradesRoutes(app: FastifyInstance, deps: Deps): void 
     // Bereiche ⊇ die des Snapshots, also eine obere Schranke für die Schätzung.
     const plan0 = coveragePlan(from, to, minN, (d) => s.days.get(d));
     const pre = {
+      // ab dem Vortag: sein last_agg_id entscheidet über den Aufzeichnungsbeginn eines Live-Tages
       dataVersion: versionOf(
         parts,
-        d0,
+        d0 - 1,
         d1,
         (d) => s.days.get(d),
         (d) => s.days.get(d)?.holes,
@@ -125,7 +135,20 @@ export function registerBigTradesRoutes(app: FastifyInstance, deps: Deps): void 
         async (tx) => {
           // Vortag für den Anschluss der ersten aggId eines Live-Tages
           const days = await readOrderDays(tx, s.symId, d0 - 1, d1);
-          const holes = await queryHoleMinutes(tx, s.symId, d0 * DAY_MS, (d1 + 1) * DAY_MS);
+          // Lückenminuten nur für Tage unter den Grenzen; darüber der ganze Tag too_many_holes
+          const holeDays: number[] = [];
+          const tooMany = new Set<number>();
+          let budget = BIG_HOLES_TOTAL;
+          for (let d = d0; d <= d1; d++) {
+            const h = days.get(d)?.holes ?? 0;
+            if (h === 0) continue;
+            if (h > BIG_HOLES_PER_DAY || h > budget) tooMany.add(d);
+            else {
+              holeDays.push(d);
+              budget -= h;
+            }
+          }
+          const holes = await queryHoleMinutes(tx, s.symId, holeDays);
           const live = new Map<number, { recordedFrom: number; recordedTo: number }>();
           const needFirst: number[] = [];
           for (let d = d0; d <= d1; d++) {
@@ -153,7 +176,9 @@ export function registerBigTradesRoutes(app: FastifyInstance, deps: Deps): void 
             minN,
             (d) => {
               const x = days.get(d);
-              return x ? { ...x, live: live.get(d) ?? null } : undefined;
+              return x
+                ? { ...x, live: live.get(d) ?? null, tooManyHoles: tooMany.has(d) }
+                : undefined;
             },
             holes,
           );
@@ -176,7 +201,7 @@ export function registerBigTradesRoutes(app: FastifyInstance, deps: Deps): void 
       );
       const ver = versionOf(
         parts,
-        d0,
+        d0 - 1,
         d1,
         (d) => days.get(d),
         (d) => days.get(d)?.holes,
