@@ -222,6 +222,49 @@ describe('Big-Trades-Format', () => {
     ['omitted ohne k', () => data([r1], { total: 2, omitted: 1 })],
     ['minN ≠ minUsdt · 10^d', () => data([], { minN: MIN_N + 1 })],
     ['from nicht ausgerichtet', () => data([], { from: D0 + 1000 })],
+    [
+      'final trotz partial',
+      () =>
+        data([], { final: true }, [
+          {
+            from: D0,
+            to: D0 + 2 * DAY,
+            status: 'partial',
+            reason: 'floor_above',
+            floorN: MIN_N + 1,
+            final: true,
+          },
+        ]),
+    ],
+    [
+      'Abschnittsgrenze nicht an einer Minute',
+      () =>
+        data([], { final: false }, [
+          { from: D0, to: D0 + 90_000, status: 'none', reason: 'gap', floorN: null, final: false },
+          {
+            from: D0 + 90_000,
+            to: D0 + 2 * DAY,
+            status: 'ok',
+            reason: null,
+            floorN: MIN_N,
+            final: false,
+          },
+        ]),
+    ],
+    [
+      'unbekannter Grund (Encoder streng)',
+      () =>
+        data([], { final: false }, [
+          {
+            from: D0,
+            to: D0 + 2 * DAY,
+            status: 'none',
+            reason: 'future_x' as 'gap',
+            floorN: null,
+            final: false,
+          },
+        ]),
+    ],
   ];
   for (const [name, mk] of bad)
     it(`Encoder lehnt ab: ${name}`, () => {
@@ -234,6 +277,58 @@ describe('Big-Trades-Format', () => {
     const back = decodeBigTrades(u8);
     back.rows.bar[0] = back.rows.bar[0]! + 3600; // Sicht auf u8
     expect(() => decodeBigTrades(u8)).toThrow(/bar passt nicht/);
+  });
+
+  it('Minutenabschnitte (Live, Lücken); Decoder nimmt künftige none-Gründe an', () => {
+    const M = 60_000;
+    const cov: CoverageSpan[] = [
+      {
+        from: D0,
+        to: D0 + 600 * M,
+        status: 'none',
+        reason: 'not_recorded',
+        floorN: null,
+        final: false,
+      },
+      {
+        from: D0 + 600 * M,
+        to: D0 + 601 * M,
+        status: 'none',
+        reason: 'gap',
+        floorN: null,
+        final: false,
+      },
+      {
+        from: D0 + 601 * M,
+        to: D0 + 900 * M,
+        status: 'ok',
+        reason: null,
+        floorN: MIN_N,
+        final: false,
+      },
+      {
+        from: D0 + 900 * M,
+        to: D0 + 2 * DAY,
+        status: 'none',
+        reason: 'pending',
+        floorN: null,
+        final: false,
+      },
+    ];
+    const row = { ...r1, ts: D0 + 700 * M };
+    const u8 = encodeBigTrades(data([row], { final: false }, cov));
+    expect(decodeBigTrades(u8).meta.coverage).toEqual(cov);
+    // Zeile in einer gap-Minute: abgelehnt
+    expect(() =>
+      encodeBigTrades(data([{ ...row, ts: D0 + 600 * M + 5 }], { final: false }, cov)),
+    ).toThrow(/ohne Order-Daten/);
+    // künftiger Grund: Header-JSON gleich lang umschreiben, Decoder akzeptiert ihn als none
+    const text = new TextDecoder().decode(u8);
+    const i = text.indexOf('"pending"');
+    const patched = u8.slice();
+    patched.set(new TextEncoder().encode('"later1"  '.slice(0, 9)), i);
+    const back = decodeBigTrades(patched);
+    expect(back.meta.coverage[3]!.reason as string).toBe('later1');
   });
 
   it('korrupte Eingaben: Magic, Padding, Länge, Kachel-Decoder', () => {

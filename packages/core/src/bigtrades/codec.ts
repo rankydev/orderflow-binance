@@ -28,12 +28,23 @@ export type CoverageStatus = 'ok' | 'partial' | 'none';
  * Grund bei partial/none: floor_above (Tag mit höherer Untergrenze geschrieben), no_day (keine
  * gespeicherten Daten an dem Tag), digest_v1 (vor den Order-Daten geschrieben, Neuimport ausstehend),
  * no_floor (ohne Untergrenze geschrieben: keine big orders gebildet), unknown_totals (laufender Tag,
- * Vollständigkeit der Order-Daten nicht nachgewiesen).
+ * Vollständigkeit der Order-Daten nicht nachgewiesen), not_recorded (Live-Tag vor dem Beginn der
+ * Aufzeichnung), pending (Live-Tag nach live_until: noch nicht geschrieben, auch die Zukunft), gap
+ * (nicht füllbare Lücke des Recorders), source_missing (Minute ohne aggTrades in der Binance-Datei).
  */
-export type CoverageReason = 'floor_above' | 'no_day' | 'digest_v1' | 'no_floor' | 'unknown_totals';
+export type CoverageReason =
+  | 'floor_above'
+  | 'no_day'
+  | 'digest_v1'
+  | 'no_floor'
+  | 'unknown_totals'
+  | 'not_recorded'
+  | 'pending'
+  | 'gap'
+  | 'source_missing';
 
 export interface CoverageSpan {
-  /** [from, to) in ms UTC, an UTC-Tagen bzw. den Rändern der Anfrage. */
+  /** [from, to) in ms UTC, an Minutengrenzen (UTC-Tage, Live-Bereich, Lückenminuten) bzw. den Rändern der Anfrage. */
   from: number;
   to: number;
   status: CoverageStatus;
@@ -72,7 +83,7 @@ export interface BigTradesMeta {
   /** Lückenlose Zerlegung von [from, to), aufsteigend. */
   coverage: CoverageSpan[];
   dataVersion: string;
-  /** Alle überdeckten Tage unveränderlich und mit Order-Daten (Antwort ändert sich nicht mehr). */
+  /** Alle Abschnitte `ok` und unveränderlich (Antwort ändert sich nicht mehr). */
   final: boolean;
 }
 
@@ -144,13 +155,17 @@ const NONE_REASONS: readonly CoverageReason[] = [
   'digest_v1',
   'no_floor',
   'unknown_totals',
+  'not_recorded',
+  'pending',
+  'gap',
+  'source_missing',
 ];
 
 const LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 const align8 = (n: number) => Math.ceil(n / 8) * 8;
 const bytesOf = (t: BigTradesColumnType) => (t === 'i32' ? 4 : 8);
 const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v);
-const DAY_MS = 86_400_000;
+const MINUTE_MS = 60_000;
 
 /** Kodiert eine Big-Trades-Antwort; prüft vorher dieselben Invarianten wie der Decoder. */
 export function encodeBigTrades(data: BigTradesData): Uint8Array {
@@ -167,7 +182,7 @@ export function encodeBigTrades(data: BigTradesData): Uint8Array {
     n,
     columns: cols.map((c) => c.spec),
   };
-  validateHeader(header);
+  validateHeader(header, true);
   validateRows(header, data.rows);
   let json = JSON.stringify(header);
   let hdr = new TextEncoder().encode(json);
@@ -193,7 +208,11 @@ export function encodeBigTrades(data: BigTradesData): Uint8Array {
   return u8;
 }
 
-function validateHeader(h: BigTradesHeader): void {
+/**
+ * strict (Encoder): nur bekannte Gründe. Decoder: bei `none` auch künftige Gründe (Kleinbuchstaben,
+ * Ziffern, _) – ein älterer Client behandelt sie als „keine Daten" statt abzulehnen.
+ */
+function validateHeader(h: BigTradesHeader, strict: boolean): void {
   const fail = (m: string): never => {
     throw new BigTradesFormatError(`Header: ${m}`);
   };
@@ -228,7 +247,7 @@ function validateHeader(h: BigTradesHeader): void {
     if (typeof c !== 'object' || c === null) fail('coverage-Eintrag ungültig');
     if (c.from !== at || !isInt(c.to) || c.to <= c.from || c.to > h.to)
       fail('coverage nicht lückenlos aufsteigend');
-    if (c.to !== h.to && c.to % DAY_MS !== 0) fail('coverage-Grenze nicht an einem UTC-Tag');
+    if (c.to !== h.to && c.to % MINUTE_MS !== 0) fail('coverage-Grenze nicht an einer Minute');
     if (!STATUSES.includes(c.status)) fail(`coverage-Status ${String(c.status)}`);
     if (typeof c.final !== 'boolean') fail('coverage.final fehlt');
     if (c.status === 'ok') {
@@ -237,14 +256,20 @@ function validateHeader(h: BigTradesHeader): void {
     } else if (c.status === 'partial') {
       if (c.reason !== 'floor_above' || !isInt(c.floorN) || c.floorN <= h.minN)
         fail('coverage partial: reason/floorN ungültig');
-    } else if (!NONE_REASONS.includes(c.reason as CoverageReason) || c.floorN !== null) {
+    } else if (
+      !(strict
+        ? NONE_REASONS.includes(c.reason as CoverageReason)
+        : typeof c.reason === 'string' && /^[a-z][a-z0-9_]{0,31}$/.test(c.reason)) ||
+      c.floorN !== null
+    ) {
       fail('coverage none: reason/floorN ungültig');
     }
-    if (!c.final || c.status === 'none') allFinal = false;
+    if (!c.final || c.status !== 'ok') allFinal = false;
     at = c.to;
   }
   if (at !== h.to) fail('coverage deckt [from, to) nicht ab');
-  if (h.final && !allFinal) fail('final trotz nicht finaler oder fehlender Order-Daten');
+  if (h.final && !allFinal)
+    fail('final trotz nicht finaler, fehlender oder unvollständiger Order-Daten');
   if (!Array.isArray(h.columns) || h.columns.length !== COLUMNS.length) fail('columns ungültig');
   COLUMNS.forEach(([k, type], i) => {
     const c = h.columns[i];
@@ -313,7 +338,7 @@ export function decodeBigTrades(input: Uint8Array | ArrayBuffer): DecodedBigTrad
   }
   if (typeof header !== 'object' || header === null || Array.isArray(header))
     throw new BigTradesFormatError('Header ist kein Objekt');
-  validateHeader(header);
+  validateHeader(header, false);
   let off = 8 + hlen;
   const arrays: Record<string, Int32Array | Float64Array> = {};
   for (const c of header.columns) {
