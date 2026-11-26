@@ -275,11 +275,13 @@ services:
     cap_drop: [ALL]
     security_opt: ['no-new-privileges:true']
     init: true
-    # Speicher: gemessen ≈ 550 MB RSS Spitze (Nachholen + Finalisierung im Prozess); 1 GB lässt
-    # ≈ 80 % Reserve. Summe der Limits DB 2 GB + API 0,6 GB + Recorder 1 GB = 3,6 GB bei ≈ 4,6 GB
-    # verfügbar; tatsächlich belegt (gemessen) DB 1,2 GiB, API 0,17 GiB.
-    mem_limit: 1g
-    memswap_limit: 1g
+    # Speicher: normal ≈ 102–111 MB RSS; beim Finalisieren eines Tages für beide Symbole im Prozess
+    # lokal gemessen Spitze 931 MB (Nachholen allein ≈ 550 MB). 1 GB bzw. 1200 MB ließen zu wenig
+    # Reserve (OOM-Kill mitten in der Finalisierung → Neustartschleife); daher 1536 MB. Summe der
+    # Limits DB 2 GB + API 0,6 GB + Recorder 1,5 GB = 4,1 GB bei ≈ 4,6 GB verfügbar; tatsächlich
+    # belegt (gemessen) DB 1,2 GiB, API 0,17 GiB. Kein NODE_OPTIONS/--max-old-space-size gesetzt.
+    mem_limit: 1536m
+    memswap_limit: 1536m
     cpus: 1.0
     pids_limit: 100
     # Bei globalem Speichermangel zuerst der Recorder (Neustart billig: Spool + REST ab letzter ID)

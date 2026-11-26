@@ -331,7 +331,7 @@ Lock-Proben) warten so lange; während Schritt 3 nichts dergleichen auf dem Mac 
 
 | Risiko                                                         | Schutz                                                                                                                                         |
 | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Speicher: kein Swap, globaler OOM könnte genius/mongod treffen | harte Limits (DB 2 GB, API 600 MB), `oom_score_adj` 300/500 für unsere Container, Preflight ≥ 3,5 GB verfügbar, Monitor warnt < 500 MB         |
+| Speicher: kein Swap, globaler OOM könnte genius/mongod treffen | harte Limits (DB 2 GB, API 600 MB, Recorder 1,5 GB), `oom_score_adj` 300/500 für unsere Container, Preflight ≥ 3,5 GB verfügbar, Monitor warnt < 500 MB         |
 | CPU (2 vCPU geteilt)                                           | `cpus` 1.5 / 1.0, parallele Worker begrenzt; Prüfbericht/Restore sind kurz                                                                     |
 | Offene Ports (UFW aus)                                         | alle Docker-Ports an 127.0.0.1; Postcheck prüft das                                                                                            |
 | nginx-Reload trifft alle Sites                                 | vorher immer `nginx -t`, bei Fehler eigene Dateien zurück und kein Reload; kein Neustart; Master-PID im Postcheck                              |

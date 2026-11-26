@@ -69,7 +69,7 @@ dafür umgebaut werden.
 - Speicher: `mem_limit 2g` (Page-Cache zählt mit), `shm_size 256mb`, `cpus 1.5`,
   `oom_score_adj 300` (bei globalem Speichermangel ohne Swap trifft der OOM-Killer zuerst uns, nicht
   genius/mongod). Begründung der Werte: ≈ 5,4 GB verfügbar, die Nachbarn wachsen (genius 1,4 GB);
-  DB + API mit 2,6 GB Limit lassen ≈ 2,8 GB Reserve. Die DB (≈ 0,8 GB) passt ganz in
+  DB + API mit 2,6 GB Limit lassen ≈ 2,8 GB Reserve (mit Recorder 1,5 GB: Summe 4,1 GB, siehe compose.prod.yml). Die DB (≈ 0,8 GB) passt ganz in
   `shared_buffers` + Cache. Mit P3 (Recorder, PulseBot/mongod gestoppt) auf 2,5 GB / 640 MB gemäß
   KONZEPT §2.4 anheben.
 - Einstellungen: `shared_buffers=512MB`, `effective_cache_size=1280MB`, `work_mem=32MB` (die Rolle
@@ -266,7 +266,7 @@ CONNECTION_TIMEOUT_MS/ADMIN_PORT/DIAG_HEADERS/NONFINAL_TTL_MS/MAX_CONNECTIONS/MA
   `of_recorder` (`OF_RECORDER_DB_USER/PASSWORD`, Passwort aus `/etc/orderflow-binance/recorder.env`,
   0600, auf dem Server erzeugt; gesetzt von `release.sh` mit `recorder-role-password.ts`).
   Health/Ereignisse auf `0.0.0.0:7701` **nur im Compose-Netz**, kein Host-Port; Monitor per
-  `docker exec`. `mem_limit 1g` (gemessen ≈ 550 MB Spitze; lokal 314–344 MB beim Nachholen),
+  `docker exec`. `mem_limit 1536m` (normal ≈ 105 MB; Spitze 931 MB beim Finalisieren beider Symbole im Prozess, ≈ 550 MB beim Nachholen; 1 GB war zu knapp, ein OOM-Kill in der Finalisierung würde sich wiederholen),
   `cpus 1.0`, `oom_score_adj 700` (vor DB/API), `stop_grace_period 120s`, `restart:
 unless-stopped`, Health-Startphase 2,5 h (REST-Nachholen: ≈ 7 Daten-Minuten je Symbol und Minute bei 600 Gewicht/min, gemessen lokal). REST-Budget 600/min (25 %, PulseBot
   teilt die IP).

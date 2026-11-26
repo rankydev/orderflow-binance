@@ -44,7 +44,7 @@ for k in disk_free_gb mem_avail_mb ports_busy ports_ours nginx_t docker compose 
 done
 dns=$(dig +short A "$PUBLIC_HOST" @1.1.1.1 | tail -1)
 check "Platte ≥ 15 GB frei ($disk_free_gb GB)" '[ "$disk_free_gb" -ge 15 ]'
-check "RAM verfügbar ≥ 3500 MB ($mem_avail_mb MB; DB 2 GB + API 0,6 GB Limit)" '[ "$mem_avail_mb" -ge 3500 ]'
+check "RAM verfügbar ≥ 3500 MB ($mem_avail_mb MB; Limits DB 2 GB + API 0,6 GB + Recorder 1,5 GB)" '[ "$mem_avail_mb" -ge 3500 ]'
 check "Ports 8780/8781/54320 frei oder unsere ($ports_busy belegt, $ports_ours eigene Container)" '[ "$ports_busy" -eq 0 ] || [ "$ports_ours" -gt 0 ]'
 check "nginx -t" '[ "$nginx_t" = ok ]'
 check "DNS $PUBLIC_HOST → $dns = Server $ip" '[ "$dns" = "$ip" ]'
