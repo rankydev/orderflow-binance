@@ -36,6 +36,20 @@
     type ProfileParams,
     type ProfileView,
   } from './lib/profile/model.ts';
+  import type { BigTradesReadout } from './lib/bigtrades/layer.ts';
+  import {
+    bigTradesParamsQuery,
+    fmtUsdtCompact,
+    groupThousands,
+    loadStoredMin,
+    MAX_MIN_USDT,
+    parseBigTradesParams,
+    resolveThreshold,
+    stepAfter,
+    stepsWith,
+    storeMin,
+    thresholdSteps,
+  } from './lib/bigtrades/model.ts';
 
   // Nur UI-Einstellungen sind reaktiv (KONZEPT §7.3); Chartdaten liegen im Controller.
   const params = new URLSearchParams(location.search);
@@ -77,6 +91,15 @@
   let pro = $state.raw<ProfileReadout | null>(null);
   let summary = $state.raw<RangeSummary | null>(null);
   let profLadder = $state.raw<number[]>([]);
+  // Big Trades (URL: bt=1, btmin=<USDT>; Schwelle zusätzlich je Symbol in localStorage)
+  const btInit = parseBigTradesParams(params);
+  let btOn = $state(btInit.on);
+  let btMin = $state<number | null>(null);
+  let bro = $state.raw<BigTradesReadout | null>(null);
+  const btFloor = $derived(symInfo?.bigTrades?.minUsdt ?? null);
+  const btSteps = $derived(
+    btFloor === null ? [] : stepsWith(thresholdSteps(btFloor, ctlMaxMin()), btMin ?? btFloor),
+  );
 
   let el: HTMLDivElement;
   // Hover-Text: höchstens einmal je Animation-Frame gesetzt (Controller bündelt per rAF)
@@ -124,7 +147,14 @@
       window.removeEventListener('pointerdown', onDown);
     };
     ctl.onHover = (t) => (hover = t);
-    ctl.onSymbols = () => refreshLists();
+    ctl.onSymbols = () => {
+      refreshLists();
+      // Untergrenze kann sich mit /symbols ändern: Schwelle nie darunter (Wert sonst unverändert)
+      if (btFloor !== null && btMin !== null && btMin < btFloor) setBtMin(btFloor);
+    };
+    ctl.bigTrades.onChange = () => {
+      if (ctl) bro = ctl.bigTrades.readout();
+    };
     // Start; ist die API (noch) nicht erreichbar, sichtbar melden und alle 10 s erneut versuchen
     const start = (): void => {
       if (!ctl) return;
@@ -140,6 +170,8 @@
           sym = ctl!.readout().sym;
           tf = ctl!.readout().tf;
           refreshLists();
+          // URL-Schwelle gilt für das Symbol der URL; sonst die gespeicherte des Symbols
+          resolveBt(sym, !params.get('sym') || params.get('sym') === sym);
           ready = true;
           // Bereich aus der URL erst mit bekanntem Datenbereich setzen
           if (view === 'tpo') showTpo();
@@ -160,6 +192,7 @@
       ro = ctl.readout();
       if (tpoView) tro = tpoView.readout();
       pro = ctl.profile.readout();
+      bro = ctl.bigTrades.readout();
       // Auswahl, URL und Controller konsistent halten: angezeigt wird das wirksame R
       const eff = ro.rAuto ? 'auto' : String(ro.R);
       if (ready && eff !== rMode && (ro.rAuto || rOptions.includes(ro.R))) {
@@ -297,8 +330,43 @@
   );
   const stackOptions = $derived(withValue([2, 3, 4, 5, 6], fpo.imb.stack));
 
+  function ctlMaxMin(): number {
+    return ctl?.bigTradesMaxMin ?? MAX_MIN_USDT;
+  }
+  /** Schwelle für ein Symbol bestimmen: URL (nur beim Start), sonst gespeichert, sonst Untergrenze. */
+  function resolveBt(name: string, preferUrl: boolean): void {
+    const info = ctl?.symbols.find((s) => s.name === name);
+    const floor = info?.bigTrades?.minUsdt ?? null;
+    if (floor === null) btMin = null;
+    else {
+      const raw = preferUrl && btInit.min !== null ? btInit.min : loadStoredMin(name);
+      btMin = resolveThreshold(raw, floor, ctlMaxMin());
+    }
+    applyBt();
+  }
+  function applyBt(): void {
+    if (!ctl) return;
+    ctl.bigTrades.enabled = btOn;
+    ctl.bigTrades.minUsdt = btMin;
+    ctl.bigTrades.changed();
+    bro = ctl.bigTrades.readout();
+  }
+  function setBtMin(v: number): void {
+    if (btFloor === null) return;
+    btMin = resolveThreshold(v, btFloor, ctlMaxMin());
+    storeMin(sym, btMin);
+    applyBt();
+    syncUrl();
+  }
+  function toggleBt(): void {
+    btOn = !btOn;
+    applyBt();
+    syncUrl();
+  }
+
   function syncUrl(): void {
-    const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${footprintParamsQuery(fpo)}${profileParamsQuery(prof)}${tpoParamsQuery(view, tpo)}${zoneSettingQuery(tzSet)}${params.has('debug') ? '&debug' : ''}`;
+    const bt = bigTradesParamsQuery({ on: btOn, min: btMin ?? btInit.min }, btFloor);
+    const q = `?sym=${encodeURIComponent(sym)}&tf=${tf}&type=${type}&r=${rMode}${footprintParamsQuery(fpo)}${profileParamsQuery(prof)}${bt}${tpoParamsQuery(view, tpo)}${zoneSettingQuery(tzSet)}${params.has('debug') ? '&debug' : ''}`;
     history.replaceState(null, '', q);
     document.title = `${sym} ${tf} · ${APP_TITLE}`;
   }
@@ -334,6 +402,7 @@
     prof = { ...prof, R: null };
     if (ctl) ctl.profile.manualR = null;
     refreshLists();
+    resolveBt(v, false);
     syncUrl();
   }
   function chooseType(v: FootprintType): void {
@@ -693,6 +762,47 @@
           </div>
         </details>
       </div>
+      <div class="group" role="group" aria-label="Big Trades">
+        <button
+          class:active={btOn}
+          aria-pressed={btOn}
+          data-testid="bt-toggle"
+          disabled={symInfo !== null && !symInfo.bigTrades}
+          title={symInfo && !symInfo.bigTrades
+            ? `Big Trades für ${sym} nicht verfügbar (keine Untergrenze)`
+            : 'Big Trades: einzelne große Orders (Notional ≥ Schwelle) als Kreise an Bar-Zeit und VWAP; Fläche ∝ Notional, Stufen 1× / 2,5× / 10× der Schwelle'}
+          onclick={toggleBt}
+        >
+          Big Trades
+        </button>
+        {#if btOn && btFloor !== null && btMin !== null}
+          <button
+            title="Schwelle eine Stufe niedriger"
+            aria-label="Schwelle niedriger"
+            disabled={btMin <= btFloor}
+            onclick={() => setBtMin(stepAfter(btSteps, btMin!, -1))}
+          >
+            −
+          </button>
+          <select
+            aria-label="Big-Trades-Schwelle"
+            data-testid="bt-min"
+            title={`Schwelle in USDT (Notional der Order); nie unter der gespeicherten Untergrenze ${groupThousands(String(btFloor))} USDT`}
+            value={String(btMin)}
+            onchange={(e) => setBtMin(Number(e.currentTarget.value))}
+          >
+            {#each btSteps as v (v)}<option value={String(v)}>≥ {fmtUsdtCompact(v)}</option>{/each}
+          </select>
+          <button
+            title="Schwelle eine Stufe höher"
+            aria-label="Schwelle höher"
+            disabled={btMin >= btSteps[btSteps.length - 1]!}
+            onclick={() => setBtMin(stepAfter(btSteps, btMin!, 1))}
+          >
+            +
+          </button>
+        {/if}
+      </div>
     {:else}
       <div class="group" role="group" aria-label="TPO">
         <button
@@ -766,6 +876,52 @@
     {#if (ro && ro.blocked) || error}
       <!-- A: nicht zoombedingte Gründe ohne Footprint dauerhaft sichtbar -->
       <div class="banner" role="alert">{error || ro?.blocked}</div>
+    {/if}
+    {#if view === 'chart' && btOn && bro}
+      <!-- Legende Big Trades: Schwelle, Marker, Ausdünnung, Abdeckung (keine Daten ≠ keine Big Trades) -->
+      <div class="bt-legend" data-testid="bt-legend">
+        {#if !bro.available}
+          <span class="hint">Big Trades für {sym} nicht verfügbar</span>
+        {:else if bro.minUsdt !== null}
+          <span>
+            <b>Big Trades</b> ≥ {fmtUsdtCompact(bro.minUsdt)} · {groupThousands(
+              String(bro.markers),
+            )}
+            Marker{bro.drawn < bro.markers
+              ? ` (${groupThousands(String(bro.drawn))} gezeichnet, je Pixelzelle der größte)`
+              : ''}
+          </span>
+          {#if bro.loading > 0}<span class="muted">· lädt …</span>{/if}
+          {#if bro.omitted > 0}
+            <span
+              class="hint"
+              title="Zu viele Orders im Abschnitt: der Server liefert je Bar und Seite nur die k größten"
+            >
+              · {groupThousands(String(bro.omitted))} weitere vom Server ausgelassen (je Bar/Seite die
+              {bro.k} größten)
+            </span>
+          {/if}
+          {#if bro.coverageNote}<span class="cov" data-testid="bt-coverage">
+              · {bro.coverageNote}
+            </span>{/if}
+          {#if bro.suggestMinUsdt !== null}
+            <span class="hint">· zu viele Orders ≥ {fmtUsdtCompact(bro.minUsdt)}</span>
+            <button
+              class="bt-suggest"
+              data-testid="bt-suggest"
+              title="Vorschlag des Servers; ändert die Schwelle erst mit diesem Klick"
+              onclick={() => setBtMin(bro!.suggestMinUsdt!)}
+            >
+              Schwelle {fmtUsdtCompact(bro.suggestMinUsdt)} laden
+            </button>
+          {:else if bro.tooManyNoSuggest}
+            <span class="hint">
+              · zu viele Orders – kürzeren Bereich oder höhere Schwelle wählen
+            </span>
+          {/if}
+          {#if bro.error}<span class="err">· {bro.error}</span>{/if}
+        {/if}
+      </div>
     {/if}
   </div>
 
@@ -925,6 +1081,38 @@
   .hint-small {
     color: #8b949e;
     font-size: 11px;
+  }
+  .bt-legend {
+    position: absolute;
+    z-index: 3;
+    top: 6px;
+    left: 8px;
+    max-width: calc(100% - 90px);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 6px;
+    align-items: center;
+    padding: 2px 6px;
+    background: rgba(15, 18, 23, 0.82);
+    border: 1px solid #222934;
+    font:
+      12px/1.5 ui-monospace,
+      Menlo,
+      monospace;
+    pointer-events: none;
+  }
+  .bt-legend button {
+    pointer-events: auto;
+    padding: 0 6px;
+  }
+  .bt-legend .cov {
+    color: #b3bac4;
+  }
+  .muted {
+    color: #8b949e;
+  }
+  button:disabled {
+    opacity: 0.45;
   }
   .chart {
     flex: 1;

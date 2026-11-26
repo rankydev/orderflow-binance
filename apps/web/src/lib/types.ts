@@ -28,6 +28,11 @@ export interface SymbolInfo {
   tileConfigVersion: number;
   /** Kachellänge n je tf und R (Ticks); fehlende R sind für diesen tf nicht zulässig (Zellgrenze). */
   tiles: Record<string, Record<string, number>>;
+  /**
+   * Big Trades (docs/BIGTRADES-API.md): Untergrenze der gespeicherten Orders; null/fehlt = für dieses
+   * Symbol nicht verfügbar. minUsdt = kleinste zulässige Schwelle in ganzen USDT.
+   */
+  bigTrades?: { floorN: number; minUsdt: number; notionalDecimals: number } | null;
 }
 
 export interface SymbolsResponse {
@@ -36,6 +41,13 @@ export interface SymbolsResponse {
   limits?: {
     profile?: { maxRows: number; maxR: number; maxRangeDays: number };
     tiles?: { statsColumns?: string[] };
+    bigtrades?: {
+      maxBars: number;
+      maxRows: number;
+      maxSourceRows: number;
+      maxMatchedRows: number;
+      maxMinUsdt: number;
+    };
   };
 }
 

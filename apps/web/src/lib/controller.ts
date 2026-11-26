@@ -71,6 +71,7 @@ import {
 } from './lod.ts';
 import type { FootprintOptions } from './footprint-options.ts';
 import { ProfileLayer } from './profile/layer.ts';
+import { BigTradesLayer } from './bigtrades/layer.ts';
 import {
   computeStats,
   CVD_UNALIGNED_NOTE,
@@ -166,6 +167,10 @@ export class ChartController {
   private statsSeries: ISeriesApi<'Custom', Time, StatsItem | WhitespaceData<Time>> | null = null;
   /** Volume-Profile (Tages- und Bereichsprofil), als Pane-Primitive unter den Serien. */
   readonly profile: ProfileLayer;
+  /** Big Trades (P5): Marker je Order als Pane-Primitive über den Kerzen/Zellen. */
+  readonly bigTrades: BigTradesLayer;
+  /** Größte Big-Trades-Schwelle aus /symbols (limits.bigtrades.maxMinUsdt) oder null */
+  bigTradesMaxMin: number | null = null;
   private readonly api: ApiClient;
   symbols: SymbolInfo[] = [];
   private sym!: SymbolInfo;
@@ -289,6 +294,25 @@ export class ChartController {
       },
     });
     this.chart.panes()[0]!.attachPrimitive(this.profile);
+    this.bigTrades = new BigTradesLayer({
+      chart: this.chart,
+      apiBase: api.base,
+      sym: () => this.sym ?? null,
+      tf: () => this.tf,
+      tfSec: () => this.tfSec,
+      items: () => this.items,
+      visibleTimeRange: () => this.visibleTimeRange(),
+      priceToY: (price) =>
+        (this.mode === 'footprint' ? this.fp : this.candle).priceToCoordinate(price),
+      footprintActive: () => this.mode === 'footprint',
+      gestureActive: () => this.gestureActive,
+      busy: () => {
+        const f = this.fpQueue.stats;
+        const b = this.barQueue.stats;
+        return f.inFlight + f.queued + b.inFlight + b.queued > 0;
+      },
+    });
+    this.chart.panes()[0]!.attachPrimitive(this.bigTrades);
     // Stats-Grid: High/Low Ratio aus den Leveln der gezeichneten Zeilengröße
     this.statsCtx.hlRatio = (t) => {
       // W-1: bei „nur Kerzen" keine Ratios aus noch gehaltenen Kacheln
@@ -317,7 +341,7 @@ export class ChartController {
     this.chart.subscribeCrosshairMove((p) => {
       this.hoverParam =
         p.point && p.time !== undefined
-          ? { t: p.time as number, x: p.point.x, y: p.point.y }
+          ? { t: p.time as number, x: p.point.x, y: p.point.y, pane: p.paneIndex ?? 0 }
           : null;
       // Auswahlvorschau: nur im Auswahlmodus mit gesetztem Anfang wird neu gezeichnet
       if (this.profile.selecting)
@@ -361,7 +385,7 @@ export class ChartController {
 
   /** Rückruf für die Hover-Anzeige (Text oder ''), gesetzt vom UI. */
   onHover: ((text: string) => void) | null = null;
-  private hoverParam: { t: number; x: number; y: number } | null = null;
+  private hoverParam: { t: number; x: number; y: number; pane: number } | null = null;
   /** Rückruf nach Änderungen am Profilzustand durch Chart-Eingaben (Bereich gewählt). */
   onProfile: (() => void) | null = null;
   private hoverReq = 0;
@@ -369,7 +393,13 @@ export class ChartController {
   /** Text der Zelle unter dem Zeiger: Zeit, Zeilenintervall, Bid/Ask/Delta in Lots und Basiswährung. */
   hoverText(): string {
     const p = this.hoverParam;
-    if (!p || !this.sym) return '';
+    if (!p || !this.sym) {
+      this.bigTrades.hoverText(Number.NaN, Number.NaN); // Hervorhebung aufheben
+      return '';
+    }
+    // über einem Big-Trade-Marker (Hauptpane): dessen Werte (exakt)
+    const big = p.pane === 0 ? this.bigTrades.hoverText(p.x, p.y) : '';
+    if (big) return big;
     const s = this.mode === 'footprint' ? this.fp : this.candle;
     const price = s.coordinateToPrice(p.y);
     if (price === null) return '';
@@ -429,6 +459,7 @@ export class ChartController {
     this.barQueue.cancelAll();
     this.fpQueue.cancelAll();
     this.profile.destroy();
+    this.bigTrades.destroy();
     for (const f of this.listeners) f();
     this.gesture.dispose();
     this.cancelRetry?.();
@@ -463,6 +494,7 @@ export class ChartController {
     if (this.destroyed) return;
     this.symbols = r.symbols;
     this.profileLimits = r.limits?.profile ?? null;
+    this.bigTradesMaxMin = r.limits?.bigtrades?.maxMinUsdt ?? null;
     const s = this.symbols.find((x) => x.name === sym) ?? this.symbols[0];
     if (!s) throw new Error('keine Symbole');
     const tfs = offeredTimeframes(s);
@@ -592,12 +624,15 @@ export class ChartController {
     this.fpQueue.cancelAll();
     this.profile.suspended = true;
     this.profile.frame();
+    this.bigTrades.suspended = true;
+    this.bigTrades.frame();
   }
 
   resume(): void {
     if (!this.suspended) return;
     this.suspended = false;
     this.profile.suspended = false;
+    this.bigTrades.suspended = false;
     const p = this.pending;
     this.pending = null;
     if (p && this.sym) {
@@ -783,6 +818,7 @@ export class ChartController {
   applyTimeZone(): void {
     this.chart.applyOptions(timeScaleFormatters());
     this.profile.redraw();
+    this.bigTrades.redraw();
   }
 
   availableR(tf = this.tf): number[] {
@@ -875,7 +911,10 @@ export class ChartController {
     // und ETag, daher eigene Serie; nicht zwischen beiden Formen hin und her laden
     this.bars = new BarStore(`${s.name}|${tf}${this.barsStats ? '+s' : ''}`, s.priceDecimals);
     if (symChanged || !this.fpStore) this.fpStore = new FootprintStore(s.qtyDecimals);
-    if (symChanged) this.profile.resetForSymbol();
+    if (symChanged) {
+      this.profile.resetForSymbol();
+      this.bigTrades.resetForSymbol();
+    }
     this.rc.store = this.fpStore;
     this.rc.priceScale = 10 ** s.priceDecimals;
     const minMove = s.tickRefUnits / 10 ** s.priceDecimals;
@@ -1160,6 +1199,7 @@ export class ChartController {
     const lr = this.logicalRange();
     this.fp.setData(m === 'footprint' ? this.items : []);
     if (lr) this.setRange(lr);
+    this.bigTrades.redraw(); // Sweep-Linie nur im Footprint-Modus
     this.colorRefDirty = true;
     this.scheduleFrame();
   }
@@ -1313,7 +1353,10 @@ export class ChartController {
     this.lastCenter = center;
     // Profile: Bedarf erst am Gestenende (die Profil-Zeilengröße wird dort neu bestimmt; sonst würde
     // während des Zoomens mit der alten Zeilengröße geladen)
-    if (!this.gestureActive) this.profile.frame();
+    if (!this.gestureActive) {
+      this.profile.frame();
+      this.bigTrades.frame();
+    }
     if (this.mode === 'footprint') this.updateFootprintWants(vis);
     else if (this.wantedFp.size > 0) {
       this.wantedFp.clear();
