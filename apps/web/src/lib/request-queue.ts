@@ -119,6 +119,12 @@ export class RequestQueue {
     return this.inFlight.has(key);
   }
 
+  /** true, wenn der Schlüssel zuletzt vorübergehend gescheitert ist (Wiederholung steht aus). */
+  failing(key: string): boolean {
+    const f = this.failures.get(key);
+    return !!f && !f.final;
+  }
+
   /** true, wenn der Schlüssel endgültig gescheitert ist (wird nicht mehr angefragt). */
   isFinal(key: string): boolean {
     return this.failures.get(key)?.final ?? false;
@@ -224,6 +230,8 @@ export class RequestQueue {
       })
       .catch((e: unknown) => {
         if (ac.signal.aborted || (e instanceof DOMException && e.name === 'AbortError')) return;
+        // sichtbar machen wie bei HTTP 5xx (A): ein Netzwerkfehler darf nicht als „lädt" stehen bleiben
+        this.lastError = `${this.label(w.key)}: keine Verbindung – neuer Versuch folgt`;
         this.fail(w.key, null);
       })
       .finally(() => {
