@@ -58,6 +58,7 @@ Stand nach P0 (nur die P1-Tabellen aus KONZEPT §3): `symbol`, `symbol_tick_hist
 ```bash
 npm test             # Unit-Tests (Vitest), keine DB nötig
 npm run test:db      # DB-Integrationstests (Schema, Postgres-Schreiber) gegen die lokale DB ("orderflow_test")
+npm run test:db:throwaway  # dieselben Tests gegen einen Wegwerf-Container (freier Port, danach gelöscht; Entwicklungs-DB und .env unberührt)
 npm run test:golden  # opt-in: Golden-Tests auf echten Dateien unter data/ (nur lesend, ~2,5 min)
 npm run typecheck    # tsc bzw. svelte-check in allen Paketen
 npm run lint         # ESLint + Prettier-Check

@@ -19,6 +19,7 @@
     "test": "vitest run --project unit",
     "test:watch": "vitest --project unit",
     "test:db": "node --env-file-if-exists=.env node_modules/vitest/vitest.mjs run --project db",
+    "test:db:throwaway": "scripts/test-db-throwaway.sh",
     "test:golden": "vitest run --project golden",
     "test:py": "verifier/.venv/bin/python -m pytest verifier/tests",
     "test:py:slow": "OF_VERIFIER_SLOW=1 verifier/.venv/bin/python -m pytest verifier/tests",
