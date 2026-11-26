@@ -266,6 +266,12 @@ services:
       OF_RECORDER_HTTP_PORT: '7701'
       OF_RECORDER_FINALISE: '1'
       OF_LOG_LEVEL: info
+      # Heap-Grenze explizit statt aus dem cgroup-Limit abgeleitet (V8-Standard bei 1536m: 864 MB
+      # heap_size_limit). Gemessen im Release-Image unter 1536m (Finalisierung 2026-11-25, BTC+ETH):
+      # heapUsed-Spitze 552 MB, heapTotal 593 MB, external ≤ 110 MB, RSS ≤ 843 MB; mit
+      # --max-old-space-size=512 (und 384) V8-„heap out of memory" nach minutenlangem GC, mit 704
+      # und 1024 problemlos. 896 lässt ≈ 300 MB über der Spitze (+ Live-Zustand ≈ 50 MB); siehe unten.
+      NODE_OPTIONS: --max-old-space-size=896
     volumes:
       - /var/lib/orderflow-binance/data:/data
     networks: [internal]
@@ -279,7 +285,9 @@ services:
     # lokal gemessen Spitze 931 MB (Nachholen allein ≈ 550 MB). 1 GB bzw. 1200 MB ließen zu wenig
     # Reserve (OOM-Kill mitten in der Finalisierung → Neustartschleife); daher 1536 MB. Summe der
     # Limits DB 2 GB + API 0,6 GB + Recorder 1,5 GB = 4,1 GB bei ≈ 4,6 GB verfügbar; tatsächlich
-    # belegt (gemessen) DB 1,2 GiB, API 0,17 GiB. Kein NODE_OPTIONS/--max-old-space-size gesetzt.
+    # belegt (gemessen) DB 1,2 GiB, API 0,17 GiB. Budget im Limit: Old-Space 896 + Young/Code ≈ 100
+    # + Nicht-Heap ≈ 230 MB (RSS − heapTotal an der Spitze, inkl. external) ≈ 1,23 GB → ≈ 300 MB
+    # Abstand zu 1536 MB, bevor der cgroup-OOM-Killer statt V8 eingreift.
     mem_limit: 1536m
     memswap_limit: 1536m
     cpus: 1.0

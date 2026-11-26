@@ -68,10 +68,13 @@ dafür umgebaut werden.
   die DB über das interne Netz an. Daten im benannten Volume.
 - Speicher: `mem_limit 2g` (Page-Cache zählt mit), `shm_size 256mb`, `cpus 1.5`,
   `oom_score_adj 300` (bei globalem Speichermangel ohne Swap trifft der OOM-Killer zuerst uns, nicht
-  genius/mongod). Begründung der Werte: ≈ 5,4 GB verfügbar, die Nachbarn wachsen (genius 1,4 GB);
-  DB + API mit 2,6 GB Limit lassen ≈ 2,8 GB Reserve (mit Recorder 1,5 GB: Summe 4,1 GB, siehe compose.prod.yml). Die DB (≈ 0,8 GB) passt ganz in
-  `shared_buffers` + Cache. Mit P3 (Recorder, PulseBot/mongod gestoppt) auf 2,5 GB / 640 MB gemäß
-  KONZEPT §2.4 anheben.
+  genius/mongod). Begründung der Werte: ≈ 4,6 GB verfügbar, die Nachbarn wachsen (genius 1,4 GB).
+  Summe der Limits DB 2 GB + API 0,6 GB + Recorder 1,5 GB (1536 MB, Heap-Grenze per
+  `NODE_OPTIONS=--max-old-space-size=896`, Begründung in `compose.prod.yml`) = 4,1 GB → ≈ 0,5 GB
+  Reserve; tatsächlich belegt (gemessen) DB 1,2 GiB, API 0,17 GiB. Die DB (≈ 0,8 GB) passt ganz in
+  `shared_buffers` + Cache. Die in KONZEPT §2.4 vorgesehene Anhebung auf 2,5 GB / 640 MB passt neben
+  dem 1,5-GB-Recorder nicht mehr (Summe ≈ 4,6 GB = alles Verfügbare); nur anheben, wenn Nachbarn
+  (PulseBot/mongod) gestoppt sind und dadurch nachweislich Speicher frei wird.
 - Einstellungen: `shared_buffers=512MB`, `effective_cache_size=1280MB`, `work_mem=32MB` (die Rolle
   `of_api` bekommt per Migration 0010 16 MB), `maintenance_work_mem=256MB`,
   `autovacuum_max_workers=2` + `autovacuum_work_mem=64MB` (sonst bis 3 × 256 MB im 2-GB-Limit),
