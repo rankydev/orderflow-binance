@@ -72,6 +72,8 @@ export class LiveWriter {
   private readonly cfg: DbConfig;
   private readonly log: (s: string) => void;
   writes = 0;
+  /** Tage (sym|day), deren big_order in dieser Sitzung einmal ganz aus dem Speicher ersetzt wurde. */
+  private readonly bigSynced = new Set<string>();
   writeMsTotal = 0;
   writeMsMax = 0;
 
@@ -199,6 +201,7 @@ export class LiveWriter {
     const symId = spec.symId;
     const dayStr = formatDay(d.day);
     const minuteEnd = new Date(d.day * DAY_MS + (d.minute + 1) * MINUTE_MS);
+    let synced: string | null = null;
     const res = await this.db.begin(async (tx) => {
       await this.ensureLock(tx);
       const [row] = await tx`
@@ -236,34 +239,55 @@ export class LiveWriter {
           await copy(tx, b.table, BAR_COLS, b.bars.map((x) => barText(symId, x, '')).join(''));
         }
       }
-      await tx`DELETE FROM big_order WHERE sym_id = ${symId} AND ts >= ${new Date(d.big.from)}
-                 AND ts < ${new Date(d.big.to)}`;
-      await copy(tx, 'big_order', BIG_ORDER_COLS, bigOrderText(symId, d.big.rows));
+      // Order-Daten des Tages (Review S1): der Speicher (LiveDay) enthält nach einem Neustart den
+      // ganzen Tag aus der Spool, geschrieben werden aber nur Minuten ab live_until. Davor kann
+      // big_order fehlen (alter Recorder vor Migration 0017) oder mit einer anderen Untergrenze
+      // stehen. Daher: deckt der Speicher genau die bar_1m-Zeilen des Tages in der DB (Anzahl,
+      // Σ Notional, Σ aggTrades, Σ erste/letzte aggId), wird big_order für den GANZEN Tag aus dem
+      // Speicher ersetzt (einmal je Tag und Sitzung, danach minutenweise), und die Ordersummen und
+      // die Untergrenze gelten. Sonst nur die Minute; Summen und Untergrenze NULL (unbekannt).
+      const dayFrom = new Date(d.day * DAY_MS);
+      const dayTo = new Date((d.day + 1) * DAY_MS);
+      const [c] = await tx`
+        SELECT count(*)::int AS n, coalesce(sum(notional), 0)::text AS ntl,
+               coalesce(sum(buy_a + sell_a), 0)::text AS a,
+               coalesce(sum(first_agg_id), 0)::text AS f, coalesce(sum(last_agg_id), 0)::text AS l
+          FROM bar_1m WHERE sym_id = ${symId} AND ts >= ${dayFrom} AND ts < ${dayTo}`;
+      const o = d.orders;
+      const complete =
+        c!.n === o.minutes &&
+        c!.ntl === String(o.notional) &&
+        c!.a === String(o.aggTrades) &&
+        c!.f === String(o.firstIdSum) &&
+        c!.l === String(o.lastIdSum);
+      const key = `${symId}|${d.day}`;
+      const wholeDay = complete && !this.bigSynced.has(key);
+      const [from, to] = wholeDay ? [dayFrom, dayTo] : [new Date(d.big.from), new Date(d.big.to)];
+      await tx`DELETE FROM big_order WHERE sym_id = ${symId} AND ts >= ${from} AND ts < ${to}`;
+      await copy(
+        tx,
+        'big_order',
+        BIG_ORDER_COLS,
+        bigOrderText(symId, wholeDay ? d.bigDay() : d.big.rows),
+      );
       const source = d.viaRest || row?.source === 'live+rest' ? 'live+rest' : 'live';
       const day = d.bars.find((b) => b.table === 'bar_1d')!.bars[0]!;
       await tx`
         UPDATE data_day SET version = version + 1, source = ${source},
                first_agg_id = ${day.firstAggId}, last_agg_id = ${day.lastAggId},
                rows = ${day.buyA + day.sellA},
-               big_floor_n = ${d.orders.bigFloorN},
+               orders_n = ${complete ? o.n : null},
+               orders_notional = ${complete ? String(o.notional) : null}::bigint,
+               big_floor_n = ${complete ? o.bigFloorN : null},
                live_until = greatest(coalesce(live_until, ${minuteEnd}), ${minuteEnd}),
                live_minutes = (SELECT count(*) FROM bar_1m WHERE sym_id = ${symId}
                                  AND ts >= ${new Date(d.day * DAY_MS)} AND ts < ${new Date((d.day + 1) * DAY_MS)})
          WHERE sym_id = ${symId} AND day = ${dayStr}::date`;
-      // Ordersummen absolut aus dem Speicher; sie gelten nur, wenn der Speicher den ganzen bisher
-      // geschriebenen Tag enthält (Neustart mit unvollständiger Spool): Σ Notional muss Σ
-      // bar_1m.notional der DB gleichen, sonst NULL (unbekannt) statt einer falschen Summe.
-      await tx`
-        UPDATE data_day SET
-               orders_n = CASE WHEN b.ntl = ${String(d.orders.notional)}::numeric THEN ${d.orders.n}::bigint END,
-               orders_notional = CASE WHEN b.ntl = ${String(d.orders.notional)}::numeric
-                                      THEN ${String(d.orders.notional)}::bigint END
-          FROM (SELECT coalesce(sum(notional), 0) AS ntl FROM bar_1m
-                 WHERE sym_id = ${symId} AND ts >= ${new Date(d.day * DAY_MS)}
-                   AND ts < ${new Date((d.day + 1) * DAY_MS)}) b
-         WHERE sym_id = ${symId} AND day = ${dayStr}::date`;
+      if (wholeDay) synced = key;
       return 'written' as const;
     });
+    // erst nach dem Commit: ab jetzt genügt der minutenweise Ersatz
+    if (synced) this.bigSynced.add(synced);
     const ms = performance.now() - t0;
     if (res === 'written') {
       this.writes++;

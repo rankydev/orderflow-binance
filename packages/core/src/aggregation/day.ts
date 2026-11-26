@@ -333,6 +333,16 @@ export class DayAggregator {
     };
   }
 
+  /**
+   * big orders aller abgeschlossenen Minuten bis einschließlich `m` (Kopie, Primärschlüssel-
+   * Reihenfolge); für den Abgleich eines ganzen Live-Tages mit der Datenbank.
+   */
+  bigUpTo(m: number): BigOrder[] {
+    const f = this.flushed.get(m);
+    if (!f) throw new Error(`bigUpTo: Minute ${m} ist nicht abgeschlossen`);
+    return this.big.slice(0, f.bigTo);
+  }
+
   /** Kandidatensummen je Minute bisher (Live-Kline-Abgleich; Referenzen, nicht kopiert). */
   candidates(): { candQ: Float64Array; candB: Float64Array; count: number } {
     return { candQ: this.candQ, candB: this.candB, count: this.candCount };

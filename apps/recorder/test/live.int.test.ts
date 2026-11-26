@@ -161,10 +161,147 @@ describe('Recorder ↔ Datenbank', () => {
       viaRest: false,
       trades: 0,
       big: { from: 0, to: 0, rows: [] },
-      orders: { n: 0, notional: 0n, bigFloorN: null },
+      bigDay: () => [],
+      orders: {
+        n: 0,
+        notional: 0n,
+        bigFloorN: null,
+        minutes: 0,
+        aggTrades: 0,
+        firstIdSum: 0n,
+        lastIdSum: 0n,
+      },
     };
     expect(await a.writeMinute(BTC, delta)).toBe('not_provisional');
     await a.close();
+  });
+});
+
+describe('Order-Daten nach einem Neustart (Review S1/S2)', () => {
+  // Tag mit einem aggTrade alle 5 s; jeder ist eine eigene Order (verschiedene T), jeder zweite groß
+  // (90 000 USDT · 0,010 = 900 USDT ≥ 300 USDT), die anderen klein (0,001 → 90 USDT).
+  const DAY_S = parseDay('2026-09-21');
+  const D0 = DAY_S * 86_400_000;
+  const BASE = 8_000_000_000;
+  const idAt = (t: number) => BASE + (t - D0) / 5_000;
+  function items(fromMin: number, toMin: number) {
+    const out = [];
+    for (let t = D0 + fromMin * 60_000; t < D0 + toMin * 60_000; t += 5_000) {
+      const a = idAt(t);
+      out.push(
+        toItem(
+          { a, p: '90000.0', q: a % 2 === 0 ? '0.010' : '0.001', f: a, l: a, T: t, m: a % 3 === 0 },
+          BTC,
+          false,
+        ),
+      );
+    }
+    return out;
+  }
+  /** Recorder-Lauf wie nach einem Neustart: Spool ab `fromMin`, DB-Stand bis `liveUntilMin`. */
+  async function restart(
+    fromMin: number,
+    toMin: number,
+    liveUntilMin: number | null,
+    floor: number,
+  ) {
+    const w = new LiveWriter(cfg);
+    await w.open();
+    const rec = new Recorder({
+      symbols: ['BTCUSDT'],
+      wsUrl: 'wss://test.invalid',
+      socketFactory: () => ({
+        onopen: null,
+        onmessage: null,
+        onclose: null,
+        onerror: null,
+        close() {},
+      }),
+      rest: { aggTrades: async () => [], klines: async () => [] },
+      sink: {
+        startState: async () => ({
+          final: {
+            day: DAY_S - 1,
+            lastAggId: idAt(D0 + fromMin * 60_000) - 1,
+            carry: null,
+            cand: null,
+          },
+          provisional:
+            liveUntilMin === null
+              ? []
+              : [{ day: DAY_S, state: 'provisional', liveUntil: D0 + liveUntilMin * 60_000 }],
+          bigFloorN: floor,
+        }),
+        writeMinute: (sp, d) => w.writeMinute(sp, d),
+        markGap: async () => {},
+        markFrozen: async () => {},
+        writeKlineChecks: async () => {},
+      },
+      spoolDir: null,
+      log: () => {},
+      klineCheck: false,
+      autoLoops: false,
+    });
+    await rec.start();
+    const st = rec.sym.get('BTCUSDT')!;
+    rec.handle(st, items(fromMin, toMin), false);
+    rec.completeMinutes(st, D0 + toMin * 60_000 + 10_000);
+    await rec.drain();
+    await rec.stop();
+    await w.close();
+  }
+  const state = async () =>
+    (
+      await sql`
+      SELECT d.orders_n, d.orders_notional::text AS ntl, d.big_floor_n::text AS floor,
+             (SELECT count(*)::int FROM big_order b WHERE b.sym_id = 1 AND b.ts >= ${new Date(D0)}
+                AND b.ts < ${new Date(D0 + 86_400_000)}) AS big,
+             (SELECT count(*)::int FROM big_order b WHERE b.sym_id = 1 AND b.ts >= ${new Date(D0)}
+                AND b.ts < ${new Date(D0 + 86_400_000)} AND b.notional < d.big_floor_n) AS below,
+             (SELECT sum(notional)::text FROM bar_1m b WHERE b.sym_id = 1 AND b.ts >= ${new Date(D0)}
+                AND b.ts < ${new Date(D0 + 86_400_000)}) AS bars
+        FROM data_day d WHERE d.sym_id = 1 AND d.day = ${formatDayS}::date`
+    )[0]!;
+  const formatDayS = '2026-09-21';
+  const bigIn = (fromMin: number, toMin: number) => (toMin - fromMin) * 6; // 12 aggTrades/min, jeder 2. groß
+
+  it('Deploy-Tag: Minuten des alten Recorders ohne big_order werden nach dem Start einmal ersetzt', async () => {
+    await restart(0, 30, null, FLOOR); // Minuten 0–29 geschrieben
+    // Zustand nach einem Recorder ohne big_order (vor Migration 0017): keine Zeilen, keine Summen
+    await sql`DELETE FROM big_order WHERE sym_id = 1 AND ts >= ${new Date(D0)} AND ts < ${new Date(D0 + 86_400_000)}`;
+    await sql`UPDATE data_day SET orders_n = NULL, orders_notional = NULL, big_floor_n = NULL
+               WHERE sym_id = 1 AND day = ${formatDayS}::date`;
+    // neuer Recorder: Spool ab Mitternacht, DB bis Minute 30 → schreibt 30–59, ersetzt big_order ganz
+    await restart(0, 60, 30, FLOOR);
+    const a = await state();
+    expect(a.big).toBe(bigIn(0, 60));
+    expect(a.below).toBe(0);
+    expect(Number(a.orders_n)).toBe(60 * 12);
+    expect(a.ntl).toBe(a.bars);
+    expect(a.floor).toBe(String(FLOOR));
+  });
+
+  it('geänderte Untergrenze nach einem Neustart: big_order des ganzen Tages mit der neuen', async () => {
+    await restart(0, 62, 60, FLOOR * 2); // 9·10⁷ ≥ 6·10⁷: alle großen bleiben, Summen/Untergrenze neu
+    const a = await state();
+    expect(a.floor).toBe(String(FLOOR * 2));
+    expect(a.big).toBe(bigIn(0, 62));
+    await restart(0, 64, 62, 100_000_000); // 1·10⁸ > 9·10⁷: keine big orders mehr, auch nicht vor 62
+    const b = await state();
+    expect(b.big).toBe(0);
+    expect(b.floor).toBe('100000000');
+    expect(Number(b.orders_n)).toBe(64 * 12);
+  });
+
+  it('unvollständige Spool nach einem Neustart: Summen und Untergrenze NULL, frühere big_order unangetastet', async () => {
+    await restart(0, 66, 64, FLOOR); // wieder vollständig mit FLOOR
+    expect((await state()).big).toBe(bigIn(0, 66));
+    await restart(40, 68, 66, FLOOR); // Speicher beginnt bei Minute 40, DB hat 0–65
+    const a = await state();
+    expect(a.orders_n).toBeNull();
+    expect(a.ntl).toBeNull();
+    expect(a.floor).toBeNull();
+    expect(a.big).toBe(bigIn(0, 68)); // 0–65 unverändert, 66–67 minutenweise geschrieben
   });
 });
 

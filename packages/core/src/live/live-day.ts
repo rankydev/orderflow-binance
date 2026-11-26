@@ -39,10 +39,25 @@ export interface MinuteDelta {
   /** big_order der Minute (Replace des Minutenbereichs [from, to)). */
   big: { from: number; to: number; rows: BigOrder[] };
   /**
-   * Ordersummen des Tages über alle bis jetzt abgeschlossenen Minuten (data_day.orders_n,
-   * orders_notional; absolut, nicht inkrementell) und die verwendete Untergrenze.
+   * big_order aller abgeschlossenen Minuten des Tages bis einschließlich dieser (für den einmaligen
+   * Ersatz des ganzen Tages nach einem Neustart, siehe LiveWriter); bei Bedarf berechnet.
    */
-  orders: { n: number; notional: bigint; bigFloorN: number | null };
+  bigDay: () => BigOrder[];
+  /**
+   * Ordersummen des Tages über alle bis jetzt abgeschlossenen Minuten (data_day.orders_n,
+   * orders_notional; absolut, nicht inkrementell), die verwendete Untergrenze und Kennzahlen der
+   * zugrunde liegenden Minuten (Anzahl, aggTrades, Σ erster/letzter aggId) für den Abgleich mit
+   * bar_1m in der Datenbank.
+   */
+  orders: {
+    n: number;
+    notional: bigint;
+    bigFloorN: number | null;
+    minutes: number;
+    aggTrades: number;
+    firstIdSum: bigint;
+    lastIdSum: bigint;
+  };
 }
 
 const TF_OF: Record<FpTableName, number> = { fp_1m: 1 } as Record<FpTableName, number>;
@@ -66,6 +81,9 @@ export class LiveDay {
   private readonly bigFloorN: number | null;
   private ordersN = 0;
   private ordersNotional = 0n;
+  private aggTrades = 0;
+  private firstIdSum = 0n;
+  private lastIdSum = 0n;
 
   /** `bigFloorN`: symbol.big_floor_n (wie im Import; null = keine big orders). */
   constructor(spec: SymbolSpec, day: number, bigFloorN: number | null) {
@@ -141,6 +159,9 @@ export class LiveDay {
     this.completed.add(minute);
     this.ordersN += got.orders.n;
     this.ordersNotional += BigInt(got.orders.notional);
+    this.aggTrades += got.bar.buyA + got.bar.sellA;
+    this.firstIdSum += BigInt(got.bar.firstAggId);
+    this.lastIdSum += BigInt(got.bar.lastAggId);
     return {
       day: this.day,
       minute,
@@ -153,7 +174,16 @@ export class LiveDay {
       viaRest: this.restMinutes.has(minute),
       trades: got.bar.buyA + got.bar.sellA,
       big: { from: ts, to: ts + MINUTE_MS, rows: got.big },
-      orders: { n: this.ordersN, notional: this.ordersNotional, bigFloorN: this.bigFloorN },
+      bigDay: () => this.agg.bigUpTo(minute),
+      orders: {
+        n: this.ordersN,
+        notional: this.ordersNotional,
+        bigFloorN: this.bigFloorN,
+        minutes: this.completed.size,
+        aggTrades: this.aggTrades,
+        firstIdSum: this.firstIdSum,
+        lastIdSum: this.lastIdSum,
+      },
     };
   }
 
