@@ -45,19 +45,15 @@ export interface MinuteDelta {
   bigDay: () => BigOrder[];
   /**
    * Ordersummen des Tages über alle bis jetzt abgeschlossenen Minuten (data_day.orders_n,
-   * orders_notional; absolut, nicht inkrementell), die verwendete Untergrenze und Kennzahlen der
-   * zugrunde liegenden Minuten (Anzahl, aggTrades, Σ erster/letzter aggId) für den Abgleich mit
-   * bar_1m in der Datenbank.
+   * orders_notional; absolut, nicht inkrementell) und die verwendete Untergrenze.
    */
-  orders: {
-    n: number;
-    notional: bigint;
-    bigFloorN: number | null;
-    minutes: number;
-    aggTrades: number;
-    firstIdSum: bigint;
-    lastIdSum: bigint;
-  };
+  orders: { n: number; notional: bigint; bigFloorN: number | null };
+  /**
+   * Schlüssel der Minuten des Tages bis einschließlich dieser für den exakten Abgleich mit bar_1m
+   * in der Datenbank: je Minute (nach ts) eine Zeile `ts,first_agg_id,last_agg_id,aggTrades,
+   * notional`, mit '\n' verbunden (ts in ms). Bei Bedarf berechnet.
+   */
+  dayBarsKey: () => string;
 }
 
 const TF_OF: Record<FpTableName, number> = { fp_1m: 1 } as Record<FpTableName, number>;
@@ -81,9 +77,6 @@ export class LiveDay {
   private readonly bigFloorN: number | null;
   private ordersN = 0;
   private ordersNotional = 0n;
-  private aggTrades = 0;
-  private firstIdSum = 0n;
-  private lastIdSum = 0n;
 
   /** `bigFloorN`: symbol.big_floor_n (wie im Import; null = keine big orders). */
   constructor(spec: SymbolSpec, day: number, bigFloorN: number | null) {
@@ -159,9 +152,6 @@ export class LiveDay {
     this.completed.add(minute);
     this.ordersN += got.orders.n;
     this.ordersNotional += BigInt(got.orders.notional);
-    this.aggTrades += got.bar.buyA + got.bar.sellA;
-    this.firstIdSum += BigInt(got.bar.firstAggId);
-    this.lastIdSum += BigInt(got.bar.lastAggId);
     return {
       day: this.day,
       minute,
@@ -179,11 +169,8 @@ export class LiveDay {
         n: this.ordersN,
         notional: this.ordersNotional,
         bigFloorN: this.bigFloorN,
-        minutes: this.completed.size,
-        aggTrades: this.aggTrades,
-        firstIdSum: this.firstIdSum,
-        lastIdSum: this.lastIdSum,
       },
+      dayBarsKey: () => this.barsKeyUpTo(ts),
     };
   }
 
@@ -208,6 +195,15 @@ export class LiveDay {
       bigOrders: [...this.completed].sort((a, b) => a - b).flatMap((m) => this.agg.minute(m)!.big),
       orders: { n: this.ordersN, notional: this.ordersNotional },
     };
+  }
+
+  /** Siehe MinuteDelta.dayBarsKey: Minuten mit ts ≤ `upToTs` (spätere können schon berechnet sein). */
+  barsKeyUpTo(upToTs: number): string {
+    return [...this.bars1m.entries()]
+      .filter(([k]) => k <= upToTs)
+      .sort((a, b) => a[0] - b[0])
+      .map(([k, b]) => `${k},${b.firstAggId},${b.lastAggId},${b.buyA + b.sellA},${b.notional}`)
+      .join('\n');
   }
 
   /** bar_1m der abgeschlossenen Minuten (für den Kline-Abgleich des Tages bis jetzt). */

@@ -21,6 +21,7 @@ import {
 import { connect, type Sql } from '@orderflow/db';
 import { BIG_ORDER_COLS, bigOrderText, readBigFloor, safeNumber } from '@orderflow/importer';
 import type { TransactionSql } from 'postgres';
+import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
@@ -245,24 +246,21 @@ export class LiveWriter {
       // Order-Daten des Tages (Review S1): der Speicher (LiveDay) enthält nach einem Neustart den
       // ganzen Tag aus der Spool, geschrieben werden aber nur Minuten ab live_until. Davor kann
       // big_order fehlen (alter Recorder vor Migration 0017) oder mit einer anderen Untergrenze
-      // stehen. Daher: deckt der Speicher genau die bar_1m-Zeilen des Tages in der DB (Anzahl,
-      // Σ Notional, Σ aggTrades, Σ erste/letzte aggId), wird big_order für den GANZEN Tag aus dem
+      // stehen. Daher: deckt der Speicher genau die bar_1m-Zeilen des Tages in der DB (je Minute
+      // ts, erste/letzte aggId, aggTrades, Notional – exakt, als SHA256 über dieselbe Textform auf
+      // beiden Seiten), wird big_order für den GANZEN Tag aus dem
       // Speicher ersetzt (einmal je Tag und Sitzung, danach minutenweise), und die Ordersummen und
       // die Untergrenze gelten. Sonst nur die Minute; Summen und Untergrenze NULL (unbekannt).
       const dayFrom = new Date(d.day * DAY_MS);
       const dayTo = new Date((d.day + 1) * DAY_MS);
       const [c] = await tx`
-        SELECT count(*)::int AS n, coalesce(sum(notional), 0)::text AS ntl,
-               coalesce(sum(buy_a + sell_a), 0)::text AS a,
-               coalesce(sum(first_agg_id), 0)::text AS f, coalesce(sum(last_agg_id), 0)::text AS l
+        SELECT encode(sha256(convert_to(coalesce(string_agg(
+                 ((extract(epoch FROM ts) * 1000)::bigint)::text || ',' || first_agg_id || ',' ||
+                 last_agg_id || ',' || (buy_a + sell_a) || ',' || notional, E'\n' ORDER BY ts), ''),
+                 'UTF8')), 'hex') AS h
           FROM bar_1m WHERE sym_id = ${symId} AND ts >= ${dayFrom} AND ts < ${dayTo}`;
       const o = d.orders;
-      const complete =
-        c!.n === o.minutes &&
-        c!.ntl === String(o.notional) &&
-        c!.a === String(o.aggTrades) &&
-        c!.f === String(o.firstIdSum) &&
-        c!.l === String(o.lastIdSum);
+      const complete = c!.h === createHash('sha256').update(d.dayBarsKey(), 'utf8').digest('hex');
       const key = `${symId}|${d.day}`;
       const wholeDay = complete && !this.bigSynced.has(key);
       const [from, to] = wholeDay ? [dayFrom, dayTo] : [new Date(d.big.from), new Date(d.big.to)];

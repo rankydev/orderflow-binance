@@ -162,15 +162,8 @@ describe('Recorder ↔ Datenbank', () => {
       trades: 0,
       big: { from: 0, to: 0, rows: [] },
       bigDay: () => [],
-      orders: {
-        n: 0,
-        notional: 0n,
-        bigFloorN: null,
-        minutes: 0,
-        aggTrades: 0,
-        firstIdSum: 0n,
-        lastIdSum: 0n,
-      },
+      orders: { n: 0, notional: 0n, bigFloorN: null },
+      dayBarsKey: () => '',
     };
     expect(await a.writeMinute(BTC, delta)).toBe('not_provisional');
     await a.close();

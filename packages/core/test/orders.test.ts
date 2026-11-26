@@ -169,11 +169,16 @@ describe('Order-Regel v1 (DayAggregator)', () => {
           n: ref.ordersN,
           notional: ref.ordersNotional,
           bigFloorN: floor,
-          minutes: ref.bars.length,
-          aggTrades: trades.length,
-          firstIdSum: ref.bars.reduce((x, b) => x + BigInt(b.firstAggId), 0n),
-          lastIdSum: ref.bars.reduce((x, b) => x + BigInt(b.lastAggId), 0n),
         });
+        // exakter Minutenschlüssel des Tages = Import-Bars
+        const key = (bars: typeof ref.bars) =>
+          bars
+            .map((b) => `${b.ts},${b.firstAggId},${b.lastAggId},${b.buyA + b.sellA},${b.notional}`)
+            .join('\n');
+        expect(last.dayBarsKey()).toBe(key(ref.bars));
+        for (const d of deltas) {
+          expect(d.dayBarsKey()).toBe(key(ref.bars.filter((b) => b.ts < d.big.to)));
+        }
         // ganzer Tag bis zur jeweiligen Minute (Ersatz nach einem Neustart)
         expect(last.bigDay()).toEqual(ref.bigOrders);
         for (const d of deltas) {
