@@ -2,9 +2,12 @@
 // Hauptpane, in Kerzen- und Footprint-Modus, gezeichnet im Zeichenzyklus der Bibliothek (kein DOM je
 // Marker). Laden wie Bars/Profile: Abschnitte zu 1 000 Bars (dieselben wie /bars) für den sichtbaren
 // Bereich ± 1, Bedarf erst am Gestenende, Abbruch bei Bedarfswechsel, zurückstehend hinter Kacheln und
-// Bars, LRU-Cache je (Symbol, tf, Abschnitt, Schwelle). Wird die Schwelle über eine geladene,
-// nicht ausgedünnte Antwort gehoben, filtert der Client ohne neue Anfrage. Abdeckung (`coverage`) wird
-// immer gezeigt: wo keine Order-Daten liegen, heißt „kein Marker" nicht „kein Big Trade".
+// Bars, LRU-Cache je (Symbol, tf, Abschnitt, Schwelle, Teilstück). Ein Abschnitt, den die API wegen zu
+// vieler gelesener Zeilen ablehnt (422 source_rows_exceeded), wird an `suggestTo` geteilt (begrenzt).
+// Wird die Schwelle über eine geladene, nicht ausgedünnte Antwort gehoben, filtert der Client ohne neue
+// Anfrage. Abdeckung (`coverage`) wird immer gezeigt: wo keine Order-Daten liegen, heißt „kein Marker"
+// nicht „kein Big Trade". Zeichnen: Zustand (collect) und Anordnung (layout) werden nur neu berechnet,
+// wenn sich Daten, Bereich, Größe oder Schwelle ändern – ein Hover zeichnet nur neu.
 import {
   decodeBigTrades,
   type BigTradeColumns,
@@ -26,10 +29,12 @@ import { chunkSpanSec } from '../tiles.ts';
 import { displayZone, fmtShown, zoneLabel } from '../time-format.ts';
 import type { BarItem, SymbolInfo } from '../types.ts';
 import {
+  barCoverageText,
+  barSegments,
   coverageBands,
   coverageNote,
   coverageSummary,
-  decimateByCell,
+  decimateAdaptive,
   fmtNotionalShort,
   fmtNotionalUsdt,
   fmtUsdtCompact,
@@ -42,6 +47,7 @@ import {
   vwapPrice,
   wantedChunks,
   type Band,
+  type BarTick,
   type CoverageSummary,
 } from './model.ts';
 
@@ -76,10 +82,17 @@ export const BIGTRADES_HOLD_MS = 150;
 export const BIGTRADES_MAX_HOLD_MS = 2_000;
 /** Höchstzahl gleichzeitig benötigter Abschnitte (Kerzenfenster: 20 Abschnitte). */
 export const BIGTRADES_MAX_CHUNKS = 24;
+/** Höchstzahl Teilstücke je Abschnitt nach source_rows_exceeded (begrenzte Teilung). */
+export const BIGTRADES_MAX_PIECES = 16;
+/** Obergrenzen der Hilfstabellen (Ablehnungen, Teilungen). */
+const MAX_AUX = 512;
 /** Größen-Label ab Stufe 1 (2,5×), nur wenn höchstens so viele Marker gezeichnet werden. */
 const LABEL_MAX_MARKERS = 300;
+/** Höchstzahl gezeichneter Kreise (Ausdünnung vergröbert ihre Zellen darüber). */
+export const MAX_DRAWN = 4000;
 
-const BAND_STYLE: Record<Band['kind'], { fill: string; line: string; text: string }> = {
+type DrawKind = Exclude<Band['kind'], 'pending'>;
+const BAND_STYLE: Record<DrawKind, { fill: string; line: string; text: string }> = {
   none: {
     fill: 'rgba(139, 148, 158, 0.07)',
     line: 'rgba(139, 148, 158, 0.16)',
@@ -101,6 +114,13 @@ const BAND_STYLE: Record<Band['kind'], { fill: string; line: string; text: strin
     text: 'rgba(239, 83, 80, 0.9)',
   },
 };
+/** Farbe der dünnen Lücken-Markierung je Art (am unteren Rand des Bars). */
+const TICK_COLOR: Record<DrawKind, string> = {
+  none: 'rgba(160, 168, 178, 0.75)',
+  partial: 'rgba(242, 201, 76, 0.7)',
+  toomany: 'rgba(239, 83, 80, 0.8)',
+  failed: 'rgba(239, 83, 80, 0.8)',
+};
 
 interface Entry {
   key: string;
@@ -108,6 +128,9 @@ interface Entry {
   tf: string;
   c: number;
   minUsdt: number;
+  /** angefragtes Teilstück [from, to) (ms) */
+  from: number;
+  to: number;
   meta: BigTradesMeta;
   rows: BigTradeColumns;
   /** VWAP als Preis (Gleitkomma, nur für die Position) */
@@ -122,6 +145,14 @@ interface Rejection {
   at: number;
 }
 
+interface Piece {
+  from: number;
+  to: number;
+  key: string;
+  entry: Entry | null;
+  rej: Rejection | null;
+}
+
 export interface BigTradesReadout {
   /** Symbol hat Big Trades (`/symbols` bigTrades ≠ null) */
   available: boolean;
@@ -134,7 +165,7 @@ export interface BigTradesReadout {
   /** Vom Server ausgedünnt (Σ omitted der sichtbaren Abschnitte), größtes k */
   omitted: number;
   k: number | null;
-  /** sichtbare Abschnitte noch ohne Antwort */
+  /** sichtbare Teilstücke noch ohne Antwort */
   loading: number;
   coverage: CoverageSummary | null;
   /** Legenden-Hinweis zur Abdeckung ('' = vollständig) */
@@ -154,6 +185,66 @@ interface Drawn {
   i: number;
 }
 
+/** Sichtbarer Zustand (ohne Pixel): Antworten, Bänder, Legendenwerte. */
+interface State {
+  key: string;
+  entries: Entry[];
+  /** minutengenau, aufsteigend (für Legende und Hover) */
+  bands: Band[];
+  /** je Bar: Flächen (überwiegend ohne Daten) und dünne Markierungen (kurze Lücken) */
+  full: Band[];
+  ticks: BarTick[];
+  minN: number;
+  /** Preisbereich der sichtbaren Orders (Stützstellen der y-Abbildung) */
+  pMin: number;
+  pMax: number;
+  markers: number;
+  omitted: number;
+  k: number | null;
+  loading: number;
+  coverage: CoverageSummary | null;
+  suggest: number | null;
+  tooManyNoSuggest: boolean;
+}
+
+/** Anordnung in Pixeln (CSS-px), gültig bis sich Zustand, Achsen, Größe oder Modus ändern. */
+interface Layout {
+  key: string;
+  /** gezeichnete Marker in Zeichenreihenfolge (größte Stufe zuerst) */
+  refs: Drawn[];
+  x: Float64Array;
+  y: Float64Array;
+  r: Float64Array;
+  tier: Uint8Array;
+  buy: Uint8Array;
+  /** Sweep: y von px_first / px_last (NaN = keine Spanne) */
+  ya: Float64Array;
+  yb: Float64Array;
+  labels: { x: number; y: number; text: string }[];
+  /** Flächen [x0, x1) und Lücken-Markierungen [x0, x1) in CSS-px */
+  full: { a: number; z: number; band: Band }[];
+  ticks: { a: number; z: number; kind: DrawKind }[];
+  grid: HitGrid;
+}
+
+const EMPTY_STATE = (key: string): State => ({
+  key,
+  entries: [],
+  bands: [],
+  full: [],
+  ticks: [],
+  minN: 0,
+  pMin: 0,
+  pMax: 0,
+  markers: 0,
+  omitted: 0,
+  k: null,
+  loading: 0,
+  coverage: null,
+  suggest: null,
+  tooManyNoSuggest: false,
+});
+
 export class BigTradesLayer implements IPanePrimitive<Time> {
   enabled = false;
   /** gewählte Schwelle in ganzen USDT (App klemmt auf ≥ Untergrenze) */
@@ -166,28 +257,19 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
   private readonly queue: RequestQueue;
   private readonly cache = new Map<string, Entry>();
   private readonly rejected = new Map<string, Rejection>();
+  /** Teilung eines Abschnitts (sym|tf|c|min) nach source_rows_exceeded: Grenzen inkl. from und to */
+  private readonly plans = new Map<string, number[]>();
   private requestUpdate: (() => void) | null = null;
   private readonly views: IPanePrimitivePaneView[];
   private error = '';
   private holdTimer: ReturnType<typeof setTimeout> | null = null;
   private holdSince: number | null = null;
-  private readonly grid = new HitGrid(32);
-  private drawnRefs: Drawn[] = [];
   private hovered: Drawn | null = null;
-  private dirty = true;
-  private bands: Band[] = [];
-  private frameEntries: Entry[] = [];
-  private stats = {
-    markers: 0,
-    drawn: 0,
-    omitted: 0,
-    k: null as number | null,
-    loading: 0,
-    coverage: null as CoverageSummary | null,
-    suggest: null as number | null,
-    tooManyNoSuggest: false,
-  };
-  readonly counters = { draws: 0, filteredFromCache: 0 };
+  /** erhöht bei jeder Änderung von Cache/Ablehnungen/Teilungen/Einstellungen */
+  private version = 0;
+  private state: State = EMPTY_STATE('');
+  private layout: Layout | null = null;
+  readonly counters = { draws: 0, layouts: 0, collects: 0, filteredFromCache: 0, splits: 0 };
 
   constructor(host: BigTradesHost, fetchFn?: FetchFn) {
     this.host = host;
@@ -218,14 +300,12 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
   detached(): void {
     this.requestUpdate = null;
   }
-  updateAllViews(): void {
-    this.dirty = true;
-  }
   paneViews(): readonly IPanePrimitivePaneView[] {
     return this.views;
   }
+  /** Daten/Einstellung geändert: Zustand neu bestimmen und neu zeichnen. */
   redraw(): void {
-    this.dirty = true;
+    this.version++;
     this.requestUpdate?.();
   }
 
@@ -257,24 +337,59 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     return this.minUsdt * 10 ** bt.notionalDecimals;
   }
 
-  private key(sym: string, tf: string, c: number, min: number): string {
-    return `bt|${sym}|${tf}|${c}|${min}`;
+  private planKey(sym: string, tf: string, c: number, min: number): string {
+    return `${sym}|${tf}|${c}|${min}`;
+  }
+
+  private pieceKey(sym: string, tf: string, c: number, min: number, a: number, b: number): string {
+    return `bt|${sym}|${tf}|${c}|${min}|${a}|${b}`;
+  }
+
+  /** Teilstücke eines Abschnitts bei Schwelle min (ohne Teilung: der ganze Abschnitt). */
+  private pieces(sym: string, tf: string, c: number, min: number, spanMs: number): Piece[] {
+    const bounds = this.plans.get(this.planKey(sym, tf, c, min)) ?? [c * spanMs, (c + 1) * spanMs];
+    const out: Piece[] = [];
+    for (let i = 0; i + 1 < bounds.length; i++) {
+      const key = this.pieceKey(sym, tf, c, min, bounds[i]!, bounds[i + 1]!);
+      out.push({
+        from: bounds[i]!,
+        to: bounds[i + 1]!,
+        key,
+        entry: this.cache.get(key) ?? null,
+        rej: this.rejected.get(key) ?? null,
+      });
+    }
+    return out;
+  }
+
+  private fresh(e: Entry, now: number): boolean {
+    return e.meta.final || now - e.loadedAt < BIGTRADES_NONFINAL_TTL_MS;
   }
 
   /**
-   * Antwort, aus der Abschnitt c bei Schwelle min gezeichnet werden kann: genau diese Schwelle, sonst
-   * eine niedrigere, nicht ausgedünnte (Filtern im Client ist dann exakt).
+   * Teilstücke, aus denen Abschnitt c bei Schwelle min gezeichnet wird: genau diese Schwelle, wenn
+   * vollständig geladen; sonst eine niedrigere, vollständig geladene, frische und nicht ausgedünnte
+   * (Filtern im Client ist dann exakt); sonst die (teilweise geladene) genaue Schwelle.
    */
-  private lookup(sym: string, tf: string, c: number, min: number): Entry | null {
-    const exact = this.cache.get(this.key(sym, tf, c, min));
-    if (exact) return exact;
-    let best: Entry | null = null;
-    for (const e of this.cache.values()) {
-      if (e.sym !== sym || e.tf !== tf || e.c !== c || e.minUsdt > min || e.meta.omitted > 0)
-        continue;
-      if (!best || e.minUsdt > best.minUsdt) best = e;
+  private resolve(
+    sym: string,
+    tf: string,
+    c: number,
+    min: number,
+    spanMs: number,
+    now: number,
+  ): { pieces: Piece[]; exact: boolean } {
+    const exact = this.pieces(sym, tf, c, min, spanMs);
+    if (exact.every((p) => p.entry)) return { pieces: exact, exact: true };
+    const mins = new Set<number>();
+    for (const e of this.cache.values())
+      if (e.sym === sym && e.tf === tf && e.c === c && e.minUsdt < min) mins.add(e.minUsdt);
+    for (const m of [...mins].sort((a, b) => b - a)) {
+      const ps = this.pieces(sym, tf, c, m, spanMs);
+      if (ps.every((p) => p.entry && p.entry.meta.omitted === 0 && this.fresh(p.entry, now)))
+        return { pieces: ps, exact: false };
     }
-    return best;
+    return { pieces: exact, exact: true };
   }
 
   private visibleChunks(): { c: number; priority: number }[] {
@@ -307,44 +422,39 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
       return;
     }
     const tf = this.host.tf();
-    const tfMs = this.host.tfSec() * 1000;
     const spanMs = chunkSpanSec(this.host.tfSec()) * 1000;
     const min = this.minUsdt;
     const now = performance.now();
+    this.prune(now);
     const wants: Want[] = [];
     const retain = new Set<string>();
     for (const { c, priority } of this.visibleChunks()) {
-      const key = this.key(s.name, tf, c, min);
-      const rj = this.rejected.get(key);
-      if (rj) {
-        if (now - rj.at < BIGTRADES_REJECT_TTL_MS) continue;
-        this.rejected.delete(key);
-        this.queue.forgetFailure(key);
+      const view = this.resolve(s.name, tf, c, min, spanMs, now);
+      if (!view.exact) {
+        this.counters.filteredFromCache++;
+        for (const p of view.pieces) this.touch(p.entry!);
+        continue;
       }
-      const e = this.lookup(s.name, tf, c, min);
-      if (e) {
-        // LRU: Benutzung frischt auf
-        this.cache.delete(e.key);
-        this.cache.set(e.key, e);
-        if (e.key !== key) this.counters.filteredFromCache++;
-        const stale = !e.meta.final && now - e.loadedAt >= BIGTRADES_NONFINAL_TTL_MS;
-        if (!stale) {
-          retain.add(key);
-          continue;
+      for (const p of view.pieces) {
+        if (p.rej) {
+          if (now - p.rej.at < BIGTRADES_REJECT_TTL_MS) continue;
+          this.rejected.delete(p.key);
+          this.queue.forgetFailure(p.key);
         }
-        if (this.queue.isFinal(key)) this.queue.forgetFailure(key);
+        retain.add(p.key);
+        if (p.entry) {
+          this.touch(p.entry);
+          if (this.fresh(p.entry, now)) continue;
+          if (this.queue.isFinal(p.key)) this.queue.forgetFailure(p.key);
+        }
+        wants.push({
+          key: p.key,
+          url: `${this.host.apiBase}/api/v1/bigtrades?sym=${encodeURIComponent(s.name)}&tf=${tf}&from=${p.from}&to=${p.to}&min=${min}`,
+          priority,
+          // nicht finale Antwort erneuern: am Browser-Cache vorbei (Server: no-cache, ETag)
+          reload: p.entry !== null,
+        });
       }
-      retain.add(key);
-      const from = c * spanMs;
-      const to = from + spanMs;
-      if (from % tfMs !== 0) continue; // nicht ausgerichtet (gibt es mit 1 000-Bar-Abschnitten nicht)
-      wants.push({
-        key,
-        url: `${this.host.apiBase}/api/v1/bigtrades?sym=${encodeURIComponent(s.name)}&tf=${tf}&from=${from}&to=${to}&min=${min}`,
-        priority,
-        // nicht finale Antwort erneuern: am Browser-Cache vorbei (Server: no-cache, ETag)
-        reload: e !== null,
-      });
     }
     if (wants.length > 0 && this.host.busy()) {
       this.holdSince ??= now;
@@ -359,6 +469,20 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     this.queue.setWanted(wants, retain);
   }
 
+  /** LRU: Benutzung frischt auf. */
+  private touch(e: Entry): void {
+    this.cache.delete(e.key);
+    this.cache.set(e.key, e);
+  }
+
+  /** Abgelaufene Ablehnungen entfernen; Hilfstabellen begrenzen (älteste zuerst). */
+  private prune(now: number): void {
+    for (const [k, r] of this.rejected)
+      if (now - r.at >= BIGTRADES_REJECT_TTL_MS) this.rejected.delete(k);
+    while (this.rejected.size > MAX_AUX) this.rejected.delete(this.rejected.keys().next().value!);
+    while (this.plans.size > MAX_AUX) this.plans.delete(this.plans.keys().next().value!);
+  }
+
   /** frame() nach BIGTRADES_HOLD_MS erneut (zurückgestellt hinter Kacheln/Bars oder einer Geste). */
   private armRetry(): void {
     if (this.holdTimer) return;
@@ -370,9 +494,9 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
 
   // ---------------------------------------------------------------- Antworten
 
-  private parseKey(key: string): { sym: string; tf: string; c: number; min: number } {
-    const [, sym = '', tf = '', c = '', min = ''] = key.split('|');
-    return { sym, tf, c: Number(c), min: Number(min) };
+  private parseKey(key: string) {
+    const [, sym = '', tf = '', c = '', min = '', a = '', b = ''] = key.split('|');
+    return { sym, tf, c: Number(c), min: Number(min), from: Number(a), to: Number(b) };
   }
 
   private onLoaded(key: string, buf: ArrayBuffer): void {
@@ -381,11 +505,10 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     if (!s || s.name !== k.sym) return; // Antwort des alten Symbols
     const d = decodeBigTrades(buf);
     const m = d.meta;
-    const spanMs = chunkSpanSec(m.tfSec) * 1000;
     // K2: Antwort gegen die Anfrage prüfen (wirft → sichtbar, endgültig für diesen Schlüssel)
     if (m.sym !== k.sym || m.tf !== k.tf || m.minUsdt !== k.min)
       throw new Error(`Antwort ${m.sym} ${m.tf} ≥ ${m.minUsdt} passt nicht zur Anfrage`);
-    if (m.from !== k.c * spanMs || m.to !== (k.c + 1) * spanMs)
+    if (m.from !== k.from || m.to !== k.to)
       throw new Error('Antwort: Zeitraum passt nicht zur Anfrage');
     if (s.bigTrades && m.notionalDecimals !== s.bigTrades.notionalDecimals)
       throw new Error('Antwort: notionalDecimals passt nicht zu /symbols');
@@ -399,6 +522,8 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
       tf: k.tf,
       c: k.c,
       minUsdt: k.min,
+      from: k.from,
+      to: k.to,
       meta: m,
       rows: d.rows,
       price,
@@ -407,12 +532,10 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     this.cache.delete(key);
     this.cache.set(key, e);
     this.rejected.delete(key);
-    // eine frühere Meldung gilt nicht mehr, sobald keine sichtbare Ablehnung „failed" übrig ist
+    // eine frühere Meldung gilt nicht mehr, sobald keine Ablehnung „failed" übrig ist
     if (![...this.rejected.values()].some((r) => r.kind === 'failed')) this.error = '';
-    while (this.cache.size > BIGTRADES_CACHE_ENTRIES) {
-      const first = this.cache.keys().next().value as string;
-      this.cache.delete(first);
-    }
+    while (this.cache.size > BIGTRADES_CACHE_ENTRIES)
+      this.cache.delete(this.cache.keys().next().value!);
     this.redraw();
     this.onChange?.();
   }
@@ -438,12 +561,13 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
         at,
       });
     } else if (status === 422 && reason === 'source_rows_exceeded') {
-      this.rejected.set(key, {
-        kind: 'failed',
-        suggestMinUsdt: null,
-        message: 'Bereich zu groß',
-        at,
-      });
+      if (!this.split(k, j.suggestTo))
+        this.rejected.set(key, {
+          kind: 'failed',
+          suggestMinUsdt: null,
+          message: 'Bereich zu groß',
+          at,
+        });
     } else if (status === 422 && reason === 'below_floor') {
       // Untergrenze hat sich geändert (neue /symbols folgen); nicht still anheben
       const m =
@@ -464,60 +588,110 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     this.onChange?.();
   }
 
+  /**
+   * source_rows_exceeded: Teilstück [from, to) an suggestTo teilen (ausgerichtet, strikt innen) und die
+   * Teile anfragen; höchstens BIGTRADES_MAX_PIECES Teile je Abschnitt. false = nicht teilbar.
+   */
+  private split(k: ReturnType<BigTradesLayer['parseKey']>, suggestTo: unknown): boolean {
+    const tfMs = this.host.tfSec() * 1000;
+    if (
+      typeof suggestTo !== 'number' ||
+      !Number.isSafeInteger(suggestTo) ||
+      suggestTo <= k.from ||
+      suggestTo >= k.to ||
+      suggestTo % tfMs !== 0
+    )
+      return false;
+    const pk = this.planKey(k.sym, k.tf, k.c, k.min);
+    const spanMs = chunkSpanSec(this.host.tfSec()) * 1000;
+    const bounds = this.plans.get(pk) ?? [k.c * spanMs, (k.c + 1) * spanMs];
+    if (bounds.length - 1 >= BIGTRADES_MAX_PIECES || !bounds.includes(k.from)) return false;
+    if (!bounds.includes(suggestTo)) bounds.push(suggestTo);
+    bounds.sort((a, b) => a - b);
+    this.plans.delete(pk);
+    this.plans.set(pk, bounds);
+    this.counters.splits++;
+    // erst nach dem Rückruf der Warteschlange neu anfragen
+    queueMicrotask(() => this.frame());
+    return true;
+  }
+
   // ---------------------------------------------------------------- Sichtbarer Zustand
 
-  /** Sichtbare Abschnitte → Antworten, Bänder, Legendenwerte (einmal je Zeichnen). */
-  private collect(): void {
-    this.dirty = false;
-    this.bands = [];
-    this.frameEntries = [];
-    const st = this.stats;
-    st.omitted = 0;
-    st.k = null;
-    st.loading = 0;
-    st.coverage = null;
-    st.suggest = null;
-    st.tooManyNoSuggest = false;
+  /** Sichtbarer Zustand; neu nur, wenn sich Bereich, Einstellung oder Daten geändert haben. */
+  private collect(): State {
     const s = this.host.sym();
     const vis = this.host.visibleTimeRange();
-    if (!this.enabled || !s?.bigTrades || this.minUsdt === null || !vis) return;
-    const minN = this.thresholdN(s)!;
+    const key = `${this.version}|${s?.name}|${s?.dataFrom}|${s?.dataTo}|${this.host.tf()}|${this.enabled}|${this.minUsdt}|${vis?.[0]}|${vis?.[1]}|${this.queue.stats.failed}|${this.queue.stats.completed}`;
+    if (this.state.key === key) return this.state;
+    this.counters.collects++;
+    const st = EMPTY_STATE(key);
+    this.state = st;
+    if (!this.enabled || !s?.bigTrades || this.minUsdt === null || !vis) return st;
+    st.minN = this.thresholdN(s)!;
     const tf = this.host.tf();
-    const spanMs = chunkSpanSec(this.host.tfSec()) * 1000;
+    const tfSec = this.host.tfSec();
+    const spanMs = chunkSpanSec(tfSec) * 1000;
+    const now = performance.now();
     const visFrom = Math.max(vis[0] * 1000, s.dataFrom);
-    const visTo = Math.min((vis[1] + this.host.tfSec()) * 1000, s.dataTo);
+    const visTo = Math.min((vis[1] + tfSec) * 1000, s.dataTo);
     const raw: Band[] = [];
     for (const { c, priority } of this.visibleChunks()) {
       if (priority !== 0) continue;
-      const e = this.lookup(s.name, tf, c, this.minUsdt);
-      const rj = this.rejected.get(this.key(s.name, tf, c, this.minUsdt));
-      const from = Math.max(c * spanMs, s.dataFrom);
-      const to = Math.min((c + 1) * spanMs, s.dataTo);
-      if (e) {
-        this.frameEntries.push(e);
-        if (e.minUsdt === this.minUsdt) {
-          st.omitted += e.meta.omitted;
-          if (e.meta.k !== null) st.k = Math.max(st.k ?? 0, e.meta.k);
-        }
-        // erst auf den Datenbereich kürzen, dann zusammenfassen (sonst trüge ein Band die Gründe der
-        // Spannen vor dem Datenbeginn bzw. nach dem Datenende mit, z. B. no_day)
-        raw.push(...coverageBands(clipSpans(e.meta.coverage, from, to), minN));
-      } else if (rj) {
-        if (to > from) raw.push({ from, to, kind: rj.kind, reasons: [], floorN: null });
-        if (rj.kind === 'toomany') {
-          if (rj.suggestMinUsdt === null) st.tooManyNoSuggest = true;
-          else st.suggest = Math.max(st.suggest ?? 0, rj.suggestMinUsdt);
-        }
-      } else st.loading++;
+      const view = this.resolve(s.name, tf, c, this.minUsdt, spanMs, now);
+      for (const p of view.pieces) {
+        const from = Math.max(p.from, s.dataFrom);
+        const to = Math.min(p.to, s.dataTo);
+        if (p.entry) {
+          const e = p.entry;
+          st.entries.push(e);
+          if (view.exact) {
+            st.omitted += e.meta.omitted;
+            if (e.meta.k !== null) st.k = Math.max(st.k ?? 0, e.meta.k);
+          }
+          // erst auf den Datenbereich kürzen, dann zusammenfassen (sonst trüge ein Band die Gründe
+          // der Spannen vor dem Datenbeginn bzw. nach dem Datenende mit, z. B. no_day)
+          raw.push(...coverageBands(clipSpans(e.meta.coverage, from, to), st.minN));
+        } else if (p.rej) {
+          if (to > from) raw.push({ from, to, kind: p.rej.kind, reasons: [], floorN: null });
+          if (p.rej.kind === 'toomany') {
+            if (p.rej.suggestMinUsdt === null) st.tooManyNoSuggest = true;
+            else st.suggest = Math.max(st.suggest ?? 0, p.rej.suggestMinUsdt);
+          }
+        } else if (this.queue.failing(p.key)) {
+          // vorübergehender Fehler (Netz, 5xx): rot markieren, Wiederholung läuft
+          if (to > from) raw.push({ from, to, kind: 'failed', reasons: [], floorN: null });
+        } else st.loading++;
+      }
     }
-    this.bands = mergeBands(raw);
-    if (visTo > visFrom) st.coverage = coverageSummary(this.bands, visFrom, visTo);
+    st.bands = mergeBands(raw);
+    const seg = barSegments(st.bands, tfSec * 1000, s.dataFrom, s.dataTo);
+    st.full = seg.full;
+    st.ticks = seg.ticks;
+    if (visTo > visFrom) st.coverage = coverageSummary(st.bands, visFrom, visTo);
+    // sichtbare Orders zählen, Preisbereich für die y-Abbildung
+    const fromMs = vis[0] * 1000;
+    const toMs = (vis[1] + tfSec) * 1000;
+    let pMin = Infinity;
+    let pMax = -Infinity;
+    for (const e of st.entries) {
+      const r = e.rows;
+      for (let i = lowerBound(r.ts, fromMs); i < r.ts.length && r.ts[i]! < toMs; i++) {
+        if (r.notional[i]! < st.minN) continue;
+        st.markers++;
+        const p = e.price[i]!;
+        if (p < pMin) pMin = p;
+        if (p > pMax) pMax = p;
+      }
+    }
+    st.pMin = pMin;
+    st.pMax = pMax > pMin ? pMax : pMin + 1;
+    return st;
   }
 
   readout(): BigTradesReadout {
     const s = this.host.sym();
-    if (this.dirty) this.collect();
-    const st = this.stats;
+    const st = this.collect();
     const bt = s?.bigTrades ?? null;
     return {
       available: !!bt,
@@ -525,7 +699,11 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
       minUsdt: this.minUsdt,
       floorUsdt: bt?.minUsdt ?? null,
       markers: this.enabled ? st.markers : 0,
-      drawn: this.enabled ? st.drawn : 0,
+      drawn: this.enabled
+        ? this.layout?.key.startsWith(`${st.key}#`)
+          ? this.layout.refs.length
+          : st.markers
+        : 0,
       omitted: st.omitted,
       k: st.k,
       loading: st.loading,
@@ -539,15 +717,140 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     };
   }
 
-  // ---------------------------------------------------------------- Zeichnen
+  /** Hover-Zusatz für den Bar zur Zeit tSec: fehlende Daten im Bar ('' = abgedeckt). */
+  barNote(tSec: number): string {
+    const s = this.host.sym();
+    if (!this.enabled || !s?.bigTrades) return '';
+    const st = this.collect();
+    return barCoverageText(
+      st.bands,
+      tSec * 1000,
+      this.host.tfSec() * 1000,
+      s.bigTrades.notionalDecimals,
+    );
+  }
 
-  /** Lineare Abbildung logischer Index → x (CSS-px) aus zwei Stützstellen; null ohne Zeitachse. */
-  private xMap(): { x0: number; bs: number } | null {
+  // ---------------------------------------------------------------- Anordnung
+
+  /** Anordnung in Pixeln; neu nur, wenn sich Zustand, Achsen, Größe oder Modus geändert haben. */
+  private arrange(W: number, H: number): Layout | null {
+    const st = this.collect();
+    const items = this.host.items();
+    const s = this.host.sym();
+    if (!this.enabled || !s?.bigTrades || items.length === 0) return null;
     const ts = this.host.chart.timeScale();
-    const a = ts.logicalToCoordinate(0 as never);
-    const b = ts.logicalToCoordinate(1 as never);
-    if (a === null || b === null) return null;
-    return { x0: a, bs: b - a };
+    const x0 = ts.logicalToCoordinate(0 as never);
+    const x1 = ts.logicalToCoordinate(1 as never);
+    if (x0 === null || x1 === null) return null;
+    const bs = x1 - x0;
+    const fp = this.host.footprintActive();
+    const yA = this.host.priceToY(st.pMin);
+    const yB = this.host.priceToY(st.pMax);
+    const key = `${st.key}#${x0}|${bs}|${yA}|${yB}|${W}|${H}|${fp}|${items.length}|${items[0]!.time}`;
+    if (this.layout?.key === key) return this.layout;
+    this.counters.layouts++;
+    const tfSec = this.host.tfSec();
+    const ym = this.yMap(st.pMin, st.pMax);
+    const xOfMs = (t: number) => x0 + logicalOfSec(items, t / 1000, tfSec) * bs - bs / 2;
+    // Bänder: Flächen und Lücken-Markierungen an Bar-Grenzen
+    const full: Layout['full'] = [];
+    for (const b of st.full) {
+      if (b.kind === 'pending') continue;
+      const a = xOfMs(b.from);
+      const z = xOfMs(b.to);
+      if (z > 0 && a < W && z > a) full.push({ a, z, band: b });
+    }
+    const ticks: Layout['ticks'] = [];
+    for (const t of st.ticks) {
+      if (t.kind === 'pending') continue;
+      const a = xOfMs(t.bar);
+      const z = a + bs;
+      if (z > 0 && a < W) ticks.push({ a, z, kind: t.kind });
+    }
+    // Marker: sichtbare Orders ≥ Schwelle → Pixel (Bar-Zeiger läuft mit, Orders je Antwort aufsteigend)
+    const vis = this.host.visibleTimeRange()!;
+    const fromMs = vis[0] * 1000;
+    const toMs = (vis[1] + tfSec) * 1000;
+    const n = st.markers;
+    const xs = new Float64Array(n);
+    const ys = new Float64Array(n);
+    const sides = new Int32Array(n);
+    const nots = new Float64Array(n);
+    const all: Drawn[] = new Array<Drawn>(n);
+    let m = 0;
+    for (const e of st.entries) {
+      const r = e.rows;
+      let ptr = 0;
+      for (let i = lowerBound(r.ts, fromMs); i < r.ts.length && r.ts[i]! < toMs; i++) {
+        if (r.notional[i]! < st.minN) continue;
+        const bar = r.bar[i]!;
+        while (ptr < items.length && items[ptr]!.time < bar) ptr++;
+        const L =
+          ptr < items.length && items[ptr]!.time === bar ? ptr : logicalOfSec(items, bar, tfSec);
+        xs[m] = x0 + L * bs;
+        ys[m] = ym(e.price[i]!) ?? Number.NaN;
+        sides[m] = r.side[i]!;
+        nots[m] = r.notional[i]!;
+        all[m] = { e, i };
+        m++;
+      }
+    }
+    const { keep } = decimateAdaptive(m, xs, ys, sides, nots, MAX_DRAWN, W, H);
+    const vis2 = keep.filter((j) => {
+      const x = xs[j]!;
+      const y = ys[j]!;
+      return Number.isFinite(y) && x >= -R_PAD && x <= W + R_PAD && y >= -R_PAD && y <= H + R_PAD;
+    });
+    // Zeichenreihenfolge: größte Stufe zuerst, kleinere darüber (bleiben sichtbar)
+    const order: number[] = [];
+    for (const tier of [2, 1, 0])
+      for (const j of vis2) if (tierOf(nots[j]!, st.minN) === tier) order.push(j);
+    const k = order.length;
+    const L: Layout = {
+      key,
+      refs: new Array<Drawn>(k),
+      x: new Float64Array(k),
+      y: new Float64Array(k),
+      r: new Float64Array(k),
+      tier: new Uint8Array(k),
+      buy: new Uint8Array(k),
+      ya: new Float64Array(k),
+      yb: new Float64Array(k),
+      labels: [],
+      full,
+      ticks,
+      grid: new HitGrid(32),
+    };
+    const pd = s.priceDecimals;
+    const nd = s.bigTrades.notionalDecimals;
+    const labels = !fp && k <= LABEL_MAX_MARKERS;
+    const placed: Box[] = [];
+    order.forEach((j, q) => {
+      const d = all[j]!;
+      const r = radiusPx(nots[j]!, st.minN);
+      L.refs[q] = d;
+      L.x[q] = xs[j]!;
+      L.y[q] = ys[j]!;
+      L.r[q] = r;
+      L.tier[q] = tierOf(nots[j]!, st.minN);
+      L.buy[q] = sides[j] === 1 ? 1 : 0;
+      const a = d.e.rows.pxFirst[d.i]!;
+      const b = d.e.rows.pxLast[d.i]!;
+      L.ya[q] = fp && a !== b ? (ym(a / 10 ** pd) ?? Number.NaN) : Number.NaN;
+      L.yb[q] = fp && a !== b ? (ym(b / 10 ** pd) ?? Number.NaN) : Number.NaN;
+      L.grid.add(q, xs[j]!, ys[j]!, r);
+      if (labels && L.tier[q]! >= 1) {
+        // nur ohne Überlappung mit bereits gesetzten Labels (gierig, größte Stufe zuerst)
+        const text = fmtNotionalShort(nots[j]!, nd);
+        const box = { x: xs[j]! + r + 3, y: ys[j]! - 6, w: text.length * 5.5, h: 12 };
+        if (!placed.some((p) => overlaps(p, box))) {
+          placed.push(box);
+          L.labels.push({ x: box.x, y: ys[j]!, text });
+        }
+      }
+    });
+    this.layout = L;
+    return L;
   }
 
   /** Preis → y: linear aus zwei Stützstellen, wenn die Skala linear ist (Probe in der Mitte). */
@@ -569,34 +872,27 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     return (p) => h.priceToY(p);
   }
 
+  // ---------------------------------------------------------------- Zeichnen
+
   private drawBands(scope: Scope): void {
-    if (this.dirty) this.collect();
-    if (!this.enabled || this.bands.length === 0) return;
-    const items = this.host.items();
-    const xm = this.xMap();
-    if (!xm || items.length === 0) return;
-    const tfSec = this.host.tfSec();
+    const L = this.arrange(scope.mediaSize.width, scope.mediaSize.height);
+    if (!L || (L.full.length === 0 && L.ticks.length === 0)) return;
     const ctx = scope.context;
     const hpr = scope.horizontalPixelRatio;
     const vpr = scope.verticalPixelRatio;
     const W = scope.bitmapSize.width;
     const H = scope.bitmapSize.height;
-    const s = this.host.sym();
-    const nd = s?.bigTrades?.notionalDecimals ?? 0;
+    const nd = this.host.sym()?.bigTrades?.notionalDecimals ?? 0;
     ctx.save();
     ctx.font = `${Math.round(10 * vpr)}px system-ui, sans-serif`;
     ctx.textBaseline = 'bottom';
-    for (const b of this.bands) {
-      // an Bar-Grenzen nach außen runden: eine Lücke mitten in einem Bar markiert den ganzen Bar
-      const tfMs = tfSec * 1000;
-      const f = Math.floor(b.from / tfMs) * tfSec;
-      const t = Math.ceil(b.to / tfMs) * tfSec;
-      const xa = (xm.x0 + logicalOfSec(items, f, tfSec) * xm.bs - xm.bs / 2) * hpr;
-      const xb = (xm.x0 + logicalOfSec(items, t, tfSec) * xm.bs - xm.bs / 2) * hpr;
-      const a = Math.max(0, Math.round(xa));
-      const z = Math.min(W, Math.round(xb));
+    for (const f of L.full) {
+      const b = f.band;
+      const kind = b.kind as DrawKind;
+      const a = Math.max(0, Math.round(f.a * hpr));
+      const z = Math.min(W, Math.round(f.z * hpr));
       if (z <= a) continue;
-      const style = BAND_STYLE[b.kind];
+      const style = BAND_STYLE[kind];
       ctx.fillStyle = style.fill;
       ctx.fillRect(a, 0, z - a, H);
       // Schraffur (diagonal, 10 px Abstand): „keine Daten" ist sichtbar etwas anderes als leere Fläche
@@ -615,11 +911,11 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
       ctx.stroke();
       ctx.restore();
       const label =
-        b.kind === 'none'
+        kind === 'none'
           ? 'keine Big-Trade-Daten'
-          : b.kind === 'partial'
-            ? `Big Trades erst ab ${fmtUsdtCompact(Math.ceil((b.floorN ?? 0) / 10 ** nd))}`
-            : b.kind === 'toomany'
+          : kind === 'partial'
+            ? `Big Trades erst ab ${fmtUsdtCompact(Math.ceil((b.floorN ?? 0) / 10 ** nd), true)}`
+            : kind === 'toomany'
               ? 'zu viele Orders – Schwelle erhöhen'
               : 'Big Trades nicht ladbar';
       const tw = ctx.measureText(label).width;
@@ -630,172 +926,94 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
         ctx.fillText(label, lx, H - Math.round(4 * vpr));
       }
     }
+    // kurze Lücken: dünne Markierung am unteren Rand des Bars (Hover nennt Minuten und Grund)
+    const th = Math.max(2, Math.round(TICK_PX * vpr));
+    for (const t of L.ticks) {
+      const a = Math.round(t.a * hpr) + 1;
+      const w = Math.max(Math.round(2 * hpr), Math.round((t.z - t.a) * hpr) - 2);
+      ctx.fillStyle = TICK_COLOR[t.kind];
+      ctx.fillRect(a, H - th, w, th);
+    }
     ctx.restore();
   }
 
   private drawMarkers(scope: Scope): void {
-    if (this.dirty) this.collect();
     this.counters.draws++;
-    this.grid.clear();
-    this.drawnRefs = [];
-    this.stats.markers = 0;
-    this.stats.drawn = 0;
-    const s = this.host.sym();
-    const vis = this.host.visibleTimeRange();
-    const items = this.host.items();
-    if (!this.enabled || !s?.bigTrades || this.minUsdt === null || !vis || items.length === 0)
-      return;
-    const xm = this.xMap();
-    if (!xm) return;
-    const minN = this.thresholdN(s)!;
-    const tfSec = this.host.tfSec();
-    const W = scope.mediaSize.width;
-    const H = scope.mediaSize.height;
-    const fromMs = vis[0] * 1000;
-    const toMs = (vis[1] + tfSec) * 1000;
-    // sichtbare Orders ≥ Schwelle sammeln (je Antwort aufsteigend nach ts → Bar-Zeiger läuft mit)
-    const xs: number[] = [];
-    const ys: number[] = [];
-    const sides: number[] = [];
-    const nots: number[] = [];
-    const refs: Drawn[] = [];
-    let pMin = Infinity;
-    let pMax = -Infinity;
-    for (const e of this.frameEntries) {
-      const r = e.rows;
-      for (let i = lowerBound(r.ts, fromMs); i < r.ts.length && r.ts[i]! < toMs; i++) {
-        if (r.notional[i]! < minN) continue;
-        const p = e.price[i]!;
-        if (p < pMin) pMin = p;
-        if (p > pMax) pMax = p;
-        refs.push({ e, i });
-      }
-    }
-    this.stats.markers = refs.length;
-    if (refs.length === 0) return;
-    const ym = this.yMap(pMin, pMax > pMin ? pMax : pMin + 1);
-    let ptr = 0;
-    let last: Entry | null = null;
-    for (const d of refs) {
-      if (d.e !== last) {
-        last = d.e;
-        ptr = 0;
-      }
-      const bar = d.e.rows.bar[d.i]!;
-      // Bar-Zeiger: Items aufsteigend, Orders aufsteigend → amortisiert O(1)
-      while (ptr < items.length && items[ptr]!.time < bar) ptr++;
-      const L =
-        ptr < items.length && items[ptr]!.time === bar ? ptr : logicalOfSec(items, bar, tfSec);
-      const y = ym(d.e.price[d.i]!);
-      xs.push(xm.x0 + L * xm.bs);
-      ys.push(y ?? Number.NaN);
-      sides.push(d.e.rows.side[d.i]!);
-      nots.push(d.e.rows.notional[d.i]!);
-    }
-    const keep = decimateByCell(refs.length, xs, ys, sides, nots).filter((j) => {
-      const x = xs[j]!;
-      const y = ys[j]!;
-      return Number.isFinite(y) && x >= -R_PAD && x <= W + R_PAD && y >= -R_PAD && y <= H + R_PAD;
-    });
-    this.stats.drawn = keep.length;
+    const L = this.arrange(scope.mediaSize.width, scope.mediaSize.height);
+    if (!L || L.refs.length === 0) return;
     const ctx = scope.context;
     const hpr = scope.horizontalPixelRatio;
     const vpr = scope.verticalPixelRatio;
-    const nd = s.bigTrades.notionalDecimals;
-    const pd = s.priceDecimals;
+    const k = L.refs.length;
     ctx.save();
-    // Sweep-Spanne px_first..px_last nur im Footprint-Modus (Entscheidung 2026-11-26)
-    const fpMode = this.host.footprintActive();
-    if (fpMode) {
-      for (const j of keep) {
-        const d = refs[j]!;
-        const a = d.e.rows.pxFirst[d.i]!;
-        const b = d.e.rows.pxLast[d.i]!;
-        if (a === b) continue;
-        const ya = ym(a / 10 ** pd);
-        const yb = ym(b / 10 ** pd);
-        if (ya === null || yb === null) continue;
-        const x = Math.round(xs[j]! * hpr) + 0.5;
-        const w = 4 * hpr;
-        const path = () => {
-          ctx.beginPath();
-          ctx.moveTo(x, ya * vpr);
-          ctx.lineTo(x, yb * vpr);
-          // kurze Querstriche an den Enden (erster / letzter Fill)
-          ctx.moveTo(x - w, ya * vpr);
-          ctx.lineTo(x + w, ya * vpr);
-          ctx.moveTo(x - w, yb * vpr);
-          ctx.lineTo(x + w, yb * vpr);
-        };
-        // dunkler Rand, damit die Linie über farbigen Zellen lesbar bleibt
-        ctx.globalAlpha = 0.9;
-        ctx.strokeStyle = HALO;
-        ctx.lineWidth = Math.max(2, Math.round(4 * hpr));
-        path();
-        ctx.stroke();
-        ctx.globalAlpha = 1;
-        ctx.strokeStyle = sides[j] === 1 ? UP_COLOR : DOWN_COLOR;
-        ctx.lineWidth = Math.max(1, Math.round(2 * hpr));
-        path();
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 1;
-    }
-    // Kreise: größte Stufe zuerst, kleinere darüber (bleiben sichtbar)
-    // Größen-Label nicht über Footprint-Zahlen (der Hover zeigt den exakten Wert)
-    const labels = !fpMode && keep.length <= LABEL_MAX_MARKERS;
-    const placed: (Box & { text: string; y0: number })[] = [];
-    ctx.font = `${Math.round(10 * vpr)}px system-ui, sans-serif`;
-    ctx.textBaseline = 'middle';
-    for (const tier of [2, 1, 0] as const) {
-      for (const j of keep) {
-        const n = nots[j]!;
-        if (tierOf(n, minN) !== tier) continue;
-        const r = radiusPx(n, minN);
-        const x = xs[j]!;
-        const y = ys[j]!;
-        const color = sides[j] === 1 ? UP_COLOR : DOWN_COLOR;
+    // Sweep-Spanne px_first..px_last nur im Footprint-Modus (Entscheidung 2026-11-26; ya NaN sonst)
+    for (let q = 0; q < k; q++) {
+      const ya = L.ya[q]!;
+      const yb = L.yb[q]!;
+      if (!Number.isFinite(ya) || !Number.isFinite(yb)) continue;
+      const x = Math.round(L.x[q]! * hpr) + 0.5;
+      const w = 4 * hpr;
+      const path = () => {
         ctx.beginPath();
-        ctx.arc(x * hpr, y * vpr, r * hpr, 0, 2 * Math.PI);
-        // dunkler Ring unter jedem Kreis: Kontrast zu Kerzen und Footprint-Zellen gleicher Farbe
-        ctx.globalAlpha = 0.85;
-        ctx.strokeStyle = HALO;
-        ctx.lineWidth = 2 * hpr;
+        ctx.moveTo(x, ya * vpr);
+        ctx.lineTo(x, yb * vpr);
+        // kurze Querstriche an den Enden (erster / letzter Fill)
+        ctx.moveTo(x - w, ya * vpr);
+        ctx.lineTo(x + w, ya * vpr);
+        ctx.moveTo(x - w, yb * vpr);
+        ctx.lineTo(x + w, yb * vpr);
+      };
+      // dunkler Rand, damit die Linie über farbigen Zellen lesbar bleibt
+      ctx.globalAlpha = 0.9;
+      ctx.strokeStyle = HALO;
+      ctx.lineWidth = Math.max(2, Math.round(4 * hpr));
+      path();
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = L.buy[q] ? UP_COLOR : DOWN_COLOR;
+      ctx.lineWidth = Math.max(1, Math.round(2 * hpr));
+      path();
+      ctx.stroke();
+    }
+    for (let q = 0; q < k; q++) {
+      const tier = L.tier[q]! as 0 | 1 | 2;
+      const x = L.x[q]! * hpr;
+      const y = L.y[q]! * vpr;
+      const color = L.buy[q] ? UP_COLOR : DOWN_COLOR;
+      ctx.beginPath();
+      ctx.arc(x, y, L.r[q]! * hpr, 0, 2 * Math.PI);
+      // dunkler Ring unter jedem Kreis: Kontrast zu Kerzen und Footprint-Zellen gleicher Farbe
+      ctx.globalAlpha = 0.85;
+      ctx.strokeStyle = HALO;
+      ctx.lineWidth = 2 * hpr;
+      ctx.stroke();
+      ctx.globalAlpha = TIER_ALPHA[tier];
+      ctx.fillStyle = color;
+      ctx.fill();
+      if (tier >= 1) {
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = tier === 2 ? 1.5 * hpr : 1 * hpr;
+        ctx.strokeStyle = tier === 2 ? 'rgba(230, 237, 243, 0.9)' : color;
         ctx.stroke();
-        ctx.globalAlpha = TIER_ALPHA[tier];
-        ctx.fillStyle = color;
-        ctx.fill();
-        if (tier >= 1) {
-          ctx.globalAlpha = 1;
-          ctx.lineWidth = tier === 2 ? 1.5 * hpr : 1 * hpr;
-          ctx.strokeStyle = tier === 2 ? 'rgba(230, 237, 243, 0.9)' : color;
-          ctx.stroke();
-          if (labels) {
-            // nur ohne Überlappung mit bereits gesetzten Labels (gierig, größte Stufe zuerst)
-            const text = fmtNotionalShort(n, nd);
-            const box = { x: x + r + 3, y: y - 6, w: ctx.measureText(text).width / hpr, h: 12 };
-            if (!placed.some((p) => overlaps(p, box))) placed.push({ ...box, text, y0: y });
-          }
-        }
-        this.grid.add(this.drawnRefs.length, x, y, r);
-        this.drawnRefs.push(refs[j]!);
       }
     }
     ctx.globalAlpha = 1;
     // Labels zuletzt, damit kein späterer Kreis sie verdeckt
-    ctx.fillStyle = 'rgba(230, 237, 243, 0.9)';
-    for (const p of placed) ctx.fillText(p.text, p.x * hpr, p.y0 * vpr);
+    if (L.labels.length > 0) {
+      ctx.font = `${Math.round(10 * vpr)}px system-ui, sans-serif`;
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = 'rgba(230, 237, 243, 0.9)';
+      for (const p of L.labels) ctx.fillText(p.text, p.x * hpr, p.y * vpr);
+    }
     // hervorgehobener Marker (Hover)
     const hv = this.hovered;
     if (hv) {
-      const k = this.drawnRefs.findIndex((d) => d.e === hv.e && d.i === hv.i);
-      if (k >= 0) {
-        const j = keep.find((jj) => refs[jj]!.e === hv.e && refs[jj]!.i === hv.i)!;
-        const r = radiusPx(nots[j]!, minN);
+      const q = L.refs.findIndex((d) => d.e === hv.e && d.i === hv.i);
+      if (q >= 0) {
         ctx.strokeStyle = '#f2c94c';
         ctx.lineWidth = 2 * hpr;
         ctx.beginPath();
-        ctx.arc(xs[j]! * hpr, ys[j]! * vpr, (r + 2) * hpr, 0, 2 * Math.PI);
+        ctx.arc(L.x[q]! * hpr, L.y[q]! * vpr, (L.r[q]! + 2) * hpr, 0, 2 * Math.PI);
         ctx.stroke();
       }
     }
@@ -804,9 +1022,10 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
 
   /** Hover: Text des Markers unter (x, y) (CSS-px der Hauptpane) oder ''. */
   hoverText(x: number, y: number): string {
-    if (!this.enabled) return this.setHover(null);
-    const id = this.grid.query(x, y);
-    const d = id === null ? null : (this.drawnRefs[id] ?? null);
+    const L = this.layout;
+    if (!this.enabled || !L) return this.setHover(null);
+    const id = L.grid.query(x, y);
+    const d = id === null ? null : (L.refs[id] ?? null);
     this.setHover(d);
     if (!d) return '';
     const s = this.host.sym();
@@ -836,6 +1055,7 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     ].join(' · ');
   }
 
+  /** Hervorhebung setzen; nur neu zeichnen (die Anordnung bleibt), wenn sie sich ändert. */
   private setHover(d: Drawn | null): string {
     const h = this.hovered;
     if (h?.e !== d?.e || h?.i !== d?.i) {
@@ -848,6 +1068,8 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
 
 /** Breite des Logos der Bibliothek unten links (CSS-px), Bandbeschriftung beginnt rechts davon. */
 const LOGO_PX = 52;
+/** Höhe der Lücken-Markierung (CSS-px). */
+const TICK_PX = 3;
 
 export interface Box {
   x: number;

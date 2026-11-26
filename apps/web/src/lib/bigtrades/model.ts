@@ -13,8 +13,8 @@ export const MAX_MIN_USDT = 1_000_000_000;
 
 /**
  * Wählbare Schwellen in ganzen USDT, logarithmisch: die Untergrenze des Symbols, dann die Stufen
- * 1-2-5 · 10^k über ihr (dieselbe Leiter wie `suggestMinUsdt` der API, damit ein Vorschlag immer eine
- * Stufe ist) bis `max`.
+ * 1-2-5 · 10^k über ihr bis `max`. Die API schlägt bei 422 `suggestMinUsdt` aus einer feineren Leiter
+ * vor (22 Stufen je Dekade); ein solcher Wert erscheint über `stepsWith` als zusätzliche Stufe.
  */
 export function thresholdSteps(floorUsdt: number, max = MAX_MIN_USDT): number[] {
   const out = [floorUsdt];
@@ -65,10 +65,14 @@ export function parseBigTradesParams(q: URLSearchParams): BigTradesParams {
   return { on: q.get('bt') === '1', min };
 }
 
-/** Query-Teil (mit führendem &): bt=1 wenn an; btmin, wenn die Schwelle nicht die Untergrenze ist. */
+/**
+ * Query-Teil (mit führendem &): bt=1 wenn an, dann immer auch btmin (ein geteilter Link zeigt dieselbe
+ * Schwelle, auch wenn der Empfänger eine andere gespeichert hat); aus: btmin nur abweichend von der
+ * Untergrenze.
+ */
 export function bigTradesParamsQuery(p: BigTradesParams, floorUsdt: number | null): string {
   let q = p.on ? '&bt=1' : '';
-  if (p.min !== null && p.min !== floorUsdt) q += `&btmin=${p.min}`;
+  if (p.min !== null && (p.on || p.min !== floorUsdt)) q += `&btmin=${p.min}`;
   return q;
 }
 
@@ -142,6 +146,34 @@ export function decimateByCell(
   cellW = 2,
   cellH = 6,
 ): number[] {
+  // Zellbereich bestimmen: klein genug → Raster als Typed Array (schnell), sonst Map
+  let x0 = Infinity;
+  let x1 = -Infinity;
+  let y0 = Infinity;
+  let y1 = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const cx = Math.floor(x[i]! / cellW);
+    const cy = Math.floor(y[i]! / cellH);
+    if (cx < x0) x0 = cx;
+    if (cx > x1) x1 = cx;
+    if (cy < y0) y0 = cy;
+    if (cy > y1) y1 = cy;
+  }
+  const cols = x1 - x0 + 1;
+  const rows = y1 - y0 + 1;
+  if (n > 0 && Number.isFinite(cols * rows) && cols * rows * 2 <= 4_000_000) {
+    const best = new Int32Array(cols * rows * 2).fill(-1);
+    for (let i = 0; i < n; i++) {
+      const c =
+        ((Math.floor(y[i]! / cellH) - y0) * cols + (Math.floor(x[i]! / cellW) - x0)) * 2 +
+        (side[i] === 1 ? 0 : 1);
+      const j = best[c]!;
+      if (j < 0 || notional[i]! > notional[j]!) best[c] = i;
+    }
+    const out: number[] = [];
+    for (const j of best) if (j >= 0) out.push(j);
+    return out.sort((a, b) => a - b);
+  }
   const best = new Map<number, number>();
   for (let i = 0; i < n; i++) {
     const cx = Math.floor(x[i]! / cellW);
@@ -226,7 +258,11 @@ export class HitGrid {
 
 // ---------------------------------------------------------------- Abdeckung
 
-export type BandKind = 'none' | 'partial' | 'toomany' | 'failed';
+/**
+ * none/partial aus der Abdeckung; pending = Live-Rand (noch nicht geschrieben, neutral: weder Band
+ * noch Warnung, nur im Hover); toomany/failed = Abschnitt nicht geladen (422 bzw. Fehler).
+ */
+export type BandKind = 'none' | 'partial' | 'pending' | 'toomany' | 'failed';
 
 export interface Band {
   /** [from, to) in ms UTC */
@@ -234,7 +270,7 @@ export interface Band {
   to: number;
   kind: BandKind;
   /** none: Gründe; partial: höchste Tagesuntergrenze (Notional) */
-  reasons: CoverageReason[];
+  reasons: string[];
   floorN: number | null;
 }
 
@@ -245,7 +281,7 @@ export function effectiveStatus(c: CoverageSpan, minN: number): 'ok' | 'partial'
 }
 
 /**
- * Abdeckung (aufsteigend, je geladenem Abschnitt) → Bänder für none/partial bei der wirksamen
+ * Abdeckung (aufsteigend, je geladenem Abschnitt) → Bänder für none/partial/pending bei der wirksamen
  * Schwelle; angrenzende gleiche Bänder (gleiche Art, bei partial gleiche Untergrenze) zusammengefasst.
  */
 export function coverageBands(spans: readonly CoverageSpan[], minN: number): Band[] {
@@ -253,23 +289,34 @@ export function coverageBands(spans: readonly CoverageSpan[], minN: number): Ban
   for (const c of spans) {
     const st = effectiveStatus(c, minN);
     if (st === 'ok') continue;
+    const kind: BandKind = st === 'none' && c.reason === 'pending' ? 'pending' : st;
     const floorN = st === 'partial' ? c.floorN : null;
+    const reasons = kind === 'none' && c.reason ? [c.reason] : [];
     const last = out[out.length - 1];
-    if (last && last.to === c.from && last.kind === st && last.floorN === floorN) {
+    if (
+      last &&
+      last.to === c.from &&
+      last.kind === kind &&
+      last.floorN === floorN &&
+      sameReasons(last.reasons, reasons)
+    ) {
       last.to = c.to;
-      if (c.reason && st === 'none' && !last.reasons.includes(c.reason))
-        last.reasons.push(c.reason);
     } else {
       out.push({
         from: c.from,
         to: c.to,
-        kind: st,
-        reasons: st === 'none' && c.reason ? [c.reason] : [],
+        kind,
+        reasons,
         floorN,
       });
     }
   }
   return out;
+}
+
+/** Gleiche Gründe (Reihenfolge egal)? Nur dann werden Bänder verbunden – Gründe bleiben je Zeit genau. */
+function sameReasons(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((r) => b.includes(r));
 }
 
 /** Bänder zusammenführen (aufsteigend nach from), angrenzende gleiche verbinden. */
@@ -278,33 +325,120 @@ export function mergeBands(bands: readonly Band[]): Band[] {
   const out: Band[] = [];
   for (const b of s) {
     const last = out[out.length - 1];
-    if (last && last.to >= b.from && last.kind === b.kind && last.floorN === b.floorN) {
+    if (
+      last &&
+      last.to >= b.from &&
+      last.kind === b.kind &&
+      last.floorN === b.floorN &&
+      sameReasons(last.reasons, b.reasons)
+    )
       last.to = Math.max(last.to, b.to);
-      for (const r of b.reasons) if (!last.reasons.includes(r)) last.reasons.push(r);
-    } else out.push({ ...b, reasons: [...b.reasons] });
+    else out.push({ ...b, reasons: [...b.reasons] });
   }
   return out;
+}
+
+/** Bar mit kurzen Lücken: dünne Markierung statt Fläche. */
+export interface BarTick {
+  /** Beginn des Bars (ms) */
+  bar: number;
+  kind: BandKind;
+  /** fehlende Zeit im Bar (ms) */
+  ms: number;
+}
+
+/** Anteil eines Bars ohne Daten, ab dem er ganz als Fläche (Band) gezeichnet wird. */
+export const FULL_BAR_SHARE = 0.5;
+
+/**
+ * Minutengenaue Bänder → Darstellung je Bar: ein Bar, der überwiegend (≥ fullShare seiner Datenzeit
+ * in [dataFrom, dataTo)) ohne Daten ist, gehört zu einer Fläche (an Bar-Grenzen); ein Bar mit kurzen
+ * Lücken bekommt nur eine dünne Markierung (Tick), damit eine fehlende Minute nicht wie ein fehlender Tag
+ * aussieht. Nichts Fehlendes entfällt: jeder Bar mit einer Lücke ist Fläche oder Tick. pending (Live-Rand)
+ * bleibt neutral und erscheint hier nicht.
+ */
+export function barSegments(
+  bands: readonly Band[],
+  tfMs: number,
+  dataFrom: number,
+  dataTo: number,
+  fullShare = FULL_BAR_SHARE,
+): { full: Band[]; ticks: BarTick[] } {
+  const full: Band[] = [];
+  const edge = new Map<number, { ms: Map<BandKind, number>; band: Map<BandKind, Band> }>();
+  const addEdge = (bar: number, b: Band, ms: number) => {
+    let e = edge.get(bar);
+    if (!e) edge.set(bar, (e = { ms: new Map(), band: new Map() }));
+    e.ms.set(b.kind, (e.ms.get(b.kind) ?? 0) + ms);
+    if (!e.band.has(b.kind)) e.band.set(b.kind, b);
+  };
+  for (const b of bands) {
+    if (b.kind === 'pending' || b.to <= b.from) continue;
+    const fb = Math.floor(b.from / tfMs) * tfMs;
+    const lb = Math.floor((b.to - 1) / tfMs) * tfMs;
+    if (fb === lb) {
+      addEdge(fb, b, b.to - b.from);
+      continue;
+    }
+    let a = fb;
+    if (b.from > fb) {
+      addEdge(fb, b, fb + tfMs - b.from);
+      a = fb + tfMs;
+    }
+    let z = lb + tfMs;
+    if (b.to < z) {
+      addEdge(lb, b, b.to - lb);
+      z = lb;
+    }
+    if (z > a) full.push({ ...b, reasons: [...b.reasons], from: a, to: z });
+  }
+  const ticks: BarTick[] = [];
+  for (const [bar, e] of edge) {
+    const denom = Math.min(bar + tfMs, dataTo) - Math.max(bar, dataFrom);
+    let total = 0;
+    let kind: BandKind = 'none';
+    let best = -1;
+    for (const [k, ms] of e.ms) {
+      total += ms;
+      if (ms > best) {
+        best = ms;
+        kind = k;
+      }
+    }
+    if (denom > 0 && total >= fullShare * denom) {
+      const b = e.band.get(kind)!;
+      full.push({ ...b, reasons: [...b.reasons], from: bar, to: bar + tfMs });
+    } else ticks.push({ bar, kind, ms: total });
+  }
+  ticks.sort((x, y) => x.bar - y.bar);
+  return { full: mergeBands(full), ticks };
 }
 
 export interface CoverageSummary {
   /** UTC-Tage, die den sichtbaren Bereich schneiden */
   visibleDays: number;
-  /** davon mit Abschnitten ohne Order-Daten (none) bzw. nur ab höherer Untergrenze (partial) */
+  /** Tage (im sichtbaren Teil) ganz ohne Order-Daten, und Tage mit Lücken samt Lückenzeit (ms) */
   noneDays: number;
+  noneReasons: string[];
+  holeDays: number;
+  holeMs: number;
+  holeReasons: string[];
+  /** Tage mit partial-Abschnitten, höchste Untergrenze (Notional) */
   partialDays: number;
-  /** Tage mit zu vielen Orders (422) bzw. nicht ladbar */
+  partialFloorN: number | null;
+  /** Tage mit nicht geladenen Abschnitten (422 bzw. Fehler) */
   toomanyDays: number;
   failedDays: number;
-  /** none-Gründe im sichtbaren Bereich */
-  reasons: CoverageReason[];
-  /** höchste Untergrenze der partial-Tage (Notional) */
-  partialFloorN: number | null;
-  /** sichtbare Zeit (ms) je Bandart bzw. insgesamt: „ganz" vs. „in Teilen" */
+  /** sichtbare Zeit (ms) je Bandart bzw. insgesamt („ganz" vs. „in Teilen") */
   ms: Record<BandKind, number>;
   visibleMs: number;
 }
 
-/** Wie viele UTC-Tage im sichtbaren Bereich [visFrom, visTo) (ms) welche Bandart haben. */
+/**
+ * Abdeckung im sichtbaren Bereich [visFrom, visTo) (ms) je UTC-Tag: ein Tag, dessen sichtbarer Teil
+ * ganz ohne Daten ist, zählt als „ohne Daten"; sonst zählen seine fehlenden Minuten als Lücken.
+ * pending (Live-Rand) zählt nicht.
+ */
 export function coverageSummary(
   bands: readonly Band[],
   visFrom: number,
@@ -314,37 +448,68 @@ export function coverageSummary(
   const sets: Record<BandKind, Set<number>> = {
     none: new Set(),
     partial: new Set(),
+    pending: new Set(),
     toomany: new Set(),
     failed: new Set(),
   };
-  const reasons: CoverageReason[] = [];
+  const noneMs = new Map<number, number>();
+  const noneR = new Map<number, Set<string>>();
   let partialFloorN: number | null = null;
-  const ms: Record<BandKind, number> = { none: 0, partial: 0, toomany: 0, failed: 0 };
+  const ms: Record<BandKind, number> = { none: 0, partial: 0, pending: 0, toomany: 0, failed: 0 };
   for (const b of bands) {
     const a = Math.max(b.from, visFrom);
     const e = Math.min(b.to, visTo);
     if (e <= a) continue;
-    for (let d = day(a); d <= day(e - 1); d++) sets[b.kind].add(d);
     ms[b.kind] += e - a;
-    if (b.kind === 'none') for (const r of b.reasons) if (!reasons.includes(r)) reasons.push(r);
+    for (let d = day(a); d <= day(e - 1); d++) {
+      sets[b.kind].add(d);
+      if (b.kind !== 'none') continue;
+      const o = Math.min(e, (d + 1) * DAY_MS) - Math.max(a, d * DAY_MS);
+      noneMs.set(d, (noneMs.get(d) ?? 0) + o);
+      let r = noneR.get(d);
+      if (!r) noneR.set(d, (r = new Set()));
+      for (const x of b.reasons) r.add(x);
+    }
     if (b.kind === 'partial' && b.floorN !== null)
       partialFloorN = Math.max(partialFloorN ?? 0, b.floorN);
   }
+  let noneDays = 0;
+  let holeDays = 0;
+  let holeMs = 0;
+  const noneReasons: string[] = [];
+  const holeReasons: string[] = [];
+  const add = (l: string[], r: Iterable<string>) => {
+    for (const x of r) if (!l.includes(x)) l.push(x);
+  };
+  for (const [d, m] of noneMs) {
+    const len = Math.min(visTo, (d + 1) * DAY_MS) - Math.max(visFrom, d * DAY_MS);
+    if (m >= len) {
+      noneDays++;
+      add(noneReasons, noneR.get(d) ?? []);
+    } else {
+      holeDays++;
+      holeMs += m;
+      add(holeReasons, noneR.get(d) ?? []);
+    }
+  }
   return {
     visibleDays: visTo > visFrom ? day(visTo - 1) - day(visFrom) + 1 : 0,
-    noneDays: sets.none.size,
+    noneDays,
+    noneReasons,
+    holeDays,
+    holeMs,
+    holeReasons,
     partialDays: sets.partial.size,
+    partialFloorN,
     toomanyDays: sets.toomany.size,
     failedDays: sets.failed.size,
-    reasons,
-    partialFloorN,
     ms,
     visibleMs: Math.max(0, visTo - visFrom),
   };
 }
 
 // Gründe aus docs/BIGTRADES-API.md; unbekannte (künftige) Gründe nimmt der Decoder bei `none` an –
-// sie erscheinen roh, die Spanne zählt trotzdem als „keine Daten".
+// sie zählen als „keine Daten" und erscheinen mit ihrem Kürzel.
 const REASON_TEXT: Readonly<Record<string, string>> = {
   digest_v1: 'Neuimport ausstehend',
   no_day: 'keine gespeicherten Daten',
@@ -355,35 +520,116 @@ const REASON_TEXT: Readonly<Record<string, string>> = {
   pending: 'noch nicht geschrieben',
   gap: 'Lücke der Aufzeichnung',
   source_missing: 'Minuten ohne Quelldaten',
+  mismatch: 'Abweichung zur Kline',
+  too_many_holes: 'zu viele Lückenminuten am Tag',
 };
 
 export function reasonText(r: CoverageReason | string): string {
-  return REASON_TEXT[r] ?? r;
+  return REASON_TEXT[r] ?? `anderer Grund (${r})`;
 }
 
-/** Legenden-Hinweis zur Abdeckung ('' = alles sichtbare abgedeckt). */
+const days = (n: number) => `${n} ${n === 1 ? 'Tag' : 'Tage'}`;
+const minutes = (ms: number) => `${Math.ceil(ms / 60_000)} min`;
+const why = (r: readonly string[]) => (r.length ? ` (${r.map(reasonText).join(', ')})` : '');
+
+/** Legenden-Hinweis zur Abdeckung ('' = alles sichtbare abgedeckt; der Live-Rand zählt nicht). */
 export function coverageNote(s: CoverageSummary, notionalDecimals: number): string {
   const parts: string[] = [];
-  // ganz (Zeitanteil) → „im sichtbaren Bereich"; sonst Tage mit Anteil, bei allen Tagen „in Teilen"
   const where = (k: BandKind, n: number, pre = 'in') =>
     s.ms[k] >= s.visibleMs
       ? 'im sichtbaren Bereich'
       : n >= s.visibleDays
         ? 'in Teilen des sichtbaren Bereichs'
         : `${pre} ${n} von ${s.visibleDays} Tagen`;
-  const of = (n: number, k: BandKind = 'none') => where(k, n);
   if (s.noneDays > 0)
     parts.push(
-      `keine Big-Trade-Daten ${of(s.noneDays)}${s.reasons.length ? ` (${s.reasons.map(reasonText).join(', ')})` : ''}`,
+      s.noneDays >= s.visibleDays
+        ? `keine Big-Trade-Daten im sichtbaren Bereich${why(s.noneReasons)}`
+        : `${days(s.noneDays)} ohne Big-Trade-Daten${why(s.noneReasons)}`,
+    );
+  if (s.holeDays > 0)
+    parts.push(
+      s.visibleDays === 1
+        ? `Lücken: ${minutes(s.holeMs)} ohne Big-Trade-Daten${why(s.holeReasons)}`
+        : `${days(s.holeDays)} mit Lücken (${minutes(s.holeMs)} ohne Big-Trade-Daten${s.holeReasons.length ? `: ${s.holeReasons.map(reasonText).join(', ')}` : ''})`,
     );
   if (s.partialDays > 0) {
     const floor = fmtUsdtCompact(Math.ceil((s.partialFloorN ?? 0) / 10 ** notionalDecimals), true);
     parts.push(`${where('partial', s.partialDays, 'an')} Big Trades erst ab ${floor} gespeichert`);
   }
   if (s.toomanyDays > 0)
-    parts.push(`zu viele Orders ${of(s.toomanyDays, 'toomany')} – nicht geladen`);
-  if (s.failedDays > 0) parts.push(`nicht ladbar ${of(s.failedDays, 'failed')}`);
+    parts.push(`zu viele Orders ${where('toomany', s.toomanyDays)} – nicht geladen`);
+  if (s.failedDays > 0) parts.push(`nicht ladbar ${where('failed', s.failedDays)}`);
   return parts.join(' · ');
+}
+
+/**
+ * Hover-Zusatz für einen Bar [barMs, barMs + tfMs): fehlende Zeit je Art mit Gründen ('' = abgedeckt).
+ * Bänder aufsteigend und überschneidungsfrei.
+ */
+export function barCoverageText(
+  bands: readonly Band[],
+  barMs: number,
+  tfMs: number,
+  notionalDecimals: number,
+): string {
+  const end = barMs + tfMs;
+  const acc = new Map<BandKind, { ms: number; reasons: string[]; floorN: number }>();
+  for (const b of bands) {
+    if (b.to <= barMs) continue;
+    if (b.from >= end) break;
+    const o = Math.min(b.to, end) - Math.max(b.from, barMs);
+    const a = acc.get(b.kind) ?? { ms: 0, reasons: [], floorN: 0 };
+    a.ms += o;
+    for (const r of b.reasons) if (!a.reasons.includes(r)) a.reasons.push(r);
+    a.floorN = Math.max(a.floorN, b.floorN ?? 0);
+    acc.set(b.kind, a);
+  }
+  const out: string[] = [];
+  const whole = (ms: number) => ms >= tfMs;
+  for (const [k, a] of acc) {
+    const t = whole(a.ms) ? 'im ganzen Bar' : minutes(a.ms);
+    if (k === 'none') out.push(`${t} ohne Daten${why(a.reasons)}`);
+    else if (k === 'pending') out.push(`${t} noch nicht geschrieben`);
+    else if (k === 'partial')
+      out.push(
+        `${t} erst ab ${fmtUsdtCompact(Math.ceil(a.floorN / 10 ** notionalDecimals), true)} gespeichert`,
+      );
+    else if (k === 'toomany') out.push(`${t} nicht geladen (zu viele Orders)`);
+    else out.push(`${t} nicht ladbar`);
+  }
+  return out.length ? `Big Trades: ${out.join(', ')}` : '';
+}
+
+/**
+ * Ausdünnung mit Obergrenze: je (2 px, 6 px, Seite) der größte Marker; bleiben mehr als `max`, Zellen
+ * verdoppeln, bis es passt (große Spannen: Kreise überlappen dort ohnehin). Mit bekannter Fläche W × H
+ * beginnt die Suche bei der Zellgröße, deren Zellzahl `max` nicht weit übersteigt (spart Durchläufe).
+ */
+export function decimateAdaptive(
+  n: number,
+  x: ArrayLike<number>,
+  y: ArrayLike<number>,
+  side: ArrayLike<number>,
+  notional: ArrayLike<number>,
+  max = 4000,
+  W = 0,
+  H = 0,
+): { keep: number[]; cellW: number; cellH: number } {
+  let cw = 2;
+  let ch = 6;
+  // nur bei sehr vielen Markern grob beginnen (sonst die feinste Zelle, die passt)
+  if (n > 4 * max && W > 0 && H > 0)
+    while ((W / cw) * (H / ch) * 2 > 4 * max && cw < 256) {
+      cw *= 2;
+      ch *= 2;
+    }
+  for (;;) {
+    const keep = decimateByCell(n, x, y, side, notional, cw, ch);
+    if (keep.length <= max || cw >= 256) return { keep, cellW: cw, cellH: ch };
+    cw *= 2;
+    ch *= 2;
+  }
 }
 
 // ---------------------------------------------------------------- Texte (exakt, ohne Gleitkomma)

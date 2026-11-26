@@ -1,13 +1,16 @@
 // Big Trades in der Anzeige (KONZEPT §6.4, docs/BIGTRADES-API.md): Schwellenstufen, URL/Speicher,
 // Radius/Stufe, Ausdünnung je Pixelzelle, Trefferraster, Abdeckung → Bänder/Legende, exakte Texte,
 // Laden (Abschnitte, Cache, Filtern ohne Anfrage, 422-Vorschlag).
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { encodeBigTrades, type BigTradeColumns, type CoverageSpan } from '@orderflow/core/browser';
 import {
   bigTradesParamsQuery,
   coverageBands,
   coverageNote,
   coverageSummary,
+  barCoverageText,
+  barSegments,
+  decimateAdaptive,
   decimateByCell,
   effectiveStatus,
   fmtNotionalShort,
@@ -82,9 +85,11 @@ describe('URL und Speicher', () => {
       expect(parseBigTradesParams(new URLSearchParams(`btmin=${v}`)).min).toBeNull();
     expect(parseBigTradesParams(new URLSearchParams('bt=true')).on).toBe(false);
   });
-  it('serialisieren: Standard (aus, Untergrenze) erzeugt nichts; Rundlauf', () => {
+  it('serialisieren: aus + Untergrenze erzeugt nichts; an schreibt immer btmin; Rundlauf', () => {
     expect(bigTradesParamsQuery({ on: false, min: 500_000 }, 500_000)).toBe('');
-    expect(bigTradesParamsQuery({ on: true, min: 500_000 }, 500_000)).toBe('&bt=1');
+    // geteilter Link: dieselbe Schwelle beim Empfänger, auch wenn er eine andere gespeichert hat
+    expect(bigTradesParamsQuery({ on: true, min: 500_000 }, 500_000)).toBe('&bt=1&btmin=500000');
+    expect(bigTradesParamsQuery({ on: false, min: 2_000_000 }, 500_000)).toBe('&btmin=2000000');
     const q = bigTradesParamsQuery({ on: true, min: 5_000_000 }, 500_000);
     expect(q).toBe('&bt=1&btmin=5000000');
     expect(parseBigTradesParams(new URLSearchParams(q.slice(1)))).toEqual({
@@ -224,10 +229,11 @@ describe('Abdeckung → Bänder und Legende', () => {
     expect(effectiveStatus(span(T, T + D, 'none', null, 'digest_v1'), 10 * MIN)).toBe('none');
   });
 
-  it('ok entfällt; gleiche Nachbarn zusammengefasst, Gründe gesammelt', () => {
+  it('ok entfällt; Nachbarn nur bei gleichem Grund zusammengefasst', () => {
     const b = coverageBands(
       [
-        span(T, T + D, 'none', null, 'digest_v1'),
+        span(T, T + D / 2, 'none', null, 'digest_v1'),
+        span(T + D / 2, T + D, 'none', null, 'digest_v1'),
         span(T + D, T + 2 * D, 'none', null, 'no_day'),
         span(T + 2 * D, T + 3 * D, 'ok', MIN),
         span(T + 3 * D, T + 4 * D, 'partial', 2 * MIN, 'floor_above'),
@@ -236,7 +242,8 @@ describe('Abdeckung → Bänder und Legende', () => {
       MIN,
     );
     expect(b).toEqual([
-      { from: T, to: T + 2 * D, kind: 'none', reasons: ['digest_v1', 'no_day'], floorN: null },
+      { from: T, to: T + D, kind: 'none', reasons: ['digest_v1'], floorN: null },
+      { from: T + D, to: T + 2 * D, kind: 'none', reasons: ['no_day'], floorN: null },
       { from: T + 3 * D, to: T + 4 * D, kind: 'partial', reasons: [], floorN: 2 * MIN },
       { from: T + 4 * D, to: T + 5 * D, kind: 'partial', reasons: [], floorN: 3 * MIN },
     ]);
@@ -260,10 +267,8 @@ describe('Abdeckung → Bänder und Legende', () => {
       MIN,
     );
     const s = coverageSummary(bands, T, T + 14 * D);
-    expect(s).toMatchObject({ visibleDays: 14, noneDays: 13, partialDays: 0 });
-    expect(coverageNote(s, 5)).toBe(
-      'keine Big-Trade-Daten in 13 von 14 Tagen (Neuimport ausstehend)',
-    );
+    expect(s).toMatchObject({ visibleDays: 14, noneDays: 13, holeDays: 0, partialDays: 0 });
+    expect(coverageNote(s, 5)).toBe('13 Tage ohne Big-Trade-Daten (Neuimport ausstehend)');
     const all = coverageSummary(bands, T + D, T + 2 * D);
     expect(coverageNote(all, 5)).toBe(
       'keine Big-Trade-Daten im sichtbaren Bereich (Neuimport ausstehend)',
@@ -280,10 +285,12 @@ describe('Abdeckung → Bänder und Legende', () => {
       ],
       MIN,
     );
-    expect(bands).toHaveLength(1);
+    expect(bands).toHaveLength(2);
     const s = coverageSummary(bands, T, T + 2 * D);
+    // Tag T hat ab 00:10 keine Daten, die ersten 10 min schon → Lücken, kein „ganzer Tag"
+    expect(s).toMatchObject({ noneDays: 0, holeDays: 1, holeMs: D - 600_000 });
     expect(coverageNote(s, 5)).toBe(
-      'keine Big-Trade-Daten in 1 von 2 Tagen (Lücke der Aufzeichnung, future_reason)',
+      '1 Tag mit Lücken (1430 min ohne Big-Trade-Daten: Lücke der Aufzeichnung, anderer Grund (future_reason))',
     );
   });
 
@@ -293,16 +300,32 @@ describe('Abdeckung → Bänder und Legende', () => {
       span(T, T + D, 'none', null, 'digest_v1'),
       span(T + D, T + 2 * D, 'ok', MIN),
     ];
-    expect(coverageBands(spans, MIN)[0]!.reasons).toEqual(['no_day', 'digest_v1']);
+    expect(coverageBands(spans, MIN).map((b) => b.reasons)).toEqual([['no_day'], ['digest_v1']]);
     const b = coverageBands(clipSpans(spans, T, T + 2 * D), MIN);
     expect(b).toEqual([{ from: T, to: T + D, kind: 'none', reasons: ['digest_v1'], floorN: null }]);
     expect(clipSpans(spans, T + D / 2, T + D)).toHaveLength(1);
   });
 
-  it('eine Lückenminute in jedem sichtbaren Tag: „in Teilen", nicht „im sichtbaren Bereich"', () => {
+  it('kurze Lücken ≠ Tag ohne Daten: Minuten getrennt ausgewiesen', () => {
     const bands = coverageBands([span(T + 600_000, T + 660_000, 'none', null, 'gap')], MIN);
     expect(coverageNote(coverageSummary(bands, T, T + 3_600_000), 5)).toBe(
-      'keine Big-Trade-Daten in Teilen des sichtbaren Bereichs (Lücke der Aufzeichnung)',
+      'Lücken: 1 min ohne Big-Trade-Daten (Lücke der Aufzeichnung)',
+    );
+    // 5 Tage, zwei ganz ohne Daten, drei mit insgesamt 11 Lückenminuten (Abweichung zur Kline)
+    const b5 = coverageBands(
+      [
+        span(T, T + 2 * D, 'none', null, 'digest_v1'),
+        span(T + 2 * D, T + 2 * D + 240_000, 'none', null, 'mismatch'),
+        span(T + 2 * D + 240_000, T + 3 * D, 'ok', MIN),
+        span(T + 3 * D, T + 3 * D + 300_000, 'none', null, 'mismatch'),
+        span(T + 3 * D + 300_000, T + 4 * D, 'ok', MIN),
+        span(T + 4 * D, T + 4 * D + 120_000, 'none', null, 'too_many_holes'),
+        span(T + 4 * D + 120_000, T + 5 * D, 'ok', MIN),
+      ],
+      MIN,
+    );
+    expect(coverageNote(coverageSummary(b5, T, T + 5 * D), 5)).toBe(
+      '2 Tage ohne Big-Trade-Daten (Neuimport ausstehend) · 3 Tage mit Lücken (11 min ohne Big-Trade-Daten: Abweichung zur Kline, zu viele Lückenminuten am Tag)',
     );
     expect(coverageNote(coverageSummary(bands, T + 600_000, T + 660_000), 5)).toBe(
       'keine Big-Trade-Daten im sichtbaren Bereich (Lücke der Aufzeichnung)',
@@ -426,6 +449,7 @@ function body(
   orders: [number, number][],
   st: (d: number) => 'ok' | 'none' = () => 'ok',
   omitted = 0,
+  extra: { final?: boolean; coverage?: (from: number, to: number) => CoverageSpan[] } = {},
 ): Response {
   const from = Number(u.searchParams.get('from'));
   const to = Number(u.searchParams.get('to'));
@@ -464,9 +488,9 @@ function body(
       total: n + omitted,
       omitted,
       k: omitted > 0 ? 2 : null,
-      coverage: coverage(from, to, st),
+      coverage: extra.coverage ? extra.coverage(from, to) : coverage(from, to, st),
       dataVersion: 'v',
-      final: false,
+      final: extra.final ?? false,
     },
     rows: cols,
   });
@@ -645,10 +669,8 @@ describe('BigTradesLayer: Laden', () => {
     await flush();
     const ro = layer.readout();
     expect(ro.coverage!.visibleDays).toBe(day(C0 + SPAN_MS - 1) - day(C0) + 1);
-    expect(ro.coverage!.noneDays).toBeGreaterThan(0);
-    expect(ro.coverageNote).toMatch(
-      /^keine Big-Trade-Daten (in \d+ von \d+ Tagen|im sichtbaren Bereich) \(Neuimport ausstehend\)$/,
-    );
+    expect(ro.coverage!.noneDays).toBe(1);
+    expect(ro.coverageNote).toBe('1 Tag ohne Big-Trade-Daten (Neuimport ausstehend)');
   });
 
   it('Antwort passt nicht zur Anfrage: sichtbarer Fehler, nicht übernommen', async () => {
@@ -700,5 +722,333 @@ describe('BigTradesLayer: Laden', () => {
     await flush();
     expect(layer.readout().error).toBe('');
     expect(layer.readout().loading).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------- Review 2: Lücken, Live-Rand, Teilung
+
+describe('Bänder je Bar: Fläche nur bei überwiegend fehlenden Daten', () => {
+  const H4 = 4 * 3_600_000;
+  const T = Date.UTC(2026, 10, 2);
+  const band = (from: number, to: number, kind: 'none' | 'pending' = 'none', r = 'mismatch') => ({
+    from,
+    to,
+    kind,
+    reasons: kind === 'none' ? [r] : [],
+    floorN: null,
+  });
+
+  it('4 Lückenminuten in einem 4h-Bar: dünne Markierung, keine Fläche', () => {
+    const { full, ticks } = barSegments(
+      [band(T + 60_000, T + 180_000), band(T + 7_200_000, T + 7_320_000)],
+      H4,
+      0,
+      T + 10 * D,
+    );
+    expect(full).toEqual([]);
+    expect(ticks).toEqual([{ bar: T, kind: 'none', ms: 240_000 }]);
+  });
+
+  it('ganzer Tag ohne Daten: Flächen an Bar-Grenzen, Ränder mit Mehrheit ebenfalls Fläche', () => {
+    // [T + 1h, T + D + 3h): Bar T (3 von 4 h) Fläche, Bar T + D (3 von 4 h) Fläche
+    const { full, ticks } = barSegments(
+      [band(T + 3_600_000, T + D + 3 * 3_600_000, 'none', 'digest_v1')],
+      H4,
+      0,
+      T + 10 * D,
+    );
+    expect(ticks).toEqual([]);
+    expect(full.map((b) => [b.from, b.to])).toEqual([[T, T + D + H4]]);
+  });
+
+  it('Randbar mit Minderheit: Markierung; Datenrand zählt beim Anteil', () => {
+    const { full, ticks } = barSegments(
+      [band(T + 3 * 3_600_000, T + 2 * D, 'none', 'digest_v1')],
+      H4,
+      0,
+      T + 10 * D,
+    );
+    expect(ticks).toEqual([{ bar: T, kind: 'none', ms: 3_600_000 }]);
+    expect(full.map((b) => [b.from, b.to])).toEqual([[T + H4, T + 2 * D]]);
+    // Daten beginnen erst T + 3h: die eine Stunde ist der ganze Datenanteil des Bars → Fläche
+    expect(
+      barSegments([band(T + 3 * 3_600_000, T + 4 * 3_600_000)], H4, T + 3 * 3_600_000, T + D).full,
+    ).toHaveLength(1);
+  });
+
+  it('Live-Rand (pending) bleibt neutral: weder Fläche noch Markierung', () => {
+    expect(barSegments([band(T + 60_000, T + D, 'pending')], D, 0, T + D)).toEqual({
+      full: [],
+      ticks: [],
+    });
+  });
+
+  it('Hover-Zusatz nennt Minuten, Gründe und den Live-Rand', () => {
+    const bands = [
+      band(T + 60_000, T + 180_000, 'none', 'gap'),
+      band(T + 3_600_000, T + H4, 'pending'),
+    ];
+    expect(barCoverageText(bands, T, H4, 5)).toBe(
+      'Big Trades: 2 min ohne Daten (Lücke der Aufzeichnung), 180 min noch nicht geschrieben',
+    );
+    expect(barCoverageText(bands, T + H4, H4, 5)).toBe('');
+    expect(barCoverageText([band(T, T + D, 'none', 'digest_v1')], T, H4, 5)).toBe(
+      'Big Trades: im ganzen Bar ohne Daten (Neuimport ausstehend)',
+    );
+  });
+
+  it('Legende: pending zählt nicht, der Live-Chart erreicht „vollständig"', () => {
+    const MIN = 50_000_000_000;
+    const spans: CoverageSpan[] = [
+      { from: T, to: T + 3_600_000, status: 'ok', reason: null, floorN: MIN, final: false },
+      {
+        from: T + 3_600_000,
+        to: T + D,
+        status: 'none',
+        reason: 'pending',
+        floorN: null,
+        final: false,
+      },
+    ];
+    const bands = coverageBands(spans, MIN);
+    expect(bands.map((b) => b.kind)).toEqual(['pending']);
+    expect(coverageNote(coverageSummary(bands, T, T + D), 5)).toBe('');
+  });
+});
+
+describe('Ausdünnung mit Obergrenze', () => {
+  it('viele Marker auf großer Fläche: höchstens max, Zellen wachsen', () => {
+    const N = 50_000;
+    const x = Float64Array.from({ length: N }, (_, i) => (i * 7919) % 1600);
+    const y = Float64Array.from({ length: N }, (_, i) => (i * 104_729) % 800);
+    const side = Int32Array.from({ length: N }, (_, i) => 1 + (i % 2));
+    const n = Float64Array.from({ length: N }, (_, i) => i);
+    const r = decimateAdaptive(N, x, y, side, n, 4000, 1600, 800);
+    expect(r.keep.length).toBeLessThanOrEqual(4000);
+    expect(r.cellW).toBeGreaterThan(2);
+    // wenige Marker: feinste Zellen
+    expect(
+      decimateAdaptive(3, [1, 50, 99], [1, 1, 1], [1, 1, 1], [1, 2, 3], 4000, 1600, 800),
+    ).toMatchObject({ cellW: 2, keep: [0, 1, 2] });
+  });
+  it('Raster (Typed Array) und Map liefern dasselbe', () => {
+    const x = [10.2, 10.9, 10.5, 10.5, 40, -3, 5000];
+    const y = [100, 101, 101, 100, 100, -20, 9000];
+    const side = [1, 1, 1, 2, 1, 1, 2];
+    const n = [5, 9, 7, 1, 2, 3, 4];
+    expect(decimateByCell(7, x, y, side, n, 2, 6)).toEqual([1, 3, 4, 5, 6]);
+  });
+});
+
+describe('BigTradesLayer: Review 2', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('source_rows_exceeded: Abschnitt an suggestTo geteilt, Rest geladen', async () => {
+    const mid = C0 + 25_000_000 - ((C0 + 25_000_000) % 60_000);
+    const { layer, calls } = setup((u) => {
+      const from = Number(u.searchParams.get('from'));
+      const to = Number(u.searchParams.get('to'));
+      if (from === C0 && to === C0 + SPAN_MS)
+        return json({ error: 'zu groß', reason: 'source_rows_exceeded', suggestTo: mid }, 422);
+      return body(u, ORDERS);
+    });
+    layer.frame();
+    await flush(12);
+    const c = calls.filter(
+      (u) =>
+        Number(u.searchParams.get('from')) >= C0 &&
+        Number(u.searchParams.get('to')) <= C0 + SPAN_MS,
+    );
+    expect(
+      c.map((u) => [Number(u.searchParams.get('from')), Number(u.searchParams.get('to'))]),
+    ).toEqual([
+      [C0, C0 + SPAN_MS],
+      [C0, mid],
+      [mid, C0 + SPAN_MS],
+    ]);
+    const ro = layer.readout();
+    expect(ro).toMatchObject({ loading: 0, error: '', markers: 3 });
+    expect(ro.coverage).toMatchObject({ failedDays: 0 });
+    expect(layer.counters.splits).toBe(1);
+  });
+
+  it('source_rows_exceeded ohne brauchbares suggestTo: rot, keine Schleife', async () => {
+    const { layer, calls } = setup(() =>
+      json({ error: 'zu groß', reason: 'source_rows_exceeded', suggestTo: null }, 422),
+    );
+    layer.frame();
+    await flush();
+    layer.frame();
+    await flush();
+    expect(calls).toHaveLength(3);
+    expect(layer.readout().coverage).toMatchObject({ failedDays: 1 });
+  });
+
+  it('Teilung begrenzt: höchstens 16 Teilstücke je Abschnitt', async () => {
+    const { layer } = setup((u) => {
+      const from = Number(u.searchParams.get('from'));
+      const to = Number(u.searchParams.get('to'));
+      const half = from + Math.floor((to - from) / 120_000) * 60_000;
+      return json({ error: 'zu groß', reason: 'source_rows_exceeded', suggestTo: half }, 422);
+    });
+    layer.frame();
+    await flush(200);
+    const plans = (layer as unknown as { plans: Map<string, number[]> }).plans;
+    for (const b of plans.values()) expect(b.length - 1).toBeLessThanOrEqual(16);
+    expect(layer.readout().coverage!.failedDays).toBeGreaterThan(0);
+  });
+
+  it('nicht finale Antwort: nach der Frist erneut, am Browser-Cache vorbei', async () => {
+    let now = 1_000_000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const inits: (RequestCache | undefined)[] = [];
+    const calls: string[] = [];
+    const layer = new BigTradesLayer(
+      {
+        chart: {} as never,
+        apiBase: '',
+        sym: () => SYM,
+        tf: () => '1m',
+        tfSec: () => 60,
+        items: () => [],
+        visibleTimeRange: () => [(C0 + 20_000_000) / 1000, (C0 + 30_000_000) / 1000],
+        priceToY: () => 0,
+        footprintActive: () => false,
+        busy: () => false,
+        gestureActive: () => false,
+      },
+      (url, init) => {
+        calls.push(url);
+        inits.push(init.cache);
+        const u = new URL(url, 'http://x');
+        return Promise.resolve(
+          body(u, ORDERS, () => 'ok', 0, { final: u.searchParams.get('from') !== String(C0) }),
+        );
+      },
+    );
+    layer.enabled = true;
+    layer.minUsdt = 500_000;
+    layer.frame();
+    await flush();
+    expect(calls).toHaveLength(3);
+    now += 30_000;
+    layer.frame();
+    await flush();
+    expect(calls).toHaveLength(3);
+    now += 31_000;
+    layer.frame();
+    await flush();
+    expect(calls).toHaveLength(4); // nur der nicht finale Abschnitt C
+    expect(calls[3]).toContain(`from=${C0}&`);
+    expect(inits[3]).toBe('reload');
+  });
+
+  it('LRU: höchstens 64 Antworten im Cache', async () => {
+    let c = C;
+    const { layer } = setup((u) => body(u, []), {
+      visibleTimeRange: () => [(c * SPAN_MS + 1000) / 1000, (c * SPAN_MS + 2000) / 1000],
+    });
+    for (let i = 0; i < 80; i++) {
+      c = C - 40 + i;
+      layer.frame();
+      await flush(3);
+    }
+    const cache = (layer as unknown as { cache: Map<string, unknown> }).cache;
+    expect(cache.size).toBe(64);
+    // der zuletzt benutzte bleibt
+    expect([...cache.keys()].some((k) => k.includes(`|${c}|`))).toBe(true);
+  });
+
+  it('tf-Wechsel während einer Anfrage: alte Antwort zeichnet nichts im neuen tf', async () => {
+    let tf = '1m';
+    const releases: (() => void)[] = [];
+    const host: BigTradesHost = {
+      chart: {} as never,
+      apiBase: '',
+      sym: () => SYM,
+      tf: () => tf,
+      tfSec: () => (tf === '1m' ? 60 : 300),
+      items: () => [],
+      visibleTimeRange: () => [(C0 + 20_000_000) / 1000, (C0 + 30_000_000) / 1000],
+      priceToY: () => 0,
+      footprintActive: () => false,
+      busy: () => false,
+      gestureActive: () => false,
+    };
+    const layer = new BigTradesLayer(host, (url) => {
+      return new Promise((r) => releases.push(() => r(body(new URL(url, 'http://x'), ORDERS))));
+    });
+    layer.enabled = true;
+    layer.minUsdt = 500_000;
+    layer.frame();
+    tf = '5m';
+    for (const f of releases.splice(0)) f();
+    await flush();
+    const ro = layer.readout();
+    expect(ro.markers).toBe(0);
+    expect(ro.loading).toBe(1);
+    expect(ro.error).toBe('');
+  });
+
+  it('below_floor nach Symbolwechsel: Fehler mit Untergrenze, keine Wiederholung', async () => {
+    const ETH: SymbolInfo = {
+      ...SYM,
+      name: 'ETHUSDT',
+      bigTrades: { floorN: 250_000_000_000, minUsdt: 250_000, notionalDecimals: 6 },
+    };
+    let sym = SYM;
+    const calls: string[] = [];
+    const releases: (() => void)[] = [];
+    const layer = new BigTradesLayer(
+      {
+        chart: {} as never,
+        apiBase: '',
+        sym: () => sym,
+        tf: () => '1m',
+        tfSec: () => 60,
+        items: () => [],
+        visibleTimeRange: () => [(C0 + 20_000_000) / 1000, (C0 + 30_000_000) / 1000],
+        priceToY: () => 0,
+        footprintActive: () => false,
+        busy: () => false,
+        gestureActive: () => false,
+      },
+      (url) => {
+        calls.push(url);
+        if (url.includes('BTCUSDT'))
+          return new Promise((r) => releases.push(() => r(body(new URL(url, 'http://x'), ORDERS))));
+        return Promise.resolve(
+          json({ error: 'unter', reason: 'below_floor', minUsdt: 300_000, floorN: 3e11 }, 422),
+        );
+      },
+    );
+    layer.enabled = true;
+    layer.minUsdt = 500_000;
+    layer.frame();
+    sym = ETH;
+    layer.resetForSymbol();
+    layer.minUsdt = 250_000;
+    layer.changed();
+    for (const f of releases.splice(0)) f(); // späte BTC-Antworten
+    await flush();
+    layer.frame();
+    await flush();
+    const eth = calls.filter((u) => u.includes('ETHUSDT'));
+    expect(eth).toHaveLength(3);
+    const ro = layer.readout();
+    expect(ro.error).toContain('Untergrenze laut Server 300 k $');
+    expect(ro.markers).toBe(0);
+    expect(ro.coverage).toMatchObject({ failedDays: 1 });
+  });
+
+  it('Netzwerkfehler: rotes Band, Meldung, Wiederholung statt „lädt" für immer', async () => {
+    const { layer } = setup(() => Promise.reject(new TypeError('Failed to fetch')) as never);
+    layer.frame();
+    await flush();
+    const ro = layer.readout();
+    expect(ro.loading).toBe(0);
+    expect(ro.coverage).toMatchObject({ failedDays: 1 });
+    expect(ro.error).toContain('keine Verbindung');
+    layer.destroy();
   });
 });

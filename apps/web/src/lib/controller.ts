@@ -390,8 +390,20 @@ export class ChartController {
   onProfile: (() => void) | null = null;
   private hoverReq = 0;
 
-  /** Text der Zelle unter dem Zeiger: Zeit, Zeilenintervall, Bid/Ask/Delta in Lots und Basiswährung. */
+  /**
+   * Hover-Text; über einem Bar mit fehlenden Big-Trade-Daten (Lücke, Live-Rand, …) zusätzlich deren
+   * Minuten und Grund – eine dünne Lücken-Markierung ist so immer auflösbar.
+   */
   hoverText(): string {
+    const t = this.hoverTextInner();
+    const p = this.hoverParam;
+    if (!p || t.startsWith('Big Trade ')) return t;
+    const note = this.bigTrades.barNote(p.t);
+    return note ? (t ? `${t} · ${note}` : note) : t;
+  }
+
+  /** Text der Zelle unter dem Zeiger: Zeit, Zeilenintervall, Bid/Ask/Delta in Lots und Basiswährung. */
+  private hoverTextInner(): string {
     const p = this.hoverParam;
     if (!p || !this.sym) {
       this.bigTrades.hoverText(Number.NaN, Number.NaN); // Hervorhebung aufheben

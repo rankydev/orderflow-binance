@@ -772,7 +772,7 @@
           class:active={btOn}
           aria-pressed={btOn}
           data-testid="bt-toggle"
-          disabled={symInfo !== null && !symInfo.bigTrades}
+          disabled={!btOn && symInfo !== null && !symInfo.bigTrades}
           title={symInfo && !symInfo.bigTrades
             ? `Big Trades für ${sym} nicht verfügbar (keine Untergrenze)`
             : 'Big Trades: einzelne große Orders (Notional ≥ Schwelle) als Kreise an Bar-Zeit und VWAP; Fläche ∝ Notional, Stufen 1× / 2,5× / 10× der Schwelle'}
