@@ -30,6 +30,13 @@ import {
 import { STATS_COLUMNS, statsColumns, TRADES_MAX_ROWS } from '../stats.ts';
 import { MAX_DAILY_DAYS, MAX_RANGE_MS, PROFILE_MAX_R } from './profile.ts';
 import { MAX_ISSUES, MAX_QUALITY_DAYS } from './status.ts';
+import {
+  BIGTRADES_MAX_BARS,
+  BIGTRADES_MAX_MATCHED_ROWS,
+  BIGTRADES_MAX_MIN_USDT,
+  BIGTRADES_MAX_ROWS,
+  BIGTRADES_MAX_SOURCE_ROWS,
+} from './bigtrades.ts';
 import { versionOf } from '../versions.ts';
 
 export const SYMBOLS_SCHEMA = 2;
@@ -57,6 +64,13 @@ export function apiLimits(cfg: Deps['cfg']) {
       va: { min: 1, max: 100, default: 70 },
     },
     quality: { maxDays: MAX_QUALITY_DAYS, maxIssues: MAX_ISSUES },
+    bigtrades: {
+      maxBars: BIGTRADES_MAX_BARS,
+      maxRows: BIGTRADES_MAX_ROWS,
+      maxSourceRows: BIGTRADES_MAX_SOURCE_ROWS,
+      maxMatchedRows: BIGTRADES_MAX_MATCHED_ROWS,
+      maxMinUsdt: BIGTRADES_MAX_MIN_USDT,
+    },
   };
 }
 
@@ -74,6 +88,14 @@ export function symbolsBody(syms: SymbolState[], limits?: ReturnType<typeof apiL
       dataTo: s.dataTo,
       tileConfigVersion: s.tileConfigVersion,
       tiles: s.tiles,
+      // null: Big Trades für dieses Symbol nicht verfügbar (docs/BIGTRADES-API.md)
+      bigTrades: s.big
+        ? {
+            floorN: s.big.floorN,
+            minUsdt: s.big.minUsdt,
+            notionalDecimals: s.big.notionalDecimals,
+          }
+        : null,
     })),
   });
 }

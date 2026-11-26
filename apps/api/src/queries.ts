@@ -44,7 +44,7 @@ function dateLit(day: number): string {
 
 /** Zeitbereich einer Hypertable, den eine Anfrage liest. */
 export interface ReadRange {
-  table: FpTableName | BarTable | 'kline_1m';
+  table: FpTableName | BarTable | 'kline_1m' | 'big_order';
   from: number;
   to: number;
 }
@@ -65,8 +65,8 @@ export async function chunkLockList(sql: Sql, ranges: ReadRange[]): Promise<stri
   if (ranges.length === 0) return [];
   const conds = ranges.map((r) => {
     const t =
-      r.table === 'kline_1m'
-        ? 'kline_1m'
+      r.table === 'kline_1m' || r.table === 'big_order'
+        ? r.table
         : FP_SET.has(r.table)
           ? fpTable(r.table)
           : barTable(r.table);
@@ -489,4 +489,141 @@ export async function queryIssues(
   if (all.length <= limit) return { issues: all, next: null };
   const next = all[limit]!.ts;
   return { issues: all.slice(0, limit).filter((x) => x.ts < next), next };
+}
+
+// ---------------------------------------------------------------- Big Trades (GET /api/v1/bigtrades)
+
+/** Order-Felder eines Tages aus data_day (Migration 0017), im Snapshot der Antwort. */
+export interface OrderDaySnap extends DaySnap {
+  /** Tag hat (oder hatte vor einem laufenden Ersatz) gespeicherte Daten. */
+  hasData: boolean;
+  digestVersion: number | null;
+  /** orders_n IS NOT NULL: Ordersummen bekannt (Order-Daten des Tages vollständig). */
+  ordersKnown: boolean;
+  /** data_day.big_floor_n: Untergrenze, mit der big_order für den Tag geschrieben wurde. */
+  floorN: number | null;
+}
+
+export async function readOrderDays(
+  tx: ReadTx,
+  symId: number,
+  d0: number,
+  d1: number,
+): Promise<Map<number, OrderDaySnap>> {
+  const rows = await tx.rows(
+    `SELECT (day - DATE '1970-01-01')::int, state, version, immutable,
+            state <> 'importing' OR state_before_import IS NOT NULL,
+            digest_version, orders_n IS NOT NULL, big_floor_n::text
+       FROM data_day WHERE sym_id = $1 AND day >= ${dateLit(d0)} AND day <= ${dateLit(d1)}`,
+    [symId],
+  );
+  const m = new Map<number, OrderDaySnap>();
+  for (const r of rows)
+    m.set(int(r[0]), {
+      day: int(r[0]),
+      state: String(r[1]),
+      version: int(r[2]),
+      immutable: r[3] === true,
+      hasData: r[4] === true,
+      digestVersion: intOrNull(r[5]),
+      ordersKnown: r[6] === true,
+      floorN: intOrNull(r[7]),
+    });
+  return m;
+}
+
+export interface BigOrderRows {
+  ts: number[];
+  firstAggId: number[];
+  side: number[];
+  pxFirst: number[];
+  pxLast: number[];
+  qty: number[];
+  notional: number[];
+  aggN: number[];
+  /** Orders ≥ Schwelle in den gelesenen Bereichen (vor der Ausdünnung). */
+  total: number;
+  /** Ausdünnung: je (Bar, Seite) die k größten; null = alle geliefert. */
+  k: number | null;
+}
+
+/**
+ * Orders mit notional ≥ minN in den Zeitbereichen `ranges` (je [from, to) in ms, disjunkt), nach
+ * (ts, first_agg_id). Liegen mehr als maxRows vor, werden je (Bar des Zeitrahmens tfSec, Seite) nur die
+ * k größten geliefert (Rang nach notional absteigend, dann ts, first_agg_id – deterministisch), mit dem
+ * größten k, für das Σ min(Anzahl, k) ≤ maxRows; alles in einer Abfrage über einen Scan.
+ */
+export async function queryBigOrders(
+  tx: ReadTx,
+  symId: number,
+  ranges: { from: number; to: number }[],
+  tfSec: number,
+  minN: number,
+  maxRows: number,
+): Promise<BigOrderRows> {
+  const out: BigOrderRows = {
+    ts: [],
+    firstAggId: [],
+    side: [],
+    pxFirst: [],
+    pxLast: [],
+    qty: [],
+    notional: [],
+    aggN: [],
+    total: 0,
+    k: null,
+  };
+  if (ranges.length === 0) return out;
+  if (!Number.isSafeInteger(minN) || minN <= 0) throw new Error(`Schwelle ${minN} ungültig`);
+  if (!Number.isSafeInteger(maxRows) || maxRows <= 0)
+    throw new Error(`maxRows ${maxRows} ungültig`);
+  const rows = await tx.rows(bigOrdersSql(ranges, tfSec), [symId, String(minN), String(maxRows)]);
+  for (const r of rows) {
+    out.total = int(r[0]);
+    out.k = r[1] === null ? null : int(r[1]);
+    if (r[2] === null) continue;
+    out.ts.push(int(r[2]));
+    out.firstAggId.push(int(r[3]));
+    out.side.push(int(r[4]));
+    out.pxFirst.push(int(r[5]));
+    out.pxLast.push(int(r[6]));
+    out.qty.push(int(r[7]));
+    out.notional.push(int(r[8]));
+    out.aggN.push(int(r[9]));
+  }
+  return out;
+}
+
+/**
+ * SQL von queryBigOrders ($1 sym_id, $2 Schwelle minN, $3 maxRows). o: alle Orders ≥ Schwelle (ein
+ * Scan); n: Gesamtzahl; ohne Ausdünnung direkt geliefert. Sonst Rang je (Bar, Seite), Häufigkeit je
+ * Rang, kumuliert → größtes k mit Σ min(Anzahl, k) ≤ maxRows. Exportiert für den Plan-Benchmark.
+ */
+export function bigOrdersSql(ranges: { from: number; to: number }[], tfSec: number): string {
+  const tfMs = tfSec * 1000;
+  if (!Number.isSafeInteger(tfMs) || tfMs <= 0) throw new Error(`Zeitrahmen ${tfSec} ungültig`);
+  if (ranges.length === 0) throw new Error('keine Bereiche');
+  const where = ranges.map((r) => `(ts >= ${tsLit(r.from)} AND ts < ${tsLit(r.to)})`).join(' OR ');
+  return `WITH o AS MATERIALIZED (
+       SELECT (extract(epoch FROM ts) * 1000)::int8 AS t, first_agg_id, side, px_first, px_last,
+              qty, notional, agg_n
+         FROM big_order WHERE sym_id = $1 AND notional >= $2::int8 AND (${where})),
+     n AS (SELECT count(*)::int8 AS total FROM o),
+     r AS MATERIALIZED (
+       SELECT o.*, row_number() OVER (PARTITION BY o.t / ${tfMs}, o.side
+                                      ORDER BY o.notional DESC, o.t, o.first_agg_id) AS rk
+         FROM o, n WHERE n.total > $3::int8),
+     h AS (SELECT rk, count(*) AS c FROM r GROUP BY rk),
+     kk AS (SELECT coalesce(max(rk), 0)::int8 AS k FROM
+              (SELECT rk, sum(c) OVER (ORDER BY rk) AS cum FROM h) x WHERE cum <= $3::int8),
+     sel AS (
+       SELECT t, first_agg_id, side, px_first, px_last, qty, notional, agg_n FROM o, n
+        WHERE n.total <= $3::int8
+       UNION ALL
+       SELECT t, first_agg_id, side, px_first, px_last, qty, notional, agg_n FROM r, kk
+        WHERE r.rk <= kk.k)
+     SELECT n.total, CASE WHEN n.total > $3::int8 THEN (SELECT k FROM kk) END,
+            s.t, s.first_agg_id, s.side, s.px_first, s.px_last, s.qty, s.notional, s.agg_n
+       FROM n LEFT JOIN sel s ON true
+      ORDER BY s.t, s.first_agg_id`;
 }

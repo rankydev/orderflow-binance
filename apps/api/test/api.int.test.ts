@@ -25,13 +25,7 @@ import {
   type FpTableName,
   type RangeProfileResponse,
 } from '@orderflow/core';
-import {
-  alterRolePasswordSql,
-  connect,
-  dropAndCreateDatabase,
-  migrateUp,
-  type Sql,
-} from '@orderflow/db';
+import { connect, dropAndCreateDatabase, migrateUp, type Sql } from '@orderflow/db';
 import { randomBytes } from 'node:crypto';
 import { createServer as createHttpServer, type ServerResponse } from 'node:http';
 import { createConnection, createServer, type AddressInfo, type Socket } from 'node:net';
@@ -44,6 +38,7 @@ import { parseApiConfig, type ApiConfig } from '../src/config.ts';
 import { Catalog, STATS_RUN_DAYS } from '../src/catalog.ts';
 import { createPool, readTx, ReadTx } from '../src/db.ts';
 import { maskOf } from '../src/minutes.ts';
+import { mirrorApiRole } from './api-role.ts';
 import { startApi, type RunningApi } from '../src/main.ts';
 import { FP_TABLE_NAMES } from '../src/plan.ts';
 import { chunkLockList, queryLevels, tsLit } from '../src/queries.ts';
@@ -208,7 +203,7 @@ beforeAll(async () => {
   await dropAndCreateDatabase(adminCfg);
   admin = connect(adminCfg);
   await migrateUp(admin);
-  await mirrorApiRole(admin);
+  await mirrorApiRole(admin, TEST_ROLE, apiPassword);
   data = generate();
   await seed(admin, data);
 }, 120_000);
@@ -222,30 +217,6 @@ afterAll(async () => {
     await admin?.end();
   }
 });
-
-/** Legt of_api_test als Spiegel von of_api in der Testdatenbank an (Rechte + Rolleneinstellungen). */
-async function mirrorApiRole(sql: Sql): Promise<void> {
-  await sql.unsafe(`DO $$ BEGIN
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${TEST_ROLE}') THEN
-      CREATE ROLE ${TEST_ROLE} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
-    END IF; END $$`);
-  // nur der SCRAM-Verifier geht an den Server (W4a); jede API-Verbindung unten beweist, dass er gilt
-  await sql.unsafe(alterRolePasswordSql(TEST_ROLE, apiPassword));
-  const [cfg] = await sql<{ rolconfig: string[] | null }[]>`
-    SELECT rolconfig FROM pg_roles WHERE rolname = 'of_api'`;
-  await sql.unsafe(`ALTER ROLE ${TEST_ROLE} RESET ALL`);
-  for (const kv of cfg!.rolconfig ?? []) {
-    const m = /^([a-z_]+)=([A-Za-z0-9_.]+)$/.exec(kv);
-    if (!m) throw new Error(`unerwartete Rolleneinstellung ${kv}`);
-    await sql.unsafe(`ALTER ROLE ${TEST_ROLE} SET ${m[1]} = '${m[2]}'`);
-  }
-  await sql.unsafe(`GRANT USAGE ON SCHEMA public TO ${TEST_ROLE}`);
-  const grants = await sql<{ t: string }[]>`
-    SELECT c.relname AS t FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm')
-       AND has_table_privilege('of_api', c.oid, 'SELECT')`;
-  for (const { t } of grants) await sql.unsafe(`GRANT SELECT ON "${t}" TO ${TEST_ROLE}`);
-}
 
 describe('Rolle of_api', () => {
   it('liest (auch Columnstore-Chunks), schreibt nie', async () => {

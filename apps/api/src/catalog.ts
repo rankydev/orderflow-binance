@@ -5,8 +5,9 @@
 //
 // Persistenz ohne Schreibzugriff: Alles hier ist eine Funktion der gespeicherten Daten. Je UTC-Tag
 // werden (a) die größte Zeilenzahl eines Bars je (tf, R), (b) die Zeilenzahl je Quelltabelle (Bars
-// exakt, Footprint als obere Schranke aus den Bars) und (c) die gespeicherten Minuten berechnet – nur
-// aus den Bar-Tabellen, nie aus den Footprint-Tabellen (Startzeit, bench/catalog-start.ts) – und
+// exakt, Footprint als obere Schranke aus den Bars), (c) die gespeicherten Minuten – nur aus den
+// Bar-Tabellen, nie aus den Footprint-Tabellen (Startzeit, bench/catalog-start.ts) – und (d) die
+// big_order-Zeilen je Notional-Stufe (Schätzung für /bigtrades) berechnet und
 // mit data_day.version als Schlüssel gehalten; ändert sich eine Version (Import,
 // Randauflösung, Kaskade), wird nur dieser Tag neu berechnet. maxRows je (tf, R) ist das Maximum
 // über die Tage (Bars der Zeitrahmen ≤ 1d überqueren nie eine UTC-Tagesgrenze, also exakt), und
@@ -30,6 +31,7 @@ import { chunkLockList, QUALITY_FP_SQL, readDays, tsLit } from './queries.ts';
 import { BAR_TABLES, barTableFor, FP_TABLE_NAMES, type BarTable, type RowsOn } from './plan.ts';
 import { DAY_MS, SYMBOL_RE } from './params.ts';
 import { minuteCount } from './minutes.ts';
+import { BIG_LADDER_USDT } from './bigtrades-plan.ts';
 
 /** Größte angebotene Zeilengröße einer Footprint-Kachel in Ticks (wie die Fixtures). */
 export const TILE_MAX_R = 10_000;
@@ -70,6 +72,10 @@ export interface DayInfo {
   hasData: boolean;
   /** Fingerabdruck der Qualitätsfelder (QUALITY_FP_SQL) für /quality. */
   quality: string;
+  /** Order-Felder (Migration 0017), Eingabe der Abdeckung von /bigtrades (bigtrades-plan.ts). */
+  digestVersion: number | null;
+  ordersKnown: boolean;
+  floorN: number | null;
 }
 
 export interface DayStats {
@@ -90,6 +96,22 @@ export interface DayStats {
    * Leerprüfung (consistency.ts) – was Importer bzw. Recorder für genau diese Minute gespeichert haben.
    */
   minutes?: Uint32Array;
+  /**
+   * big_order-Zeilen des Tages je Notional-Stufe: Index i = Orders mit BIG_LADDER_USDT[i−1] ≤ USDT <
+   * BIG_LADDER_USDT[i] (Index 0 darunter, letzter darüber); exakt. Schätzung der gelesenen Zeilen
+   * und der Treffer einer Schwelle (bigtrades-plan.ts estimateBig); fehlt = keine Zeilen.
+   */
+  bigHist?: Int32Array;
+}
+
+/** Big Trades eines Symbols (symbol.big_floor_n, Migration 0017); null = nicht verfügbar. */
+export interface BigInfo {
+  /** Untergrenze als Notional (price_unit·qty_unit). */
+  floorN: number;
+  /** price_decimals + qty_decimals: Notional in USDT = notional / 10^notionalDecimals. */
+  notionalDecimals: number;
+  /** Kleinste zulässige Schwelle in ganzen USDT: ceil(floorN / 10^notionalDecimals). */
+  minUsdt: number;
 }
 
 export interface SymbolState {
@@ -99,6 +121,8 @@ export interface SymbolState {
   qtyDecimals: number;
   tickRefUnits: number;
   tickUnits: number;
+  /** Big Trades: Untergrenze und Einheiten; null ohne Untergrenze oder bei Einheiten ≠ 10^-Stellen. */
+  big: BigInfo | null;
   days: Map<number, DayInfo>;
   stats: Map<number, DayStats>;
   /**
@@ -335,12 +359,15 @@ export class Catalog extends EventEmitter {
     const symRows = await tx.rows(
       `SELECT s.sym_id, s.name, s.price_decimals, s.qty_decimals, s.tick_ref_units,
               (SELECT h.min_step_units FROM symbol_tick_history h
-                WHERE h.sym_id = s.sym_id ORDER BY h.day DESC LIMIT 1)
+                WHERE h.sym_id = s.sym_id ORDER BY h.day DESC LIMIT 1),
+              s.big_floor_n::text,
+              s.price_unit * s.qty_unit * power(10::numeric, s.price_decimals + s.qty_decimals) = 1
          FROM symbol s WHERE s.active ORDER BY s.sym_id`,
     );
     const dayRows = await tx.rows(
       `SELECT sym_id, (day - DATE '1970-01-01')::int, state, version, immutable,
-              state_before_import IS NOT NULL, ${QUALITY_FP_SQL}
+              state_before_import IS NOT NULL, ${QUALITY_FP_SQL},
+              digest_version, orders_n IS NOT NULL, big_floor_n::text
          FROM data_day ORDER BY sym_id, day`,
     );
     const out = new Map<string, SymbolState>();
@@ -357,6 +384,7 @@ export class Catalog extends EventEmitter {
         qtyDecimals: int(r[3]),
         tickRefUnits: tickRef,
         tickUnits: r[5] === null ? tickRef : int(r[5]),
+        big: bigInfo(r[6], r[7] === true, int(r[2]) + int(r[3])),
         days: new Map(),
         stats: old ? new Map(old.stats) : new Map(),
         refStats: old ? new Map(old.refStats) : new Map(),
@@ -383,6 +411,9 @@ export class Catalog extends EventEmitter {
         immutable: r[4] === true,
         hasData,
         quality: String(r[6]),
+        digestVersion: r[7] === null ? null : int(r[7]),
+        ordersKnown: r[8] === true,
+        floorN: r[9] === null ? null : int(r[9]),
       });
     }
     return out;
@@ -403,7 +434,7 @@ export class Catalog extends EventEmitter {
       // Ein Lauf liest nur die Bar-Tabellen (≈ 45 KB je Tag und Symbol in bar_1m); bis zu einem Jahr je
       // Abfrage – die Zahl der Abfragen hängt so praktisch nur von der Zahl der Symbole ab.
       for (const [a, b] of runs(todo, STATS_RUN_DAYS)) {
-        const ranges = BAR_TABLES.map((table) => ({
+        const ranges = [...BAR_TABLES, 'big_order' as const].map((table) => ({
           table,
           from: a * DAY_MS,
           to: (b + 1) * DAY_MS,
@@ -510,7 +541,11 @@ export class Catalog extends EventEmitter {
            FROM bar_1h WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 2
          UNION ALL
          SELECT 'bar_1d'::text, time_bucket('1 day'::interval, ts), count(*)::int
-           FROM bar_1d WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 2) q`,
+           FROM bar_1d WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 2) q
+       UNION ALL
+       SELECT 'big_order'::text, (extract(epoch from time_bucket('1 day'::interval, ts))::int8 / 86400)::int8,
+              ${bigBucketSql(s.big)}, count(*)::int
+         FROM big_order WHERE sym_id = $1 AND ts >= ${A} AND ts < ${B} GROUP BY 2, 3`,
       [s.symId],
     );
     for (const r of cr) {
@@ -522,6 +557,11 @@ export class Catalog extends EventEmitter {
         st.minutes ??= new Uint32Array(48);
         st.minutes[2 * (x % 24)] = int(r[2]);
         st.minutes[2 * (x % 24) + 1] = int(r[3]);
+      } else if (k === 'big_order') {
+        const st = fresh.get(x);
+        if (!st) continue;
+        st.bigHist ??= new Int32Array(BIG_LADDER_USDT.length + 1);
+        st.bigHist[int(r[2])] = int(r[3]);
       } else fresh.get(x)?.rows.set(k as BarTable, int(r[2]));
     }
     for (const st of fresh.values()) {
@@ -546,6 +586,31 @@ export function minutesFor(
     const v = snapVersion(day);
     return st?.minutes && v !== undefined && st.version === v ? st.minutes : undefined;
   };
+}
+
+/**
+ * Big-Trades-Angaben eines Symbols aus symbol.big_floor_n (Text, exakt) und der Prüfung
+ * price_unit · qty_unit = 10^-(price_decimals + qty_decimals); sonst null (Endpunkt antwortet 422).
+ */
+export function bigInfo(
+  floorText: unknown,
+  unitsOk: boolean,
+  notionalDecimals: number,
+): BigInfo | null {
+  if (floorText === null || floorText === undefined || !unitsOk) return null;
+  const floorN = int(floorText);
+  if (floorN <= 0 || notionalDecimals > 15) return null;
+  const unit = 10n ** BigInt(notionalDecimals);
+  const minUsdt = Number((BigInt(floorN) + unit - 1n) / unit);
+  return { floorN, notionalDecimals, minUsdt };
+}
+
+/** Stufe einer big_order-Zeile (width_bucket über BIG_LADDER_USDT in Notional-Einheiten). */
+function bigBucketSql(big: BigInfo | null): string {
+  if (!big) return '0';
+  const unit = 10n ** BigInt(big.notionalDecimals);
+  const edges = BIG_LADDER_USDT.map((u) => (BigInt(u) * unit).toString());
+  return `width_bucket(notional, ARRAY[${edges.join(', ')}]::int8[])`;
 }
 
 /** Zusammenhängende Läufe (je ≤ maxLen Tage) aus einer sortierten Tagesliste. */

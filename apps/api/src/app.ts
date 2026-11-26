@@ -4,6 +4,7 @@ import Fastify, { LogController, type FastifyInstance } from 'fastify';
 import { corsAllowed } from './config.ts';
 import { newCtx, type Deps } from './context.ts';
 import { HttpError } from './errors.ts';
+import { registerBigTradesRoutes } from './routes/bigtrades.ts';
 import { registerProfileRoutes } from './routes/profile.ts';
 import { healthDetail, registerStatusRoutes } from './routes/status.ts';
 import { registerTileRoutes } from './routes/tiles.ts';
@@ -133,6 +134,7 @@ export function buildApp(deps: Deps, opt: AppOptions = {}): FastifyInstance {
 
   registerTileRoutes(app, deps);
   registerProfileRoutes(app, deps);
+  registerBigTradesRoutes(app, deps);
   registerStatusRoutes(app, deps);
   return app;
 }
