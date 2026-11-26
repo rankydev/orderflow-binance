@@ -30,8 +30,10 @@ import {
 } from '../src/lib/bigtrades/model.ts';
 import {
   BigTradesLayer,
+  clipSpans,
   logicalOfSec,
   lowerBound,
+  overlaps,
   type BigTradesHost,
 } from '../src/lib/bigtrades/layer.ts';
 import type { BarItem, SymbolInfo } from '../src/lib/types.ts';
@@ -281,6 +283,18 @@ describe('Abdeckung → Bänder und Legende', () => {
     );
   });
 
+  it('erst kürzen, dann zusammenfassen: Gründe außerhalb des Datenbereichs fallen weg', () => {
+    const spans = [
+      span(T - 2 * D, T, 'none', null, 'no_day'),
+      span(T, T + D, 'none', null, 'digest_v1'),
+      span(T + D, T + 2 * D, 'ok', MIN),
+    ];
+    expect(coverageBands(spans, MIN)[0]!.reasons).toEqual(['no_day', 'digest_v1']);
+    const b = coverageBands(clipSpans(spans, T, T + 2 * D), MIN);
+    expect(b).toEqual([{ from: T, to: T + D, kind: 'none', reasons: ['digest_v1'], floorN: null }]);
+    expect(clipSpans(spans, T + D / 2, T + D)).toHaveLength(1);
+  });
+
   it('partial mit Untergrenze in USDT; Tage am Rand des sichtbaren Bereichs zählen', () => {
     const bands = coverageBands([span(T, T + 2 * D, 'partial', 2 * MIN, 'floor_above')], MIN);
     const s = coverageSummary(bands, T + D - 1, T + 3 * D);
@@ -340,6 +354,12 @@ describe('Abschnitte und Zeitachse', () => {
     expect(logicalOfSec(items, 360, 60)).toBe(5);
     expect(lowerBound(new Float64Array([1, 3, 3, 5]), 3)).toBe(1);
     expect(lowerBound(new Float64Array([1, 3]), 9)).toBe(2);
+  });
+  it('Label-Kollision: Überlappung ja, berührende Kanten nein', () => {
+    const a = { x: 0, y: 0, w: 10, h: 12 };
+    expect(overlaps(a, { x: 9, y: 11, w: 5, h: 5 })).toBe(true);
+    expect(overlaps(a, { x: 10, y: 0, w: 5, h: 5 })).toBe(false);
+    expect(overlaps(a, { x: 0, y: 12, w: 5, h: 5 })).toBe(false);
   });
 });
 

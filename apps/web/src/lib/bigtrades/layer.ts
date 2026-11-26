@@ -5,7 +5,12 @@
 // Bars, LRU-Cache je (Symbol, tf, Abschnitt, Schwelle). Wird die Schwelle über eine geladene,
 // nicht ausgedünnte Antwort gehoben, filtert der Client ohne neue Anfrage. Abdeckung (`coverage`) wird
 // immer gezeigt: wo keine Order-Daten liegen, heißt „kein Marker" nicht „kein Big Trade".
-import { decodeBigTrades, type BigTradeColumns, type BigTradesMeta } from '@orderflow/core/browser';
+import {
+  decodeBigTrades,
+  type BigTradeColumns,
+  type BigTradesMeta,
+  type CoverageSpan,
+} from '@orderflow/core/browser';
 import type {
   IChartApi,
   IPanePrimitive,
@@ -295,7 +300,12 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
       this.queue.setWanted([], new Set());
       return;
     }
-    if (this.host.gestureActive()) return; // Bedarf erst am Gestenende (Entprellen wie Profile)
+    // Bedarf erst am Gestenende (Entprellen wie Profile). Der Controller ruft frame() am Gestenende
+    // nicht in jedem Pfad (z. B. „nur Kerzen"); daher selbst nachprüfen, bis die Geste vorbei ist.
+    if (this.host.gestureActive()) {
+      this.armRetry();
+      return;
+    }
     const tf = this.host.tf();
     const tfMs = this.host.tfSec() * 1000;
     const spanMs = chunkSpanSec(this.host.tfSec()) * 1000;
@@ -342,15 +352,20 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
         const first = [...wants].sort((a, b) => a.priority - b.priority).slice(0, 1);
         this.queue.setWanted(this.queue.stats.inFlight > 0 ? [] : first, retain);
       } else this.queue.setWanted([], retain);
-      if (!this.holdTimer)
-        this.holdTimer = setTimeout(() => {
-          this.holdTimer = null;
-          if (!this.host.gestureActive()) this.frame();
-        }, BIGTRADES_HOLD_MS);
+      this.armRetry();
       return;
     }
     this.holdSince = null;
     this.queue.setWanted(wants, retain);
+  }
+
+  /** frame() nach BIGTRADES_HOLD_MS erneut (zurückgestellt hinter Kacheln/Bars oder einer Geste). */
+  private armRetry(): void {
+    if (this.holdTimer) return;
+    this.holdTimer = setTimeout(() => {
+      this.holdTimer = null;
+      this.frame();
+    }, BIGTRADES_HOLD_MS);
   }
 
   // ---------------------------------------------------------------- Antworten
@@ -482,11 +497,9 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
           st.omitted += e.meta.omitted;
           if (e.meta.k !== null) st.k = Math.max(st.k ?? 0, e.meta.k);
         }
-        for (const b of coverageBands(e.meta.coverage, minN)) {
-          const a = Math.max(b.from, from);
-          const z = Math.min(b.to, to);
-          if (z > a) raw.push({ ...b, from: a, to: z });
-        }
+        // erst auf den Datenbereich kürzen, dann zusammenfassen (sonst trüge ein Band die Gründe der
+        // Spannen vor dem Datenbeginn bzw. nach dem Datenende mit, z. B. no_day)
+        raw.push(...coverageBands(clipSpans(e.meta.coverage, from, to), minN));
       } else if (rj) {
         if (to > from) raw.push({ from, to, kind: rj.kind, reasons: [], floorN: null });
         if (rj.kind === 'toomany') {
@@ -570,7 +583,7 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     const nd = s?.bigTrades?.notionalDecimals ?? 0;
     ctx.save();
     ctx.font = `${Math.round(10 * vpr)}px system-ui, sans-serif`;
-    ctx.textBaseline = 'top';
+    ctx.textBaseline = 'bottom';
     for (const b of this.bands) {
       const xa = (xm.x0 + logicalOfSec(items, b.from / 1000, tfSec) * xm.bs - xm.bs / 2) * hpr;
       const xb = (xm.x0 + logicalOfSec(items, b.to / 1000, tfSec) * xm.bs - xm.bs / 2) * hpr;
@@ -604,9 +617,11 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
               ? 'zu viele Orders – Schwelle erhöhen'
               : 'Big Trades nicht ladbar';
       const tw = ctx.measureText(label).width;
-      if (z - a >= tw + 8 * hpr) {
+      // unten in der Pane (oben liegt die Legende), rechts neben dem Logo der Bibliothek
+      const lx = Math.max(a + 4 * hpr, LOGO_PX * hpr);
+      if (z - lx >= tw + 4 * hpr) {
         ctx.fillStyle = style.text;
-        ctx.fillText(label, a + 4 * hpr, Math.round(4 * vpr));
+        ctx.fillText(label, lx, H - Math.round(4 * vpr));
       }
     }
     ctx.restore();
@@ -684,8 +699,8 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     const pd = s.priceDecimals;
     ctx.save();
     // Sweep-Spanne px_first..px_last nur im Footprint-Modus (Entscheidung 2026-11-26)
-    if (this.host.footprintActive()) {
-      ctx.lineWidth = Math.max(1, Math.round(2 * hpr));
+    const fpMode = this.host.footprintActive();
+    if (fpMode) {
       for (const j of keep) {
         const d = refs[j]!;
         const a = d.e.rows.pxFirst[d.i]!;
@@ -695,25 +710,35 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
         const yb = ym(b / 10 ** pd);
         if (ya === null || yb === null) continue;
         const x = Math.round(xs[j]! * hpr) + 0.5;
-        ctx.strokeStyle = sides[j] === 1 ? UP_COLOR : DOWN_COLOR;
-        ctx.globalAlpha = 0.85;
-        ctx.beginPath();
-        ctx.moveTo(x, ya * vpr);
-        ctx.lineTo(x, yb * vpr);
+        const w = 4 * hpr;
+        const path = () => {
+          ctx.beginPath();
+          ctx.moveTo(x, ya * vpr);
+          ctx.lineTo(x, yb * vpr);
+          // kurze Querstriche an den Enden (erster / letzter Fill)
+          ctx.moveTo(x - w, ya * vpr);
+          ctx.lineTo(x + w, ya * vpr);
+          ctx.moveTo(x - w, yb * vpr);
+          ctx.lineTo(x + w, yb * vpr);
+        };
+        // dunkler Rand, damit die Linie über farbigen Zellen lesbar bleibt
+        ctx.globalAlpha = 0.9;
+        ctx.strokeStyle = HALO;
+        ctx.lineWidth = Math.max(2, Math.round(4 * hpr));
+        path();
         ctx.stroke();
-        // kurze Querstriche an den Enden
-        const w = 3 * hpr;
-        ctx.beginPath();
-        ctx.moveTo(x - w, ya * vpr);
-        ctx.lineTo(x + w, ya * vpr);
-        ctx.moveTo(x - w, yb * vpr);
-        ctx.lineTo(x + w, yb * vpr);
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = sides[j] === 1 ? UP_COLOR : DOWN_COLOR;
+        ctx.lineWidth = Math.max(1, Math.round(2 * hpr));
+        path();
         ctx.stroke();
       }
       ctx.globalAlpha = 1;
     }
     // Kreise: größte Stufe zuerst, kleinere darüber (bleiben sichtbar)
-    const labels = keep.length <= LABEL_MAX_MARKERS;
+    // Größen-Label nicht über Footprint-Zahlen (der Hover zeigt den exakten Wert)
+    const labels = !fpMode && keep.length <= LABEL_MAX_MARKERS;
+    const placed: (Box & { text: string; y0: number })[] = [];
     ctx.font = `${Math.round(10 * vpr)}px system-ui, sans-serif`;
     ctx.textBaseline = 'middle';
     for (const tier of [2, 1, 0] as const) {
@@ -724,10 +749,15 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
         const x = xs[j]!;
         const y = ys[j]!;
         const color = sides[j] === 1 ? UP_COLOR : DOWN_COLOR;
-        ctx.globalAlpha = TIER_ALPHA[tier];
-        ctx.fillStyle = color;
         ctx.beginPath();
         ctx.arc(x * hpr, y * vpr, r * hpr, 0, 2 * Math.PI);
+        // dunkler Ring unter jedem Kreis: Kontrast zu Kerzen und Footprint-Zellen gleicher Farbe
+        ctx.globalAlpha = 0.85;
+        ctx.strokeStyle = HALO;
+        ctx.lineWidth = 2 * hpr;
+        ctx.stroke();
+        ctx.globalAlpha = TIER_ALPHA[tier];
+        ctx.fillStyle = color;
         ctx.fill();
         if (tier >= 1) {
           ctx.globalAlpha = 1;
@@ -735,8 +765,10 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
           ctx.strokeStyle = tier === 2 ? 'rgba(230, 237, 243, 0.9)' : color;
           ctx.stroke();
           if (labels) {
-            ctx.fillStyle = 'rgba(230, 237, 243, 0.9)';
-            ctx.fillText(fmtNotionalShort(n, nd), (x + r + 3) * hpr, y * vpr);
+            // nur ohne Überlappung mit bereits gesetzten Labels (gierig, größte Stufe zuerst)
+            const text = fmtNotionalShort(n, nd);
+            const box = { x: x + r + 3, y: y - 6, w: ctx.measureText(text).width / hpr, h: 12 };
+            if (!placed.some((p) => overlaps(p, box))) placed.push({ ...box, text, y0: y });
           }
         }
         this.grid.add(this.drawnRefs.length, x, y, r);
@@ -744,6 +776,9 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
       }
     }
     ctx.globalAlpha = 1;
+    // Labels zuletzt, damit kein späterer Kreis sie verdeckt
+    ctx.fillStyle = 'rgba(230, 237, 243, 0.9)';
+    for (const p of placed) ctx.fillText(p.text, p.x * hpr, p.y0 * vpr);
     // hervorgehobener Marker (Hover)
     const hv = this.hovered;
     if (hv) {
@@ -805,8 +840,40 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
   }
 }
 
+/** Breite des Logos der Bibliothek unten links (CSS-px), Bandbeschriftung beginnt rechts davon. */
+const LOGO_PX = 52;
+
+export interface Box {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** Überlappen sich zwei Rechtecke (Kanten berühren zählt nicht)? */
+export function overlaps(a: Box, b: Box): boolean {
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+/** Hintergrundfarbe des Charts als Kontrastrand. */
+const HALO = '#0f1217';
 /** Rand außerhalb der Pane, in dem Marker noch gezeichnet werden (größter Radius). */
 const R_PAD = 18;
+
+/** Abdeckungsspannen auf [from, to) gekürzt (leere entfallen). */
+export function clipSpans(
+  spans: readonly CoverageSpan[],
+  from: number,
+  to: number,
+): CoverageSpan[] {
+  const out: CoverageSpan[] = [];
+  for (const c of spans) {
+    const a = Math.max(c.from, from);
+    const z = Math.min(c.to, to);
+    if (z > a) out.push({ ...c, from: a, to: z });
+  }
+  return out;
+}
 
 /** Erster Index mit a[i] ≥ v (a aufsteigend). */
 export function lowerBound(a: ArrayLike<number>, v: number): number {
