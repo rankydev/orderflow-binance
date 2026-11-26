@@ -91,6 +91,7 @@ function make(o: {
     startState: async () => ({
       final: o.final ? { ...o.final, carry: null, cand: null } : null,
       provisional: [],
+      bigFloorN: null,
     }),
     writeMinute: async (_s, d) => {
       if (o.writeMinute) await o.writeMinute(d);

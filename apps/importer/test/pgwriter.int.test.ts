@@ -5,7 +5,8 @@
 // (TS-Textform = Postgres-Zeilentextform); Re-Import → version + 2, identischer Digest (K8);
 // Zeilenzahlen = Dry-Run; Auflösung der Randminute eines vorher importierten Nachbartags;
 // Single-Writer-Lock inkl. Verbindungsabbruch (Review K2); Randminute ohne bar-Zeile (W1);
-// Resume mit offenen Randminuten (W2); DB-verankerte Digest-Textform inkl. bigint > 2^53.
+// Resume mit offenen Randminuten (W2); DB-verankerte Digest-Textform inkl. bigint > 2^53;
+// big_order und Ordersummen im Tagesersatz, Digest-Version 1 → 2 (Migration 0017).
 import {
   barDigest,
   fpDigest,
@@ -29,6 +30,8 @@ import { archive } from './synth.ts';
 const base = parseConfig(process.env).db;
 const cfg: DbConfig = { ...base, database: `${base.database}_test_importer` }; // eigene DB: andere Agenten nutzen _test parallel
 const BTC = getSymbol('BTCUSDT');
+/** Untergrenze big_order der Test-DB: 3·10⁷ = 300 USDT (synthetische Einzel-aggTrades, 1–13 Lots). */
+const FLOOR = 30_000_000;
 let sql: Sql;
 let dataDir: string;
 
@@ -70,6 +73,11 @@ beforeAll(async () => {
   await dropAndCreateDatabase(cfg);
   sql = connect(cfg);
   await migrateUp(sql);
+  // Symbolzeile wie der Importer anlegen, dann die Untergrenze als Daten setzen (wie 0017 in Betrieb)
+  const w = new PostgresWriter(cfg, BTC);
+  await w.open();
+  await w.close();
+  await sql`UPDATE symbol SET big_floor_n = ${FLOOR} WHERE sym_id = ${BTC.symId}`;
   dataDir = archive();
 });
 afterAll(async () => {
@@ -79,7 +87,8 @@ afterAll(async () => {
 describe('PostgresWriter', () => {
   it('schreibt einen Tag atomar; DB-Digest = Importer-Digest; Zeilen = Dry-Run', async () => {
     const [s] = await run(new PostgresWriter(cfg, BTC), '2026-09-10', '2026-09-10');
-    const [dry] = await run(new DryRunWriter(), '2026-09-10', '2026-09-10');
+    const [dry] = await run(new DryRunWriter(undefined, FLOOR), '2026-09-10', '2026-09-10');
+    expect(s!.orders.big).toBeGreaterThan(0);
     expect(s!.dbDigest).toBe(s!.digest);
     expect(s!.digest).toBe(dry!.digest);
     const [dd] = await sql`SELECT * FROM data_day WHERE sym_id = 1 AND day = '2026-09-10'`;
@@ -836,5 +845,158 @@ describe('Erstkompression gealterter Chunks durch die Policy (Review-Frage, H1)'
       await reader.end();
       await runner.end();
     }
+  });
+});
+
+describe('Big Orders (P5, Migration 0017)', () => {
+  const DAY = '2026-09-06';
+  const dayRows = async () =>
+    (
+      await sql`
+      SELECT count(*)::int AS n, count(*) FILTER (WHERE notional < (SELECT big_floor_n FROM symbol WHERE sym_id = 1))::int AS below,
+             coalesce(min(notional), 0)::text AS min
+        FROM big_order WHERE sym_id = 1 AND ts >= ${DAY}::date AND ts < ${DAY}::date + 1`
+    )[0]!;
+
+  it('Tagesimport: big_order ≥ Untergrenze, Ordersummen = Σ bar_1m, digest_version 2, Ersatz des ganzen Tages', async () => {
+    const [s] = await run(new PostgresWriter(cfg, BTC), DAY, DAY);
+    expect(s!.dbDigest).toBe(s!.digest);
+    expect(s!.orders.bigFloorN).toBe(FLOOR);
+    expect(s!.orders.diff).toBe('0');
+    const r = await dayRows();
+    expect(r.n).toBe(s!.orders.big);
+    expect(r.n).toBeGreaterThan(0);
+    expect(r.below).toBe(0);
+    const [dd] = await sql`
+      SELECT orders_n, orders_notional::text AS ntl, big_floor_n::text AS floor, digest_version,
+             (SELECT sum(notional)::text FROM bar_1m WHERE sym_id = 1 AND ts >= ${DAY}::date AND ts < ${DAY}::date + 1) AS bars,
+             day_digest('big_order', 1::smallint, ${DAY}::date) AS big_digest
+        FROM data_day WHERE sym_id = 1 AND day = ${DAY}::date`;
+    expect(dd).toMatchObject({
+      orders_n: String(s!.orders.n),
+      ntl: s!.orders.notional,
+      bars: s!.orders.barsNotional,
+      floor: String(FLOOR),
+      digest_version: 2,
+      big_digest: s!.digests.big_order,
+    });
+    // eine fremde Zeile im Tag verschwindet beim Ersatz (Replace, nie Merge)
+    await sql`INSERT INTO big_order VALUES (1, ${DAY}::date + interval '1 hour 0.25 second', 1, 1, 1, 1, 1, 1, 1, 1)`;
+    const w = new PostgresWriter(cfg, BTC);
+    await w.open();
+    try {
+      const bad = await w.verifyDb(parseDay(DAY), parseDay(DAY));
+      expect(bad[0]!.stored).not.toBe(bad[0]!.actual); // fremde Zeile fällt im Digest auf
+      const forced = await new Importer({
+        dataDir,
+        spec: BTC,
+        firstDay: parseDay(DAY),
+        lastDay: parseDay(DAY),
+        prefer: 'auto',
+        neighbours: true,
+        writer: w,
+        importerVersion: 'int-test',
+        sidecar: false,
+        force: true,
+        log: () => {},
+      }).run();
+      expect(forced[0]!.decision).toBe('write');
+      const ok = await w.verifyDb(parseDay(DAY), parseDay(DAY));
+      expect(ok[0]).toMatchObject({ stored: s!.digest, actual: s!.digest, version: 2 });
+    } finally {
+      await w.close();
+    }
+    expect((await dayRows()).n).toBe(s!.orders.big);
+  });
+
+  it('geänderte Untergrenze ist eine Datenänderung: der Tag wird neu geschrieben', async () => {
+    const before = await dayRows();
+    await sql`UPDATE symbol SET big_floor_n = ${FLOOR * 2} WHERE sym_id = 1`;
+    try {
+      const [s] = await run(new PostgresWriter(cfg, BTC), DAY, DAY);
+      expect(s!.decision).toBe('write');
+      expect(s!.reasons).toContain('Daten');
+      const after = await dayRows();
+      expect(after.n).toBe(s!.orders.big);
+      expect(after.n).toBeLessThan(before.n);
+      expect(after.below).toBe(0);
+      const [dd] =
+        await sql`SELECT big_floor_n::text AS f FROM data_day WHERE sym_id = 1 AND day = ${DAY}::date`;
+      expect(dd!.f).toBe(String(FLOOR * 2));
+    } finally {
+      await sql`UPDATE symbol SET big_floor_n = ${FLOOR} WHERE sym_id = 1`;
+    }
+    const [s2] = await run(new PostgresWriter(cfg, BTC), DAY, DAY);
+    expect(s2!.decision).toBe('write');
+    expect((await dayRows()).n).toBe(before.n);
+  });
+
+  it('Tag aus der Zeit vor 0017 (Digest-Version 1): verifyDb ohne Fehlalarm, kein falsches „match" für Orders, Import schreibt neu', async () => {
+    // Zustand eines vor der Migration geschriebenen Tages nachstellen: keine big_order-Zeilen,
+    // keine Ordersummen, Digest über die zwölf Tabellen (Version 1)
+    await sql`DELETE FROM big_order WHERE sym_id = 1 AND ts >= ${DAY}::date AND ts < ${DAY}::date + 1`;
+    await sql`
+      UPDATE data_day SET orders_n = NULL, orders_notional = NULL, big_floor_n = NULL,
+             digest = day_digest_all_v(1::smallint, ${DAY}::date, 1), digest_version = 1
+       WHERE sym_id = 1 AND day = ${DAY}::date`;
+    const w = new PostgresWriter(cfg, BTC);
+    await w.open();
+    try {
+      const [v] = await w.verifyDb(parseDay(DAY), parseDay(DAY));
+      expect(v!.version).toBe(1);
+      expect(v!.actual).toBe(v!.stored); // geprüft in seiner Version: kein Fehlalarm
+      const [cur] = await sql`SELECT day_digest_all(1::smallint, ${DAY}::date) AS d`;
+      expect(cur!.d).not.toBe(v!.stored); // ein naiver Vergleich mit Version 2 wäre ein Fehlalarm
+      const st = await w.storedDay('BTCUSDT', parseDay(DAY));
+      expect(st!.digestVersion).toBe(1);
+      const [s] = await run(w, DAY, DAY, true, undefined, true);
+      expect(s!.decision).toBe('write');
+      expect(s!.reasons).toContain('Digest-Version 1→2');
+      expect(s!.reasons).not.toContain('Daten');
+    } finally {
+      await w.close();
+    }
+    const [dd] =
+      await sql`SELECT digest_version, orders_n FROM data_day WHERE sym_id = 1 AND day = ${DAY}::date`;
+    expect(dd!.digest_version).toBe(2);
+    expect(dd!.orders_n).not.toBeNull();
+    expect((await dayRows()).n).toBeGreaterThan(0);
+  });
+
+  it('ohne Untergrenze (symbol.big_floor_n NULL): keine big orders, Summen trotzdem, NULL am Tag', async () => {
+    await sql`UPDATE symbol SET big_floor_n = NULL WHERE sym_id = 1`;
+    const logs: string[] = [];
+    try {
+      const w = new PostgresWriter(cfg, BTC);
+      await w.open();
+      try {
+        const [s] = await new Importer({
+          dataDir,
+          spec: BTC,
+          firstDay: parseDay(DAY),
+          lastDay: parseDay(DAY),
+          prefer: 'auto',
+          neighbours: true,
+          writer: w,
+          importerVersion: 'int-test',
+          sidecar: false,
+          log: (l) => logs.push(l),
+        }).run();
+        expect(s!.orders.big).toBe(0);
+        expect(s!.orders.bigFloorN).toBeNull();
+      } finally {
+        await w.close();
+      }
+    } finally {
+      await sql`UPDATE symbol SET big_floor_n = ${FLOOR} WHERE sym_id = 1`;
+    }
+    expect(logs.some((l) => /keine Untergrenze big_floor_n/.test(l))).toBe(true);
+    expect((await dayRows()).n).toBe(0);
+    const [dd] =
+      await sql`SELECT big_floor_n, orders_n FROM data_day WHERE sym_id = 1 AND day = ${DAY}::date`;
+    expect(dd!.big_floor_n).toBeNull();
+    expect(Number(dd!.orders_n)).toBeGreaterThan(0);
+    await run(new PostgresWriter(cfg, BTC), DAY, DAY); // wiederherstellen
+    expect((await dayRows()).n).toBeGreaterThan(0);
   });
 });

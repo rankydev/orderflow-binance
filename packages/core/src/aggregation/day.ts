@@ -1,6 +1,8 @@
 // Tagesaggregation (KONZEPT §3.3–§3.5): aggTrades eines UTC-Tages in aggId-Reihenfolge →
 // fp_1m-Basiszeilen (1 Minute × nativer Preis), bar_1m, Kandidaten für den Kline-Abgleich (§4.6)
 // und die empirische Tickweite (symbol_tick_history). Speicher: nur der Tag, nie Rohzeilen.
+// Ab P5 (§3.7) zusätzlich die Orders nach Order-Regel v1: Summen über ALLE Orders und die Orders
+// mit Notional ≥ Untergrenze (big_order). Importer und Recorder rechnen beide hier.
 import type { AggTrade } from '../parser/csv.ts';
 import { DAY_MS, MINUTE_MS } from '../constants.ts';
 import { MINUTES_PER_DAY } from '../time.ts';
@@ -16,6 +18,34 @@ export function isCandidate(t: Pick<AggTrade, 'f' | 'l' | 'T'>): boolean {
 
 const INT32_MAX = 2_147_483_647;
 
+/**
+ * Order-Regel v1 (KONZEPT §3.7, entschieden): maximaler Lauf von aggTrades mit gleichem T (ms),
+ * gleicher Seite (m) und lückenlos fortlaufender aggId (+1) bildet eine Order. Versioniert: ein
+ * Wechsel bedeutet Neuberechnung von big_order und der Ordersummen aus dem Archiv.
+ */
+export const ORDER_RULE_VERSION = 1;
+
+/** Seite einer Order wie in size_hist_* (§3.7): 1 = Käufer-Aggressor (m = false), 2 = Verkäufer. */
+export const SIDE_BUY = 1;
+export const SIDE_SELL = 2;
+
+/** Eine Order (Zeile von big_order). Notional ganzzahlig Σ px·lots (price_unit·qty_unit). */
+export interface BigOrder {
+  /** T der Order in ms (alle aggTrades der Order haben dasselbe T). */
+  ts: number;
+  firstAggId: number;
+  lastAggId: number;
+  side: 1 | 2;
+  pxFirst: number;
+  pxLast: number;
+  /** Σ Lots. */
+  qty: number;
+  /** Σ px·lots; eine Order liegt in einer Minute, deren Notional < 2^53 geprüft ist. */
+  notional: number;
+  /** Anzahl aggTrades. */
+  aggN: number;
+}
+
 export interface DayAggregate {
   /** UTC-Tagesindex. */
   day: number;
@@ -30,6 +60,20 @@ export interface DayAggregate {
   candCount: number;
   /** ggT aller |px_i − px_{i−1}| des Tages (0, wenn nur ein Preis vorkam). */
   minStepUnits: number;
+  /** Anzahl aller Orders des Tages (Order-Regel v1). */
+  ordersN: number;
+  /** Σ Notional aller Orders (= Σ bar_1m.notional, je Minute geprüft). */
+  ordersNotional: bigint;
+  /** Untergrenze, mit der bigOrders gebildet wurden; null = keine Untergrenze, keine big orders. */
+  bigFloorN: number | null;
+  /** Orders mit notional ≥ bigFloorN, sortiert nach (ts, firstAggId) wie der Primärschlüssel. */
+  bigOrders: BigOrder[];
+}
+
+/** Ordersummen einer Minute (Live-Pfad, Abgleich). */
+export interface MinuteOrders {
+  n: number;
+  notional: number;
 }
 
 function gcd(a: number, b: number): number {
@@ -65,13 +109,69 @@ export class DayAggregator {
   private lvSA: number[] = [];
   private finished = false;
   /** Für den Live-Pfad: je abgeschlossener Minute Zeilenbereich in fp und Index in bars. */
-  private readonly flushed = new Map<number, { from: number; to: number; bar: number }>();
+  private readonly flushed = new Map<
+    number,
+    { from: number; to: number; bar: number; bigFrom: number; bigTo: number }
+  >();
   private onFlush: ((minute: number) => void) | null = null;
+  // Orders (§3.7): die laufende Order und die Summen der laufenden Minute
+  private readonly bigFloorN: number | null;
+  private oOpen = false;
+  private oT = 0;
+  private oM = false;
+  private oFirst = 0;
+  private oLast = 0;
+  private oPxFirst = 0;
+  private oPxLast = 0;
+  private oQty = 0;
+  private oNtl = 0;
+  private oN = 0;
+  private mOrdersN = 0;
+  private mOrdersQty = 0;
+  private mOrdersAgg = 0;
+  private mOrdersNtl = 0;
+  private ordersN = 0;
+  private ordersNotional = 0n;
+  private readonly minOrdersN = new Float64Array(MINUTES_PER_DAY);
+  private readonly minOrdersNtl = new Float64Array(MINUTES_PER_DAY);
+  private readonly big: BigOrder[] = [];
+  private bigMinuteFrom = 0;
 
-  constructor(day: number) {
+  /**
+   * `bigFloorN`: Untergrenze für big_order als ganzzahliges Notional (symbol.big_floor_n, Daten,
+   * keine Code-Konstante); null = keine Untergrenze bekannt → es werden keine big orders gebildet.
+   */
+  constructor(day: number, bigFloorN: number | null) {
+    if (bigFloorN !== null && !(Number.isSafeInteger(bigFloorN) && bigFloorN > 0)) {
+      throw new Error(`big_floor_n muss eine positive Ganzzahl sein (ist ${bigFloorN})`);
+    }
     this.day = day;
     this.dayStart = day * DAY_MS;
     this.dayEnd = this.dayStart + DAY_MS;
+    this.bigFloorN = bigFloorN;
+  }
+
+  /** Laufende Order abschließen (Summen der Minute, ggf. big order). */
+  private closeOrder(): void {
+    if (!this.oOpen) return;
+    this.oOpen = false;
+    this.mOrdersN++;
+    this.mOrdersQty += this.oQty;
+    this.mOrdersAgg += this.oN;
+    this.mOrdersNtl += this.oNtl;
+    if (this.bigFloorN !== null && this.oNtl >= this.bigFloorN) {
+      this.big.push({
+        ts: this.oT,
+        firstAggId: this.oFirst,
+        lastAggId: this.oLast,
+        side: this.oM ? SIDE_SELL : SIDE_BUY,
+        pxFirst: this.oPxFirst,
+        pxLast: this.oPxLast,
+        qty: this.oQty,
+        notional: this.oNtl,
+        aggN: this.oN,
+      });
+    }
   }
 
   /** aggTrades müssen in aggId-Reihenfolge kommen; T darf innerhalb des Tages nicht über eine Minutengrenze zurücklaufen. */
@@ -93,6 +193,26 @@ export class DayAggregator {
       throw new Error(
         `aggTrade ${t.a}: Minute ${minute} ist bereits abgeschlossen (verspäteter Trade)`,
       );
+    }
+    // Order-Regel v1: gleiches T, gleiche Seite, aggId lückenlos +1 (T gleich ⇒ gleiche Minute).
+    if (this.oOpen && t.T === this.oT && t.m === this.oM && t.a === this.oLast + 1) {
+      this.oLast = t.a;
+      this.oPxLast = t.px;
+      this.oQty += t.q;
+      this.oNtl += t.px * t.q;
+      this.oN++;
+    } else {
+      this.closeOrder();
+      this.oOpen = true;
+      this.oT = t.T;
+      this.oM = t.m;
+      this.oFirst = t.a;
+      this.oLast = t.a;
+      this.oPxFirst = t.px;
+      this.oPxLast = t.px;
+      this.oQty = t.q;
+      this.oNtl = t.px * t.q;
+      this.oN = 1;
     }
     let s = this.slot.get(t.px);
     if (s === undefined) {
@@ -126,6 +246,7 @@ export class DayAggregator {
 
   private flushMinute(): void {
     const ts = this.dayStart + this.cur * MINUTE_MS;
+    this.closeOrder();
     const from = this.fp.n;
     const idx = new Array<number>(this.lvN);
     for (let i = 0; i < this.lvN; i++) idx[i] = i;
@@ -139,8 +260,44 @@ export class DayAggregator {
       }
       this.fp.push(ts, px[i]!, bq, sq, this.lvBA[i]!, this.lvSA[i]!);
     }
-    this.bars.push(this.bar.finish(ts));
-    this.flushed.set(this.cur, { from, to: this.fp.n, bar: this.bars.length - 1 });
+    const bar = this.bar.finish(ts);
+    // Abgleich (§3.7): die Orders zerlegen die aggTrades der Minute; Menge, Anzahl und Notional
+    // müssen exakt den Bar ergeben. Bricht hier, statt still falsche Orders zu speichern.
+    if (
+      BigInt(this.mOrdersNtl) !== bar.notional ||
+      this.mOrdersQty !== bar.buyQ + bar.sellQ ||
+      this.mOrdersAgg !== bar.buyA + bar.sellA
+    ) {
+      throw new Error(
+        `Order-Zerlegung ≠ bar_1m bei ts=${ts}: notional ${this.mOrdersNtl}/${bar.notional}, ` +
+          `qty ${this.mOrdersQty}/${bar.buyQ + bar.sellQ}, aggTrades ${this.mOrdersAgg}/${bar.buyA + bar.sellA}`,
+      );
+    }
+    this.minOrdersN[this.cur] = this.mOrdersN;
+    this.minOrdersNtl[this.cur] = this.mOrdersNtl;
+    this.ordersN += this.mOrdersN;
+    this.ordersNotional += BigInt(this.mOrdersNtl);
+    this.mOrdersN = 0;
+    this.mOrdersQty = 0;
+    this.mOrdersAgg = 0;
+    this.mOrdersNtl = 0;
+    // big orders der Minute in Primärschlüssel-Reihenfolge (T darf innerhalb der Minute zurücklaufen)
+    const bigFrom = this.bigMinuteFrom;
+    if (this.big.length - bigFrom > 1) {
+      const part = this.big
+        .slice(bigFrom)
+        .sort((a, b) => a.ts - b.ts || a.firstAggId - b.firstAggId);
+      for (let i = 0; i < part.length; i++) this.big[bigFrom + i] = part[i]!;
+    }
+    this.bigMinuteFrom = this.big.length;
+    this.bars.push(bar);
+    this.flushed.set(this.cur, {
+      from,
+      to: this.fp.n,
+      bar: this.bars.length - 1,
+      bigFrom,
+      bigTo: this.big.length,
+    });
     const done = this.cur;
     this.bar.reset();
     this.slot.clear();
@@ -161,11 +318,19 @@ export class DayAggregator {
     if (this.cur >= 0 && this.cur < beforeMinute && !this.flushed.has(this.cur)) this.flushMinute();
   }
 
-  /** Zeilen und Bar einer abgeschlossenen Minute (Kopie bzw. Referenz); undefined ohne Trades. */
-  minute(m: number): { fp: FpTable; bar: Bar } | undefined {
+  /**
+   * Zeilen, Bar, big orders und Ordersummen einer abgeschlossenen Minute (Kopie bzw. Referenz);
+   * undefined ohne Trades.
+   */
+  minute(m: number): { fp: FpTable; bar: Bar; big: BigOrder[]; orders: MinuteOrders } | undefined {
     const f = this.flushed.get(m);
     if (!f) return undefined;
-    return { fp: this.fp.slice(f.from, f.to), bar: this.bars[f.bar]! };
+    return {
+      fp: this.fp.slice(f.from, f.to),
+      bar: this.bars[f.bar]!,
+      big: this.big.slice(f.bigFrom, f.bigTo),
+      orders: { n: this.minOrdersN[m]!, notional: this.minOrdersNtl[m]! },
+    };
   }
 
   /** Kandidatensummen je Minute bisher (Live-Kline-Abgleich; Referenzen, nicht kopiert). */
@@ -191,13 +356,21 @@ export class DayAggregator {
       candB: this.candB,
       candCount: this.candCount,
       minStepUnits: this.g,
+      ordersN: this.ordersN,
+      ordersNotional: this.ordersNotional,
+      bigFloorN: this.bigFloorN,
+      bigOrders: this.big,
     };
   }
 }
 
 /** Bequemlichkeit für Tests: aggregiert eine Liste von aggTrades (in aggId-Reihenfolge) eines Tages. */
-export function aggregateDay(day: number, trades: Iterable<AggTrade>): DayAggregate {
-  const agg = new DayAggregator(day);
+export function aggregateDay(
+  day: number,
+  trades: Iterable<AggTrade>,
+  bigFloorN: number | null = null,
+): DayAggregate {
+  const agg = new DayAggregator(day, bigFloorN);
   for (const t of trades) agg.add(t);
   return agg.finish();
 }

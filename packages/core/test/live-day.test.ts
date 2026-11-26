@@ -23,7 +23,7 @@ describe('LiveDay', () => {
         tradesArb({ spanMin: 1440, maxTrades: 400 }),
         fc.integer({ min: 1, max: 6 }),
         (trades, steps) => {
-          const live = new LiveDay(BTC, DAY);
+          const live = new LiveDay(BTC, DAY, null);
           let done = 0;
           const per = Math.ceil(trades.length / steps);
           for (let i = 0; i < trades.length; i++) {
@@ -51,7 +51,7 @@ describe('LiveDay', () => {
   });
 
   it('Delta einer Minute enthält genau die betroffenen Buckets; verspäteter Trade ist ein Fehler', () => {
-    const live = new LiveDay(BTC, DAY);
+    const live = new LiveDay(BTC, DAY, null);
     const t = (a: number, T: number) => ({ a, px: 6_000_000, q: 1, f: a, l: a, T, m: false });
     live.add(t(1, DAY_START + 61 * MINUTE_MS + 5));
     live.add(t(2, DAY_START + 62 * MINUTE_MS + 5));

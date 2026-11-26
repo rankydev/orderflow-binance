@@ -5,7 +5,7 @@
 // Import (bewiesen per Replay-Test, Digest-Gleichheit). Rein, ohne I/O.
 import type { Bar } from '../aggregation/bar.ts';
 import { composeBars } from '../aggregation/bar.ts';
-import { DayAggregator } from '../aggregation/day.ts';
+import { DayAggregator, type BigOrder } from '../aggregation/day.ts';
 import { concatFp, emptyFp, type FpTable } from '../aggregation/fp.ts';
 import { FP_ROLLUPS, rollupFp, type FpTableName } from '../aggregation/rollup.ts';
 import { DAY_MS, MINUTE_MS } from '../constants.ts';
@@ -36,6 +36,13 @@ export interface MinuteDelta {
   /** Mindestens ein Trade der Minute kam per REST (bar_1m.source = 2 statt 1). */
   viaRest: boolean;
   trades: number;
+  /** big_order der Minute (Replace des Minutenbereichs [from, to)). */
+  big: { from: number; to: number; rows: BigOrder[] };
+  /**
+   * Ordersummen des Tages über alle bis jetzt abgeschlossenen Minuten (data_day.orders_n,
+   * orders_notional; absolut, nicht inkrementell) und die verwendete Untergrenze.
+   */
+  orders: { n: number; notional: bigint; bigFloorN: number | null };
 }
 
 const TF_OF: Record<FpTableName, number> = { fp_1m: 1 } as Record<FpTableName, number>;
@@ -56,11 +63,17 @@ export class LiveDay {
   /** Minuten, die bereits vollständig verarbeitet sind (für Kontrolle und Neustart). */
   readonly completed = new Set<number>();
 
-  constructor(spec: SymbolSpec, day: number) {
+  private readonly bigFloorN: number | null;
+  private ordersN = 0;
+  private ordersNotional = 0n;
+
+  /** `bigFloorN`: symbol.big_floor_n (wie im Import; null = keine big orders). */
+  constructor(spec: SymbolSpec, day: number, bigFloorN: number | null) {
     this.spec = spec;
     this.day = day;
     this.dayStart = day * DAY_MS;
-    this.agg = new DayAggregator(day);
+    this.bigFloorN = bigFloorN;
+    this.agg = new DayAggregator(day, bigFloorN);
     this.fp.set('fp_1m', new Map());
     for (const r of FP_ROLLUPS) this.fp.set(r.table, new Map());
     this.agg.setOnFlush((m) => this.pending.push(m));
@@ -124,7 +137,10 @@ export class LiveDay {
     this.bars1h.set(hFrom, h);
     const dayBars = [...this.bars1h.entries()].sort((a, b) => a[0] - b[0]).map(([, b]) => b);
     this.bar1d = composeBars(this.dayStart, dayBars);
+    if (this.completed.has(minute)) throw new Error(`LiveDay: Minute ${minute} doppelt berechnet`);
     this.completed.add(minute);
+    this.ordersN += got.orders.n;
+    this.ordersNotional += BigInt(got.orders.notional);
     return {
       day: this.day,
       minute,
@@ -136,11 +152,20 @@ export class LiveDay {
       ],
       viaRest: this.restMinutes.has(minute),
       trades: got.bar.buyA + got.bar.sellA,
+      big: { from: ts, to: ts + MINUTE_MS, rows: got.big },
+      orders: { n: this.ordersN, notional: this.ordersNotional, bigFloorN: this.bigFloorN },
     };
   }
 
   /** Aktueller Stand aller Tabellen (für Replay-Beweis und Abgleich). */
-  snapshot(): { fp: Record<FpTableName, FpTable>; bar_1m: Bar[]; bar_1h: Bar[]; bar_1d: Bar[] } {
+  snapshot(): {
+    fp: Record<FpTableName, FpTable>;
+    bar_1m: Bar[];
+    bar_1h: Bar[];
+    bar_1d: Bar[];
+    bigOrders: BigOrder[];
+    orders: { n: number; notional: bigint };
+  } {
     const fp = {} as Record<FpTableName, FpTable>;
     for (const [t] of this.fp) fp[t] = this.rowsIn(t, this.dayStart, this.dayStart + DAY_MS);
     const sorted = (m: Map<number, Bar>) =>
@@ -150,6 +175,8 @@ export class LiveDay {
       bar_1m: sorted(this.bars1m),
       bar_1h: sorted(this.bars1h),
       bar_1d: this.bar1d ? [this.bar1d] : [],
+      bigOrders: [...this.completed].sort((a, b) => a - b).flatMap((m) => this.agg.minute(m)!.big),
+      orders: { n: this.ordersN, notional: this.ordersNotional },
     };
   }
 

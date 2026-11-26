@@ -5,8 +5,11 @@
 // Ersatz wird der live geschriebene Tag minutenweise mit dem offiziellen verglichen und das Ergebnis
 // in recorder_quality festgehalten.
 import {
+  bigOrderLine,
   DAY_MS,
+  DIGEST_COLUMNS,
   formatDay,
+  MINUTE_MS,
   pgTimestamptz,
   sha256Hex,
   type DayData,
@@ -39,14 +42,18 @@ export interface QualityResult {
 const BAR_ROW =
   'ROW(sym_id, ts, open_px, high_px, low_px, close_px, buy_q, sell_q, buy_a, sell_a, notional, first_agg_id, last_agg_id, first_trade_ms, last_trade_ms, run_max, run_min, d_from_low, d_from_high)::text';
 
-/** Minutenweiser Vergleich des gespeicherten (live) Tages mit dem offiziellen Ergebnis. */
+/**
+ * Minutenweiser Vergleich des gespeicherten (live) Tages mit dem offiziellen Ergebnis: eine Minute
+ * ist identisch, wenn fp_1m, bar_1m (ohne source/check_state) und ihre big_order-Zeilen gleich sind.
+ * Dazu je Tabelle der Tages-Digest (inkl. big_order und der Ordersummen in data_day, `order_day`).
+ */
 export async function compareLiveDay(sql: Sql, data: DayData): Promise<QualityResult> {
   const symId = data.spec.symId;
   const from = new Date(data.day * DAY_MS);
   const to = new Date((data.day + 1) * DAY_MS);
   // live: je Minute SHA256 über die fp_1m-Zeilen und den bar_1m-Text (ohne source/check_state);
   // Zeittext in UTC unabhängig von der Sitzung (SET LOCAL)
-  const [liveFp, liveBar] = await sql.begin(async (tx) => {
+  const [liveFp, liveBar, liveBig] = await sql.begin(async (tx) => {
     await tx`SET LOCAL timezone = 'UTC'`;
     const a = await tx.unsafe(
       `SELECT ts, encode(sha256(convert_to(string_agg(ROW(sym_id, ts, px, buy_q, sell_q, buy_a, sell_a)::text, E'\\n' ORDER BY px), 'UTF8')), 'hex') AS h
@@ -57,8 +64,25 @@ export async function compareLiveDay(sql: Sql, data: DayData): Promise<QualityRe
       `SELECT ts, ${BAR_ROW} AS t FROM bar_1m WHERE sym_id = $1 AND ts >= $2 AND ts < $3`,
       [symId, from, to],
     );
-    return [a, b] as const;
+    const c = await tx.unsafe(
+      `SELECT date_trunc('minute', ts) AS m,
+              string_agg(ROW(${DIGEST_COLUMNS.big_order})::text, E'\\n' ORDER BY ts, first_agg_id) AS t
+         FROM big_order WHERE sym_id = $1 AND ts >= $2 AND ts < $3 GROUP BY 1`,
+      [symId, from, to],
+    );
+    return [a, b, c] as const;
   });
+  const lbig = new Map<number, string>(
+    liveBig.map((r) => [(r.m as Date).getTime(), r.t as string]),
+  );
+  const obigLines = new Map<number, string[]>();
+  for (const o of data.agg.bigOrders) {
+    const m = o.ts - (o.ts % MINUTE_MS);
+    const a = obigLines.get(m) ?? [];
+    a.push(bigOrderLine(symId, o));
+    obigLines.set(m, a);
+  }
+  const obig = new Map<number, string>([...obigLines].map(([m, a]) => [m, a.join('\n')]));
   const lf = new Map<number, string>(liveFp.map((r) => [(r.ts as Date).getTime(), r.h as string]));
   const lb = new Map<number, string>(liveBar.map((r) => [(r.ts as Date).getTime(), r.t as string]));
   // offiziell: gleiche Textform
@@ -95,15 +119,20 @@ export async function compareLiveDay(sql: Sql, data: DayData): Promise<QualityRe
       continue;
     }
     const fpSame = lf.get(ts) === createHashLine(of.get(ts) ?? []);
-    if (fpSame && live === bar) r.identical++;
+    const bigSame = (lbig.get(ts) ?? '') === (obig.get(ts) ?? '');
+    if (fpSame && live === bar && bigSame) r.identical++;
     else {
       r.differing++;
       if (r.firstDiff.length < 10) {
-        r.firstDiff.push({ minute: new Date(ts).toISOString(), what: fpSame ? 'bar_1m' : 'fp_1m' });
+        r.firstDiff.push({
+          minute: new Date(ts).toISOString(),
+          what: !fpSame ? 'fp_1m' : live !== bar ? 'bar_1m' : 'big_order',
+        });
       }
     }
   }
   for (const ts of lb.keys()) if (!ob.has(ts)) r.extra++;
+  // big orders in Minuten, die offiziell keinen Bar haben, fallen über tablesEqual.big_order auf
   // Tabellen außer bar_1m (dessen source sich zwangsläufig unterscheidet)
   for (const tbl of Object.keys(data.digests)) {
     if (tbl === 'bar_1m' || tbl === 'kline_1m') continue;

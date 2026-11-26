@@ -65,6 +65,7 @@ function setup(rows: RawAgg[], spoolDir: string | null = null, budget?: WeightBu
         cand: { q: 0, b: 0 },
       },
       provisional: [],
+      bigFloorN: null,
     }),
     writeMinute: async (_s, d) => {
       written.push(d);

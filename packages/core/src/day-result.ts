@@ -14,7 +14,9 @@ import { buildReconcileInput, ohlcReport } from './classifier/input.ts';
 import type { ReconcileInput } from './classifier/reconcile.ts';
 import {
   barDigest,
+  bigOrderDigest,
   combineDigests,
+  orderDayDigest,
   fpDigest,
   klineDigest,
   SOURCE_VISION,
@@ -50,6 +52,8 @@ export function buildDayData(spec: SymbolSpec, agg: DayAggregate, klines: Kline[
   digests.bar_1h = barDigest(spec.symId, bar_1h);
   digests.bar_1d = barDigest(spec.symId, bar_1d);
   digests.kline_1m = klineDigest(spec.symId, klines);
+  digests.big_order = bigOrderDigest(spec.symId, agg.bigOrders);
+  digests.order_day = orderDayDigest(spec.symId, agg.day, agg);
   return {
     spec,
     day: agg.day,

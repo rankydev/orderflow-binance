@@ -22,7 +22,7 @@
 //  - als Eigentümer (of_admin) ausführen; der Recorder sollte dabei gestoppt sein (nicht nötig für
 //    die Korrektheit, aber seine Schreibzugriffe verlängern die Sperrwartezeit nicht unnötig).
 import type { Sql } from '@orderflow/db';
-import { DIGEST_TABLES } from '@orderflow/core';
+import { DATA_HYPERTABLES } from '@orderflow/core';
 
 export interface RepairResult {
   chunk: string;
@@ -44,7 +44,7 @@ export async function openColumnstoreChunks(
       FROM timescaledb_information.chunks c
       JOIN _timescaledb_catalog.chunk k
         ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
-     WHERE c.hypertable_schema = 'public' AND c.hypertable_name = ANY(${[...DIGEST_TABLES]}::text[])
+     WHERE c.hypertable_schema = 'public' AND c.hypertable_name = ANY(${[...DATA_HYPERTABLES]}::text[])
        AND (k.status & 1) <> 0 AND (k.status & 4) = 0 AND NOT k.osm_chunk
        AND c.range_end > now() - of_hot_margin()
      ORDER BY c.hypertable_name, c.range_start`;

@@ -9,6 +9,7 @@ import {
   buildDayData,
   buildReconcileInput,
   comparableDayManifest,
+  DIGEST_VERSION,
   formatDay,
   monthDays,
   monthOfDay,
@@ -132,10 +133,25 @@ export interface DaySummary {
   ohlc: DayData['ohlc'];
   minStepUnits: number;
   digest: string;
+  /** Version von `digest` (immer die aktuelle, DIGEST_VERSION). */
+  digestVersion: number;
   digests: DayData['digests'];
   qualityDigest: string;
   /** Digest der eigenen Klassen (data_day.quality_digest). */
   ownQualityDigest: string;
+  /**
+   * Orders nach Order-Regel v1 (§3.7): Anzahl und Σ Notional aller Orders, Σ bar_1m.notional
+   * zum Abgleich (Notional als Dezimalstring, Tagessummen können 2^53 überschreiten), gespeicherte
+   * big orders und die verwendete Untergrenze.
+   */
+  orders: {
+    n: number;
+    notional: string;
+    barsNotional: string;
+    diff: string;
+    big: number;
+    bigFloorN: number | null;
+  };
   inputs: DayInputs;
   /** write = neu/geändert geschrieben; skip = unverändert; keep = gespeicherte (bessere) Klassifikation behalten. */
   decision: 'write' | 'skip' | 'keep';
@@ -159,7 +175,11 @@ export function writeReasons(
   if (st.state !== 'final_ok' && st.state !== 'final_bad') return [`Zustand ${st.state}`];
   const r: string[] = [];
   if (st.stale) r.push('stale');
-  if (st.digest !== now.digest) r.push('Daten');
+  // Ein Digest älterer Version (vor big_order, Migration 0017) ist mit dem aktuellen nicht
+  // vergleichbar: der Tag hat keine Order-Daten und wird neu geschrieben.
+  if (st.digestVersion !== DIGEST_VERSION)
+    r.push(`Digest-Version ${st.digestVersion ?? '–'}→${DIGEST_VERSION}`);
+  else if (st.digest !== now.digest) r.push('Daten');
   if (st.qualityDigest !== now.quality) r.push('Klassifikation');
   const si = st.inputs;
   if (
@@ -407,6 +427,7 @@ export class Importer {
         firstDay: src.firstDay,
         lastDay: src.lastDay,
         want: (d) => d === day,
+        bigFloorN: this.floor,
         stopAfterDay: day,
         onDay: (c) => {
           if (c.day === day) chunk = c;
@@ -427,10 +448,18 @@ export class Importer {
 
   private chain: Chain | null = null;
   private open: OpenDay | null = null;
+  /** Untergrenze big_order für alle Tage dieses Laufs (aus dem geöffneten Schreiber). */
+  private floor: number | null = null;
 
   async run(): Promise<DaySummary[]> {
     const { spec, firstDay, writer, log } = this.o;
     let lastDay = this.o.lastDay;
+    this.floor = writer.bigFloorN();
+    if (this.floor === null) {
+      log(
+        `WARNUNG: keine Untergrenze big_floor_n für ${spec.name}: es werden keine big orders gespeichert`,
+      );
+    }
 
     // Vortag des Bereichs: gespeicherter Zustand (DB/Resume) hat Vorrang vor der Neuberechnung,
     // damit ein Lauf und mehrere Teilläufe identisch klassifizieren (die Kette des gespeicherten
@@ -586,6 +615,7 @@ export class Importer {
         firstDay: run.src.firstDay,
         lastDay: run.src.lastDay,
         want: (d) => want.has(d),
+        bigFloorN: this.floor,
         stopAfterDay: lastWanted,
         onDay: async (c) => {
           if (c.day !== expectNext) {
@@ -829,6 +859,8 @@ export class Importer {
     const inp = p.data.reconcileInput;
     const fpRows: Record<string, number> = {};
     for (const [t, tab] of Object.entries(p.data.fp)) fpRows[t] = tab.n;
+    const barsNotional = p.data.bar_1m.reduce((x, b) => x + b.notional, 0n);
+    const agg = p.data.agg;
     const s: DaySummary = {
       symbol: spec.name,
       day: formatDay(p.day),
@@ -858,9 +890,18 @@ export class Importer {
       ohlc: p.data.ohlc,
       minStepUnits: p.data.agg.minStepUnits,
       digest: p.data.digest,
+      digestVersion: DIGEST_VERSION,
       digests: p.data.digests,
       qualityDigest: qualityDigest(recon),
       ownQualityDigest: own,
+      orders: {
+        n: agg.ordersN,
+        notional: String(agg.ordersNotional),
+        barsNotional: String(barsNotional),
+        diff: String(agg.ordersNotional - barsNotional),
+        big: agg.bigOrders.length,
+        bigFloorN: agg.bigFloorN,
+      },
       inputs,
       decision,
       reasons,
@@ -923,6 +964,7 @@ export function formatSummary(s: DaySummary): string {
     `  Σvol ours=${t.ourQ} kline=${t.klQ} diff=${t.ourQ - t.klQ} | Σtaker ours=${t.ourB} kline=${t.klB} diff=${t.ourB - t.klB} | s(-1)=${s.carryIn.q}/${s.carryIn.b}${s.carryInKnown ? '' : ' (geschätzt)'} s(1439)=${s.carryOut.q}/${s.carryOut.b} identity=${t.identityQ && t.identityB} bounds=${t.carryBoundsOk}`,
     `  edge m0: ${e0.cls} (own ${e0.ownCls}, D=${e0.dQ}/${e0.dB}, s=${e0.sQ}/${e0.sB}) m1439: ${e1.cls} (own ${e1.ownCls}, D=${e1.dQ}/${e1.dB}, s=${e1.sQ}/${e1.sB}, cand=${e1.candQ}/${e1.candB})`,
     `  ohlc diff o/h/l/c=${s.ohlc.open}/${s.ohlc.high}/${s.ohlc.low}/${s.ohlc.close} of ${s.ohlc.compared} | fp_1m=${fmtInt(s.fpRows.fp_1m ?? 0)} bars=${s.bars} tick=${s.minStepUnits}`,
+    `  orders n=${fmtInt(s.orders.n)} Σnotional orders=${s.orders.notional} bars=${s.orders.barsNotional} diff=${s.orders.diff} | big_order=${fmtInt(s.orders.big)} (floor ${s.orders.bigFloorN ?? 'keine'})`,
     `  state=${s.state}${s.extraBad.length ? ` (${s.extraBad.join('; ')})` : ''}${s.decision === 'write' ? ` WRITTEN(${s.reasons.join(', ')})` : s.decision === 'skip' ? ' UNCHANGED' : ` KEPT(${s.reasons.join(', ')})`} digest=${s.digest}${s.dbDigest ? ` db=${s.dbDigest === s.digest ? 'match' : s.dbDigest}` : ''}`,
     `  time read=${s.timing.readMs}ms build=${s.timing.buildMs}ms write=${s.timing.writeMs}ms → ${fmtInt(s.timing.rowsPerSec)} rows/s`,
   ].join('\n');

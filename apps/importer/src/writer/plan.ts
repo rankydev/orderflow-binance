@@ -18,6 +18,9 @@ export class PlanWriter implements DayWriter {
   open(): Promise<void> {
     return this.inner.open();
   }
+  bigFloorN(): number | null {
+    return this.inner.bigFloorN();
+  }
   close(): Promise<void> {
     return this.inner.close();
   }

@@ -5,6 +5,7 @@
 // Schreiben in die Datenbank (minutenweise und je Tabelle per day_digest).
 import {
   barDigest,
+  bigOrderDigest,
   buildDayData,
   dayIndex,
   DAY_MS,
@@ -12,6 +13,7 @@ import {
   FP_TABLES,
   fpDigest,
   getSymbol,
+  orderDayDigest,
   parseAggTradeRange,
   SOURCE_VISION,
   type AggTrade,
@@ -24,6 +26,7 @@ import {
   isPresent,
   klineRef,
   readAggTrades,
+  readBigFloor,
   readKlineDay,
   streamSingleEntry,
   textBlocks,
@@ -82,6 +85,11 @@ export async function replayDay(o: {
   day: number;
   /** Datenbank für den Schreibtest (Test-Datenbank verwenden; der Tag wird dort ersetzt). */
   db: DbConfig | null;
+  /**
+   * Untergrenze big_order für Import und Live-Weg; ohne Angabe symbol.big_floor_n der Datenbank
+   * (mit `db`) bzw. keine (ohne).
+   */
+  bigFloorN?: number | null;
   log: (msg: string, f?: Record<string, unknown>) => void;
 }): Promise<ReplayResult> {
   const t0 = performance.now();
@@ -98,12 +106,33 @@ export async function replayDay(o: {
     throw new Error(`Tagesdateien für ${o.symbol} ${ds} fehlen`);
   await verifyFile(aggPath);
   const raw = await readRaw(aggPath, spec);
+  let writer: LiveWriter | null = null;
+  if (o.db) {
+    writer = new LiveWriter(o.db);
+    await writer.open();
+    // löscht und ersetzt einen ganzen Tag: nur auf Test-Datenbanken (Review: gleiche Klasse wie
+    // der Vorfall vom 2026-11-24)
+    try {
+      await assertTestDatabase(writer.db);
+    } catch (e) {
+      await writer.close();
+      throw e;
+    }
+    await writer.ensureSymbol(spec);
+  }
+  const bigFloorN =
+    o.bigFloorN !== undefined
+      ? o.bigFloorN
+      : writer
+        ? await readBigFloor(writer.db, spec.symId)
+        : null;
   // Referenz: der Importer-Weg
   let agg;
   await readAggTrades(aggPath, spec, {
     firstDay: o.day,
     lastDay: o.day,
     want: () => true,
+    bigFloorN,
     onDay: (c) => {
       agg = c.agg;
     },
@@ -128,22 +157,17 @@ export async function replayDay(o: {
     },
   };
   const deltas: MinuteDelta[] = [];
-  let writer: LiveWriter | null = null;
   let sink: LiveSink;
-  if (o.db) {
-    writer = new LiveWriter(o.db);
-    await writer.open();
-    // löscht und ersetzt einen ganzen Tag: nur auf Test-Datenbanken (Review: gleiche Klasse wie
-    // der Vorfall vom 2026-11-24)
-    try {
-      await assertTestDatabase(writer.db);
-    } catch (e) {
-      await writer.close();
-      throw e;
-    }
-    await writer.ensureSymbol(spec);
+  if (writer) {
     // Tag in der (Test-)DB vorher entfernen; data_day des Vortags als finale Kette setzen
-    for (const t of [...FP_TABLES, 'bar_1m', 'bar_1h', 'bar_1d', 'data_minute_issue']) {
+    for (const t of [
+      ...FP_TABLES,
+      'bar_1m',
+      'bar_1h',
+      'bar_1d',
+      'big_order',
+      'data_minute_issue',
+    ]) {
       await writer.db.unsafe(`DELETE FROM ${t} WHERE sym_id = $1 AND ts >= $2 AND ts < $3`, [
         spec.symId,
         new Date(o.day * DAY_MS),
@@ -156,6 +180,7 @@ export async function replayDay(o: {
       startState: async () => ({
         final: { day: o.day - 1, lastAggId: raw[0]!.a - 1, carry: null, cand: null },
         provisional: [],
+        bigFloorN,
       }),
       writeMinute: async (s, d) => {
         deltas.push(d);
@@ -170,6 +195,7 @@ export async function replayDay(o: {
       startState: async () => ({
         final: { day: o.day - 1, lastAggId: raw[0]!.a - 1, carry: null, cand: null },
         provisional: [],
+        bigFloorN,
       }),
       writeMinute: async (_s, d) => {
         deltas.push(d);
@@ -234,6 +260,13 @@ export async function replayDay(o: {
   tables.bar_1m = barDigest(spec.symId, snap.bar_1m, SOURCE_VISION) === ref.digests.bar_1m;
   tables.bar_1h = barDigest(spec.symId, snap.bar_1h) === ref.digests.bar_1h;
   tables.bar_1d = barDigest(spec.symId, snap.bar_1d) === ref.digests.bar_1d;
+  tables.big_order = bigOrderDigest(spec.symId, snap.bigOrders) === ref.digests.big_order;
+  tables.order_day =
+    orderDayDigest(spec.symId, o.day, {
+      ordersN: snap.orders.n,
+      ordersNotional: snap.orders.notional,
+      bigFloorN,
+    }) === ref.digests.order_day;
   let db: QualityResult | null = null;
   if (writer) {
     db = await compareLiveDay(writer.db, ref);

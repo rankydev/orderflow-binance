@@ -4,26 +4,30 @@
 //  1. Transaktion A: Lock prüfen; data_day → 'importing' (anlegen oder umstellen, alter Zustand gemerkt).
 //  2. Transaktion B: Lock prüfen → den Tag überdeckende Columnstore-Chunks in den Rowstore wandeln
 //     (convert_to_rowstore, §3.9) → DELETE des Tages in allen Tabellen → COPY fp_1m, Rollups,
-//     bar_1m/1h/1d, kline_1m → data_minute_issue (eigene Klasse je Minute), raw_file, raw_day,
-//     symbol_tick_history → day_digest_all (SQL) muss dem TS-Digest gleichen → data_day final_* mit
-//     version + 1, Übertrag und offenen Randminuten → COMMIT → vorher komprimierte Chunks wieder
-//     konvertieren (convert_to_columnstore).
+//     bar_1m/1h/1d, kline_1m, big_order → data_minute_issue (eigene Klasse je Minute), raw_file,
+//     raw_day, symbol_tick_history, Ordersummen in data_day → day_digest_all (SQL) muss dem
+//     TS-Digest gleichen → data_day final_* mit version + 1, digest_version, Übertrag und offenen
+//     Randminuten → COMMIT → vorher komprimierte Chunks wieder konvertieren (convert_to_columnstore).
 //  3. Fehler in B: Rollback; data_day zurück auf den vorherigen Zustand (bzw. provisional_import_failed).
 // Single Writer: Session-Advisory-Lock auf einer Verbindung ohne max_lifetime/idle_timeout; vor jeder
 // Transaktion wird geprüft, dass diese Sitzung ihn noch hält (sonst neu erwerben oder Abbruch).
 // Backfill-Modus (§4.1): Columnstore-Jobs pausiert, abgeschlossene Chunks explizit konvertiert.
 import {
   checkStateOf,
+  DATA_HYPERTABLES,
   DAY_MS,
   DIGEST_TABLES,
+  DIGEST_VERSION,
   formatDay,
   FP_TABLES,
   MinuteClass,
   MINUTE_MS,
   pgTimestamptz,
+  pgTimestamptzMs,
   SOURCE_VISION,
   unitString,
   type Bar,
+  type BigOrder,
   type DayManifest,
   type DbConfig,
   type FileManifest,
@@ -57,6 +61,29 @@ const BAR_COLS =
   'first_agg_id, last_agg_id, first_trade_ms, last_trade_ms, run_max, run_min, d_from_low, d_from_high';
 const KLINE_COLS =
   'sym_id, ts, open_px, high_px, low_px, close_px, vol, taker_buy, trades, quote_vol_n';
+export const BIG_ORDER_COLS =
+  'sym_id, ts, first_agg_id, last_agg_id, side, px_first, px_last, qty, notional, agg_n';
+
+/** big_order-Zeilen im COPY-Textformat (ts mit Millisekunden). Auch vom Recorder verwendet. */
+export function bigOrderText(symId: number, rows: readonly BigOrder[]): string {
+  return rows
+    .map(
+      (o) =>
+        `${symId}\t${pgTimestamptzMs(o.ts)}\t${o.firstAggId}\t${o.lastAggId}\t${o.side}\t` +
+        `${o.pxFirst}\t${o.pxLast}\t${o.qty}\t${o.notional}\t${o.aggN}\n`,
+    )
+    .join('');
+}
+
+/** symbol.big_floor_n lesen (bigint → Zahl, nur exakt; NULL = keine Untergrenze). */
+export async function readBigFloor(sql: Tx, symId: number): Promise<number | null> {
+  const [r] = await sql`SELECT big_floor_n::text AS f FROM symbol WHERE sym_id = ${symId}`;
+  if (!r) throw new Error(`Tabelle symbol: sym_id ${symId} fehlt`);
+  if (r.f === null) return null;
+  const n = safeNumber(r.f, 'symbol.big_floor_n');
+  if (n <= 0) throw new Error(`symbol.big_floor_n (sym_id ${symId}) muss positiv sein: ${n}`);
+  return n;
+}
 
 type Tx = Sql | TransactionSql;
 
@@ -213,6 +240,8 @@ export class PostgresWriter implements DayWriter {
   private pausedJobs: number[] = [];
   /** Zeitpunkte (ms), bis zu denen Chunks im Backfill konvertiert werden dürfen. */
   private writtenUntil = 0;
+  /** symbol.big_floor_n beim Öffnen; undefined = nicht geöffnet. */
+  private floor: number | null | undefined = undefined;
 
   constructor(cfg: DbConfig, spec: SymbolSpec, opt: PostgresWriterOptions = {}) {
     this.cfg = cfg;
@@ -249,9 +278,19 @@ export class PostgresWriter implements DayWriter {
     return this.sql;
   }
 
+  bigFloorN(): number | null {
+    if (this.floor === undefined) throw new Error('PostgresWriter nicht geöffnet (big_floor_n)');
+    return this.floor;
+  }
+
   async open(): Promise<void> {
     this.sql = connect(this.cfg);
-    if (this.opt.readOnly) return; // --plan: nur lesen, kein Lock, keine Änderungen
+    if (this.opt.readOnly) {
+      // --plan: nur lesen, kein Lock, keine Änderungen (ohne Symbolzeile: wie ein neues Symbol)
+      const [r] = await this.db`SELECT 1 FROM symbol WHERE sym_id = ${this.spec.symId}`;
+      this.floor = r ? await readBigFloor(this.db, this.spec.symId) : null;
+      return;
+    }
     const [l] = await this.db`SELECT pg_try_advisory_lock(${IMPORTER_LOCK_KEY}) AS ok`;
     if (!l?.ok) {
       await this.sql.end();
@@ -280,6 +319,8 @@ export class PostgresWriter implements DayWriter {
         `Tabelle symbol (sym_id ${s.symId}) passt nicht zu den Einheiten im Code: ${JSON.stringify(row)}`,
       );
     }
+    // Untergrenze big_order (§3.7) ist Daten (Migration 0017 setzt sie); für den ganzen Lauf fest.
+    this.floor = await readBigFloor(this.db, s.symId);
     // Review H2: offene Chunks im Columnstore (Migration 0015 verbietet sie) laut melden; ein Import
     // in einen solchen Chunk ist korrekt, ließe ihn aber teilweise komprimiert zurück.
     const hot = await openColumnstoreChunks(this.db);
@@ -318,7 +359,7 @@ export class PostgresWriter implements DayWriter {
       const jobs = await tx`
         SELECT job_id FROM timescaledb_information.jobs
          WHERE proc_name IN ('policy_compression', 'policy_columnstore')
-           AND hypertable_schema = 'public' AND hypertable_name = ANY(${[...DIGEST_TABLES]}::text[])
+           AND hypertable_schema = 'public' AND hypertable_name = ANY(${[...DATA_HYPERTABLES]}::text[])
            AND scheduled = ${from}`;
       for (const j of jobs)
         await tx`SELECT alter_job(${j.job_id as number}, scheduled => ${scheduled})`;
@@ -335,7 +376,7 @@ export class PostgresWriter implements DayWriter {
           ON h.hypertable_schema = c.hypertable_schema AND h.hypertable_name = c.hypertable_name
         JOIN _timescaledb_catalog.chunk k
           ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
-       WHERE c.hypertable_schema = 'public' AND c.hypertable_name = ANY(${[...DIGEST_TABLES]}::text[])
+       WHERE c.hypertable_schema = 'public' AND c.hypertable_name = ANY(${[...DATA_HYPERTABLES]}::text[])
          AND h.compression_enabled AND c.range_end <= ${new Date(untilMs)}
          AND c.range_end <= now() - of_hot_margin() -- offene Chunks nie (0015/0016)
          -- nur Chunks mit unkomprimierten Zeilen: nicht komprimiert, oder teilweise (Status-Bit 8
@@ -370,7 +411,7 @@ export class PostgresWriter implements DayWriter {
         FROM timescaledb_information.chunks c
         JOIN _timescaledb_catalog.chunk k
           ON k.relid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
-       WHERE c.hypertable_schema = 'public' AND c.hypertable_name = ANY(${[...DIGEST_TABLES]}::text[])
+       WHERE c.hypertable_schema = 'public' AND c.hypertable_name = ANY(${[...DATA_HYPERTABLES]}::text[])
          AND (${to ?? null}::timestamptz IS NULL OR c.range_start < ${to ?? null})
          AND (${from ?? null}::timestamptz IS NULL OR c.range_end > ${from ?? null})
          AND (k.status & 8) <> 0 AND (k.status & 4) = 0 AND NOT k.osm_chunk
@@ -443,7 +484,7 @@ export class PostgresWriter implements DayWriter {
 
   async storedDay(_symbol: string, day: number): Promise<StoredDay | null> {
     const [r] = await this.db`
-      SELECT state, stale, digest, quality_digest, raw_sha256, kline_sha256, importer_version,
+      SELECT state, stale, digest, digest_version, quality_digest, raw_sha256, kline_sha256, importer_version,
              carry_in_q, carry_in_b, carry_in_origin, prev_last_agg_id, cand_in_q, cand_in_b,
              carry_q, carry_b, cand_last_q, cand_last_b, last_agg_id
         FROM data_day WHERE sym_id = ${this.spec.symId} AND day = ${formatDay(day)}::date`;
@@ -454,6 +495,7 @@ export class PostgresWriter implements DayWriter {
       state: r.state as string,
       stale: r.stale as boolean,
       digest: (r.digest as string | null) ?? null,
+      digestVersion: (r.digest_version as number | null) ?? null,
       qualityDigest: (r.quality_digest as string | null) ?? null,
       aggSha256: (r.raw_sha256 as string | null) ?? null,
       klineSha256: (r.kline_sha256 as string | null) ?? null,
@@ -479,20 +521,38 @@ export class PostgresWriter implements DayWriter {
   }
 
   /**
-   * H-e: Tabelleninhalt gegen data_day.digest prüfen (day_digest_all je Tag, ≈ 1 s/Tag). „Fertig"
-   * vertraut sonst dem gespeicherten Digest; dies deckt nachträgliche Änderungen der Tabellen auf.
+   * H-e: Tabelleninhalt gegen data_day.digest prüfen (≈ 1 s/Tag). „Fertig" vertraut sonst dem
+   * gespeicherten Digest; dies deckt nachträgliche Änderungen der Tabellen auf. Geprüft wird in der
+   * Digest-Version des gespeicherten Digests (day_digest_all_v, Migration 0017): ein Tag aus der Zeit
+   * vor big_order stimmt in Version 1 überein und wird mit seiner Version gemeldet, nicht als
+   * Abweichung und nicht als Tag mit Order-Daten.
    */
   async verifyDb(
     firstDay: number,
     lastDay: number,
-  ): Promise<{ day: string; stored: string | null; actual: string }[]> {
-    const out: { day: string; stored: string | null; actual: string }[] = [];
+  ): Promise<
+    { day: string; stored: string | null; actual: string | null; version: number | null }[]
+  > {
+    const out: {
+      day: string;
+      stored: string | null;
+      actual: string | null;
+      version: number | null;
+    }[] = [];
     for (let d = firstDay; d <= lastDay; d++) {
       const day = formatDay(d);
       const [r] = await this.db`
-        SELECT digest, day_digest_all(${this.spec.symId}::smallint, ${day}::date) AS actual
+        SELECT digest, digest_version,
+               CASE WHEN digest_version IS NULL THEN NULL
+                    ELSE day_digest_all_v(sym_id, day, digest_version) END AS actual
           FROM data_day WHERE sym_id = ${this.spec.symId} AND day = ${day}::date`;
-      if (r) out.push({ day, stored: r.digest as string | null, actual: r.actual as string });
+      if (r)
+        out.push({
+          day,
+          stored: r.digest as string | null,
+          actual: r.actual as string | null,
+          version: (r.digest_version as number | null) ?? null,
+        });
     }
     return out;
   }
@@ -532,7 +592,7 @@ export class PostgresWriter implements DayWriter {
   }
 
   private async rowstoreDay(from: Date, to: Date): Promise<string[]> {
-    const tables = [...DIGEST_TABLES];
+    const tables = [...DATA_HYPERTABLES];
     const chunks = await this.db`
       SELECT format('%I.%I', chunk_schema, chunk_name) AS c
         FROM timescaledb_information.chunks
@@ -586,6 +646,13 @@ export class PostgresWriter implements DayWriter {
     const from = new Date(data.day * DAY_MS);
     const to = new Date((data.day + 1) * DAY_MS);
     const state = stateOf(recon, w.extraBad);
+    // Der Tag muss mit der Untergrenze dieser Datenbank berechnet sein (sonst wären big_order und
+    // data_day.big_floor_n inkonsistent).
+    if (data.agg.bigFloorN !== this.bigFloorN()) {
+      throw new Error(
+        `${dayStr}: mit big_floor_n ${data.agg.bigFloorN} berechnet, symbol.big_floor_n ist ${this.floor}`,
+      );
+    }
 
     // A: 'importing' setzen; den Zustand davor merken (bei einem früher abgebrochenen Import den
     // dort gemerkten, damit ein Tag mit gültigen finalen Daten final bleibt, Review N4).
@@ -617,7 +684,7 @@ export class PostgresWriter implements DayWriter {
         // in fp_1m: > 10⁶ Zeilen); Timescales Standardgrenze (100 000 je Transaktion) bräche den
         // Ersatz ab. Nur für diese Transaktion aufheben (USERSET, auch für of_recorder erlaubt).
         await tx`SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0`;
-        for (const t of DIGEST_TABLES) {
+        for (const t of DATA_HYPERTABLES) {
           await tx.unsafe(`DELETE FROM ${t} WHERE sym_id = $1 AND ts >= $2 AND ts < $3`, [
             symId,
             from,
@@ -635,6 +702,7 @@ export class PostgresWriter implements DayWriter {
         await copyInto(tx, 'bar_1h', BAR_COLS, barLines(symId, data.bar_1h));
         await copyInto(tx, 'bar_1d', BAR_COLS, barLines(symId, data.bar_1d));
         await copyInto(tx, 'kline_1m', KLINE_COLS, klineLines(symId, data.klines));
+        await copyInto(tx, 'big_order', BIG_ORDER_COLS, [bigOrderText(symId, data.agg.bigOrders)]);
         const issues = issueRows(symId, data.day, recon, data.reconcileInput);
         if (issues.length) await tx`INSERT INTO data_minute_issue ${tx(issues)}`;
         await this.upsertFile(tx, w.aggFile);
@@ -646,6 +714,21 @@ export class PostgresWriter implements DayWriter {
             INSERT INTO symbol_tick_history (sym_id, day, min_step_units)
             VALUES (${symId}, ${dayStr}::date, ${data.agg.minStepUnits})
             ON CONFLICT (sym_id, day) DO UPDATE SET min_step_units = EXCLUDED.min_step_units`;
+        }
+        // Ordersummen vor der Digest-Gegenprobe: sie sind Teil des Digests (order_day, Version 2)
+        await tx`
+          UPDATE data_day SET orders_n = ${data.agg.ordersN},
+                 orders_notional = ${String(data.agg.ordersNotional)}::bigint,
+                 big_floor_n = ${data.agg.bigFloorN}
+           WHERE sym_id = ${symId} AND day = ${dayStr}::date`;
+        // Abgleich in der Datenbank: Σ Notional aller Orders = Σ bar_1m.notional des Tages
+        const [rc] = await tx`
+          SELECT coalesce(sum(notional), 0)::text AS bars FROM bar_1m
+           WHERE sym_id = ${symId} AND ts >= ${from} AND ts < ${to}`;
+        if (rc!.bars !== String(data.agg.ordersNotional)) {
+          throw new Error(
+            `${dayStr}: Σ Notional Orders ${data.agg.ordersNotional} ≠ Σ bar_1m.notional ${rc!.bars as string}`,
+          );
         }
         const [dg] = await tx`SELECT day_digest_all(${symId}::smallint, ${dayStr}::date) AS d`;
         const dbDigest = dg?.d as string;
@@ -670,7 +753,8 @@ export class PostgresWriter implements DayWriter {
                  edge_last_pending = ${recon.cls[1439] === MinuteClass.edge_pending},
                  carry_q = ${recon.carryOut.q}, carry_b = ${recon.carryOut.b},
                  cand_last_q = ${recon.candLast.q}, cand_last_b = ${recon.candLast.b},
-                 digest = ${data.digest}, importer_version = ${w.importerVersion}, imported_at = now(),
+                 digest = ${data.digest}, digest_version = ${DIGEST_VERSION},
+                 importer_version = ${w.importerVersion}, imported_at = now(),
                  quality_digest = ${w.qualityDigest}, rules_version = ${w.rulesVersion},
                  kline_sha256 = ${w.klineFile.sha256},
                  carry_in_q = ${w.inputs.carryIn.q}, carry_in_b = ${w.inputs.carryIn.b},

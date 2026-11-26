@@ -77,6 +77,8 @@ export interface ReadAggOptions {
   lastDay: number;
   /** Tage, für die aggregiert wird. */
   want: (day: number) => boolean;
+  /** Untergrenze für big_order (symbol.big_floor_n; null = keine big orders). */
+  bigFloorN: number | null;
   /** Lesen beenden, sobald ein Tag nach diesem beginnt (Nachbartag aus einer Monatsdatei). */
   stopAfterDay?: number;
   /** Sofort nach der ersten Zeile: Kopfzeile vorhanden? */
@@ -126,7 +128,7 @@ export async function readAggTrades(
       close();
       curDay = d;
       stats = new DayStats();
-      agg = opt.want(d) ? new DayAggregator(d) : null;
+      agg = opt.want(d) ? new DayAggregator(d, opt.bigFloorN) : null;
     }
     if (t.a <= lastA)
       throw new ParseError(`aggId ${t.a} nicht aufsteigend (vorher ${lastA}): Duplikat/Umordnung`);

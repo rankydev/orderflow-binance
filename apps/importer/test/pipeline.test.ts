@@ -15,8 +15,8 @@ import { archive } from './synth.ts';
 
 const BTC = getSymbol('BTCUSDT');
 const PIN = {
-  rules: '1',
-  digest: 'c07ef0d791154d390f42f74cf13345f131420d35df6fb5eef62155ae00fd7310',
+  rules: '2',
+  digest: '94d5f10e5dbc73451b2120c31bd032d5012ba4b7cc02ac090e228ae9cc839873',
   quality: '3c85bb6fa313f59f20b54f93b26503f8d2f8dbed9984b2abe70f71417a2a1ba6',
   candidates: 1,
   cand: [

@@ -22,7 +22,10 @@ export function indexKlines(day: number, klines: readonly Kline[]): (Kline | und
   return out;
 }
 
-export function buildReconcileInput(agg: DayAggregate, klines: readonly Kline[]): ReconcileInput {
+export function buildReconcileInput(
+  agg: Pick<DayAggregate, 'day' | 'bars' | 'candQ' | 'candB'>,
+  klines: readonly Kline[],
+): ReconcileInput {
   const n = MINUTES_PER_DAY;
   const start = agg.day * DAY_MS;
   const inp: ReconcileInput = {

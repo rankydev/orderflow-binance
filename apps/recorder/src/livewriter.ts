@@ -1,7 +1,8 @@
 // Datenbank-Schreiber des Recorders (KONZEPT §4.2, §4.3). Eine Transaktion je abgeschlossener
 // Minute: Lock prüfen → data_day des Tages FOR UPDATE (anlegen als `provisional`; ist der Tag nicht
 // `provisional`, wird nichts geschrieben) → je betroffener Tabelle Bucket löschen und neu einfügen
-// (Replace, nie Merge) → data_day (version + 1, live_until). Leser sehen eine Minute ganz oder gar
+// (Replace, nie Merge; auch big_order der Minute) → data_day (version + 1, live_until, Ordersummen
+// des Tages absolut). Leser sehen eine Minute ganz oder gar
 // nicht. Eigener Advisory-Lock (ein Recorder je Datenbank), unabhängig vom Importer-Lock; die
 // Reihenfolge „data_day-Zeile zuerst" in Recorder und Importer verhindert Deadlocks.
 import {
@@ -17,7 +18,7 @@ import {
   type SymbolSpec,
 } from '@orderflow/core';
 import { connect, type Sql } from '@orderflow/db';
-import { safeNumber } from '@orderflow/importer';
+import { BIG_ORDER_COLS, bigOrderText, readBigFloor, safeNumber } from '@orderflow/importer';
 import type { TransactionSql } from 'postgres';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -161,6 +162,7 @@ export class LiveWriter {
   async startState(spec: SymbolSpec): Promise<{
     final: StoredFinal | null;
     provisional: { day: number; state: string; liveUntil: number | null; frozen: string | null }[];
+    bigFloorN: number | null;
   }> {
     const n = (v: unknown) => safeNumber(v, 'data_day');
     const [f] = await this.db`
@@ -180,6 +182,8 @@ export class LiveWriter {
          AND day > ${final ? formatDay(final.day) : '1970-01-01'}::date ORDER BY day`;
     return {
       final,
+      // dieselbe Quelle wie der Importer (Migration 0017); feste Größe für die Laufzeit
+      bigFloorN: await readBigFloor(this.db, spec.symId),
       provisional: prov.map((p) => ({
         day: Date.parse(`${p.day as string}T00:00:00Z`) / DAY_MS,
         state: p.state as string,
@@ -232,15 +236,31 @@ export class LiveWriter {
           await copy(tx, b.table, BAR_COLS, b.bars.map((x) => barText(symId, x, '')).join(''));
         }
       }
+      await tx`DELETE FROM big_order WHERE sym_id = ${symId} AND ts >= ${new Date(d.big.from)}
+                 AND ts < ${new Date(d.big.to)}`;
+      await copy(tx, 'big_order', BIG_ORDER_COLS, bigOrderText(symId, d.big.rows));
       const source = d.viaRest || row?.source === 'live+rest' ? 'live+rest' : 'live';
       const day = d.bars.find((b) => b.table === 'bar_1d')!.bars[0]!;
       await tx`
         UPDATE data_day SET version = version + 1, source = ${source},
                first_agg_id = ${day.firstAggId}, last_agg_id = ${day.lastAggId},
                rows = ${day.buyA + day.sellA},
+               big_floor_n = ${d.orders.bigFloorN},
                live_until = greatest(coalesce(live_until, ${minuteEnd}), ${minuteEnd}),
                live_minutes = (SELECT count(*) FROM bar_1m WHERE sym_id = ${symId}
                                  AND ts >= ${new Date(d.day * DAY_MS)} AND ts < ${new Date((d.day + 1) * DAY_MS)})
+         WHERE sym_id = ${symId} AND day = ${dayStr}::date`;
+      // Ordersummen absolut aus dem Speicher; sie gelten nur, wenn der Speicher den ganzen bisher
+      // geschriebenen Tag enthält (Neustart mit unvollständiger Spool): Σ Notional muss Σ
+      // bar_1m.notional der DB gleichen, sonst NULL (unbekannt) statt einer falschen Summe.
+      await tx`
+        UPDATE data_day SET
+               orders_n = CASE WHEN b.ntl = ${String(d.orders.notional)}::numeric THEN ${d.orders.n}::bigint END,
+               orders_notional = CASE WHEN b.ntl = ${String(d.orders.notional)}::numeric
+                                      THEN ${String(d.orders.notional)}::bigint END
+          FROM (SELECT coalesce(sum(notional), 0) AS ntl FROM bar_1m
+                 WHERE sym_id = ${symId} AND ts >= ${new Date(d.day * DAY_MS)}
+                   AND ts < ${new Date((d.day + 1) * DAY_MS)}) b
          WHERE sym_id = ${symId} AND day = ${dayStr}::date`;
       return 'written' as const;
     });

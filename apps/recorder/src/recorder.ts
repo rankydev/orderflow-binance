@@ -26,6 +26,8 @@ export interface LiveSink {
   startState(spec: SymbolSpec): Promise<{
     final: StoredFinal | null;
     provisional: { day: number; state: string; liveUntil: number | null; frozen?: string | null }[];
+    /** symbol.big_floor_n (Untergrenze big_order wie im Import; null = keine big orders). */
+    bigFloorN: number | null;
   }>;
   writeMinute(spec: SymbolSpec, d: MinuteDelta): Promise<MinuteWriteResult>;
   markGap(spec: SymbolSpec, fromMs: number, toMs: number): Promise<void>;
@@ -93,6 +95,8 @@ interface DayInfo {
 
 export interface SymbolState {
   spec: SymbolSpec;
+  /** Untergrenze big_order beim Start (symbol.big_floor_n). */
+  bigFloorN: number | null;
   feed: SymbolFeed;
   spool: SpoolWriter | null;
   days: Map<number, DayInfo>;
@@ -157,6 +161,7 @@ export class Recorder {
       const st = await this.o.sink.startState(spec);
       const s: SymbolState = {
         spec,
+        bigFloorN: st.bigFloorN,
         feed: new SymbolFeed(st.final?.lastAggId != null ? st.final.lastAggId + 1 : null),
         spool: this.o.spoolDir ? new SpoolWriter(this.o.spoolDir, name) : null,
         days: new Map(),
@@ -263,7 +268,7 @@ export class Recorder {
     let di = s.days.get(day);
     if (!di) {
       di = {
-        live: new LiveDay(s.spec, day),
+        live: new LiveDay(s.spec, day, s.bigFloorN),
         skipBefore: 0,
         frozen: null,
         klines: new Map(),
@@ -672,16 +677,7 @@ export class Recorder {
     const bars = di.live.completedBars();
     const cands = di.live.agg.candidates();
     const inp = buildReconcileInput(
-      {
-        day,
-        trades: 0,
-        fp1m: undefined as never,
-        bars,
-        candQ: cands.candQ,
-        candB: cands.candB,
-        candCount: cands.count,
-        minStepUnits: 0,
-      },
+      { day, bars, candQ: cands.candQ, candB: cands.candB },
       [...di.klines.values()].sort((a, b) => a.openTime - b.openTime),
     );
     const prev =

@@ -59,3 +59,14 @@ export function pgTimestamptz(ms: number): string {
   const iso = new Date(ms).toISOString(); // YYYY-MM-DDTHH:MM:SS.000Z
   return `${iso.slice(0, 10)} ${iso.slice(11, 19)}+00`;
 }
+
+/**
+ * Wie pgTimestamptz, aber mit Millisekunden (big_order.ts = T der Order): Postgres gibt den
+ * Sekundenbruch ohne abschließende Nullen aus („…:05.12+00" für 120 ms, ganz ohne bei 0 ms).
+ */
+export function pgTimestamptzMs(ms: number): string {
+  if (!Number.isSafeInteger(ms)) throw new Error(`pgTimestamptzMs: ${ms} ist keine Ganzzahl`);
+  const iso = new Date(ms).toISOString();
+  const frac = iso.slice(20, 23).replace(/0+$/, '');
+  return `${iso.slice(0, 10)} ${iso.slice(11, 19)}${frac ? `.${frac}` : ''}+00`;
+}

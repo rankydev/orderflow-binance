@@ -126,7 +126,7 @@ async function checkFinalise(): Promise<void> {
   const snap = async () =>
     (
       await db.sql`SELECT state, stale, live_frozen, version, rows, digest, edge_first_pending,
-                          day_digest_all(sym_id, day) AS db_digest
+                          day_digest_all_v(sym_id, day, coalesce(digest_version, 2)) AS db_digest
                      FROM data_day WHERE sym_id = ${spec.symId} AND day = ${day}::date`
     )[0];
   const a = await snap();

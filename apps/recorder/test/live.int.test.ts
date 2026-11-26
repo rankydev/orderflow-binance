@@ -27,11 +27,21 @@ const BTC = getSymbol('BTCUSDT');
 let sql: Sql;
 let dir: string;
 const DAY = parseDay('2026-09-10');
+/**
+ * Untergrenze big_order der Test-DB (Daten, wie in Produktion): 3·10⁷ = 300 USDT, damit der
+ * synthetische Tag (Einzel-aggTrades mit 1–13 Lots) big orders hat.
+ */
+const FLOOR = 30_000_000;
 
 beforeAll(async () => {
   await dropAndCreateDatabase(cfg);
   sql = connect(cfg);
   await migrateUp(sql);
+  const w = new LiveWriter(cfg);
+  await w.open();
+  await w.ensureSymbol(BTC);
+  await w.close();
+  await sql`UPDATE symbol SET big_floor_n = ${FLOOR} WHERE sym_id = ${BTC.symId}`;
   dir = archive({ dailyDays: ['2026-09-10', '2026-09-14', '2026-09-15'] });
 });
 afterAll(async () => {
@@ -74,6 +84,21 @@ describe('Recorder ↔ Datenbank', () => {
       live_minutes: 1440,
     });
     expect(d!.version).toBeGreaterThanOrEqual(1440);
+    // big orders live geschrieben (je Minute ersetzt) = Import; Ordersummen absolut = Σ bar_1m
+    expect(r.tables.big_order && r.tables.order_day).toBe(true);
+    expect(r.db!.tablesEqual).toMatchObject({ big_order: true, order_day: true });
+    const [o] = await sql`
+      SELECT d.orders_n, d.orders_notional::text AS ntl, d.big_floor_n::text AS floor,
+             (SELECT count(*)::int FROM big_order WHERE sym_id = 1 AND ts >= '2026-09-10' AND ts < '2026-09-11') AS big,
+             (SELECT count(*)::int FROM big_order WHERE sym_id = 1 AND ts >= '2026-09-10' AND ts < '2026-09-11'
+                AND notional < ${FLOOR}) AS below,
+             (SELECT sum(notional)::text FROM bar_1m WHERE sym_id = 1 AND ts >= '2026-09-10' AND ts < '2026-09-11') AS bars
+        FROM data_day d WHERE d.sym_id = 1 AND d.day = '2026-09-10'`;
+    expect(o!.big).toBeGreaterThan(0);
+    expect(o!.below).toBe(0);
+    expect(o!.ntl).toBe(o!.bars);
+    expect(o!.floor).toBe(String(FLOOR));
+    expect(Number(o!.orders_n)).toBeGreaterThanOrEqual(1440);
     // jede Minute vollständig: Footprint-Summen = Bar je Minute, check_state ungeprüft
     const bad = await sql`
       SELECT b.ts FROM bar_1m b
@@ -98,19 +123,25 @@ describe('Recorder ↔ Datenbank', () => {
       lastDay: DAY,
       prefer: 'daily',
       neighbours: true,
-      writer: new DryRunWriter(),
+      writer: new DryRunWriter(undefined, FLOOR),
       importerVersion: 'x',
       sidecar: false,
       log: () => {},
     }).run();
-    const [d] =
-      await sql`SELECT state, digest, immutable, source FROM data_day WHERE sym_id = 1 AND day = '2026-09-10'`;
+    const [d] = await sql`
+      SELECT state, digest, digest_version, immutable, source, orders_n,
+             (SELECT count(*)::int FROM big_order WHERE sym_id = 1 AND ts >= '2026-09-10' AND ts < '2026-09-11') AS big
+        FROM data_day WHERE sym_id = 1 AND day = '2026-09-10'`;
     expect(d).toMatchObject({
       state: 'final_ok',
       digest: dry!.digest,
+      digest_version: 2,
       immutable: true,
       source: 'vision',
+      big: dry!.orders.big,
     });
+    expect(dry!.orders.big).toBeGreaterThan(0);
+    expect(q!.tables_equal).toMatchObject({ big_order: true, order_day: true });
   });
 
   it('Locks: ein Recorder je DB; Importer und Recorder blockieren sich nicht; Import beendet das Schreiben', async () => {
@@ -129,6 +160,8 @@ describe('Recorder ↔ Datenbank', () => {
       bars: [{ table: 'bar_1d' as const, from: 0, to: 0, bars: [] }],
       viaRest: false,
       trades: 0,
+      big: { from: 0, to: 0, rows: [] },
+      orders: { n: 0, notional: 0n, bigFloorN: null },
     };
     expect(await a.writeMinute(BTC, delta)).toBe('not_provisional');
     await a.close();
@@ -150,6 +183,7 @@ const RECORDER_WRITES = [
   'bar_1h',
   'bar_1d',
   'kline_1m',
+  'big_order',
   'data_day',
   'data_minute_issue',
   'raw_file',
@@ -591,6 +625,7 @@ describe('Offene Chunks nie im Columnstore (Migration 0015)', () => {
         startState: async () => ({
           final: { day: day - 1, lastAggId: firstId - 1, carry: null, cand: null },
           provisional: [],
+          bigFloorN: null,
         }),
         writeMinute: (s, d) => w.writeMinute(s, d),
         markGap: async () => {},

@@ -36,6 +36,8 @@ const P1_TABLES = [
   'ingest_status',
   'live_kline_check',
   'recorder_quality',
+  // P5 (Migration 0017)
+  'big_order',
 ];
 // KONZEPT §3.9: Chunk-Intervall und Columnstore-Frist je Hypertable
 // afterDays null = kein Columnstore (Jahres-Chunk-Tabellen, Migration 0006 / Review N5).
@@ -49,6 +51,7 @@ const HYPERTABLES: Record<string, { chunkDays: number; afterDays: number | null 
   fp_1h_b100: { chunkDays: 30, afterDays: 4 },
   bar_1m: { chunkDays: 30, afterDays: 4 },
   kline_1m: { chunkDays: 30, afterDays: 4 },
+  big_order: { chunkDays: 30, afterDays: 4 },
   fp_1d_b100: { chunkDays: 365, afterDays: null },
   fp_1d_b1000: { chunkDays: 365, afterDays: null },
   bar_1h: { chunkDays: 365, afterDays: null },
@@ -154,6 +157,86 @@ describe('Migrationen', () => {
     expect(cs?.is_compressed).toBe(true);
     await sql.unsafe(`CALL convert_to_rowstore('${c}'::regclass)`);
     await sql`DELETE FROM fp_1m`;
+  });
+
+  it('0017 auf bestehenden Daten: alte Digests werden Version 1, Untergrenzen aus den Einheiten, down entfernt alles', async () => {
+    const all = loadMigrations(MIGRATIONS_DIR);
+    const i17 = all.findIndex((m) => m.version === '0017');
+    expect(await migrateDown(sql, all.length - i17)).toEqual(['0017_big_order']);
+    await sql`INSERT INTO symbol (sym_id, name, price_unit, price_decimals, tick_ref_units, qty_unit, qty_decimals, data_from)
+              VALUES (1, 'BTCUSDT', 0.01, 2, 10, 0.001, 3, '2025-01-01'),
+                     (2, 'ETHUSDT', 0.001, 3, 10, 0.001, 3, '2025-01-01')`;
+    await sql`INSERT INTO data_day (sym_id, day, state, digest) VALUES
+                (1, '2026-09-01', 'final_ok', 'alt'), (1, '2026-09-02', 'provisional', NULL)`;
+    await migrateUp(sql);
+    const days =
+      await sql`SELECT day::text AS day, digest_version, orders_n FROM data_day ORDER BY day`;
+    expect(days.map((d) => [d.day, d.digest_version, d.orders_n])).toEqual([
+      ['2026-09-01', 1, null],
+      ['2026-09-02', null, null],
+    ]);
+    const floors = await sql`SELECT name, big_floor_n::text AS f FROM symbol ORDER BY sym_id`;
+    expect(floors.map((r) => [r.name, r.f])).toEqual([
+      ['BTCUSDT', '50000000000'], // 500 000 USDT / (0,01 · 0,001)
+      ['ETHUSDT', '250000000000'], // 250 000 USDT / (0,001 · 0,001)
+    ]);
+    // Digest und Version nur gemeinsam
+    await expect(
+      sql`UPDATE data_day SET digest_version = NULL WHERE day = '2026-09-01'`,
+    ).rejects.toThrow(/data_day_digest_version/);
+    await expect(sql`UPDATE data_day SET digest = 'neu' WHERE day = '2026-09-02'`).rejects.toThrow(
+      /data_day_digest_version/,
+    );
+    // v1 = Fassung 0005 (zwölf Teile), v2 = zusätzlich big_order und order_day; unbekannte Version
+    const [v] = await sql`
+      SELECT day_digest_all_v(1::smallint, '2026-09-01', 1) AS v1,
+             day_digest_all_v(1::smallint, '2026-09-01', 2) AS v2,
+             day_digest_all(1::smallint, '2026-09-01') AS cur`;
+    expect(v!.cur).toBe(v!.v2);
+    expect(v!.v1).not.toBe(v!.v2);
+    await expect(sql`SELECT day_digest_all_v(1::smallint, '2026-09-01', 3)`).rejects.toThrow(
+      /unbekannte Digest-Version/,
+    );
+    // order_day liest die Zeile aus data_day (NULL-Felder leer), ohne Zeile = leerer Digest
+    await sql`UPDATE data_day SET orders_n = 5, orders_notional = 123 WHERE day = '2026-09-02'`;
+    const [od] = await sql`
+      SELECT day_digest('order_day', 1::smallint, '2026-09-02') AS a,
+             encode(sha256(convert_to('(1,2026-09-02,5,123,)', 'UTF8')), 'hex') AS want,
+             day_digest('order_day', 1::smallint, '2026-08-31') AS none,
+             encode(sha256(''::bytea), 'hex') AS empty`;
+    expect(od!.a).toBe(od!.want);
+    expect(od!.none).toBe(od!.empty);
+    // big_order: Prüfbedingungen der Order-Regel
+    await expect(
+      sql`INSERT INTO big_order VALUES (1, '2026-09-02 00:00:00.5+00', 10, 12, 1, 100, 100, 3, 300, 2)`,
+    ).rejects.toThrow(/check/i);
+    await sql`INSERT INTO big_order VALUES (1, '2026-09-02 00:00:00.5+00', 10, 12, 1, 100, 100, 3, 300, 3)`;
+    const [bo] = await sql`
+      SELECT day_digest('big_order', 1::smallint, '2026-09-02') AS a,
+             encode(sha256(convert_to('(1,"2026-09-02 00:00:00.5+00",10,12,1,100,100,3,300,3)', 'UTF8')), 'hex') AS want`;
+    expect(bo!.a).toBe(bo!.want);
+    // of_recompress_chunk kennt big_order (lehnt den offenen Chunk wegen der Marge ab, nicht als fremd)
+    const [ch] = await sql`
+      SELECT format('%I.%I', chunk_schema, chunk_name) AS c FROM timescaledb_information.chunks
+       WHERE hypertable_name = 'big_order'`;
+    const r = await sql`SELECT of_chunk_is_hot(${ch!.c as string}::regclass) AS hot`;
+    if (r[0]!.hot) {
+      await expect(sql`SELECT of_recompress_chunk(${ch!.c as string}::regclass)`).rejects.toThrow(
+        /offen/,
+      );
+    } else {
+      await sql`SELECT of_recompress_chunk(${ch!.c as string}::regclass)`;
+    }
+    expect(await migrateDown(sql, 1)).toEqual(['0017_big_order']);
+    const [gone] = await sql`
+      SELECT to_regclass('big_order') AS t,
+             (SELECT count(*)::int FROM information_schema.columns
+               WHERE table_name = 'data_day' AND column_name IN ('orders_n', 'digest_version')) AS cols,
+             (SELECT count(*)::int FROM symbol WHERE big_floor_n IS NOT NULL) AS floors`;
+    expect(gone).toEqual({ t: null, cols: 0, floors: 0 });
+    await sql`DELETE FROM data_day`;
+    await sql`DELETE FROM symbol`;
+    await migrateUp(sql);
   });
 
   it('Rollback aller Migrationen und erneutes Anwenden funktionieren', async () => {

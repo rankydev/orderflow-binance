@@ -26,6 +26,7 @@ describe('Migrationsdateien im Repo', () => {
       '0014',
       '0015',
       '0016',
+      '0017',
     ]);
     for (const m of real) {
       expect(m.upSql.trim().length).toBeGreaterThan(0);
@@ -33,7 +34,7 @@ describe('Migrationsdateien im Repo', () => {
     }
   });
 
-  it('legen genau die P1-Tabellen des Konzepts an (und keine P5-Tabellen)', () => {
+  it('legen die Tabellen des Konzepts an (big_order ab P5, size_hist_* noch nicht)', () => {
     const created = real
       .flatMap((m) => [...m.upSql.matchAll(/CREATE TABLE (\w+)/g)].map((x) => x[1]))
       .concat(
@@ -65,6 +66,7 @@ describe('Migrationsdateien im Repo', () => {
       'bar_1h',
       'bar_1d',
       'kline_1m',
+      'big_order',
     ]) {
       expect(created, t).toContain(t);
     }
@@ -72,7 +74,7 @@ describe('Migrationsdateien im Repo', () => {
       .map((m) => m.upSql)
       .join('\n')
       .replace(/--.*$/gm, ''); // Kommentare ignorieren
-    for (const later of ['size_hist', 'big_order']) {
+    for (const later of ['size_hist']) {
       expect(all).not.toContain(later);
     }
   });

@@ -29,6 +29,7 @@ async function split(path: string, first: number, last: number) {
     firstDay: first,
     lastDay: last,
     want: () => true,
+    bigFloorN: null,
     onDay: (c) => {
       days.push(c);
     },

@@ -4,9 +4,11 @@
 //   import   --symbol S (--day D | --from D --to D | --month YYYY-MM) [--dry-run | --db]
 //            [--prefer auto|daily|monthly] [--no-neighbours] [--out datei.jsonl] [--resume]
 //            [--sidecar | --sidecar-dir DIR] [--data-dir DIR] [--quiet] [--backfill | --online] [--force] [--plan] [--verify-db]
+//            [--big-floor-n N]   (nur --dry-run: Untergrenze big_order; mit --db gilt symbol.big_floor_n)
 //   download --symbol S --kind aggTrades|klines (--day D | --from D --to D)
 // Standard ist --dry-run (schreibt nichts); --db schreibt in die Datenbank aus OF_DB_* (.env).
 import {
+  DIGEST_VERSION,
   getSymbol,
   monthDays,
   parseConfig,
@@ -43,6 +45,7 @@ export const USAGE = `Verwendung:
   importer import --symbol BTCUSDT (--day YYYY-MM-DD | --from YYYY-MM-DD --to YYYY-MM-DD | --month YYYY-MM)
                   [--dry-run | --db] [--prefer auto|daily|monthly] [--no-neighbours]
                   [--out ergebnis.jsonl] [--resume] [--sidecar | --sidecar-dir DIR] [--data-dir DIR] [--quiet]
+                  [--big-floor-n N (nur --dry-run)]
   importer download --symbol BTCUSDT --kind aggTrades|klines (--day YYYY-MM-DD | --from … --to …)
   importer repair-open-chunks [--dry-run] [--lock-timeout-ms 500] [--attempts 30] [--ignore-open-transactions]`;
 
@@ -71,6 +74,8 @@ export interface ImportArgs {
   verifyDb: boolean;
   /** Mehrtägigen historischen DB-Import ohne --backfill ausdrücklich erlauben. */
   online: boolean;
+  /** Nur Dry-Run: Untergrenze big_order (ganzzahliges Notional); sonst null (keine big orders). */
+  bigFloorN: number | null;
 }
 
 function dayRange(v: Record<string, string | boolean | undefined>): [number, number] {
@@ -122,6 +127,7 @@ export function parseImportArgs(
       plan: { type: 'boolean' },
       'verify-db': { type: 'boolean' },
       online: { type: 'boolean' },
+      'big-floor-n': { type: 'string' },
     },
     strict: true,
   });
@@ -131,6 +137,15 @@ export function parseImportArgs(
   if (v.plan && !v.db) throw new UsageError('--plan liest die Datenbank: nur mit --db');
   if (v['verify-db'] && !v.db) throw new UsageError('--verify-db nur mit --db');
   if (v['dry-run'] && v.db) throw new UsageError('--dry-run und --db schließen sich aus');
+  // Mit --db ist die Untergrenze Daten (symbol.big_floor_n); eine zweite Quelle wäre widersprüchlich.
+  if (v['big-floor-n'] !== undefined && v.db)
+    throw new UsageError('--big-floor-n nur mit --dry-run (mit --db gilt symbol.big_floor_n)');
+  let bigFloorN: number | null = null;
+  if (v['big-floor-n'] !== undefined) {
+    bigFloorN = Number(v['big-floor-n']);
+    if (!/^[1-9][0-9]*$/.test(v['big-floor-n']) || !Number.isSafeInteger(bigFloorN))
+      throw new UsageError('--big-floor-n: positive Ganzzahl (Notional in price_unit·qty_unit)');
+  }
   const prefer = (v.prefer ?? 'auto') as Prefer;
   if (!['auto', 'daily', 'monthly'].includes(prefer))
     throw new UsageError('--prefer auto|daily|monthly');
@@ -159,6 +174,7 @@ export function parseImportArgs(
     plan: !!v.plan,
     verifyDb: !!v['verify-db'],
     online: !!v.online,
+    bigFloorN,
   };
   if (v.out) a.out = v.out;
   // Review N5: mehrtägige Importe historischer Tage im laufenden Betrieb (ohne --backfill) wandeln
@@ -183,7 +199,7 @@ async function runImport(argv: string[]): Promise<number> {
           readOnly: a.plan,
           log: (s) => console.log(s),
         })
-      : new DryRunWriter(a.resume ? a.out : undefined);
+      : new DryRunWriter(a.resume ? a.out : undefined, a.bigFloorN);
   const plan = a.plan ? new PlanWriter(base) : null;
   const writer: DayWriter = plan ?? base;
   // Ctrl-C / SIGTERM: Schreiber geordnet schließen (Backfill-Jobs wieder aktivieren, Lock lösen).
@@ -225,7 +241,16 @@ async function runImport(argv: string[]): Promise<number> {
     if (a.verifyDb && base instanceof PostgresWriter) {
       const res = await base.verifyDb(a.firstDay, a.lastDay);
       const bad = res.filter((r) => r.stored !== r.actual);
-      console.log(`verify-db: ${res.length} Tage geprüft, ${bad.length} Abweichungen`);
+      const byVersion = new Map<string, number>();
+      for (const r of res) {
+        const k = `v${r.version ?? '–'}`;
+        byVersion.set(k, (byVersion.get(k) ?? 0) + 1);
+      }
+      // Version < DIGEST_VERSION: Digest stimmt in seiner Version, der Tag hat aber keine Order-Daten
+      console.log(
+        `verify-db: ${res.length} Tage geprüft, ${bad.length} Abweichungen; Digest-Versionen ${[...byVersion].map(([k, n]) => `${k}=${n}`).join(' ')}` +
+          ` (v${DIGEST_VERSION} = mit big_order)`,
+      );
       for (const b of bad)
         console.log(`verify-db ABWEICHUNG ${b.day}: data_day=${b.stored} Tabellen=${b.actual}`);
       if (bad.length > 0) verifyFailed = true;

@@ -77,6 +77,8 @@ export interface StoredDay {
   state: string;
   stale: boolean;
   digest: string | null;
+  /** Digest-Version des gespeicherten Digests (data_day.digest_version; null = kein Digest). */
+  digestVersion: number | null;
   qualityDigest: string | null;
   aggSha256: string | null;
   klineSha256: string | null;
@@ -89,6 +91,11 @@ export interface StoredDay {
 export interface DayWriter {
   readonly kind: 'postgres' | 'dry-run';
   open(): Promise<void>;
+  /**
+   * Untergrenze für big_order (symbol.big_floor_n; Daten, nicht Code), gültig nach open().
+   * null = keine Untergrenze: es werden keine big orders gebildet (data_day.big_floor_n NULL).
+   */
+  bigFloorN(): number | null;
   /** Gespeicherter Zustand eines Tages (null = unbekannt). */
   storedDay(symbol: string, day: number): Promise<StoredDay | null>;
   /** Tag ist unverändert (gleiche Daten, Klassen, Quellen, Eingaben): nur Herkunft aktualisieren. */

@@ -79,6 +79,7 @@ async function main(): Promise<void> {
       firstDay: d,
       lastDay: d,
       want: (x) => x === d,
+      bigFloorN: null, // Fixtures ohne big orders
       onDay: ({ agg }) => {
         if (!agg) return;
         trades += agg.trades;

@@ -89,6 +89,7 @@ const apiPassword = randomBytes(18).toString('hex');
 /** Tabellen, die of_api lesen darf (Migrationen 0009/0010); jede neue Tabelle muss hier bewusst landen. */
 const API_READABLE = [
   'bar_1d',
+  'big_order',
   'bar_1h',
   'bar_1m',
   'data_day',

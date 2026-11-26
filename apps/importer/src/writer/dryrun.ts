@@ -17,6 +17,7 @@ interface ResumeLine {
   day: string;
   state?: string;
   digest?: string;
+  digestVersion?: number;
   ownQualityDigest?: string;
   aggSha256?: string;
   klineSha256?: string;
@@ -44,9 +45,15 @@ export class DryRunWriter implements DayWriter {
   readonly touched: string[] = [];
   readonly stale: { day: string; reason: string }[] = [];
   private readonly stored = new Map<string, StoredDay>();
+  private readonly floor: number | null;
 
-  /** `resumeFrom`: JSONL mit DaySummary-Zeilen früherer Läufe; die letzte Zeile je Tag gilt. */
-  constructor(resumeFrom?: string) {
+  /**
+   * `resumeFrom`: JSONL mit DaySummary-Zeilen früherer Läufe; die letzte Zeile je Tag gilt.
+   * `bigFloorN`: Untergrenze für big_order (ohne Datenbank als Option, z. B. --big-floor-n);
+   * null = keine big orders.
+   */
+  constructor(resumeFrom?: string, bigFloorN: number | null = null) {
+    this.floor = bigFloorN;
     if (resumeFrom && existsSync(resumeFrom)) {
       for (const line of readFileSync(resumeFrom, 'utf8').split('\n')) {
         if (!line.trim()) continue;
@@ -56,6 +63,8 @@ export class DryRunWriter implements DayWriter {
           state: r.state ?? 'unknown',
           stale: false,
           digest: r.digest ?? null,
+          // Zeilen von Läufen vor Migration 0017 tragen keine Version: deren Digest ist Version 1
+          digestVersion: r.digest ? (r.digestVersion ?? 1) : null,
           qualityDigest: r.ownQualityDigest ?? null,
           aggSha256: r.aggSha256 ?? null,
           klineSha256: r.klineSha256 ?? null,
@@ -77,6 +86,10 @@ export class DryRunWriter implements DayWriter {
   async open(): Promise<void> {}
   async close(): Promise<void> {}
 
+  bigFloorN(): number | null {
+    return this.floor;
+  }
+
   async storedDay(symbol: string, day: number): Promise<StoredDay | null> {
     return this.stored.get(`${symbol}|${formatDay(day)}`) ?? null;
   }
@@ -96,6 +109,7 @@ export class DryRunWriter implements DayWriter {
     rows.bar_1h = w.data.bar_1h.length;
     rows.bar_1d = w.data.bar_1d.length;
     rows.kline_1m = w.data.klines.length;
+    rows.big_order = w.data.agg.bigOrders.length;
     const state = stateOf(w.recon, w.extraBad);
     this.records.push({
       symbol: w.data.spec.name,

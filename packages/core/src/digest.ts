@@ -9,18 +9,31 @@
 // Nicht im Digest: bar_1m.check_state. Die Klassifikation ist eine Prüfaussage über die Daten,
 // keine Daten; sie ändert sich, wenn ein Nachbartag abgeglichen wird (edge_pending → exact/shift),
 // ohne dass die Daten sich ändern. Sie hat einen eigenen Digest (`qualityDigest`).
+//
+// Digest-Version (data_day.digest_version, Migration 0017): 1 = die zwölf Tabellen bis P4;
+// 2 = zusätzlich big_order und die Ordersummen des Tages (`order_day`: data_day.orders_n,
+// orders_notional, big_floor_n). Ein gespeicherter Digest wird immer gegen SEINE Version geprüft
+// (SQL `day_digest_all_v`); ein Tag mit Version < DIGEST_VERSION hat keine Order-Daten und wird
+// beim nächsten Import neu geschrieben.
 import { createHash, type Hash } from 'node:crypto';
 import type { Bar } from './aggregation/bar.ts';
+import type { BigOrder } from './aggregation/day.ts';
 import type { FpTable } from './aggregation/fp.ts';
 import type { FpTableName } from './aggregation/rollup.ts';
 import type { Kline } from './parser/csv.ts';
 import type { ReconcileResult } from './classifier/reconcile.ts';
-import { pgTimestamptz } from './time.ts';
+import { formatDay, pgTimestamptz, pgTimestamptzMs } from './time.ts';
 
-export type DigestTable = FpTableName | 'bar_1m' | 'bar_1h' | 'bar_1d' | 'kline_1m';
+/** Aktuelle Digest-Version (data_day.digest_version), siehe Kopf. */
+export const DIGEST_VERSION = 2;
 
-/** Reihenfolge der Tabellen im kombinierten Tages-Digest (identisch in SQL `day_digest_all`). */
-export const DIGEST_TABLES: readonly DigestTable[] = [
+export type HypertableName =
+  FpTableName | 'bar_1m' | 'bar_1h' | 'bar_1d' | 'kline_1m' | 'big_order';
+/** Teil des Tages-Digests: eine Tabelle oder die Ordersummen des Tages aus data_day. */
+export type DigestTable = HypertableName | 'order_day';
+
+/** Digest-Teile der Version 1 (bis P4), Reihenfolge wie `day_digest_all_v(…, 1)`. */
+export const DIGEST_TABLES_V1: readonly DigestTable[] = [
   'fp_1m',
   'fp_1m_b10',
   'fp_5m_b10',
@@ -34,6 +47,24 @@ export const DIGEST_TABLES: readonly DigestTable[] = [
   'bar_1d',
   'kline_1m',
 ];
+
+/**
+ * Reihenfolge der Teile im kombinierten Tages-Digest der aktuellen Version (identisch in SQL
+ * `day_digest_all` = `day_digest_all_v(…, 2)`).
+ */
+export const DIGEST_TABLES: readonly DigestTable[] = [
+  ...DIGEST_TABLES_V1,
+  'big_order',
+  'order_day',
+];
+
+/**
+ * Hypertables mit Tagesdaten (der Importer ersetzt den Tag in allen; Columnstore-Pflege). Ohne
+ * `order_day`, das in data_day liegt.
+ */
+export const DATA_HYPERTABLES: readonly HypertableName[] = DIGEST_TABLES.filter(
+  (t): t is HypertableName => t !== 'order_day',
+);
 
 const FP_COLUMNS = 'sym_id, ts, px, buy_q, sell_q, buy_a, sell_a';
 const BAR_COLUMNS =
@@ -54,6 +85,8 @@ export const DIGEST_COLUMNS: Record<DigestTable, string> = {
   bar_1h: BAR_COLUMNS,
   bar_1d: BAR_COLUMNS,
   kline_1m: 'sym_id, ts, open_px, high_px, low_px, close_px, vol, taker_buy, trades, quote_vol_n',
+  big_order: 'sym_id, ts, first_agg_id, last_agg_id, side, px_first, px_last, qty, notional, agg_n',
+  order_day: 'sym_id, day, orders_n, orders_notional, big_floor_n',
 };
 
 /** Quelle in bar_1m.source (KONZEPT §3.5). */
@@ -131,10 +164,64 @@ export function klineDigest(symId: number, klines: readonly Kline[]): string {
   return h.hex();
 }
 
-/** Kombinierter Tages-Digest aus den Tabellen-Digests (SQL: `day_digest_all`). */
-export function combineDigests(perTable: Record<DigestTable, string>): string {
+/** Zeilentextform einer big_order-Zeile (= ROW(<DIGEST_COLUMNS.big_order>)::text in UTC). */
+export function bigOrderLine(symId: number, o: BigOrder): string {
+  return (
+    `(${symId},"${pgTimestamptzMs(o.ts)}",${o.firstAggId},${o.lastAggId},${o.side},` +
+    `${o.pxFirst},${o.pxLast},${o.qty},${o.notional},${o.aggN})`
+  );
+}
+
+/** big_order nach Primärschlüssel (ts, first_agg_id) sortiert. */
+export function bigOrderDigest(symId: number, rows: readonly BigOrder[]): string {
+  const h = new LineHasher();
+  let lastTs = -1;
+  let lastA = -1;
+  for (const o of rows) {
+    if (o.ts < lastTs || (o.ts === lastTs && o.firstAggId <= lastA))
+      throw new Error('bigOrderDigest: Zeilen nicht nach (ts, first_agg_id) sortiert');
+    lastTs = o.ts;
+    lastA = o.firstAggId;
+    h.line(bigOrderLine(symId, o));
+  }
+  return h.hex();
+}
+
+/**
+ * Ordersummen des Tages (data_day.orders_n, orders_notional, big_floor_n) als eine Zeile; NULL
+ * (keine Untergrenze) erscheint wie in der Postgres-Zeilentextform als leeres Feld.
+ */
+export function orderDayDigest(
+  symId: number,
+  day: number,
+  o: { ordersN: number; ordersNotional: bigint; bigFloorN: number | null },
+): string {
+  const h = new LineHasher();
+  h.line(`(${symId},${formatDay(day)},${o.ordersN},${o.ordersNotional},${o.bigFloorN ?? ''})`);
+  return h.hex();
+}
+
+/**
+ * Kombinierter Tages-Digest aus den Teil-Digests (SQL: `day_digest_all_v`); Standard ist die
+ * aktuelle Version.
+ */
+export function combineDigests(
+  perTable: Partial<Record<DigestTable, string>>,
+  version: number = DIGEST_VERSION,
+): string {
+  const parts = version === 1 ? DIGEST_TABLES_V1 : version === 2 ? DIGEST_TABLES : null;
+  if (!parts) throw new Error(`combineDigests: unbekannte Digest-Version ${version}`);
   const h = createHash('sha256');
-  h.update(DIGEST_TABLES.map((t) => `${t}:${perTable[t]}`).join('\n'), 'utf8');
+  h.update(
+    parts
+      .map((t) => {
+        const d = perTable[t];
+        if (d === undefined) throw new Error(`combineDigests: Digest für ${t} fehlt`);
+        return `${t}:${d}`;
+      })
+      .join('\n'),
+    'utf8',
+  );
   return h.digest('hex');
 }
 
