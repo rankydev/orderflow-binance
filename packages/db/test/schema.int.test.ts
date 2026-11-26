@@ -168,6 +168,21 @@ describe('Migrationen', () => {
                      (2, 'ETHUSDT', 0.001, 3, 10, 0.001, 3, '2025-01-01')`;
     await sql`INSERT INTO data_day (sym_id, day, state, digest) VALUES
                 (1, '2026-09-01', 'final_ok', 'alt'), (1, '2026-09-02', 'provisional', NULL)`;
+    // ein offener Leser auf data_day: die Migration wartet höchstens 5 s und bricht dann ab (S4)
+    const reader = connect(cfg);
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const tx = reader.begin(async (t) => {
+      await t`SELECT count(*) FROM data_day`;
+      await held;
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    const t0 = Date.now();
+    await expect(migrateUp(sql)).rejects.toThrow(/lock timeout/);
+    expect(Date.now() - t0).toBeLessThan(15_000);
+    release();
+    await tx;
+    await reader.end();
     await migrateUp(sql);
     const days =
       await sql`SELECT day::text AS day, digest_version, orders_n FROM data_day ORDER BY day`;

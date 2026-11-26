@@ -95,7 +95,11 @@ interface DayInfo {
 
 export interface SymbolState {
   spec: SymbolSpec;
-  /** Untergrenze big_order beim Start (symbol.big_floor_n). */
+  /**
+   * Untergrenze big_order beim Start (symbol.big_floor_n), fest für die Laufzeit (Review O1): eine
+   * Änderung wirkt ab dem nächsten Start; dieser ersetzt big_order des laufenden Tages ganz
+   * (LiveWriter, deploy/RUNBOOK.md „Release mit Migration 0017").
+   */
   bigFloorN: number | null;
   feed: SymbolFeed;
   spool: SpoolWriter | null;

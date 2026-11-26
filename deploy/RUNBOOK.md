@@ -288,6 +288,41 @@ der Uhrzeit ab; die harte Prüfung „0" gehört hierher, nicht in einen Transfe
 offen (≈ 6 min bei zwei Symbolen). Sperrende Vorgänge auf `orderflow` (Chunk-Konvertierung,
 Lock-Proben) warten so lange; während Schritt 3 nichts dergleichen auf dem Mac starten.
 
+## Release mit Migration 0017 (Big Trades) – vorbereitet, nicht ausgeführt
+
+0017 legt `big_order` an, ergänzt `data_day` (`orders_n`, `orders_notional`, `big_floor_n`,
+`digest_version`), setzt die Untergrenzen in `symbol` (BTCUSDT 5·10¹⁰ = 500 000 USDT, ETHUSDT
+2,5·10¹¹ = 250 000 USDT) und stellt die Digest-Funktionen auf Version 2 um. Bestehende Tage behalten
+ihren Digest als Version 1 (`--verify-db` und `verify-db.sql` prüfen sie in Version 1, ohne
+Fehlalarm); der Importer schreibt sie beim nächsten Lauf neu (Grund „Digest-Version 1→2").
+
+Reihenfolge:
+
+1. Außerhalb der Finalisierung (nicht zwischen 06:00 UTC und dem Abschluss des Vortags): ein
+   alter Recorder-Prozess würde nach der Migration einen Tag ohne `digest_version` finalisieren
+   wollen und scheitert dabei laut (Prüfbedingung `data_day_digest_version`).
+2. `deploy/recorder.sh stop`. Der Recorder muss während der Migration nicht zwingend stehen, aber
+   so gibt es weder Sperrkonkurrenz noch einen alten Finalisierungslauf.
+3. `deploy/release.sh "$ID" --migrate 0017`. 0017 sperrt zuerst `data_day`, dann `symbol`
+   (Reihenfolge von Recorder und Importer) mit `lock_timeout = 5s`: hält ein langer Leser die
+   Tabellen, bricht die Migration nach 5 s ab (Transaktion zurückgerollt, nichts geändert) –
+   einfach erneut ausführen. Danach `SELECT name, big_floor_n FROM symbol` prüfen (beide gesetzt;
+   ohne Untergrenze verweigert `import --db` das Schreiben).
+4. `deploy/recorder.sh start`. Erster Start für den laufenden Tag: der Recorder spielt die Spool
+   des Tages ein und schreibt ab `live_until`. In der ersten geschriebenen Minute vergleicht er den
+   Tag im Speicher mit `bar_1m` in der DB (Minuten, Σ Notional, Σ aggTrades, Σ erste/letzte aggId);
+   stimmt er, ersetzt er `big_order` für den ganzen Tag aus dem Speicher (also auch die Minuten ab
+   00:00, die der alte Recorder ohne big orders geschrieben hat) und setzt Ordersummen und
+   Untergrenze. Stimmt er nicht (Spool unvollständig), bleiben Summen und `big_floor_n` NULL – der
+   Tag gilt als ohne vollständige Order-Daten, bis der Import ihn finalisiert.
+5. Historie: alle Tage einmal neu importieren (Mac, dann Teilübertragung) – nicht Teil dieses
+   Releases.
+
+Untergrenze ändern: `UPDATE symbol SET big_floor_n = …`. Der Recorder liest sie nur beim Start
+(Review O1): danach `deploy/recorder.sh stop` + `start`; der erste Start ersetzt `big_order` des
+laufenden Tages mit der neuen Untergrenze (Punkt 4). Finale Tage ändern sich erst beim nächsten
+Import (die Untergrenze ist Teil des Digests, sie werden dann neu geschrieben).
+
 ## Nach dem Rollout – wichtig
 
 - **Niemand wird alarmiert.** Der Monitor schreibt nur ins Journal (und markiert die Unit als
@@ -329,17 +364,17 @@ Lock-Proben) warten so lange; während Schritt 3 nichts dergleichen auf dem Mac 
 
 ## Risiken für die Nachbardienste und Schutz
 
-| Risiko                                                         | Schutz                                                                                                                                         |
-| -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Speicher: kein Swap, globaler OOM könnte genius/mongod treffen | harte Limits (DB 2 GB, API 600 MB, Recorder 1,5 GB), `oom_score_adj` 300/500 für unsere Container, Preflight ≥ 3,5 GB verfügbar, Monitor warnt < 500 MB         |
-| CPU (2 vCPU geteilt)                                           | `cpus` 1.5 / 1.0, parallele Worker begrenzt; Prüfbericht/Restore sind kurz                                                                     |
-| Offene Ports (UFW aus)                                         | alle Docker-Ports an 127.0.0.1; Postcheck prüft das                                                                                            |
-| nginx-Reload trifft alle Sites                                 | vorher immer `nginx -t`, bei Fehler eigene Dateien zurück und kein Reload; kein Neustart; Master-PID im Postcheck                              |
-| Standardserver kippt                                           | kein `default_server`, kein server-Block in conf.d, Symlink `zz-orderflow.rankyhub.com` sortiert zuletzt; Postcheck prüft unbekannten Host     |
-| HTTP/2 oder Socket-Optionen ändern Nachbarn                    | bewusst nicht gesetzt (Entscheidung offen)                                                                                                     |
-| certbot fasst andere Zertifikate an                            | nur `certonly --cert-name orderflow…`, Webroot, Deploy-Hook in der eigenen Renewal-Datei; Postcheck vergleicht Renewal-Dateien und Ablaufdaten |
-| Docker-Namenskonflikte                                         | eigener Projektname, Präfix `orderflow-` für Container/Netz/Volume; Preflight prüft                                                            |
-| Docker-Logs füllen die Platte                                  | journald-Treiber nur für unsere Container (daemon.json unverändert)                                                                            |
-| Platte                                                         | Dump ≈ 0,85 GB, DB ≈ 1,2 GB, Image-Pull ≈ 1 GB; Preflight ≥ 15 GB; Dumps werden gelöscht                                                       |
-| Node 20 von PulseBot                                           | kein Node auf dem Host installiert, API im Container                                                                                           |
-| Unattended-Upgrades starten Docker/nginx neu                   | außerhalb unserer Kontrolle; Postcheck zeigt es (Startzeitpunkte) – dann nicht uns zuschreiben, sondern im Journal prüfen                      |
+| Risiko                                                         | Schutz                                                                                                                                                  |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Speicher: kein Swap, globaler OOM könnte genius/mongod treffen | harte Limits (DB 2 GB, API 600 MB, Recorder 1,5 GB), `oom_score_adj` 300/500 für unsere Container, Preflight ≥ 3,5 GB verfügbar, Monitor warnt < 500 MB |
+| CPU (2 vCPU geteilt)                                           | `cpus` 1.5 / 1.0, parallele Worker begrenzt; Prüfbericht/Restore sind kurz                                                                              |
+| Offene Ports (UFW aus)                                         | alle Docker-Ports an 127.0.0.1; Postcheck prüft das                                                                                                     |
+| nginx-Reload trifft alle Sites                                 | vorher immer `nginx -t`, bei Fehler eigene Dateien zurück und kein Reload; kein Neustart; Master-PID im Postcheck                                       |
+| Standardserver kippt                                           | kein `default_server`, kein server-Block in conf.d, Symlink `zz-orderflow.rankyhub.com` sortiert zuletzt; Postcheck prüft unbekannten Host              |
+| HTTP/2 oder Socket-Optionen ändern Nachbarn                    | bewusst nicht gesetzt (Entscheidung offen)                                                                                                              |
+| certbot fasst andere Zertifikate an                            | nur `certonly --cert-name orderflow…`, Webroot, Deploy-Hook in der eigenen Renewal-Datei; Postcheck vergleicht Renewal-Dateien und Ablaufdaten          |
+| Docker-Namenskonflikte                                         | eigener Projektname, Präfix `orderflow-` für Container/Netz/Volume; Preflight prüft                                                                     |
+| Docker-Logs füllen die Platte                                  | journald-Treiber nur für unsere Container (daemon.json unverändert)                                                                                     |
+| Platte                                                         | Dump ≈ 0,85 GB, DB ≈ 1,2 GB, Image-Pull ≈ 1 GB; Preflight ≥ 15 GB; Dumps werden gelöscht                                                                |
+| Node 20 von PulseBot                                           | kein Node auf dem Host installiert, API im Container                                                                                                    |
+| Unattended-Upgrades starten Docker/nginx neu                   | außerhalb unserer Kontrolle; Postcheck zeigt es (Startzeitpunkte) – dann nicht uns zuschreiben, sondern im Journal prüfen                               |

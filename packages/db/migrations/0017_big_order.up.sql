@@ -1,6 +1,15 @@
 -- Big Trades, Stufen 1–3 (KONZEPT §3.7, Phase P5; Entscheidung 2026-11-26): Orders nach
 -- Order-Regel v1, gespeichert ab einer absoluten Untergrenze je Symbol, als Teil des Tages-Digests.
 --
+-- 0. Sperren (Review S4): ACCESS EXCLUSIVE auf data_day und symbol nehmen die ALTER TABLE unten
+--    ohnehin. Explizit vorab, in der Reihenfolge des Recorders und Importers (erst data_day, dann
+--    symbol über die Fremdschlüsselprüfung) – kein Sperrzyklus mit deren Transaktionen –, und mit
+--    begrenzter Wartezeit: hinter einem langen Leser bricht die Migration nach 5 s ab (Migration
+--    erneut ausführen), statt API und Recorder hinter sich warten zu lassen.
+SET LOCAL lock_timeout = '5s';
+LOCK TABLE data_day IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE symbol IN ACCESS EXCLUSIVE MODE;
+
 -- 1. big_order: eine Zeile je Order mit notional ≥ symbol.big_floor_n. Chunk 30 Tage (§3.9, wie
 --    bar_1m); Columnstore-Policy wie alle Projekttabellen nach 0014/0016: erst nach 4 Tagen,
 --    ohne Nachverdichtung durch die Policy (die macht nur of_recompress_chunk unter Sperre).
