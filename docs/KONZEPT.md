@@ -223,7 +223,7 @@ CREATE TABLE symbol (
   tick_ref_units integer NOT NULL,               -- Referenz-Tick in price_unit (BTC 10 = 0,1 $; ETH 10 = 0,01 $)
   qty_unit       numeric NOT NULL,               -- min(stepSize LOT_SIZE, MARKET_LOT_SIZE) bei Aufnahme (BTC/ETH 0.001, aus exchangeInfo)
   qty_decimals   smallint NOT NULL,
-  big_floor_n    bigint,                         -- Untergrenze big_order als ganzzahliges Notional (§3.7), NULL bis P5
+  big_floor_n    bigint,                         -- Untergrenze big_order als ganzzahliges Notional (§3.7); Daten, gesetzt mit Migration 0017
   data_from      date NOT NULL,                  -- Beginn der gespeicherten Historie: v1 2026-06-10, nach P7 2025-01-01
   active         boolean NOT NULL DEFAULT true
 );
@@ -334,6 +334,10 @@ Gleiche Spalten wie `fp_1m` (Mengen `bigint`). UI-Zeilengrößen liegen auf der 
 | gleiche ms, gleiche Seite (**v1**) | 1,32 Mio. | 1 042 / 30 188 / 238 100 / 1 113 394 | 65 |
 | ≤ 100 ms ab erstem aggTrade, gleiche Seite | 0,80 Mio. | 1 898 / 50 982 / 386 450 / 1 718 730 | 135 |
 
+**Entscheidung 2026-11-26 (Nutzer): absolute Schwelle zuerst.** Big Trades werden in v1 über eine **absolute Notional-Schwelle in USDT** bestimmt, die der Nutzer in der UI einstellt (≥ Untergrenze). Das Perzentil-Modell (Größenverteilung `size_hist_*`, Schwellen je Stunde, Zwei-Durchlauf-Untergrenze, unten und §6.4) ist **[später]**. Gespeichert werden nur Orders mit `notional ≥ symbol.big_floor_n`; die Untergrenze ist **Daten** (Tabelle `symbol`, Migration 0017), keine Code-Konstante: BTCUSDT 500 000 USDT (= 5·10¹⁰ in 10⁻⁵ USDT), ETHUSDT 250 000 USDT (= 2,5·10¹¹ in 10⁻⁶ USDT). Big Orders sind Teil des Tages-Digests (eine Wahrheit je Tag, Digest-Version 2, §4.8); alle Tage werden dafür einmal neu importiert.
+
+**Gebaut (Stufen 1–3: Core, Migration 0017, Schreiber):** Die Order-Bildung läuft im gemeinsamen `DayAggregator` (Importer und Recorder rechnen identisch). Je Tag entstehen außer `big_order` die Summen über **alle** Orders, `data_day.orders_n` und `data_day.orders_notional`; je Minute wird geprüft, dass die Orders die aggTrades exakt zerlegen (Σ Notional = `bar_1m.notional`, Σ Lots, Anzahl aggTrades), sonst bricht der Import ab. `data_day.big_floor_n` hält die beim Schreiben verwendete Untergrenze (NULL = keine Untergrenze bekannt, dann keine big orders; der Importer warnt). Der Importer ersetzt `big_order` in der Tagestransaktion, der Recorder minutenweise (Replace) samt absoluter Tagessummen; der Live-/Import-Vergleich der Finalisierung umfasst `big_order` je Minute und die Tagessummen. Gemessen (2026-11-21, unabhängig nachgezählt): BTCUSDT 1 318 662 Orders, 4 257 ≥ 500 000 USDT (0,32 %); ETHUSDT 1 151 258 Orders, 4 626 ≥ 250 000 USDT (0,40 %); Σ Notional Orders = Σ `bar_1m.notional` (Differenz 0).
+
 Die Schwellen hängen also merklich von der Regel ab (P99,9 Faktor ≈ 1,5). Eine verkettete Regel („Abstand zum Vorgänger ≤ x") erzeugte Spannen bis 531 ms und wird nicht verwendet. Unter der v1-Regel kann nur der letzte aggTrade einer Order über T hinausreichen (14,8 % der Mehr-aggTrade-Orders, 0,74 % um > 50 ms). Die Regel ist eine Konstante mit Versionsnummer; ein Wechsel bedeutet Neuberechnung von `size_hist_*` und `big_order` aus dem Archiv auf dem Mac + Teilübertragung.
 
 Größenverteilung: logarithmisch nach Notional, 20 Buckets pro Dekade, k = 0…179 (1 USDT … 10⁹ USDT). Die Grenzen sind je Symbol eine **ganzzahlige Tabelle** `edge_n[k] = round(10^(k/20) USDT / (price_unit·qty_unit))`, versioniert; Zuordnung per Binärsuche auf ganzzahligem Notional – TS-Importer und Python-Verifier sortieren damit bitgleich ein. Genauigkeit: Bucketbreite Faktor 1,122; Ausgabe der geometrischen Bucketmitte ⇒ Fehler ≤ ±5,9 %, log-linear interpoliert meist deutlich weniger. Bei P99,97 über 7 Tage liegen ≈ 2 000 Orders oberhalb – statistisch tragfähig.
@@ -356,12 +360,14 @@ CREATE TABLE big_order (
   side smallint NOT NULL,
   px_first integer NOT NULL, px_last integer NOT NULL,        -- Sweep-Spanne
   qty bigint NOT NULL, notional bigint NOT NULL,              -- Lots, ganzzahliges Notional
-  agg_n smallint NOT NULL,
+  agg_n integer NOT NULL,                                     -- gebaut als integer (smallint könnte überlaufen)
+  CHECK (last_agg_id - first_agg_id + 1 = agg_n),             -- Regel v1: IDs lückenlos
   PRIMARY KEY (sym_id, ts, first_agg_id)
 );
+-- gebaut (Migration 0017): big_order mit side 1 = Käufer-, 2 = Verkäufer-Aggressor; size_hist_* [später]
 ```
 
-**Untergrenze `big_floor_n` (zwei Durchläufe):** Unterstützt werden nur Schwellen ab dem oberen 1 % der Orders (entschieden: Perzentile ≥ P99). Durchlauf 1 berechnet `size_hist_*` für die gesamte Historie (braucht keine Untergrenze). Daraus: `big_floor_n` = 0,5 × Minimum des stündlichen `rolling7d`-P99 (beide Seiten) über die gesamte Historie, auf eine Bucketgrenze abgerundet. Durchlauf 2 schreibt `big_order` mit `notional ≥ big_floor_n`. Damit liegt jede zulässige Schwelle (≥ P99 in jedem 7-Tage-Fenster und – wegen Faktor 0,5 – mit Reserve auch in `how`/`daysofar`-Fenstern) über der Untergrenze. Der resultierende Anteil gespeicherter Orders wird gemessen und hier nachgetragen (Erwartung: einige Prozent). Fällt eine Schwelle dennoch unter die Untergrenze, markiert die API das Intervall `incomplete`.
+**[später] Untergrenze `big_floor_n` aus dem Perzentil-Modell (zwei Durchläufe; bis dahin gilt die absolute Untergrenze oben):** Unterstützt werden nur Schwellen ab dem oberen 1 % der Orders (entschieden: Perzentile ≥ P99). Durchlauf 1 berechnet `size_hist_*` für die gesamte Historie (braucht keine Untergrenze). Daraus: `big_floor_n` = 0,5 × Minimum des stündlichen `rolling7d`-P99 (beide Seiten) über die gesamte Historie, auf eine Bucketgrenze abgerundet. Durchlauf 2 schreibt `big_order` mit `notional ≥ big_floor_n`. Damit liegt jede zulässige Schwelle (≥ P99 in jedem 7-Tage-Fenster und – wegen Faktor 0,5 – mit Reserve auch in `how`/`daysofar`-Fenstern) über der Untergrenze. Der resultierende Anteil gespeicherter Orders wird gemessen und hier nachgetragen (Erwartung: einige Prozent). Fällt eine Schwelle dennoch unter die Untergrenze, markiert die API das Intervall `incomplete`.
 
 ### 3.8 Qualität, Referenzdaten, Betrieb
 
@@ -386,7 +392,10 @@ CREATE TABLE data_day (
   rules_version text, importer_version text,   -- Herkunft; „fertig" hängt NICHT davon ab (§4.1)
   deep_check text,           -- NULL | 'passed' | 'failed' | 'reference_unusable'
   immutable boolean GENERATED ALWAYS AS (state IN ('final_ok','final_bad') AND NOT coalesce(edge_pending, true) AND NOT stale) STORED,
-  imported_at timestamptz, verified_at timestamptz
+  imported_at timestamptz, verified_at timestamptz,
+  orders_n bigint, orders_notional bigint,  -- alle Orders des Tages (§3.7); NULL = ohne Order-Daten geschrieben
+  big_floor_n bigint,        -- beim Schreiben verwendete Untergrenze big_order; NULL = keine big orders
+  digest_version smallint    -- 1 = zwölf Tabellen (bis P4), 2 = mit big_order und Ordersummen (§4.8)
 );
 -- geplant (P7): regime ('A' | 'B'), tail_status ('n/a' | 'unverified' | 'repaired'),
 --               kline_origin ('vision' | 'rest'), Zeilenquelle 'synthetic' (§4.11)
@@ -612,6 +621,8 @@ Jede Abweichung ist ein Fehler (keine Toleranz – beide Seiten rechnen ganzzahl
 
 **Digest:** je (Tabelle, Symbol, Tag) SHA256 über die nach Primärschlüssel sortierten Zeilen in kanonischer Textform (SQL-Funktion `day_digest`, Tagesdigest `day_digest_all`; der Importer berechnet dieselbe Textform ohne DB und prüft sie in der Import-Transaktion). `bar_1m.check_state` ist **nicht** enthalten: die Klassifikation ändert sich beim Randminuten-Entscheid ohne Datenänderung; sie hat einen eigenen Qualitäts-Digest. `bar_1m.source` ist enthalten. Verwendet für Idempotenz (K8), „fertig"-Entscheid (§4.1), Transferprüfung (§2.3) und den Mac/VPS-Gleichlauf.
 
+**Digest-Version (ab Migration 0017, `data_day.digest_version`):** Version 1 = die zwölf Tabellen bis P4; Version 2 = zusätzlich `big_order` und die Ordersummen des Tages (`order_day`: `sym_id, day, orders_n, orders_notional, big_floor_n` aus `data_day`). Ein gespeicherter Digest wird immer in **seiner** Version geprüft (`day_digest_all_v`; `day_digest_all` = aktuelle Version): ein vor 0017 geschriebener Tag stimmt in Version 1 weiter überein (kein Fehlalarm in `--verify-db` und Transferprüfung), gilt aber nie als Tag mit Order-Daten (`digest_version = 1`, `orders_n` NULL) und wird vom Importer neu geschrieben (Grund „Digest-Version 1→2"). Digest und Version werden nur gemeinsam gesetzt (Prüfbedingung). Eine geänderte Untergrenze ändert den Digest und führt ebenfalls zum Neuschreiben.
+
 ### 4.9 Qualitätsanzeige
 
 `GET /api/v1/quality?sym&from&to` liefert je Tag Zustand, Quelle, Zähler, Tiefenprüfung und Issue-Minuten. Die UI zeigt ein farbiges Band unter der Zeitachse (grün `final_ok`; gelb `provisional`, `provisional_import_failed`, `edge_pending`; rot `gap`, `final_bad`), Tooltip mit Zählern, Markierung betroffener Bars; `shift`-Minuten gelten als korrekt und werden nur im Tooltip gezählt. Annotierte Quelldefekte (§3.8) erscheinen mit ihrer Erklärung statt als unerklärter Fehler; Regime-A-Tage mit `tail_status = unverified` (ab P7) nie grün. Statusbutton: Recorder-Zustand, Datenalter, Health.
@@ -825,7 +836,9 @@ Prioritätsänderung des Nutzers: gemeint war ursprünglich „Volume Profile mi
 
 **Einheit:** Order nach §3.7; Position = (Bar-Zeit, VWAP der Order). Tooltip zeigt Notional, Menge, Preisspanne, Anzahl aggTrades, Perzentilrang; die Fill-Zahl wird mit „≈" gekennzeichnet (Order-Regel ist heuristisch).
 
-**Schwellen** aus `size_hist_1h`, nach Anzahl Orders, log-linear interpoliert; Seiten gemeinsam (Default) oder getrennt; nur Perzentile p ≥ 99 wählbar:
+**Schwelle [v1] (Entscheidung 2026-11-26):** absolut in USDT, in der UI einstellbar, nicht unter `big_floor_n` des Symbols (BTCUSDT 500 000, ETHUSDT 250 000 USDT); Tage mit `digest_version < 2` haben keine Order-Daten und werden so angezeigt.
+
+**[später] Perzentil-Schwellen** aus `size_hist_1h`, nach Anzahl Orders, log-linear interpoliert; Seiten gemeinsam (Default) oder getrennt; nur Perzentile p ≥ 99 wählbar:
 
 | `def` | Referenzfenster für Stunde h | Parameter | Default |
 |---|---|---|---|
@@ -972,7 +985,7 @@ Gegenüber Fassung 2 (57–78 PT) kommen P7 und der Review-Aufwand hinzu.
 | Rohdaten/Berechnung | Archiv auf dem Mac (+ Backup), Historie auf dem Mac berechnet und übertragen, VPS mit 14-Tage-Fenster |
 | Reihenfolge | vertikaler Schnitt BTC zuerst (§8) |
 | COT | DeepCharts-Semantik (§3.5) |
-| Big Trades | Perzentile ≥ P99, Default `rolling7d` P99,9, Stufen 99,5/99,9/99,97; Order-Regel „gleiche ms + Seite + fortlaufende ID"; Untergrenze per Zwei-Durchlauf; ganzzahliges Notional; erst P5 |
+| Big Trades | **2026-11-26:** zuerst absolute USDT-Schwelle (in der UI einstellbar), gespeichert ab `symbol.big_floor_n` (BTCUSDT 500 000, ETHUSDT 250 000 USDT, Daten); Teil des Tages-Digests (Version 2); Order-Regel v1 „gleiche ms + Seite + fortlaufende ID"; ganzzahliges Notional; [später] Perzentile ≥ P99 (Default `rolling7d` P99,9, Stufen 99,5/99,9/99,97) mit Untergrenze per Zwei-Durchlauf |
 | Tagesgrenze | UTC 00:00, Offset in ganzen Stunden |
 | Delta-POC, DC-Elemente ohne Formel | max. \|Delta\|; Single Prints/Bar Ratio/Effort entfallen in v1 |
 | PulseBot | wird mit P3 (Live-Betrieb) gestoppt (inkl. mongod) |
@@ -984,7 +997,7 @@ Gegenüber Fassung 2 (57–78 PT) kommen P7 und der Review-Aufwand hinzu.
 | Ops-Alarm | E-Mail an den Nutzer über healthchecks.io-Totmann; Fallback ntfy |
 | Zugriff | v1 öffentlich über HTTPS, **ohne Passwort** (§10.2) |
 
-Offene Messgrößen: Kalt- und VPS-Werte (M1), ETH-Größen, Anteil `big_order`, Transferverhalten von `pg_dump`, komprimierte Kachelgröße. Offene Fragen siehe §10.3.
+Offene Messgrößen: Kalt- und VPS-Werte (M1), ETH-Größen, Anteil `big_order` über die ganze Historie (2026-11-21 gemessen: BTC 0,32 %, ETH 0,40 % der Orders, §3.7), Transferverhalten von `pg_dump`, komprimierte Kachelgröße. Offene Fragen siehe §10.3.
 
 ### 10.2 Zugriff (entschieden)
 
@@ -1072,4 +1085,4 @@ Marktdaten-Weitergabe: Binance Vision hat eigene Nutzungsbedingungen (PDF auf da
 | Footprint-Status (§6.1) | Spalte „Stand": gebaut sind Delta, Bid×Ask, Box, Volumen-Eingabe, Hover; v1 aber offen (P4): Volume, Delta+Volume, aggTrade-Anzahl, Profile-Modus, Imbalance, VA, POC/Delta-POC, Ratios | ehrlicher Stand |
 | Phasen (§8) | neue Reihenfolge: P1 Schnitt (teilweise erledigt) → M1 → P2 Volume Profile → P3 Live + ETH → P4 Footprint + Stats → P5 Big Trades → P6 TPO → P7 Reparatur; Stand je Phase; Aufwand ≈ 64–89 PT | Prioritätsänderung des Nutzers (Volume Profile mit Delta), zweistufige Historie, Review-Prozess |
 | Entscheidungen (§10) | OrbStack, Node/Python-Versionen, Prozessregel Review, Historie zweistufig, Feature-Reihenfolge; offene Fragen O1–O4 | Nutzerentscheidungen und gebauter Stand |
-
+| Big Trades (§3.7, §4.8, §6.4, §10.1) | absolute USDT-Schwelle zuerst, Perzentil-Modell und Zwei-Durchlauf-Untergrenze [später]; Untergrenze je Symbol als Daten (BTC 500 000, ETH 250 000 USDT); `big_order` gebaut (Migration 0017, `agg_n integer`); Ordersummen und verwendete Untergrenze in `data_day`; Digest-Version 2 mit Prüfung je gespeicherter Version | Nutzerentscheidung 2026-11-26; gebaut und an 2026-11-21 gemessen |

@@ -2,7 +2,7 @@
 -- und auf dem Ziel (VPS bzw. Restore-Test) ausgeführt; die beiden Ausgaben müssen bis auf die
 -- Zeilen mit dem Präfix "info|" identisch sein (deploy/transfer-db.sh vergleicht sie per diff).
 --   psql -X -At -v ON_ERROR_STOP=1 -f deploy/sql/verify-db.sql
--- Laufzeit ≈ 1 s je Tag (day_digest_all liest jeden Tag aus allen zwölf Digest-Tabellen).
+-- Laufzeit ≈ 1 s je Tag (day_digest_all_v liest jeden Tag aus allen Digest-Tabellen).
 \set QUIET on
 \pset footer off
 SET statement_timeout = 0;
@@ -60,9 +60,14 @@ SELECT 'data_day|count=' || count(*) || '|from=' || min(day) || '|to=' || max(da
   FROM data_day d;
 SELECT 'data_day_state|' || state || '|' || count(*) FROM data_day GROUP BY state ORDER BY state;
 
--- Digest je Tag: gespeicherter data_day.digest = day_digest_all über die Tabelleninhalte
--- (dieselbe Prüfung wie `import --db --verify-db`, ohne Node und ohne Rohdaten)
-WITH d AS (SELECT sym_id, day, digest AS stored, day_digest_all(sym_id, day) AS actual
+-- Digest je Tag: gespeicherter data_day.digest = Digest über die Tabelleninhalte in der Version des
+-- gespeicherten Digests (Migration 0017: v1 ohne, v2 mit big_order; ohne Digest die aktuelle).
+-- Dieselbe Prüfung wie `import --db --verify-db`, ohne Node und ohne Rohdaten.
+SELECT 'digest_version|' || coalesce(digest_version::text, 'NULL') || '|' || count(*)
+  FROM data_day GROUP BY digest_version ORDER BY digest_version NULLS FIRST;
+WITH d AS (SELECT sym_id, day, digest AS stored,
+                  CASE WHEN digest_version IS NULL THEN day_digest_all(sym_id, day)
+                       ELSE day_digest_all_v(sym_id, day, digest_version) END AS actual
              FROM data_day)
 SELECT CASE WHEN g.k = 0 THEN
          'digest|days=' || count(*) || '|match=' || count(*) FILTER (WHERE stored = actual)
@@ -174,7 +179,7 @@ SELECT 'info|hot_compressed_chunks|' || count(*) || '|'
  WHERE c.hypertable_schema = 'public'
    AND c.hypertable_name IN ('fp_1m', 'fp_1m_b10', 'fp_5m_b10', 'fp_15m_b100', 'fp_1h_b10',
                              'fp_1h_b100', 'fp_1d_b100', 'fp_1d_b1000', 'bar_1m', 'bar_1h',
-                             'bar_1d', 'kline_1m')
+                             'bar_1d', 'kline_1m', 'big_order')
    AND (k.status & 1) <> 0 AND (k.status & 4) = 0 AND NOT k.osm_chunk
    AND c.range_end > now() - :hot_margin_expr;
 SELECT 'info|db_size|' || pg_size_pretty(pg_database_size(current_database()));

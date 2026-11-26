@@ -21,7 +21,7 @@ WITH hot AS (
    WHERE c.hypertable_schema = 'public'
      AND c.hypertable_name IN ('fp_1m', 'fp_1m_b10', 'fp_5m_b10', 'fp_15m_b100', 'fp_1h_b10',
                                'fp_1h_b100', 'fp_1d_b100', 'fp_1d_b1000', 'bar_1m', 'bar_1h',
-                               'bar_1d', 'kline_1m')
+                               'bar_1d', 'kline_1m', 'big_order')
      AND (k.status & 1) <> 0 AND (k.status & 4) = 0 AND NOT k.osm_chunk
      AND c.range_end > now() - :hot_margin_expr
 )
