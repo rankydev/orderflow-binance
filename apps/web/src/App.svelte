@@ -893,7 +893,7 @@
               String(bro.markers),
             )}
             Marker{bro.drawn < bro.markers
-              ? ` (${groupThousands(String(bro.drawn))} gezeichnet, je Pixelzelle der größte)`
+              ? ` (${groupThousands(String(bro.drawn))} gezeichnet: je ${bro.cellW}×${bro.cellH}-px-Zelle und Seite der größte)`
               : ''}
           </span>
           {#if bro.loading > 0}<span class="muted">· lädt …</span>{/if}

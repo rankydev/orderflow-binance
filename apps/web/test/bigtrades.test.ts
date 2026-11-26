@@ -12,6 +12,8 @@ import {
   barSegments,
   decimateAdaptive,
   decimateByCell,
+  markStalePending,
+  PENDING_TOLERANCE_MS,
   effectiveStatus,
   fmtNotionalShort,
   fmtNotionalUsdt,
@@ -32,8 +34,10 @@ import {
   wantedChunks,
 } from '../src/lib/bigtrades/model.ts';
 import {
+  bandGeometry,
   BigTradesLayer,
   clipSpans,
+  MIN_BAND_PX,
   logicalOfSec,
   lowerBound,
   overlaps,
@@ -1050,5 +1054,215 @@ describe('BigTradesLayer: Review 2', () => {
     expect(ro.coverage).toMatchObject({ failedDays: 1 });
     expect(ro.error).toContain('keine Verbindung');
     layer.destroy();
+  });
+});
+
+// ---------------------------------------------------------------- Review 3: Live-Rand, Breite, Zellen
+
+describe('Live-Rand: neutral nur kurz, danach Warnung', () => {
+  const T = Date.UTC(2026, 10, 25);
+  const pend = (from: number, to: number) => ({
+    from,
+    to,
+    kind: 'pending' as const,
+    reasons: [],
+    floorN: null,
+  });
+  it('Toleranz 5 min gegen die neuesten Bars (dataTo)', () => {
+    expect(PENDING_TOLERANCE_MS).toBe(300_000);
+    const live = T + 18 * 3_600_000;
+    // Recorder hängt 2 min hinter den Bars: neutral
+    expect(markStalePending([pend(live, T + D)], live + 120_000)[0]!.kind).toBe('pending');
+    // genau 5 min: noch neutral; 5 min + 1 ms: Warnung (ganze Spanne ab live_until)
+    expect(markStalePending([pend(live, T + D)], live + 300_000)[0]!.kind).toBe('pending');
+    const st = markStalePending([pend(live, T + D)], live + 300_001)[0]!;
+    expect(st).toMatchObject({ kind: 'stale', from: live, to: T + D });
+  });
+  it('Warnung in Legende, Fläche und Hover', () => {
+    const live = T + 18 * 3_600_000;
+    const bands = markStalePending([pend(live, T + 21 * 3_600_000)], T + 21 * 3_600_000);
+    const sum = coverageSummary(bands, T, T + 21 * 3_600_000);
+    expect(sum.staleSince).toBe(live);
+    expect(coverageNote(sum, 5, (ms) => new Date(ms).toISOString().slice(11, 16))).toBe(
+      'Big Trades seit 18:00 nicht aktualisiert',
+    );
+    expect(barSegments(bands, 3_600_000, 0, T + D).full.map((b) => b.kind)).toEqual(['stale']);
+    expect(barCoverageText(bands, live, 3_600_000, 5)).toBe(
+      'Big Trades: im ganzen Bar nicht aktualisiert (Aufzeichnung steht)',
+    );
+  });
+  it('Schicht: stehende Aufzeichnung → Legendenhinweis; kurzer Verzug → nichts', async () => {
+    for (const [lagMin, expectStale] of [
+      [2, false],
+      [90, true],
+    ] as const) {
+      const dataTo = C0 + 40_020_000;
+      const liveUntil = dataTo - lagMin * 60_000;
+      const { layer } = setup(
+        (u) =>
+          body(u, [], () => 'ok', 0, {
+            coverage: (from, to) => {
+              const m = Math.min(to, Math.max(from, liveUntil));
+              return [
+                { from, to: m, status: 'ok' as const, reason: null, floorN: 5e10, final: false },
+                {
+                  from: m,
+                  to,
+                  status: 'none' as const,
+                  reason: 'pending' as const,
+                  floorN: null,
+                  final: false,
+                },
+              ].filter((c) => c.to > c.from);
+            },
+          }),
+        {
+          sym: () => ({ ...SYM, dataTo }),
+          visibleTimeRange: () => [(C0 + 20_000_000) / 1000, (dataTo - 60_000) / 1000],
+        },
+      );
+      layer.frame();
+      await flush();
+      const note = layer.readout().coverageNote;
+      if (expectStale) expect(note).toMatch(/^Big Trades seit .* nicht aktualisiert$/);
+      else expect(note).toBe('');
+    }
+  });
+});
+
+describe('Bandgeometrie auf der Index-Achse', () => {
+  const H = 3_600;
+  // Bars 0, 1, 2, dann 5 Stunden ohne Bars, dann 8, 9 (Stunden ab T0s)
+  const T0s = 1_795_000_000 - (1_795_000_000 % H);
+  const items = [0, 1, 2, 8, 9].map((h) => ({ time: T0s + h * H }) as BarItem);
+  const band = (fromH: number, toH: number, kind: 'none' | 'stale' = 'none') => ({
+    from: (T0s + fromH * H) * 1000,
+    to: (T0s + toH * H) * 1000,
+    kind,
+    reasons: ['gap'],
+    floorN: null,
+  });
+  it('Fläche über Bars: an Bar-Grenzen', () => {
+    const g = bandGeometry(items, [band(1, 3)], [], 100, 10, H, 1000);
+    expect(g.full.map((f) => [f.a, f.z])).toEqual([[105, 125]]);
+    expect(g.marks).toEqual([]);
+  });
+  it('Spanne nur über Zeit ohne Bars: Grenzmarke statt nichts', () => {
+    const g = bandGeometry(items, [band(4, 6)], [], 100, 10, H, 1000);
+    expect(g.full).toEqual([]);
+    expect(g.marks).toEqual([{ x: 125, kind: 'none' }]);
+  });
+  it('ein Bar bei starkem Herauszoomen: Mindestbreite', () => {
+    const g = bandGeometry(items, [band(1, 2)], [], 0, 0.2, H, 1000);
+    expect(g.full[0]!.z - g.full[0]!.a).toBe(MIN_BAND_PX);
+  });
+  it('Lücken-Markierung: Bar vorhanden → Strich unter dem Bar; Bar fehlt → Grenzmarke', () => {
+    const g = bandGeometry(
+      items,
+      [],
+      [
+        { bar: (T0s + 2 * H) * 1000, kind: 'none', ms: 60_000 },
+        { bar: (T0s + 5 * H) * 1000, kind: 'none', ms: 60_000 },
+      ],
+      100,
+      10,
+      H,
+      1000,
+    );
+    expect(g.ticks).toEqual([{ a: 115, z: 125, kind: 'none' }]);
+    expect(g.marks).toEqual([{ x: 125, kind: 'none' }]);
+  });
+  it('außerhalb der Pane: nichts', () => {
+    expect(bandGeometry(items, [band(1, 3)], [], -500, 10, H, 1000).full).toEqual([]);
+  });
+});
+
+describe('Ausdünnung nach dem Pane-Filter', () => {
+  it('Marker außerhalb vergröbern die Zellen nicht', async () => {
+    const orders: [number, number][] = [];
+    for (let i = 0; i < 20_000; i++) orders.push([C0 + i * 3000, 600_000 + (i % 7) * 100_000]);
+    const items = Array.from({ length: 1000 }, (_, i) => ({ time: C0 / 1000 + i * 60 }) as BarItem);
+    const { layer } = setup((u) => body(u, orders), {
+      chart: {
+        // nur die letzten ≈ 100 Bars liegen in der 1 600 px breiten Pane
+        timeScale: () => ({ logicalToCoordinate: (l: number) => (l - 900) * 1.6 }),
+      } as never,
+      items: () => items,
+      visibleTimeRange: () => [C0 / 1000, (C0 + SPAN_MS) / 1000 - 60],
+      priceToY: (p) => 400 + (p - 97_000) * 2,
+    });
+    layer.frame();
+    await flush();
+    const noop = () => {};
+    const ctx = new Proxy(
+      { measureText: () => ({ width: 20 }) },
+      {
+        get: (t, k) => (k in t ? (t as Record<string, unknown>)[k as string] : noop),
+        set: () => true,
+      },
+    );
+    const scope = {
+      context: ctx,
+      horizontalPixelRatio: 1,
+      verticalPixelRatio: 1,
+      bitmapSize: { width: 1600, height: 800 },
+      mediaSize: { width: 1600, height: 800 },
+    };
+    for (const v of layer.paneViews())
+      v.renderer()!.draw(
+        { useBitmapCoordinateSpace: (f: (s: unknown) => void) => f(scope) } as never,
+        undefined as never,
+      );
+    const ro = layer.readout();
+    expect(ro.markers).toBe(20_000);
+    expect(ro).toMatchObject({ cellW: 2, cellH: 6 });
+    expect(ro.drawn).toBeLessThan(3000);
+  });
+});
+
+describe('BigTradesLayer: Review 3 (optional)', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('Teilung gilt für jede Schwelle', async () => {
+    const mid = C0 + 24_000_000;
+    const { layer, calls } = setup((u) => {
+      const from = Number(u.searchParams.get('from'));
+      const to = Number(u.searchParams.get('to'));
+      if (from === C0 && to === C0 + SPAN_MS)
+        return json({ error: 'zu groß', reason: 'source_rows_exceeded', suggestTo: mid }, 422);
+      return body(u, ORDERS, () => 'ok', 1); // ausgedünnt: kein Filtern aus dem Cache
+    });
+    layer.frame();
+    await flush(12);
+    layer.minUsdt = 1_000_000;
+    layer.changed();
+    await flush(12);
+    const at1m = calls.filter(
+      (u) =>
+        u.searchParams.get('min') === '1000000' &&
+        Number(u.searchParams.get('from')) >= C0 &&
+        Number(u.searchParams.get('to')) <= C0 + SPAN_MS,
+    );
+    expect(
+      at1m.map((u) => [Number(u.searchParams.get('from')), Number(u.searchParams.get('to'))]),
+    ).toEqual([
+      [C0, mid],
+      [mid, C0 + SPAN_MS],
+    ]);
+  });
+
+  it('Zustand veraltet mit der Antwort, nicht erst beim nächsten Versionswechsel', async () => {
+    let now = 5_000_000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const { layer, calls } = setup((u) => body(u, ORDERS)); // nicht final
+    layer.frame();
+    await flush();
+    layer.minUsdt = 1_000_000;
+    layer.changed(); // aus dem Cache gefiltert
+    await flush();
+    expect(calls).toHaveLength(3);
+    expect(layer.readout().loading).toBe(0);
+    now += 61_000;
+    expect(layer.readout().loading).toBe(1); // ohne frame(): Filtergrundlage veraltet
   });
 });

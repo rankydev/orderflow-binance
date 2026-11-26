@@ -3,6 +3,7 @@
 // Legende, Trefferprüfung über ein Eimerraster, exakte Texte. Kein DOM, kein Chart (testbar).
 import type { CoverageReason, CoverageSpan } from '@orderflow/core/browser';
 import { exactDecimal } from '../format.ts';
+import { fmtShownZ } from '../time-format.ts';
 
 export const DAY_MS = 86_400_000;
 
@@ -262,7 +263,33 @@ export class HitGrid {
  * none/partial aus der Abdeckung; pending = Live-Rand (noch nicht geschrieben, neutral: weder Band
  * noch Warnung, nur im Hover); toomany/failed = Abschnitt nicht geladen (422 bzw. Fehler).
  */
-export type BandKind = 'none' | 'partial' | 'pending' | 'toomany' | 'failed';
+export type BandKind = 'none' | 'partial' | 'pending' | 'stale' | 'toomany' | 'failed';
+
+/**
+ * Wie lange der Live-Rand (`pending`, ab live_until) hinter den neuesten Bars (dataTo) zurückliegen
+ * darf, bevor er als Warnung gilt („seit HH:MM nicht aktualisiert"). Normaler Verzug: der Recorder
+ * schreibt einmal je Minute (≤ 60 s), eine nicht finale Antwort wird nach 60 s erneuert (≤ 60 s), dazu
+ * Anfrage/Antwort; dataTo aus /symbols ist eher älter (das verkürzt die Spanne nur). 5 min = gut das
+ * Doppelte des normalen Höchstverzugs: kein Fehlalarm im Normalbetrieb, eine stehende Aufzeichnung ist
+ * nach wenigen Minuten sichtbar.
+ */
+export const PENDING_TOLERANCE_MS = 5 * 60_000;
+
+/**
+ * Live-Rand bewerten: `pending`-Bänder (auf den Datenbereich gekürzt) länger als die Toleranz werden
+ * zur Warnung `stale` (ganze Spanne ab live_until); kürzere bleiben neutral.
+ */
+export function markStalePending(
+  bands: readonly Band[],
+  dataTo: number,
+  tolMs = PENDING_TOLERANCE_MS,
+): Band[] {
+  return bands.map((b) =>
+    b.kind === 'pending' && Math.min(b.to, dataTo) - b.from > tolMs
+      ? { ...b, kind: 'stale' as const }
+      : b,
+  );
+}
 
 export interface Band {
   /** [from, to) in ms UTC */
@@ -429,6 +456,8 @@ export interface CoverageSummary {
   /** Tage mit nicht geladenen Abschnitten (422 bzw. Fehler) */
   toomanyDays: number;
   failedDays: number;
+  /** Live-Rand steht (stale): Beginn (live_until, ms) oder null */
+  staleSince: number | null;
   /** sichtbare Zeit (ms) je Bandart bzw. insgesamt („ganz" vs. „in Teilen") */
   ms: Record<BandKind, number>;
   visibleMs: number;
@@ -449,17 +478,27 @@ export function coverageSummary(
     none: new Set(),
     partial: new Set(),
     pending: new Set(),
+    stale: new Set(),
     toomany: new Set(),
     failed: new Set(),
   };
+  let staleSince: number | null = null;
   const noneMs = new Map<number, number>();
   const noneR = new Map<number, Set<string>>();
   let partialFloorN: number | null = null;
-  const ms: Record<BandKind, number> = { none: 0, partial: 0, pending: 0, toomany: 0, failed: 0 };
+  const ms: Record<BandKind, number> = {
+    none: 0,
+    partial: 0,
+    pending: 0,
+    stale: 0,
+    toomany: 0,
+    failed: 0,
+  };
   for (const b of bands) {
     const a = Math.max(b.from, visFrom);
     const e = Math.min(b.to, visTo);
     if (e <= a) continue;
+    if (b.kind === 'stale') staleSince = Math.min(staleSince ?? Infinity, b.from);
     ms[b.kind] += e - a;
     for (let d = day(a); d <= day(e - 1); d++) {
       sets[b.kind].add(d);
@@ -503,6 +542,7 @@ export function coverageSummary(
     partialFloorN,
     toomanyDays: sets.toomany.size,
     failedDays: sets.failed.size,
+    staleSince,
     ms,
     visibleMs: Math.max(0, visTo - visFrom),
   };
@@ -533,8 +573,14 @@ const minutes = (ms: number) => `${Math.ceil(ms / 60_000)} min`;
 const why = (r: readonly string[]) => (r.length ? ` (${r.map(reasonText).join(', ')})` : '');
 
 /** Legenden-Hinweis zur Abdeckung ('' = alles sichtbare abgedeckt; der Live-Rand zählt nicht). */
-export function coverageNote(s: CoverageSummary, notionalDecimals: number): string {
+export function coverageNote(
+  s: CoverageSummary,
+  notionalDecimals: number,
+  fmtTime: (ms: number) => string = fmtShownZ,
+): string {
   const parts: string[] = [];
+  if (s.staleSince !== null)
+    parts.push(`Big Trades seit ${fmtTime(s.staleSince)} nicht aktualisiert`);
   const where = (k: BandKind, n: number, pre = 'in') =>
     s.ms[k] >= s.visibleMs
       ? 'im sichtbaren Bereich'
@@ -595,6 +641,7 @@ export function barCoverageText(
       out.push(
         `${t} erst ab ${fmtUsdtCompact(Math.ceil(a.floorN / 10 ** notionalDecimals), true)} gespeichert`,
       );
+    else if (k === 'stale') out.push(`${t} nicht aktualisiert (Aufzeichnung steht)`);
     else if (k === 'toomany') out.push(`${t} nicht geladen (zu viele Orders)`);
     else out.push(`${t} nicht ladbar`);
   }

@@ -40,6 +40,7 @@ import {
   fmtUsdtCompact,
   fmtVwap,
   HitGrid,
+  markStalePending,
   mergeBands,
   radiusPx,
   TIER_ALPHA,
@@ -103,6 +104,11 @@ const BAND_STYLE: Record<DrawKind, { fill: string; line: string; text: string }>
     line: 'rgba(242, 201, 76, 0.14)',
     text: 'rgba(242, 201, 76, 0.85)',
   },
+  stale: {
+    fill: 'rgba(240, 136, 62, 0.07)',
+    line: 'rgba(240, 136, 62, 0.2)',
+    text: 'rgba(240, 136, 62, 0.95)',
+  },
   toomany: {
     fill: 'rgba(239, 83, 80, 0.06)',
     line: 'rgba(239, 83, 80, 0.16)',
@@ -118,6 +124,7 @@ const BAND_STYLE: Record<DrawKind, { fill: string; line: string; text: string }>
 const TICK_COLOR: Record<DrawKind, string> = {
   none: 'rgba(160, 168, 178, 0.75)',
   partial: 'rgba(242, 201, 76, 0.7)',
+  stale: 'rgba(240, 136, 62, 0.85)',
   toomany: 'rgba(239, 83, 80, 0.8)',
   failed: 'rgba(239, 83, 80, 0.8)',
 };
@@ -162,6 +169,9 @@ export interface BigTradesReadout {
   /** Marker ≥ Schwelle im sichtbaren Bereich (vor der Pixel-Ausdünnung) bzw. gezeichnet */
   markers: number;
   drawn: number;
+  /** Zelle der Pixel-Ausdünnung (CSS-px), je Zelle und Seite der größte Marker */
+  cellW: number;
+  cellH: number;
   /** Vom Server ausgedünnt (Σ omitted der sichtbaren Abschnitte), größtes k */
   omitted: number;
   k: number | null;
@@ -205,6 +215,8 @@ interface State {
   coverage: CoverageSummary | null;
   suggest: number | null;
   tooManyNoSuggest: boolean;
+  /** Zeitpunkt (performance.now), ab dem eine benutzte nicht finale Antwort veraltet ist */
+  validUntil: number;
 }
 
 /** Anordnung in Pixeln (CSS-px), gültig bis sich Zustand, Achsen, Größe oder Modus ändern. */
@@ -224,6 +236,10 @@ interface Layout {
   /** Flächen [x0, x1) und Lücken-Markierungen [x0, x1) in CSS-px */
   full: { a: number; z: number; band: Band }[];
   ticks: { a: number; z: number; kind: DrawKind }[];
+  /** Lücken ohne eigene Bars (a = z): Grenzmarke an x */
+  marks: { x: number; kind: DrawKind }[];
+  cellW: number;
+  cellH: number;
   grid: HitGrid;
 }
 
@@ -243,6 +259,7 @@ const EMPTY_STATE = (key: string): State => ({
   coverage: null,
   suggest: null,
   tooManyNoSuggest: false,
+  validUntil: Infinity,
 });
 
 export class BigTradesLayer implements IPanePrimitive<Time> {
@@ -337,8 +354,9 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     return this.minUsdt * 10 ** bt.notionalDecimals;
   }
 
-  private planKey(sym: string, tf: string, c: number, min: number): string {
-    return `${sym}|${tf}|${c}|${min}`;
+  /** Teilung gilt für jede Schwelle (die gelesenen Quellzeilen hängen nicht von ihr ab). */
+  private planKey(sym: string, tf: string, c: number): string {
+    return `${sym}|${tf}|${c}`;
   }
 
   private pieceKey(sym: string, tf: string, c: number, min: number, a: number, b: number): string {
@@ -347,7 +365,7 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
 
   /** Teilstücke eines Abschnitts bei Schwelle min (ohne Teilung: der ganze Abschnitt). */
   private pieces(sym: string, tf: string, c: number, min: number, spanMs: number): Piece[] {
-    const bounds = this.plans.get(this.planKey(sym, tf, c, min)) ?? [c * spanMs, (c + 1) * spanMs];
+    const bounds = this.plans.get(this.planKey(sym, tf, c)) ?? [c * spanMs, (c + 1) * spanMs];
     const out: Piece[] = [];
     for (let i = 0; i + 1 < bounds.length; i++) {
       const key = this.pieceKey(sym, tf, c, min, bounds[i]!, bounds[i + 1]!);
@@ -478,7 +496,10 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
   /** Abgelaufene Ablehnungen entfernen; Hilfstabellen begrenzen (älteste zuerst). */
   private prune(now: number): void {
     for (const [k, r] of this.rejected)
-      if (now - r.at >= BIGTRADES_REJECT_TTL_MS) this.rejected.delete(k);
+      if (now - r.at >= BIGTRADES_REJECT_TTL_MS) {
+        this.rejected.delete(k);
+        this.version++;
+      }
     while (this.rejected.size > MAX_AUX) this.rejected.delete(this.rejected.keys().next().value!);
     while (this.plans.size > MAX_AUX) this.plans.delete(this.plans.keys().next().value!);
   }
@@ -602,7 +623,7 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
       suggestTo % tfMs !== 0
     )
       return false;
-    const pk = this.planKey(k.sym, k.tf, k.c, k.min);
+    const pk = this.planKey(k.sym, k.tf, k.c);
     const spanMs = chunkSpanSec(this.host.tfSec()) * 1000;
     const bounds = this.plans.get(pk) ?? [k.c * spanMs, (k.c + 1) * spanMs];
     if (bounds.length - 1 >= BIGTRADES_MAX_PIECES || !bounds.includes(k.from)) return false;
@@ -623,7 +644,7 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     const s = this.host.sym();
     const vis = this.host.visibleTimeRange();
     const key = `${this.version}|${s?.name}|${s?.dataFrom}|${s?.dataTo}|${this.host.tf()}|${this.enabled}|${this.minUsdt}|${vis?.[0]}|${vis?.[1]}|${this.queue.stats.failed}|${this.queue.stats.completed}`;
-    if (this.state.key === key) return this.state;
+    if (this.state.key === key && performance.now() < this.state.validUntil) return this.state;
     this.counters.collects++;
     const st = EMPTY_STATE(key);
     this.state = st;
@@ -664,7 +685,12 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
         } else st.loading++;
       }
     }
-    st.bands = mergeBands(raw);
+    // Live-Rand: neutral, solange er kurz ist; steht die Aufzeichnung, Warnung (stale)
+    st.bands = markStalePending(mergeBands(raw), s.dataTo);
+    // gültig, bis eine benutzte oder ersetzbare nicht finale Antwort veraltet (resolve() hängt daran)
+    for (const e of this.cache.values())
+      if (e.sym === s.name && e.tf === tf && !e.meta.final)
+        st.validUntil = Math.min(st.validUntil, e.loadedAt + BIGTRADES_NONFINAL_TTL_MS);
     const seg = barSegments(st.bands, tfSec * 1000, s.dataFrom, s.dataTo);
     st.full = seg.full;
     st.ticks = seg.ticks;
@@ -704,6 +730,8 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
           ? this.layout.refs.length
           : st.markers
         : 0,
+      cellW: this.layout?.cellW ?? 2,
+      cellH: this.layout?.cellH ?? 6,
       omitted: st.omitted,
       k: st.k,
       loading: st.loading,
@@ -751,22 +779,7 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
     this.counters.layouts++;
     const tfSec = this.host.tfSec();
     const ym = this.yMap(st.pMin, st.pMax);
-    const xOfMs = (t: number) => x0 + logicalOfSec(items, t / 1000, tfSec) * bs - bs / 2;
-    // Bänder: Flächen und Lücken-Markierungen an Bar-Grenzen
-    const full: Layout['full'] = [];
-    for (const b of st.full) {
-      if (b.kind === 'pending') continue;
-      const a = xOfMs(b.from);
-      const z = xOfMs(b.to);
-      if (z > 0 && a < W && z > a) full.push({ a, z, band: b });
-    }
-    const ticks: Layout['ticks'] = [];
-    for (const t of st.ticks) {
-      if (t.kind === 'pending') continue;
-      const a = xOfMs(t.bar);
-      const z = a + bs;
-      if (z > 0 && a < W) ticks.push({ a, z, kind: t.kind });
-    }
+    const geo = bandGeometry(items, st.full, st.ticks, x0, bs, tfSec, W);
     // Marker: sichtbare Orders ≥ Schwelle → Pixel (Bar-Zeiger läuft mit, Orders je Antwort aufsteigend)
     const vis = this.host.visibleTimeRange()!;
     const fromMs = vis[0] * 1000;
@@ -795,12 +808,32 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
         m++;
       }
     }
-    const { keep } = decimateAdaptive(m, xs, ys, sides, nots, MAX_DRAWN, W, H);
-    const vis2 = keep.filter((j) => {
+    // erst auf die Pane beschränken, dann ausdünnen: Marker außerhalb vergröbern die Zellen nicht
+    const on: number[] = [];
+    for (let j = 0; j < m; j++) {
       const x = xs[j]!;
       const y = ys[j]!;
-      return Number.isFinite(y) && x >= -R_PAD && x <= W + R_PAD && y >= -R_PAD && y <= H + R_PAD;
-    });
+      if (Number.isFinite(y) && x >= -R_PAD && x <= W + R_PAD && y >= -R_PAD && y <= H + R_PAD)
+        on.push(j);
+    }
+    const all1 = on.length === m; // alles in der Pane: ohne Kopie
+    const pick = <T extends Float64Array | Int32Array>(a: T, mk: (n: number) => T): T => {
+      if (all1) return a;
+      const o = mk(on.length);
+      on.forEach((j, q) => (o[q] = a[j]!));
+      return o;
+    };
+    const dec = decimateAdaptive(
+      on.length,
+      pick(xs, (n) => new Float64Array(n)),
+      pick(ys, (n) => new Float64Array(n)),
+      pick(sides, (n) => new Int32Array(n)),
+      pick(nots, (n) => new Float64Array(n)),
+      MAX_DRAWN,
+      W,
+      H,
+    );
+    const vis2 = all1 ? dec.keep : dec.keep.map((q) => on[q]!);
     // Zeichenreihenfolge: größte Stufe zuerst, kleinere darüber (bleiben sichtbar)
     const order: number[] = [];
     for (const tier of [2, 1, 0])
@@ -817,8 +850,11 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
       ya: new Float64Array(k),
       yb: new Float64Array(k),
       labels: [],
-      full,
-      ticks,
+      full: geo.full,
+      ticks: geo.ticks,
+      marks: geo.marks,
+      cellW: dec.cellW,
+      cellH: dec.cellH,
       grid: new HitGrid(32),
     };
     const pd = s.priceDecimals;
@@ -876,7 +912,7 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
 
   private drawBands(scope: Scope): void {
     const L = this.arrange(scope.mediaSize.width, scope.mediaSize.height);
-    if (!L || (L.full.length === 0 && L.ticks.length === 0)) return;
+    if (!L || (L.full.length === 0 && L.ticks.length === 0 && L.marks.length === 0)) return;
     const ctx = scope.context;
     const hpr = scope.horizontalPixelRatio;
     const vpr = scope.verticalPixelRatio;
@@ -913,11 +949,13 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
       const label =
         kind === 'none'
           ? 'keine Big-Trade-Daten'
-          : kind === 'partial'
-            ? `Big Trades erst ab ${fmtUsdtCompact(Math.ceil((b.floorN ?? 0) / 10 ** nd), true)}`
-            : kind === 'toomany'
-              ? 'zu viele Orders – Schwelle erhöhen'
-              : 'Big Trades nicht ladbar';
+          : kind === 'stale'
+            ? `Big Trades seit ${fmtShown(b.from)} ${zoneLabel(b.from, displayZone())} nicht aktualisiert`
+            : kind === 'partial'
+              ? `Big Trades erst ab ${fmtUsdtCompact(Math.ceil((b.floorN ?? 0) / 10 ** nd), true)}`
+              : kind === 'toomany'
+                ? 'zu viele Orders – Schwelle erhöhen'
+                : 'Big Trades nicht ladbar';
       const tw = ctx.measureText(label).width;
       // unten in der Pane (oben liegt die Legende), rechts neben dem Logo der Bibliothek
       const lx = Math.max(a + 4 * hpr, LOGO_PX * hpr);
@@ -934,6 +972,21 @@ export class BigTradesLayer implements IPanePrimitive<Time> {
       ctx.fillStyle = TICK_COLOR[t.kind];
       ctx.fillRect(a, H - th, w, th);
     }
+    // Lücken ohne eigene Bars (Spanne fällt auf der Index-Achse auf eine Bar-Grenze): gestrichelte
+    // Grenzmarke über die ganze Höhe, damit auch eine fehlende Stunde ohne Bars sichtbar bleibt
+    ctx.lineWidth = Math.max(1, Math.round(hpr));
+    ctx.setLineDash([Math.round(3 * vpr), Math.round(3 * vpr)]);
+    for (const mk of L.marks) {
+      const x = Math.round(mk.x * hpr) + 0.5;
+      ctx.strokeStyle = TICK_COLOR[mk.kind];
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, H);
+      ctx.stroke();
+      ctx.fillStyle = TICK_COLOR[mk.kind];
+      ctx.fillRect(x - Math.round(2 * hpr), H - th, Math.round(4 * hpr), th);
+    }
+    ctx.setLineDash([]);
     ctx.restore();
   }
 
@@ -1087,6 +1140,74 @@ export function overlaps(a: Box, b: Box): boolean {
 const HALO = '#0f1217';
 /** Rand außerhalb der Pane, in dem Marker noch gezeichnet werden (größter Radius). */
 const R_PAD = 18;
+
+/** Mindestbreite einer Fläche (CSS-px), damit ein einzelner Bar bei starkem Herauszoomen bleibt. */
+export const MIN_BAND_PX = 2;
+
+/**
+ * Bänder → Pixel (CSS-px) auf der indexbasierten Zeitachse: Flächen [a, z) an Bar-Grenzen, mindestens
+ * MIN_BAND_PX breit; Markierungen je Bar mit kurzer Lücke. Liegt eine Spanne nur über Zeit ohne Bars
+ * (z. B. eine Lückenminute ohne Trades auf 1m, eine Stunde ohne Bars), fiele sie auf a = z: dafür eine
+ * Grenzmarke an x. Nur was in [0, W] liegt.
+ */
+export function bandGeometry(
+  items: readonly BarItem[],
+  full: readonly Band[],
+  ticks: readonly BarTick[],
+  x0: number,
+  bs: number,
+  tfSec: number,
+  W: number,
+): {
+  full: { a: number; z: number; band: Band }[];
+  ticks: { a: number; z: number; kind: DrawKind }[];
+  marks: { x: number; kind: DrawKind }[];
+} {
+  const xOf = (sec: number) => x0 + logicalOfSec(items, sec, tfSec) * bs - bs / 2;
+  const out = {
+    full: [] as { a: number; z: number; band: Band }[],
+    ticks: [] as { a: number; z: number; kind: DrawKind }[],
+    marks: [] as { x: number; kind: DrawKind }[],
+  };
+  const inView = (a: number, z: number) => z >= 0 && a <= W;
+  for (const b of full) {
+    if (b.kind === 'pending') continue;
+    const kind = b.kind as DrawKind;
+    const a = xOf(b.from / 1000);
+    let z = xOf(b.to / 1000);
+    if (z - a < 1e-9) {
+      if (inView(a, a)) out.marks.push({ x: a, kind });
+      continue;
+    }
+    if (z - a < MIN_BAND_PX) z = a + MIN_BAND_PX;
+    if (inView(a, z)) out.full.push({ a, z, band: b });
+  }
+  for (const t of ticks) {
+    if (t.kind === 'pending') continue;
+    const kind = t.kind as DrawKind;
+    const sec = t.bar / 1000;
+    const i = indexOfTime(items, sec);
+    const a = xOf(sec);
+    if (i < 0) {
+      if (inView(a, a)) out.marks.push({ x: a, kind });
+      continue;
+    }
+    if (inView(a, a + bs)) out.ticks.push({ a, z: a + bs, kind });
+  }
+  return out;
+}
+
+/** Index des Bars mit genau dieser Zeit (s) oder −1. */
+function indexOfTime(items: readonly BarItem[], t: number): number {
+  let lo = 0;
+  let hi = items.length;
+  while (lo < hi) {
+    const m = (lo + hi) >>> 1;
+    if (items[m]!.time < t) lo = m + 1;
+    else hi = m;
+  }
+  return lo < items.length && items[lo]!.time === t ? lo : -1;
+}
 
 /** Abdeckungsspannen auf [from, to) gekürzt (leere entfallen). */
 export function clipSpans(
