@@ -1,5 +1,5 @@
 // Plan und Laufzeit der /bigtrades-Abfrage (queries.ts bigOrdersSql) auf SYNTHETISCHEN big_order-Zeilen
-// im Columnstore – nie auf der Entwicklungsdatenbank: legt "<OF_DB_NAME>_bench_bigtrades" an (Admin-
+// im Columnstore – nie auf der Entwicklungsdatenbank: legt "<OF_DB_NAME>_test_bench_bigtrades" an (Admin-
 // Rolle aus OF_DB_*) und löscht sie am Ende. Gedacht für einen Wegwerf-Container:
 //   scripts/test-db-throwaway.sh node apps/api/bench/bigtrades-plan.ts
 // Daten: BENCH_DAYS Tage (Standard 400) × BENCH_PER_DAY Orders (Standard 4 600, gemessen 2026-11-21:
@@ -9,6 +9,8 @@ import { parseConfig } from '@orderflow/core';
 import { connect, dropAndCreateDatabase, migrateUp } from '@orderflow/db';
 import { BIGTRADES_MAX_ROWS } from '../src/routes/bigtrades.ts';
 import { bigOrdersSql } from '../src/queries.ts';
+// Review H2c: Chunk-Konvertierung nur auf Test-Datenbanken
+import { assertTestDatabase } from '../../importer/src/maintenance.ts';
 
 const DAY = 86_400_000;
 const DAYS = Number(process.env.BENCH_DAYS ?? 400);
@@ -18,13 +20,14 @@ const FLOOR_N = 50_000_000_000; // 500 000 USDT in 10^-5 USDT (BTCUSDT)
 const UNIT = 100_000; // 10^(2+3)
 
 const base = parseConfig(process.env).db;
-const cfg = { ...base, database: `${base.database}_bench_bigtrades` };
+const cfg = { ...base, database: `${base.database}_test_bench_bigtrades` };
 // Standardport der Entwicklungs-DB (docker-compose.yml): nie dort
 if (cfg.port === 54320 || !process.env.OF_DB_PORT)
   throw new Error('nur im Wegwerf-Container laufen lassen (scripts/test-db-throwaway.sh)');
 await dropAndCreateDatabase(cfg);
 const sql = connect(cfg);
 try {
+  await assertTestDatabase(sql);
   await migrateUp(sql);
   await sql`INSERT INTO symbol (sym_id, name, price_unit, price_decimals, tick_ref_units, qty_unit,
                                qty_decimals, data_from, big_floor_n)
