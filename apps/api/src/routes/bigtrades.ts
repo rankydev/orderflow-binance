@@ -13,7 +13,7 @@ import {
   type BigTradesMeta,
 } from '@orderflow/core';
 import type { FastifyInstance } from 'fastify';
-import { BIG_LADDER_USDT, coveragePlan, estimateBig } from '../bigtrades-plan.ts';
+import { BIG_LADDER_USDT, coveragePlan, dayCoverage, estimateBig } from '../bigtrades-plan.ts';
 import { guardedRead, requireSymbol, type Deps } from '../context.ts';
 import { badRequest, unprocessable } from '../errors.ts';
 import { makeResponse } from '../http.ts';
@@ -140,8 +140,10 @@ export function registerBigTradesRoutes(app: FastifyInstance, deps: Deps): void 
           const tooMany = new Set<number>();
           let budget = BIG_HOLES_TOTAL;
           for (let d = d0; d <= d1; d++) {
-            const h = days.get(d)?.holes ?? 0;
-            if (h === 0) continue;
+            const x = days.get(d);
+            const h = x?.holes ?? 0;
+            // Tage ohne Order-Daten aus anderem Grund verbrauchen kein Budget (ihr Grund bleibt)
+            if (h === 0 || dayCoverage(x, minN).status === 'none') continue;
             if (h > BIG_HOLES_PER_DAY || h > budget) tooMany.add(d);
             else {
               holeDays.push(d);

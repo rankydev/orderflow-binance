@@ -779,4 +779,35 @@ describe('/bigtrades', () => {
     const b = (await get(p)).decode();
     expect(b.meta.coverage[0]).toEqual(ok(at(10), GAPS[0]!, false));
   });
+
+  it('Lückenbudget: Tage ohne Order-Daten (digest_v1) verbrauchen es nicht', async () => {
+    // 35 v1-Tage mit je 118 mismatch-Minuten (Σ 4 130 > BIG_HOLES_TOTAL), danach ein gültiger Tag
+    await admin.unsafe(
+      `INSERT INTO data_day (sym_id, day, state, version, source, edge_pending, digest, digest_version)
+       SELECT 1, DATE '1970-01-01' + d, 'final_ok', 1, 'vision', false, 'x', 1
+         FROM generate_series(${D + 16}, ${D + 50}) d`,
+    );
+    await admin.unsafe(
+      `INSERT INTO data_minute_issue (sym_id, ts, kind)
+       SELECT 1, to_timestamp(d::int8 * 86400 + m * 60), 'mismatch'
+         FROM generate_series(${D + 16}, ${D + 50}) d, generate_series(0, 117) m`,
+    );
+    await admin`INSERT INTO data_day (sym_id, day, state, version, source, edge_pending, digest, digest_version,
+                                      orders_n, orders_notional, big_floor_n)
+                VALUES (1, ${dayStr(51)}::date, 'final_ok', 1, 'vision', false, 'x', 2, 1, 1, ${FLOOR})`;
+    // 110 Minuten: mehr als der Rest des Budgets, hätten die v1-Tage es verbraucht (4 000 − 33 · 118 = 106)
+    await admin.unsafe(
+      `INSERT INTO data_minute_issue (sym_id, ts, kind)
+       SELECT 1, $1::timestamptz + m * interval '1 minute', 'mismatch' FROM generate_series(0, 109) m`,
+      [new Date(at(51, 5)).toISOString()],
+    );
+    await waitFor(async () => api.deps.catalog.symbol('BTCUSDT')!.days.has(D + 51));
+    const d = (await get(url(at(16), at(52), 500_000, '1d'))).decode();
+    expect(d.meta.coverage).toEqual([
+      none(at(16), at(51), 'digest_v1', true),
+      ok(at(51), at(51, 5), true),
+      none(at(51, 5), at(51, 5, 110), 'mismatch', true),
+      ok(at(51, 5, 110), at(52), true),
+    ]);
+  });
 });
