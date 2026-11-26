@@ -714,7 +714,7 @@ Querprüfung: Der Client prüft jede Footprint-Kachel auf finalen Daten gegen di
 | `GET /api/v1/footprint` | sym, tf, R, tile, cfg | Vertrag in TILE-FORMAT.md |
 | Volume Profile (Range, je Tag) | – | Vertrag in `PROFILE-API.md` (entsteht mit P2) |
 | `GET /api/v1/tpo` | sym, day, block_min, R, ib_min | §6.5 |
-| `GET /api/v1/bigtrades` | sym, from, to, def, Parameter, tiers, side_mode | Orders ≥ Schwelle mit Stufe; Schwellen-Stufenreihe; `incomplete`-Intervalle |
+| `GET /api/v1/bigtrades` | sym, tf, from, to, min (USDT) – v1, absolute Schwelle; [später] def, tiers, side_mode | Vertrag in `BIGTRADES-API.md`: Orders ≥ Schwelle (Binärspalten), Abdeckung je Tag (`ok`/`partial`/`none`), Ausdünnung je Bar |
 | `GET /api/v1/thresholds` | sym, from, to, def, … | nur Schwellen-Zeitreihe |
 | `GET /api/v1/quality` | sym, from, to | §4.9 |
 | `GET /api/v1/health` | – | §2.5; nur von localhost erreichbar (nginx leitet ihn nicht nach außen) |

@@ -179,7 +179,8 @@ Mit den Fixtures (Zuschlag 1,5): 0 Kacheln über 30 000, 0 abgelehnt; feinste an
       "dataFrom": 1795132800000,   // [dataFrom, dataTo) in ms UTC; der Client fordert nichts außerhalb an
       "dataTo": 1795392000000,
       "tileConfigVersion": 3,
-      "tiles": { "1m": { "10": 32, "20": 32, "50": 64 }, "5m": { … } }   // nur angebotene (tf, R) → n
+      "tiles": { "1m": { "10": 32, "20": 32, "50": 64 }, "5m": { … } },  // nur angebotene (tf, R) → n
+      "bigTrades": { "floorN": 50000000000, "minUsdt": 500000, "notionalDecimals": 5 }  // oder null; BIGTRADES-API.md
     }
   ]
 }
@@ -225,6 +226,10 @@ aber vom Client nicht vorausgesetzt.
 **CORS:** Liegt die API auf einem anderen Ursprung als die Seite (`VITE_API_BASE`), muss sie für den Seiten-Ursprung
 `Access-Control-Allow-Origin` setzen (nur GET, keine Credentials, keine besonderen Header). Gleicher Ursprung über
 nginx ist der Normalfall (§2.4).
+
+`limits` (Grenzen je Endpunkt) enthält auch `bigtrades: { maxBars, maxRows, maxSourceRows, maxMatchedRows,
+maxMinUsdt }`; `bigTrades` und `limits` sind Zusätze ohne neues `schema`. Vertrag und Binärformat (`OFB1`) von
+`GET /api/v1/bigtrades`: [`BIGTRADES-API.md`](BIGTRADES-API.md).
 
 **Hinweise für die API-Implementierung:**
 - `/symbols` trägt `"schema": 2`; der Client lehnt andere Werte mit sichtbarer Meldung ab. Inkompatible Änderungen

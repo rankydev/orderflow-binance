@@ -1,7 +1,8 @@
 # @orderflow/api – lesende HTTP-API
 
 Verträge: [`docs/TILE-FORMAT.md`](../../docs/TILE-FORMAT.md) (`/symbols`, `/bars`, `/footprint`) und
-[`docs/PROFILE-API.md`](../../docs/PROFILE-API.md) (`/profile`, `/profiles/daily`, `/quality`). Nur lesende
+[`docs/PROFILE-API.md`](../../docs/PROFILE-API.md) (`/profile`, `/profiles/daily`, `/quality`),
+[`docs/BIGTRADES-API.md`](../../docs/BIGTRADES-API.md) (`/bigtrades`). Nur lesende
 Endpunkte, Datenbankrolle `of_api` (nur SELECT).
 
 ## Starten (lokal)
