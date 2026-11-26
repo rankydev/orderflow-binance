@@ -539,6 +539,12 @@ describe('Review vor dem Backfill (DB)', () => {
       await sql`UPDATE data_day SET digest = 'x' WHERE day = '2026-09-28'`;
       const badRes = await w.verifyDb(parseDay('2026-09-28'), parseDay('2026-09-28'));
       expect(badRes[0]!.stored).not.toBe(badRes[0]!.actual);
+      // Tag ohne Digest (z. B. provisorisch) gilt als Abweichung – wie deploy/sql/verify-db.sql (O2)
+      await sql`INSERT INTO data_day (sym_id, day, state) VALUES (1, '2026-09-30', 'provisional')`;
+      const [none] = await w.verifyDb(parseDay('2026-09-30'), parseDay('2026-09-30'));
+      expect(none!.stored).toBeNull();
+      expect(none!.actual).toMatch(/^[0-9a-f]{64}$/);
+      await sql`DELETE FROM data_day WHERE sym_id = 1 AND day = '2026-09-30'`;
     } finally {
       await w.close();
     }

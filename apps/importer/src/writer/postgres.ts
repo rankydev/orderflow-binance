@@ -554,7 +554,9 @@ export class PostgresWriter implements DayWriter {
       const day = formatDay(d);
       const [r] = await this.db`
         SELECT digest, digest_version,
-               CASE WHEN digest_version IS NULL THEN NULL
+               -- ohne gespeicherten Digest gegen die aktuelle Version: ein solcher Tag gilt als
+               -- Abweichung (wie deploy/sql/verify-db.sql, Review O2)
+               CASE WHEN digest_version IS NULL THEN day_digest_all(sym_id, day)
                     ELSE day_digest_all_v(sym_id, day, digest_version) END AS actual
           FROM data_day WHERE sym_id = ${this.spec.symId} AND day = ${day}::date`;
       if (r)
