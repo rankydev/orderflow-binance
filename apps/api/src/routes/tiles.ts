@@ -13,7 +13,7 @@ import { assertFresh, guardedRead, requireSymbol, type Deps } from '../context.t
 import { serveVersioned } from '../respond.ts';
 import { badRequest, HttpError, unprocessable } from '../errors.ts';
 import { etagOfBody, makeResponse, send, acceptsGzip } from '../http.ts';
-import { checkRange, MAX_TIME_MS, Params, SYMBOL_RE } from '../params.ts';
+import { checkRange, MAX_BARS_PER_REQUEST, MAX_TIME_MS, Params, SYMBOL_RE } from '../params.ts';
 import { barTableFor, coveredDays, estimateRows } from '../plan.ts';
 import { allImmutable, checkCoverage, checkTile } from '../consistency.ts';
 import type { ReadTx } from '../db.ts';
@@ -40,8 +40,7 @@ import {
 import { versionOf } from '../versions.ts';
 
 export const SYMBOLS_SCHEMA = 2;
-/** Größte Bar-Anzahl je /bars-Anfrage (der Client fragt 1 000 an). */
-export const MAX_BARS_PER_REQUEST = 5_000;
+export { MAX_BARS_PER_REQUEST };
 const BIN = 'application/octet-stream';
 
 /** Grenzen der Endpunkte für Clients (statisch je Konfiguration; ändert sich nicht mit den Daten). */

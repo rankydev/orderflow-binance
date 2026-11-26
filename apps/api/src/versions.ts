@@ -21,6 +21,8 @@ export function versionOf(
   d0: number,
   d1: number,
   get: (day: number) => DayVersion | null | undefined,
+  /** Zusatz je Tag für den Hash (z. B. Zahl der Lückenminuten, die ohne Versionswechsel entstehen). */
+  extra?: (day: number) => string | number | undefined,
 ): { dataVersion: string; final: boolean } {
   const h = createHash('sha256');
   h.update(`b${RESPONSE_BUILD_VERSION}|${parts.join('|')}|${d0}..${d1}|`);
@@ -34,6 +36,7 @@ export function versionOf(
       if (!v.immutable) final = false;
       h.update(`${v.version}${v.immutable ? 'i' : 'm'},`);
     }
+    if (extra) h.update(`${extra(d) ?? '-'};`);
   }
   return { dataVersion: h.digest('base64url').slice(0, 27), final };
 }

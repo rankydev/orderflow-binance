@@ -27,7 +27,7 @@ import {
   type Timeframe,
 } from '@orderflow/core';
 import { int, readTx, type ReadTx, type Sql } from './db.ts';
-import { chunkLockList, QUALITY_FP_SQL, readDays, tsLit } from './queries.ts';
+import { chunkLockList, HOLES_SQL, QUALITY_FP_SQL, readDays, tsLit } from './queries.ts';
 import { BAR_TABLES, barTableFor, FP_TABLE_NAMES, type BarTable, type RowsOn } from './plan.ts';
 import { DAY_MS, SYMBOL_RE } from './params.ts';
 import { minuteCount } from './minutes.ts';
@@ -76,6 +76,8 @@ export interface DayInfo {
   digestVersion: number | null;
   ordersKnown: boolean;
   floorN: number | null;
+  /** Minuten mit gap/missing in data_minute_issue (markGap erhöht data_day.version nicht). */
+  holes: number;
 }
 
 export interface DayStats {
@@ -367,8 +369,8 @@ export class Catalog extends EventEmitter {
     const dayRows = await tx.rows(
       `SELECT sym_id, (day - DATE '1970-01-01')::int, state, version, immutable,
               state_before_import IS NOT NULL, ${QUALITY_FP_SQL},
-              digest_version, orders_n IS NOT NULL, big_floor_n::text
-         FROM data_day ORDER BY sym_id, day`,
+              digest_version, orders_n IS NOT NULL, big_floor_n::text, ${HOLES_SQL}
+         FROM data_day d ORDER BY sym_id, day`,
     );
     const out = new Map<string, SymbolState>();
     const byId = new Map<number, SymbolState>();
@@ -414,6 +416,7 @@ export class Catalog extends EventEmitter {
         digestVersion: r[7] === null ? null : int(r[7]),
         ordersKnown: r[8] === true,
         floorN: r[9] === null ? null : int(r[9]),
+        holes: int(r[10]),
       });
     }
     return out;

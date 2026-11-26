@@ -17,14 +17,22 @@ import { BIG_LADDER_USDT, coveragePlan, estimateBig } from '../bigtrades-plan.ts
 import { guardedRead, requireSymbol, type Deps } from '../context.ts';
 import { badRequest, unprocessable } from '../errors.ts';
 import { makeResponse } from '../http.ts';
-import { checkRange, MAX_TIME_MS, Params, SYMBOL_RE } from '../params.ts';
+import {
+  checkRange,
+  DAY_MS,
+  MAX_BARS_PER_REQUEST,
+  MAX_TIME_MS,
+  MINUTE_MS,
+  Params,
+  SYMBOL_RE,
+} from '../params.ts';
 import { coveredDays } from '../plan.ts';
-import { queryBigOrders, readOrderDays } from '../queries.ts';
+import { queryBigOrders, queryFirstMinutes, queryHoleMinutes, readOrderDays } from '../queries.ts';
 import { serveVersioned } from '../respond.ts';
 import { versionOf } from '../versions.ts';
 
-/** Höchstzahl Bars je Anfrage (wie /bars; der Client fragt Abschnitte zu 1 000 Bars an). */
-export const BIGTRADES_MAX_BARS = 5_000;
+/** Höchstzahl Bars je Anfrage (= /bars; der Client fragt Abschnitte zu 1 000 Bars an). */
+export const BIGTRADES_MAX_BARS = MAX_BARS_PER_REQUEST;
 /**
  * Höchstzahl Zeilen je Antwort. ≥ 2 · 2 · BIGTRADES_MAX_BARS: auch voll ausgedünnt bleiben je (Bar,
  * Seite) mindestens die 2 größten Orders – die Ausdünnung scheitert nie, ein 422 wegen der Antwortgröße
@@ -91,70 +99,66 @@ export function registerBigTradesRoutes(app: FastifyInstance, deps: Deps): void 
       minN,
       BIGTRADES_MAX_ROWS,
     ];
+    // Vorab aus dem Katalog (Tagesebene; Live-Bereich und Lückenminuten kennt erst der Snapshot):
+    // Bereiche ⊇ die des Snapshots, also eine obere Schranke für die Schätzung.
     const plan0 = coveragePlan(from, to, minN, (d) => s.days.get(d));
     const pre = {
-      dataVersion: versionOf(parts, d0, d1, (d) => s.days.get(d)).dataVersion,
+      dataVersion: versionOf(
+        parts,
+        d0,
+        d1,
+        (d) => s.days.get(d),
+        (d) => s.days.get(d)?.holes,
+      ).dataVersion,
       final: plan0.final,
     };
     req.ctx.src = 'big_order';
     const histOn = (d: number) => s.stats.get(d)?.bigHist;
-    const est = estimateBig(plan0.ranges, histOn, minUsdt);
-    req.ctx.rowsEstimate = est.scanned;
-    if (est.scanned > BIGTRADES_MAX_SOURCE_ROWS) {
-      // Gelesen (entpackt) wird jede Zeile im Zeitraum, unabhängig von der Schwelle; Vorschlag: größtes
-      // ausgerichtetes to ab from, dessen Schätzung in der Grenze liegt (Rest in Folgeanfragen).
-      const step = tfSec * 1000;
-      const scannedTo = (t: number) =>
-        estimateBig(coveragePlan(from, t, minN, (d) => s.days.get(d)).ranges, histOn, minUsdt)
-          .scanned;
-      let lo = 1;
-      let hi = (to - from) / step - 1;
-      let best: number | null = null;
-      while (lo <= hi) {
-        const m = (lo + hi) >> 1;
-        if (scannedTo(from + m * step) <= BIGTRADES_MAX_SOURCE_ROWS) {
-          best = from + m * step;
-          lo = m + 1;
-        } else hi = m - 1;
-      }
-      throw unprocessable(
-        `Bereich zu groß (≈ ${est.scanned} big_order-Zeilen > ${BIGTRADES_MAX_SOURCE_ROWS}); kürzer anfragen`,
-        {
-          reason: 'source_rows_exceeded',
-          rowsEstimate: est.scanned,
-          limit: BIGTRADES_MAX_SOURCE_ROWS,
-          suggestTo: best,
-        },
-      );
-    }
-    if (est.matched > BIGTRADES_MAX_MATCHED_ROWS) {
-      // Treffer werden je (Bar, Seite) gerankt (Sortierung aller Treffer); Vorschlag: kleinste Stufe
-      // über der Schwelle, deren (dort exakte) Trefferzahl in der Grenze liegt.
-      const suggest =
-        BIG_LADDER_USDT.find(
-          (u) =>
-            u > minUsdt &&
-            estimateBig(plan0.ranges, histOn, u).matched <= BIGTRADES_MAX_MATCHED_ROWS,
-        ) ?? null;
-      throw unprocessable(
-        `zu viele Orders ≥ ${minUsdt} USDT (≈ ${est.matched} > ${BIGTRADES_MAX_MATCHED_ROWS}); höhere Schwelle wählen`,
-        {
-          reason: 'matched_rows_exceeded',
-          rowsEstimate: est.matched,
-          limit: BIGTRADES_MAX_MATCHED_ROWS,
-          suggestMinUsdt: suggest,
-        },
-      );
-    }
+    req.ctx.rowsEstimate = checkLimits(plan0.ranges, histOn, minUsdt, from, to, tfSec, (t) =>
+      coveragePlan(from, t, minN, (d) => s.days.get(d)),
+    );
     const key = `bigtrades|${s.name}|${tf}|${from}|${to}|${minN}`;
     return serveVersioned(deps, req, reply, key, pre, async (ctx) => {
       const { days, orders, plan } = await guardedRead(
         deps,
         ctx,
         async (tx) => {
-          const days = await readOrderDays(tx, s.symId, d0, d1);
+          // Vortag für den Anschluss der ersten aggId eines Live-Tages
+          const days = await readOrderDays(tx, s.symId, d0 - 1, d1);
+          const holes = await queryHoleMinutes(tx, s.symId, d0 * DAY_MS, (d1 + 1) * DAY_MS);
+          const live = new Map<number, { recordedFrom: number; recordedTo: number }>();
+          const needFirst: number[] = [];
+          for (let d = d0; d <= d1; d++) {
+            const x = days.get(d);
+            if (!x || !x.hasData || x.source === 'vision') continue;
+            const prev = days.get(d - 1);
+            const contiguous =
+              prev?.lastAggId != null &&
+              x.firstAggId != null &&
+              x.firstAggId === prev.lastAggId + 1;
+            const recordedTo = x.liveUntil ?? d * DAY_MS;
+            live.set(d, { recordedFrom: contiguous ? d * DAY_MS : recordedTo, recordedTo });
+            if (!contiguous) needFirst.push(d);
+          }
+          // ohne Anschluss: aufgezeichnet erst ab dem Ende der ersten gespeicherten Minute (sie kann
+          // angeschnitten sein, wenn der Recorder mitten in der Minute begann)
+          for (const [d, t] of await queryFirstMinutes(tx, s.symId, needFirst)) {
+            const l = live.get(d)!;
+            l.recordedFrom = Math.min(l.recordedTo, t + MINUTE_MS);
+          }
           // Abdeckung aus demselben Snapshot wie die Orders (nicht aus dem Katalog)
-          const plan = coveragePlan(from, to, minN, (d) => days.get(d));
+          const plan = coveragePlan(
+            from,
+            to,
+            minN,
+            (d) => {
+              const x = days.get(d);
+              return x ? { ...x, live: live.get(d) ?? null } : undefined;
+            },
+            holes,
+          );
+          // dieselben Grenzen auf den gelesenen Bereichen des Snapshots
+          checkLimits(plan.ranges, histOn, minUsdt, from, to, tfSec, null);
           const orders = await queryBigOrders(
             tx,
             s.symId,
@@ -165,9 +169,18 @@ export function registerBigTradesRoutes(app: FastifyInstance, deps: Deps): void 
           );
           return { days, orders, plan };
         },
-        [{ table: 'big_order', from, to }],
+        [
+          { table: 'big_order', from, to },
+          { table: 'bar_1m', from: d0 * DAY_MS, to: (d1 + 1) * DAY_MS },
+        ],
       );
-      const ver = versionOf(parts, d0, d1, (d) => days.get(d));
+      const ver = versionOf(
+        parts,
+        d0,
+        d1,
+        (d) => days.get(d),
+        (d) => days.get(d)?.holes,
+      );
       if (ver.dataVersion !== pre.dataVersion) void deps.catalog.refresh();
       const n = orders.ts.length;
       if (orders.k === 0) throw new Error('Ausdünnung ohne Ergebnis (Grenzen inkonsistent)');
@@ -209,4 +222,67 @@ export function registerBigTradesRoutes(app: FastifyInstance, deps: Deps): void 
       return makeResponse(body, BIN, ver.dataVersion, plan.final, true);
     });
   });
+}
+
+/**
+ * Grenzen der Schätzung (422 mit Vorschlag); Ergebnis: geschätzte gelesene Zeilen. planTo (nur vorab)
+ * liefert die Abdeckung von [from, t) für den Vorschlag suggestTo.
+ */
+function checkLimits(
+  ranges: { from: number; to: number }[],
+  histOn: (d: number) => Int32Array | undefined,
+  minUsdt: number,
+  from: number,
+  to: number,
+  tfSec: number,
+  planTo: ((t: number) => { ranges: { from: number; to: number }[] }) | null,
+): number {
+  const est = estimateBig(ranges, histOn, minUsdt);
+  if (est.scanned > BIGTRADES_MAX_SOURCE_ROWS) {
+    // Gelesen (entpackt) wird jede Zeile im Zeitraum, unabhängig von der Schwelle; Vorschlag: größtes
+    // ausgerichtetes to ab from, dessen Schätzung in der Grenze liegt (Rest in Folgeanfragen).
+    let best: number | null = null;
+    if (planTo) {
+      const step = tfSec * 1000;
+      let lo = 1;
+      let hi = (to - from) / step - 1;
+      while (lo <= hi) {
+        const m = (lo + hi) >> 1;
+        if (
+          estimateBig(planTo(from + m * step).ranges, histOn, minUsdt).scanned <=
+          BIGTRADES_MAX_SOURCE_ROWS
+        ) {
+          best = from + m * step;
+          lo = m + 1;
+        } else hi = m - 1;
+      }
+    }
+    throw unprocessable(
+      `Bereich zu groß (≈ ${est.scanned} big_order-Zeilen > ${BIGTRADES_MAX_SOURCE_ROWS}); kürzer anfragen`,
+      {
+        reason: 'source_rows_exceeded',
+        rowsEstimate: est.scanned,
+        limit: BIGTRADES_MAX_SOURCE_ROWS,
+        suggestTo: best,
+      },
+    );
+  }
+  if (est.matched > BIGTRADES_MAX_MATCHED_ROWS) {
+    // Treffer werden je (Bar, Seite) gerankt (Sortierung aller Treffer); Vorschlag: kleinste Stufe
+    // über der Schwelle, deren (dort exakte) Trefferzahl in der Grenze liegt.
+    const suggest =
+      BIG_LADDER_USDT.find(
+        (u) => u > minUsdt && estimateBig(ranges, histOn, u).matched <= BIGTRADES_MAX_MATCHED_ROWS,
+      ) ?? null;
+    throw unprocessable(
+      `zu viele Orders ≥ ${minUsdt} USDT (≈ ${est.matched} > ${BIGTRADES_MAX_MATCHED_ROWS}); höhere Schwelle wählen`,
+      {
+        reason: 'matched_rows_exceeded',
+        rowsEstimate: est.matched,
+        limit: BIGTRADES_MAX_MATCHED_ROWS,
+        suggestMinUsdt: suggest,
+      },
+    );
+  }
+  return est.scanned;
 }

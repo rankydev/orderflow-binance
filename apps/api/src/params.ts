@@ -11,6 +11,9 @@ export const MINUTE_MS = 60_000;
 /** Größter Zeitpunkt (ms), den das Kachelformat abbilden kann (Int32-Sekunden). */
 export const MAX_TIME_MS = 2 ** 31 * 1000;
 
+/** Größte Bar-Anzahl je /bars- bzw. /bigtrades-Anfrage (der Client fragt 1 000 an). */
+export const MAX_BARS_PER_REQUEST = 5_000;
+
 export type RawQuery = Record<string, unknown>;
 
 export class Params {

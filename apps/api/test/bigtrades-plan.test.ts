@@ -1,5 +1,5 @@
-// Abdeckung und Schätzung von /bigtrades (rein): Gründe je Tag, Zusammenfassen, Ränder, final,
-// Stufenstatistik als obere Schranke.
+// Abdeckung und Schätzung von /bigtrades (rein): Gründe je Tag, Live-Bereich und Lückenminuten,
+// Zusammenfassen, Ränder, final, Stufenstatistik als obere Schranke.
 import { describe, expect, it } from 'vitest';
 import {
   BIG_LADDER_USDT,
@@ -11,6 +11,8 @@ import {
 } from '../src/bigtrades-plan.ts';
 
 const DAY = 86_400_000;
+const HOUR = 3_600_000;
+const MIN = 60_000;
 const FLOOR = 50_000_000_000;
 const ok: OrderDay = {
   hasData: true,
@@ -51,13 +53,6 @@ describe('dayCoverage', () => {
       floorN: FLOOR,
       final: true,
     });
-    // Live-Tag mit bekannten Summen (digest_version NULL): ok, nicht final
-    expect(dayCoverage({ ...ok, digestVersion: null, immutable: false }, FLOOR)).toEqual({
-      status: 'ok',
-      reason: null,
-      floorN: FLOOR,
-      final: false,
-    });
   });
 });
 
@@ -69,9 +64,9 @@ describe('coveragePlan', () => {
     [13, { ...ok, floorN: 2 * FLOOR }],
     [15, { ...ok, immutable: false, digestVersion: null }],
   ]);
-  it('fasst gleiche Tage zusammen, schneidet an from/to ab, liest nur Tage mit Daten', () => {
-    const from = 10 * DAY + 3_600_000;
-    const to = 15 * DAY + 7_200_000;
+  it('Tagesebene: fasst gleiche Tage zusammen, schneidet an from/to ab, liest nur Tage mit Daten', () => {
+    const from = 10 * DAY + HOUR;
+    const to = 15 * DAY + 2 * HOUR;
     const p = coveragePlan(from, to, FLOOR, (d) => days.get(d));
     expect(p.spans).toEqual([
       { from, to: 12 * DAY, status: 'ok', reason: null, floorN: FLOOR, final: true },
@@ -108,24 +103,114 @@ describe('coveragePlan', () => {
     ]);
     expect(p.final).toBe(false);
   });
-  it('final nur, wenn alle Tage unveränderlich sind und Order-Daten haben', () => {
+
+  it('final nur, wenn alles ok und unveränderlich ist (nicht bei none, partial, Lückenminuten)', () => {
     expect(coveragePlan(10 * DAY, 12 * DAY, FLOOR, (d) => days.get(d)).final).toBe(true);
-    expect(coveragePlan(13 * DAY, 14 * DAY, FLOOR, (d) => days.get(d)).final).toBe(true);
+    // partial: ein Neuimport mit anderer Untergrenze ändert die Antwort
+    expect(coveragePlan(13 * DAY, 14 * DAY, FLOOR, (d) => days.get(d)).final).toBe(false);
+    expect(coveragePlan(13 * DAY, 14 * DAY, 2 * FLOOR, (d) => days.get(d)).final).toBe(true);
     // v1-Tag ist unveränderlich, aber ohne Order-Daten: die Antwort wird sich mit dem Neuimport ändern
     expect(coveragePlan(10 * DAY, 13 * DAY, FLOOR, (d) => days.get(d)).final).toBe(false);
+    // Lückenminuten am Tag (Katalog kennt nur die Zahl): nie final, auch außerhalb des Ausschnitts
+    expect(coveragePlan(10 * DAY, 10 * DAY + HOUR, FLOOR, () => ({ ...ok, holes: 2 })).final).toBe(
+      false,
+    );
+  });
+
+  it('Live-Tag: vor der Aufzeichnung not_recorded, nach live_until pending (auch Zukunft), gap-Minuten', () => {
+    const live: OrderDay = {
+      ...ok,
+      immutable: false,
+      digestVersion: null,
+      live: { recordedFrom: 20 * DAY + 10 * HOUR + MIN, recordedTo: 20 * DAY + 15 * HOUR },
+    };
+    const holes = [
+      { ts: 20 * DAY + 12 * HOUR, reason: 'gap' as const },
+      { ts: 20 * DAY + 12 * HOUR + MIN, reason: 'gap' as const },
+      { ts: 20 * DAY + 13 * HOUR, reason: 'gap' as const },
+      { ts: 20 * DAY + 16 * HOUR, reason: 'gap' as const }, // nach live_until: bleibt pending
+    ];
+    const from = 20 * DAY;
+    const to = 22 * DAY; // reicht in die Zukunft (Tag 21 ohne Zeile)
+    const p = coveragePlan(from, to, FLOOR, (d) => (d === 20 ? live : undefined), holes);
+    const n = (a: number, b: number, reason: string, final = false) => ({
+      from: a,
+      to: b,
+      status: 'none',
+      reason,
+      floorN: null,
+      final,
+    });
+    const o = (a: number, b: number) => ({
+      from: a,
+      to: b,
+      status: 'ok',
+      reason: null,
+      floorN: FLOOR,
+      final: false,
+    });
+    const at = (h: number, m = 0) => 20 * DAY + h * HOUR + m * MIN;
+    expect(p.spans).toEqual([
+      n(from, at(10, 1), 'not_recorded'),
+      o(at(10, 1), at(12)),
+      n(at(12), at(12, 2), 'gap'),
+      o(at(12, 2), at(13)),
+      n(at(13), at(13, 1), 'gap'),
+      o(at(13, 1), at(15)),
+      n(at(15), 21 * DAY, 'pending'),
+      n(21 * DAY, to, 'no_day'),
+    ]);
+    expect(p.ranges).toEqual([
+      { from: at(10, 1), to: at(12) },
+      { from: at(12, 2), to: at(13) },
+      { from: at(13, 1), to: at(15) },
+    ]);
+    // nichts aufgezeichnet (live_until NULL): ganzer Tag pending
+    const empty = coveragePlan(from, from + DAY, FLOOR, () => ({
+      ...live,
+      live: { recordedFrom: from, recordedTo: from },
+    }));
+    expect(empty.spans).toEqual([n(from, from + DAY, 'pending')]);
+    expect(empty.ranges).toEqual([]);
+  });
+
+  it('final_bad-Tag mit missing-Minuten: source_missing, Rest ok, nicht final', () => {
+    const p = coveragePlan(5 * DAY, 6 * DAY, FLOOR, () => ({ ...ok, holes: 1 }), [
+      { ts: 5 * DAY + 100 * MIN, reason: 'source_missing' },
+    ]);
+    expect(p.spans.map((x) => [x.from - 5 * DAY, x.to - 5 * DAY, x.status, x.reason])).toEqual([
+      [0, 100 * MIN, 'ok', null],
+      [100 * MIN, 101 * MIN, 'none', 'source_missing'],
+      [101 * MIN, DAY, 'ok', null],
+    ]);
+    expect(p.final).toBe(false);
   });
 });
 
 describe('Stufenstatistik', () => {
+  const idx = (u: number) => BIG_LADDER_USDT.indexOf(u);
   // Index i: [L[i−1], L[i]); Index 0 < 100 000 USDT
   const h = new Int32Array(BIG_LADDER_USDT.length + 1);
-  h[2] = 1000; // 200 000 … 500 000
-  h[3] = 400; // 500 000 … 1 Mio.
-  h[4] = 100; // 1 … 2 Mio.
+  h[idx(250_000) + 1] = 1000; // 250 000 … 280 000
+  h[idx(500_000) + 1] = 400; // 500 000 … 550 000
+  h[idx(1_000_000) + 1] = 100; // 1 … 1,1 Mio.
   h[BIG_LADDER_USDT.length] = 3; // ≥ 1 Mrd.
+  it('Stufen: 22 je Dekade, benachbart höchstens Faktor 7/6, enthält die Untergrenzen', () => {
+    expect(BIG_LADDER_USDT[0]).toBe(100_000);
+    expect(BIG_LADDER_USDT.at(-1)).toBe(1_000_000_000);
+    for (let i = 1; i < BIG_LADDER_USDT.length; i++) {
+      const r = BIG_LADDER_USDT[i]! / BIG_LADDER_USDT[i - 1]!;
+      expect(r).toBeGreaterThan(1);
+      expect(r).toBeLessThanOrEqual(7 / 6 + 1e-9);
+    }
+    expect(BIG_LADDER_USDT).toEqual(expect.arrayContaining([250_000, 500_000, 1_000_000]));
+  });
   it('exakt auf einer Stufe, sonst Schranke ab der Stufe darunter', () => {
     expect(matchedAtLeast(h, 500_000)).toBe(503);
-    expect(matchedAtLeast(h, 600_000)).toBe(503); // ≥ tatsächlich
+    expect(matchedAtLeast(h, 540_000)).toBe(503); // ≥ tatsächlich (Intervall 500 000 … 550 000)
+    expect(matchedAtLeast(h, 550_000)).toBe(103);
+    // mit 1-2-5-Stufen zählte 999 999 alles ab 500 000; jetzt nur ab 900 000
+    expect(matchedAtLeast(h, 999_999)).toBe(103);
     expect(matchedAtLeast(h, 1_000_000)).toBe(103);
     expect(matchedAtLeast(h, 250_000)).toBe(1503);
     expect(matchedAtLeast(h, 50_000)).toBe(1503);

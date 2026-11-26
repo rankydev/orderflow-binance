@@ -493,6 +493,15 @@ export async function queryIssues(
 
 // ---------------------------------------------------------------- Big Trades (GET /api/v1/bigtrades)
 
+/**
+ * Anzahl der gap/missing-Minuten eines data_day-Tages (Alias d), über den Primärschlüssel von
+ * data_minute_issue. Für Version und `final` von /bigtrades (markGap ändert data_day.version nicht).
+ */
+export const HOLES_SQL = `(SELECT count(*)::int FROM data_minute_issue i
+   WHERE i.sym_id = d.sym_id AND i.kind IN ('gap', 'missing')
+     AND i.ts >= d.day::timestamp AT TIME ZONE 'UTC'
+     AND i.ts < (d.day + 1)::timestamp AT TIME ZONE 'UTC')`;
+
 /** Order-Felder eines Tages aus data_day (Migration 0017), im Snapshot der Antwort. */
 export interface OrderDaySnap extends DaySnap {
   /** Tag hat (oder hatte vor einem laufenden Ersatz) gespeicherte Daten. */
@@ -502,6 +511,13 @@ export interface OrderDaySnap extends DaySnap {
   ordersKnown: boolean;
   /** data_day.big_floor_n: Untergrenze, mit der big_order für den Tag geschrieben wurde. */
   floorN: number | null;
+  /** HOLES_SQL */
+  holes: number;
+  source: string | null;
+  /** live_until in ms (Ende der letzten geschriebenen Minute) oder null. */
+  liveUntil: number | null;
+  firstAggId: number | null;
+  lastAggId: number | null;
 }
 
 export async function readOrderDays(
@@ -513,8 +529,9 @@ export async function readOrderDays(
   const rows = await tx.rows(
     `SELECT (day - DATE '1970-01-01')::int, state, version, immutable,
             state <> 'importing' OR state_before_import IS NOT NULL,
-            digest_version, orders_n IS NOT NULL, big_floor_n::text
-       FROM data_day WHERE sym_id = $1 AND day >= ${dateLit(d0)} AND day <= ${dateLit(d1)}`,
+            digest_version, orders_n IS NOT NULL, big_floor_n::text, ${HOLES_SQL}, source,
+            (extract(epoch FROM live_until) * 1000)::int8, first_agg_id, last_agg_id
+       FROM data_day d WHERE sym_id = $1 AND day >= ${dateLit(d0)} AND day <= ${dateLit(d1)}`,
     [symId],
   );
   const m = new Map<number, OrderDaySnap>();
@@ -528,7 +545,51 @@ export async function readOrderDays(
       digestVersion: intOrNull(r[5]),
       ordersKnown: r[6] === true,
       floorN: intOrNull(r[7]),
+      holes: int(r[8]),
+      source: r[9] === null ? null : String(r[9]),
+      liveUntil: intOrNull(r[10]),
+      firstAggId: intOrNull(r[11]),
+      lastAggId: intOrNull(r[12]),
     });
+  return m;
+}
+
+/** gap/missing-Minuten (Beginn in ms) in [from, to), aufsteigend; missing → source_missing. */
+export async function queryHoleMinutes(
+  tx: ReadTx,
+  symId: number,
+  from: number,
+  to: number,
+): Promise<{ ts: number; reason: 'gap' | 'source_missing' }[]> {
+  const rows = await tx.rows(
+    `SELECT (extract(epoch FROM ts) * 1000)::int8, bool_or(kind = 'gap') FROM data_minute_issue
+      WHERE sym_id = $1 AND kind IN ('gap', 'missing') AND ts >= ${tsLit(from)} AND ts < ${tsLit(to)}
+      GROUP BY 1 ORDER BY 1`,
+    [symId],
+  );
+  return rows.map((r) => ({ ts: int(r[0]), reason: r[1] === true ? 'gap' : 'source_missing' }));
+}
+
+/** Erste gespeicherte Minute (ms) je Tag in bar_1m, für die Tage `days`. */
+export async function queryFirstMinutes(
+  tx: ReadTx,
+  symId: number,
+  days: number[],
+): Promise<Map<number, number>> {
+  const m = new Map<number, number>();
+  if (days.length === 0) return m;
+  const where = days
+    .map((d) => `(ts >= ${tsLit(d * DAY_MS)} AND ts < ${tsLit((d + 1) * DAY_MS)})`)
+    .join(' OR ');
+  const rows = await tx.rows(
+    `SELECT (extract(epoch FROM min(ts)) * 1000)::int8 FROM bar_1m
+      WHERE sym_id = $1 AND (${where}) GROUP BY time_bucket('1 day'::interval, ts)`,
+    [symId],
+  );
+  for (const r of rows) {
+    const t = int(r[0]);
+    m.set(Math.floor(t / DAY_MS), t);
+  }
   return m;
 }
 
