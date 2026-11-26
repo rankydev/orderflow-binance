@@ -9,5 +9,6 @@ export * from './digest.ts';
 export * from './manifest.ts';
 export * from './day-result.ts';
 export * from './tile/index.ts';
+export * from './bigtrades/codec.ts';
 export * from './profile/index.ts';
 export * from './live/live-day.ts';
