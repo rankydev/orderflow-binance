@@ -93,18 +93,10 @@ describe('Order-Regel v1 (DayAggregator)', () => {
       fc.property(ordersArb, fc.integer({ min: 1, max: 3_000_000_000 }), (trades, floor) => {
         const agg = aggregateDay(DAY, trades, floor);
         const ref = refOrders(trades);
-        // Partition: jede aggId genau einmal, in Reihenfolge
-        expect(ref.flat().map((t) => t.a)).toEqual(trades.map((t) => t.a));
         expect(agg.ordersN).toBe(ref.length);
         const sumNtl = trades.reduce((x, t) => x + BigInt(t.px * t.q), 0n);
         expect(agg.ordersNotional).toBe(sumNtl);
         expect(agg.ordersNotional).toBe(agg.bars.reduce((x, b) => x + b.notional, 0n));
-        for (const o of ref) {
-          // gleiches T ⇒ gleiche Minute; gleiche Seite; IDs lückenlos
-          expect(new Set(o.map((t) => t.T)).size).toBe(1);
-          expect(new Set(o.map((t) => t.m)).size).toBe(1);
-          o.forEach((t, i) => i > 0 && expect(t.a).toBe(o[i - 1]!.a + 1));
-        }
         // big orders = Referenz-Orders ≥ Untergrenze, nach (ts, first_agg_id)
         const want = ref
           .map(toBig)
@@ -130,6 +122,22 @@ describe('Order-Regel v1 (DayAggregator)', () => {
           agg.bars.reduce((x, b) => x + b.buyQ + b.sellQ, 0),
         );
         expect(agg.bigOrders.reduce((x, o) => x + o.aggN, 0)).toBe(trades.length);
+        // Eigenschaften der vom Code gebildeten Orders gegen die Eingabe: Partition der aggIds,
+        // je Order dasselbe T (also dieselbe Minute) und dieselbe Seite, IDs lückenlos
+        const byId = new Map(trades.map((t) => [t.a, t]));
+        const ids = agg.bigOrders
+          .flatMap((o) => Array.from({ length: o.aggN }, (_, i) => o.firstAggId + i))
+          .sort((x, y) => x - y);
+        expect(ids).toEqual(trades.map((t) => t.a));
+        for (const o of agg.bigOrders) {
+          for (let a = o.firstAggId; a <= o.lastAggId; a++) {
+            const t = byId.get(a)!;
+            expect(t.T).toBe(o.ts);
+            expect(t.m ? 2 : 1).toBe(o.side);
+          }
+          expect(byId.get(o.firstAggId)!.px).toBe(o.pxFirst);
+          expect(byId.get(o.lastAggId)!.px).toBe(o.pxLast);
+        }
       }),
       { numRuns: 200 },
     );
@@ -160,7 +168,16 @@ describe('Order-Regel v1 (DayAggregator)', () => {
           n: ref.ordersN,
           notional: ref.ordersNotional,
           bigFloorN: floor,
+          minutes: ref.bars.length,
+          aggTrades: trades.length,
+          firstIdSum: ref.bars.reduce((x, b) => x + BigInt(b.firstAggId), 0n),
+          lastIdSum: ref.bars.reduce((x, b) => x + BigInt(b.lastAggId), 0n),
         });
+        // ganzer Tag bis zur jeweiligen Minute (Ersatz nach einem Neustart)
+        expect(last.bigDay()).toEqual(ref.bigOrders);
+        for (const d of deltas) {
+          expect(d.bigDay()).toEqual(ref.bigOrders.filter((o) => o.ts < d.big.to));
+        }
         const snap = live.snapshot();
         expect(snap.bigOrders).toEqual(ref.bigOrders);
         expect(snap.orders).toEqual({ n: ref.ordersN, notional: ref.ordersNotional });
