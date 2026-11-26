@@ -68,8 +68,18 @@ ROLLUPS: tuple[RollupDef, ...] = (
 )
 
 FP_TABLES = ("fp_1m",) + tuple(r.table for r in ROLLUPS)
-# Reihenfolge exakt wie die Liste in day_digest_all (packages/db/migrations/0005_day_digest.up.sql).
-DIGEST_TABLES = (*FP_TABLES, "bar_1m", "bar_1h", "bar_1d", "kline_1m")
+# Digest-Teile je Version (data_day.digest_version, Migration 0017, SQL day_digest_all_v):
+# Version 1 = Liste aus 0005 (zwölf Tabellen bis P4); Version 2 = zusätzlich big_order und die
+# Ordersummen des Tages (order_day: sym_id, day, orders_n, orders_notional, big_floor_n).
+DIGEST_TABLES_V1 = (*FP_TABLES, "bar_1m", "bar_1h", "bar_1d", "kline_1m")
+# Tabellen eines Tages in der aktuellen Version (order_day ist keine Tabelle, sondern eine Zeile
+# von data_day und kommt nur im kombinierten Digest vor).
+DIGEST_TABLES = (*DIGEST_TABLES_V1, "big_order")
+DIGEST_TABLES_V2 = (*DIGEST_TABLES, "order_day")
+DIGEST_PARTS = {1: DIGEST_TABLES_V1, 2: DIGEST_TABLES_V2}
+DIGEST_VERSION = 2
+# Order-Regel v1 (KONZEPT §3.7): maximaler Lauf gleicher ms, gleicher Seite, aggId lückenlos +1.
+ORDER_RULE_VERSION = 1
 
 
 def dec_int_sql(col: str, decimals: int) -> str:

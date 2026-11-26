@@ -1,6 +1,7 @@
 """Dateimodus: ein Symbol-Tag vollständig aus den Rohdateien neu berechnen (KONZEPT §4.8).
 
-Ergebnis (JSON-fähig): Manifestkennzahlen, Digests je Tabelle und kombiniert, Minutenklassifikation,
+Ergebnis (JSON-fähig): Manifestkennzahlen, Digests je Tabelle und kombiniert (je Digest-Version),
+Orders des Tages nach Order-Regel v1 (Summen, big_order ab der Untergrenze), Minutenklassifikation,
 Tagessummen, OHLC-Bericht, Laufzeit/Speicher. Die DuckDB-Verbindung mit allen Tagestabellen bleibt
 für Tiefenprüfung und Datenbankvergleich erhalten.
 """
@@ -18,7 +19,7 @@ import duckdb
 from . import classify as cl
 from . import files as fl
 from . import recompute as rc
-from .units import MS_DAY, MS_MIN, SymbolSpec, lots_to_str
+from .units import DIGEST_VERSION, MS_DAY, MS_MIN, SymbolSpec, lots_to_str
 
 TOOL_VERSION = "orderflow-verifier@0.1.0"
 
@@ -97,7 +98,10 @@ def verify_day(
     threads: int | None = None,
     checksums: bool = True,
     all_minutes: bool = False,
+    big_floor_n: int | None = None,
 ) -> tuple[dict, duckdb.DuckDBPyConnection]:
+    """``big_floor_n``: Untergrenze big_order (ganzzahliges Notional) wie beim Schreiben des Tages;
+    im Datenbankmodus die des Tages aus data_day.big_floor_n, None = keine big orders."""
     t_start = time.perf_counter()
     d = dt.date.fromisoformat(day)
     d0 = fl.day_to_ms(d)
@@ -153,8 +157,8 @@ def verify_day(
         }
 
     t0 = time.perf_counter()
-    rc.build_day_tables(con, sym, d0)
-    digests = rc.day_digests(con, sym)
+    orders = rc.build_day_tables(con, sym, d0, big_floor_n)
+    digests = rc.day_digests(con, sym, day, orders)
     t_build = time.perf_counter() - t0
 
     day_tot = cl.totals(mins, dc, cand_prev)
@@ -192,7 +196,10 @@ def verify_day(
         "state": "final_bad" if has_bad else "final_ok",
         "manifest": manifest,
         "tables": digests["tables"],
+        "digest_version": DIGEST_VERSION,
         "day_digest": digests["day_digest"],
+        "day_digests": digests["day_digests"],
+        "orders": orders,
         "range_checks": rc.range_checks(con),
         "classification": {
             "counts": counts,

@@ -6,7 +6,7 @@ import pytest
 
 import world as w
 from orderflow_verifier.recompute import combine_digests
-from orderflow_verifier.units import DIGEST_TABLES, symbol_spec
+from orderflow_verifier.units import DIGEST_PARTS, FP_TABLES, symbol_spec
 from orderflow_verifier.verify import verify_day
 
 SPEC = symbol_spec("BTCUSDT")  # sym_id 1, price_decimals 2, qty_decimals 3
@@ -91,7 +91,7 @@ def test_rollups_hand_values(day):
 def test_rollup_sums_equal_base(day):
     _, con = day
     base = q(con, "SELECT sum(buy_q), sum(sell_q), sum(buy_a), sum(sell_a) FROM fp_1m")
-    for t in DIGEST_TABLES[1:8]:
+    for t in FP_TABLES[1:]:
         assert q(con, f"SELECT sum(buy_q), sum(sell_q), sum(buy_a), sum(sell_a) FROM {t}") == base
 
 
@@ -163,12 +163,16 @@ def _ts(ms):
 
 def test_combined_digest_form(day):
     result, _ = day
-    parts = [f"{t}:{result['tables'][t]['digest']}" for t in DIGEST_TABLES]
-    assert result["day_digest"] == hashlib.sha256("\n".join(parts).encode()).hexdigest()
-    assert (
-        combine_digests({t: result["tables"][t]["digest"] for t in DIGEST_TABLES})
-        == result["day_digest"]
-    )
+    for v, key in ((1, "1"), (2, "2")):
+        parts = [f"{t}:{result['tables'][t]['digest']}" for t in DIGEST_PARTS[v]]
+        want = hashlib.sha256("\n".join(parts).encode()).hexdigest()
+        assert result["day_digests"][key] == want
+        assert (
+            combine_digests({t: result["tables"][t]["digest"] for t in DIGEST_PARTS[v]}, v) == want
+        )
+    assert result["day_digest"] == result["day_digests"]["2"]
+    assert result["digest_version"] == 2
+    assert result["day_digests"]["1"] != result["day_digests"]["2"]
 
 
 def test_empty_table_digest_is_sha256_of_empty_string():

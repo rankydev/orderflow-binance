@@ -8,7 +8,7 @@ import world as w
 from orderflow_verifier import dbmode, deepcheck
 from orderflow_verifier import recompute as rc
 from orderflow_verifier.compare import compare_importer
-from orderflow_verifier.units import DIGEST_TABLES, symbol_spec
+from orderflow_verifier.units import DIGEST_PARTS, DIGEST_TABLES, FP_TABLES, symbol_spec
 from orderflow_verifier.verify import verify_day
 
 SPEC = symbol_spec("BTCUSDT")
@@ -81,8 +81,18 @@ def test_db_diff_reports_first_differing_rows():
 class FakeDb:
     """Ersatz-Datenbank: kopiert die berechneten Tabellen in eine zweite DuckDB (optional manipuliert)."""
 
-    def __init__(self, con, spec, result, corrupt=None):
+    def __init__(self, con, spec, result, corrupt=None, day_overrides=None):
         self.con, self.spec, self.result = con, spec, result
+        o = result["orders"]
+        # gespeicherte data_day-Felder wie vom Importer geschrieben (Version 2)
+        self.day = {
+            "digest_version": 2,
+            "digest": result["day_digest"],
+            "orders_n": o["orders_n"],
+            "orders_notional": o["orders_notional"],
+            "big_floor_n": o["big_floor_n"],
+            **(day_overrides or {}),
+        }
         self.store = duckdb.connect()
         for t in DIGEST_TABLES:
             self.store.register(f"src_{t}", con.cursor().sql(f"SELECT * FROM {t}").to_arrow_table())
@@ -100,10 +110,16 @@ class FakeDb:
         }
 
     def server_digest(self, table, sym_id, day):
+        if table == "order_day":
+            d = self.day
+            return rc.order_day_digest(
+                sym_id, day, d["orders_n"], d["orders_notional"], d["big_floor_n"]
+            )
         return rc.table_digest(self.store, table, sym_id)[0]
 
-    def server_digest_all(self, sym_id, day):
-        return rc.combine_digests({t: self.server_digest(t, sym_id, day) for t in DIGEST_TABLES})
+    def server_digest_all(self, sym_id, day, version):
+        parts = DIGEST_PARTS[version]
+        return rc.combine_digests({t: self.server_digest(t, sym_id, day) for t in parts}, version)
 
     def load_table(self, con, table, sym_id, day, into):
         stored = self.store.cursor().sql(f"SELECT * FROM {table}").to_arrow_table()  # noqa: F841
@@ -115,8 +131,8 @@ class FakeDb:
         if "FROM data_day" in sql:
             return [
                 {
+                    **self.day,
                     "state": r["state"],
-                    "digest": r["day_digest"],
                     "rows": m["rows"],
                     "first_agg_id": m["first_agg_id"],
                     "last_agg_id": m["last_agg_id"],
@@ -186,7 +202,15 @@ def test_compare_importer_fields(tmp_path):
         "symbol": "BTCUSDT",
         "day": DAY,
         "digest": res["day_digest"],
-        "digests": {t: res["tables"][t]["digest"] for t in DIGEST_TABLES},
+        "digestVersion": 2,
+        "digests": {t: res["tables"][t]["digest"] for t in DIGEST_PARTS[2]},
+        "orders": {
+            "n": res["orders"]["orders_n"],
+            "notional": str(res["orders"]["orders_notional"]),
+            "barsNotional": str(res["orders"]["bars_notional"]),
+            "big": res["orders"]["big_orders"],
+            "bigFloorN": res["orders"]["big_floor_n"],
+        },
         "counts": c["counts"],
         "exactQ": c["exact_volume_minutes"],
         "exactB": c["exact_taker_buy_minutes"],
@@ -222,7 +246,7 @@ def test_compare_importer_fields(tmp_path):
             }
             for e in c["edges"]
         ],
-        "fpRows": {t: res["tables"][t]["rows"] for t in DIGEST_TABLES[:8]},
+        "fpRows": {t: res["tables"][t]["rows"] for t in FP_TABLES},
         "bars": res["tables"]["bar_1m"]["rows"],
         "ohlc": {k: res["ohlc"][k] for k in ("compared", "open", "high", "low", "close")},
     }

@@ -38,7 +38,12 @@ def _summary(r: dict) -> str:
         f"  totals q: ours={r['totals_display']['q']['ours']} kline={r['totals_display']['q']['kline']}"
         f" diff={r['totals_display']['q']['diff']} s(-1)={t['q']['carry_in']} s(1439)={t['q']['carry_out']}"
         f" | b: diff={r['totals_display']['b']['diff']} identity={t['identity']} bounds={t['bounds_ok']}",
-        f"  state={r['state']} day_digest={r['day_digest']}",
+        f"  state={r['state']} day_digest(v{r['digest_version']})={r['day_digest']} "
+        f"v1={r['day_digests']['1']}",
+        f"  orders (Regel v{r['orders']['rule_version']}) n={r['orders']['orders_n']:,} "
+        f"Σnotional={r['orders']['orders_notional']} bars={r['orders']['bars_notional']} "
+        f"reconciled={r['orders']['reconciled']} | big_order={r['orders']['big_orders']:,} "
+        f"(floor {r['orders']['big_floor_n'] if r['orders']['big_floor_n'] is not None else 'keine'})",
     ]
     for tname, v in r["tables"].items():
         lines.append(f"    {tname:12s} rows={v['rows']:>9,} {v['digest']}")
@@ -73,6 +78,7 @@ def cmd_day(args: argparse.Namespace) -> int:
         work_dir=args.work_dir,
         checksums=not args.no_checksum,
         all_minutes=args.all_minutes,
+        big_floor_n=args.big_floor_n,
     )
     text = _summary(result)
     if args.deep:
@@ -137,13 +143,19 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--no-checksum", action="store_true")
     d.add_argument("--all-minutes", action="store_true", help="alle 1440 Minuten ins JSON")
     d.add_argument("--deep", action="store_true", help="zusätzlich Tiefenprüfung (trades-Dump)")
+    d.add_argument(
+        "--big-floor-n",
+        type=int,
+        default=None,
+        help="Untergrenze big_order (ganzzahliges Notional); Standard keine (DB-Modus: aus data_day)",
+    )
     d.set_defaults(fn=cmd_day)
 
     k = sub.add_parser("deep", help="Tiefenprüfung gegen den trades-Dump (KONZEPT §4.7)")
     _common(k)
     k.set_defaults(fn=cmd_deep)
 
-    b = sub.add_parser("db", help="Datenbankmodus (UNGETESTET, keine Datenbank vorhanden)")
+    b = sub.add_parser("db", help="Datenbankmodus: Neuberechnung gegen PostgreSQL vergleichen")
     _common(b)
     b.add_argument("--lookback", type=int, default=2)
     b.add_argument(

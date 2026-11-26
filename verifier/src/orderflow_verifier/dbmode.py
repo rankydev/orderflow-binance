@@ -1,11 +1,16 @@
 """Datenbankmodus: Neuberechnung (Dateimodus) gegen den Inhalt von PostgreSQL vergleichen.
 
-UNGETESTET gegen eine echte Datenbank: zum Zeitpunkt der Entwicklung gab es keine PostgreSQL-Instanz
-(Docker fehlte). Getestet ist nur die Diff-Logik mit einem DuckDB-Ersatz (tests/test_dbmode.py).
-Die SQL-Texte gegen Postgres sind sorgfältig gegen die Migrationen 0002–0005 geschrieben, aber nie
-ausgeführt worden.
+Die Diff-Logik ist mit einem DuckDB-Ersatz getestet (tests/test_deep_db_compare.py); gegen eine echte
+Datenbank läuft der opt-in-Test tests/test_db_real_days.py (OF_VERIFIER_DB=1, Wegwerf-Datenbank,
+vom Importer geschrieben).
 
-Vorgehen je Tabelle (alle 12 Tabellen aus ``day_digest_all``):
+Digest-Version (Migration 0017): geprüft wird in der Version des gespeicherten Tages
+(data_day.digest_version; ohne gespeicherten Digest die aktuelle). Version 1 = zwölf Tabellen,
+der Tag hat keine Order-Daten und wird nie als Tag mit big_order gemeldet; Version 2 = zusätzlich
+big_order und order_day (Ordersummen und Untergrenze aus data_day). Die Orders werden mit der
+Untergrenze des Tages (data_day.big_floor_n) unabhängig aus den Rohdaten gebildet.
+
+Vorgehen je Digest-Teil der Version (Liste wie ``day_digest_all_v``):
  1. Zeilenzahl und ``day_digest(tabelle, sym, tag)`` des Servers gegen die eigene Berechnung;
  2. bei Abweichung werden die gespeicherten Zeilen des Tages geholt und per FULL JOIN über den
     Primärschlüssel verglichen; gemeldet werden die ersten Differenzzeilen (nur eigene / nur DB /
@@ -27,11 +32,20 @@ from typing import Protocol
 import duckdb
 
 from . import recompute as rc
-from .units import DIGEST_TABLES, SymbolSpec
+from .units import DIGEST_PARTS, DIGEST_TABLES, DIGEST_VERSION, SymbolSpec
 from .verify import verify_day
 
 STATE_CODE = {"exact": 1, "shift": 2, "mismatch": 3, "edge_pending": 4}  # bar_1m.check_state
-KEY_COLS = {t: (["ts", "px"] if t.startswith("fp_") else ["ts"]) for t in DIGEST_TABLES}
+KEY_COLS = {
+    t: (
+        ["ts", "px"]
+        if t.startswith("fp_")
+        else ["ts", "first_agg_id"]
+        if t == "big_order"
+        else ["ts"]
+    )
+    for t in DIGEST_TABLES
+}
 
 
 class Fetcher(Protocol):
@@ -39,7 +53,7 @@ class Fetcher(Protocol):
 
     def symbol_row(self, name: str) -> dict | None: ...
     def server_digest(self, table: str, sym_id: int, day: str) -> str: ...
-    def server_digest_all(self, sym_id: int, day: str) -> str: ...
+    def server_digest_all(self, sym_id: int, day: str, version: int) -> str: ...
     def load_table(
         self, con: duckdb.DuckDBPyConnection, table: str, sym_id: int, day: str, into: str
     ) -> None: ...
@@ -52,7 +66,7 @@ def stored_select(table: str) -> str:
         "(extract(epoch FROM ts) * 1000)::bigint AS ts" if c == "ts" else c
         for c in rc.TABLE_COLS[table]
     )
-    order = "ts, px" if table.startswith("fp_") else "ts"
+    order = rc.ORDER_BY[table]
     return (
         f"SELECT {cols} FROM {table} WHERE sym_id = %s "
         "AND ts >= (%s::date::timestamp AT TIME ZONE 'UTC') "
@@ -99,9 +113,11 @@ class PgFetcher:
             cur.execute("SELECT day_digest(%s, %s::smallint, %s::date)", (table, sym_id, day))
             return cur.fetchone()[0]
 
-    def server_digest_all(self, sym_id: int, day: str) -> str:
+    def server_digest_all(self, sym_id: int, day: str, version: int) -> str:
         with self.conn.cursor() as cur:
-            cur.execute("SELECT day_digest_all(%s::smallint, %s::date)", (sym_id, day))
+            cur.execute(
+                "SELECT day_digest_all_v(%s::smallint, %s::date, %s)", (sym_id, day, version)
+            )
             return cur.fetchone()[0]
 
     def load_table(
@@ -183,9 +199,15 @@ def compare_with_fetcher(
     day: str,
     limit: int = 5,
 ) -> dict:
-    """Kernvergleich zwischen Dateimodus-Ergebnis (``result``, Tabellen in ``con``) und der DB."""
+    """Kernvergleich zwischen Dateimodus-Ergebnis (``result``, Tabellen in ``con``) und der DB, in
+    der Digest-Version des gespeicherten Tages."""
+    row = day_row(fx, spec.sym_id, day)
+    stored_version = row.get("digest_version") if row else None
+    version = DIGEST_VERSION if stored_version is None else int(stored_version)
+    if version not in DIGEST_PARTS:
+        raise ValueError(f"{spec.name} {day}: unbekannte Digest-Version {version} in data_day")
     tables: dict[str, dict] = {}
-    for t in DIGEST_TABLES:
+    for t in DIGEST_PARTS[version]:
         mine = result["tables"][t]
         srv = fx.server_digest(t, spec.sym_id, day)
         entry = {
@@ -194,43 +216,48 @@ def compare_with_fetcher(
             "db_digest": srv,
             "equal": srv == mine["digest"],
         }
-        if not entry["equal"]:
+        # order_day ist eine data_day-Zeile: Feldvergleich in der Qualitätsprüfung
+        if not entry["equal"] and t != "order_day":
             into = f"db_{t}"
             fx.load_table(con, t, spec.sym_id, day, into)
             entry["db_rows"] = con.execute(f"SELECT count(*) FROM {into}").fetchone()[0]
             entry.update(diff_table(con, t, into, limit))
         tables[t] = entry
-    all_db = fx.server_digest_all(spec.sym_id, day)
-    quality = _compare_quality(fx, con, spec, result, day, limit)
-    equal = (
-        all(v["equal"] for v in tables.values())
-        and all_db == result["day_digest"]
-        and quality["equal"]
-    )
+    mine_all = result["day_digests"][str(version)]
+    all_db = fx.server_digest_all(spec.sym_id, day, version)
+    quality = _compare_quality(fx, row, spec, result, day, limit, version)
+    equal = all(v["equal"] for v in tables.values()) and all_db == mine_all and quality["equal"]
     return {
         "mode": "db",
-        "untested_against_real_database": True,
         "symbol": spec.name,
         "sym_id": spec.sym_id,
         "day": day,
         "equal": equal,
-        "day_digest": {
-            "recomputed": result["day_digest"],
-            "db": all_db,
-            "equal": all_db == result["day_digest"],
-        },
+        # Version, in der geprüft wurde; Version 1 = ohne Order-Daten (vor big_order geschrieben)
+        "verified_version": version,
+        "stored_digest_version": stored_version,
+        "order_data": "verified"
+        if version >= 2
+        else "absent (digest v1, written before big_order)",
+        "day_digest": {"recomputed": mine_all, "db": all_db, "equal": all_db == mine_all},
         "tables": tables,
         "quality": quality,
     }
 
 
+def day_row(fx: Fetcher, sym_id: int, day: str) -> dict | None:
+    dd = fx.rows("SELECT * FROM data_day WHERE sym_id = %s AND day = %s::date", (sym_id, day))
+    return dd[0] if dd else None
+
+
 def _compare_quality(
     fx: Fetcher,
-    con: duckdb.DuckDBPyConnection,
+    row: dict | None,
     spec: SymbolSpec,
     result: dict,
     day: str,
     limit: int,
+    version: int,
 ) -> dict:
     cls = result["classification"]
     out: dict = {"checks": {}}
@@ -238,15 +265,26 @@ def _compare_quality(
     def check(name: str, mine, db) -> None:
         out["checks"][name] = {"recomputed": mine, "db": db, "equal": mine == db}
 
-    dd = fx.rows("SELECT * FROM data_day WHERE sym_id = %s AND day = %s::date", (spec.sym_id, day))
-    if not dd:
+    if row is None:
         out["data_day"] = "keine Zeile"
         out["equal"] = False
         return out
-    row = dd[0]
     counts = cls["counts"]
     check("state", result["state"], row["state"])
-    check("digest", result["day_digest"], row["digest"])
+    check("digest", result["day_digests"][str(version)], row["digest"])
+    o = result["orders"]
+    if version >= 2:
+        check("orders_n", o["orders_n"], row.get("orders_n"))
+        check("orders_notional", o["orders_notional"], row.get("orders_notional"))
+        check("big_floor_n", o["big_floor_n"], row.get("big_floor_n"))
+    else:
+        # Version 1: der Tag darf keine Ordersummen tragen (sonst passt der Digest nicht zum Inhalt)
+        check(
+            "v1_without_order_data",
+            True,
+            row.get("orders_n") is None and row.get("orders_notional") is None,
+        )
+    check("orders_reconciled_with_bars", True, o["reconciled"])
     check("rows", result["manifest"]["rows"], row["rows"])
     check("first_agg_id", result["manifest"]["first_agg_id"], row["first_agg_id"])
     check("last_agg_id", result["manifest"]["last_agg_id"], row["last_agg_id"])
@@ -346,6 +384,7 @@ def compare_db(
     limit: int = 5,
     fetcher: Fetcher | None = None,
 ) -> dict:
+    """Neuberechnung mit der Untergrenze des gespeicherten Tages, dann Vergleich (siehe Kopf)."""
     fx = fetcher or PgFetcher()
     row = fx.symbol_row(sym.name)
     if row is None:
@@ -364,14 +403,24 @@ def compare_db(
         int(row["qty_decimals"]),
         int(row["tick_ref_units"]),
     )
+    row_day = day_row(fx, spec.sym_id, day)
+    floor = row_day.get("big_floor_n") if row_day else None
     result, con = verify_day(
-        root, spec, day, prefer=prefer, lookback=lookback, work_dir=work_dir, checksums=False
+        root,
+        spec,
+        day,
+        prefer=prefer,
+        lookback=lookback,
+        work_dir=work_dir,
+        checksums=False,
+        big_floor_n=None if floor is None else int(floor),
     )
     out = compare_with_fetcher(fx, con, spec, result, day, limit)
     out["notes"] = notes
     out["recomputation"] = {
         "state": result["state"],
         "classification_counts": result["classification"]["counts"],
+        "orders": result["orders"],
         "perf": result["perf"],
     }
     return out
@@ -379,9 +428,10 @@ def compare_db(
 
 def db_summary(r: dict) -> str:
     lines = [
-        f"DB-Vergleich {r['symbol']} {r['day']} (UNGETESTET gegen echte DB): "
-        f"{'GLEICH' if r['equal'] else 'ABWEICHUNG'}",
-        f"  Tages-Digest eigen={r['day_digest']['recomputed']} db={r['day_digest']['db']}",
+        f"DB-Vergleich {r['symbol']} {r['day']}: {'GLEICH' if r['equal'] else 'ABWEICHUNG'} "
+        f"(geprüft in Digest-Version {r['verified_version']}; Order-Daten: {r['order_data']})",
+        f"  Tages-Digest v{r['verified_version']} eigen={r['day_digest']['recomputed']} "
+        f"db={r['day_digest']['db']}",
     ]
     for t, v in r["tables"].items():
         mark = "ok " if v["equal"] else "DIFF"

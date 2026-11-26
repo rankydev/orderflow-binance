@@ -8,7 +8,10 @@ dependencies = ["duckdb==2.0.1", "pyarrow==26.0.1"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-markers = ["slow: Tests auf echten Rohdaten unter data/ (opt-in: OF_VERIFIER_SLOW=1)"]
+markers = [
+  "slow: Tests auf echten Rohdaten unter data/ (opt-in: OF_VERIFIER_SLOW=1)",
+  "db: Datenbankmodus gegen eine echte Wegwerf-DB (opt-in: OF_VERIFIER_DB=1, OF_DB_*)",
+]
 
 [tool.ruff]
 line-length = 100

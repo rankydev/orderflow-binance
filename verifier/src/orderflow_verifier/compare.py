@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .units import DIGEST_TABLES
+from .units import DIGEST_PARTS, FP_TABLES
 
 
 def _load_jsonl(path: Path) -> dict[tuple[str, str], dict]:
@@ -28,9 +28,21 @@ def _cmp(name: str, mine, theirs, rows: list[dict]) -> None:
 
 def compare_one(v: dict, im: dict) -> dict:
     rows: list[dict] = []
-    for t in DIGEST_TABLES:
+    # Digest-Version der Importer-Zeile (Zeilen vor Migration 0017 tragen keine: Version 1)
+    version = int(im.get("digestVersion", 1))
+    _cmp("digest_version_known", version in DIGEST_PARTS, True, rows)
+    for t in DIGEST_PARTS.get(version, ()):
         _cmp(f"digest.{t}", v["tables"][t]["digest"], im.get("digests", {}).get(t), rows)
-    _cmp("day_digest", v["day_digest"], im.get("digest"), rows)
+    _cmp(f"day_digest.v{version}", v["day_digests"].get(str(version)), im.get("digest"), rows)
+    if version >= 2:
+        o, io = v["orders"], im.get("orders", {})
+        # Notional als Dezimalstring im Importer-JSON (Tagessummen > 2^53)
+        _cmp("orders.n", o["orders_n"], io.get("n"), rows)
+        _cmp("orders.notional", str(o["orders_notional"]), io.get("notional"), rows)
+        _cmp("orders.bars_notional", str(o["bars_notional"]), io.get("barsNotional"), rows)
+        _cmp("orders.big", o["big_orders"], io.get("big"), rows)
+        _cmp("orders.big_floor_n", o["big_floor_n"], io.get("bigFloorN"), rows)
+        _cmp("orders.reconciled", o["reconciled"], True, rows)
     c = v["classification"]
     for k in ("exact", "shift", "mismatch", "missing", "edge_pending"):
         _cmp(f"class.{k}", c["counts"][k], im.get("counts", {}).get(k), rows)
@@ -54,7 +66,7 @@ def compare_one(v: dict, im: dict) -> dict:
     _cmp("agg_id_holes", m["agg_id_holes"], im.get("aggIdHoles"), rows)
     _cmp("continues_prev", m["continues_prev"], im.get("continuesPrev"), rows)
     fp = im.get("fpRows", {})
-    for tname in DIGEST_TABLES[:8]:
+    for tname in FP_TABLES:
         _cmp(f"rows.{tname}", v["tables"][tname]["rows"], fp.get(tname), rows)
     _cmp("rows.bar_1m", v["tables"]["bar_1m"]["rows"], im.get("bars"), rows)
     o, io = v["ohlc"], im.get("ohlc", {})
