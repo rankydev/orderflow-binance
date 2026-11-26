@@ -320,7 +320,18 @@ export class PostgresWriter implements DayWriter {
       );
     }
     // Untergrenze big_order (§3.7) ist Daten (Migration 0017 setzt sie); für den ganzen Lauf fest.
+    // Ohne Untergrenze kein Schreiben: ein finaler Tag ohne big orders sähe sonst vollständig aus.
     this.floor = await readBigFloor(this.db, s.symId);
+    if (this.floor === null) {
+      await this.db`SELECT pg_advisory_unlock(${IMPORTER_LOCK_KEY})`;
+      await this.db.end();
+      this.sql = null;
+      this.floor = undefined;
+      throw new Error(
+        `symbol.big_floor_n für ${s.name} ist NULL: Untergrenze big_order setzen ` +
+          `(UPDATE symbol SET big_floor_n = … WHERE sym_id = ${s.symId}), dann importieren`,
+      );
+    }
     // Review H2: offene Chunks im Columnstore (Migration 0015 verbietet sie) laut melden; ein Import
     // in einen solchen Chunk ist korrekt, ließe ihn aber teilweise komprimiert zurück.
     const hot = await openColumnstoreChunks(this.db);

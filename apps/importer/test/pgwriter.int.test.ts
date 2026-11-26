@@ -73,11 +73,11 @@ beforeAll(async () => {
   await dropAndCreateDatabase(cfg);
   sql = connect(cfg);
   await migrateUp(sql);
-  // Symbolzeile wie der Importer anlegen, dann die Untergrenze als Daten setzen (wie 0017 in Betrieb)
-  const w = new PostgresWriter(cfg, BTC);
-  await w.open();
-  await w.close();
-  await sql`UPDATE symbol SET big_floor_n = ${FLOOR} WHERE sym_id = ${BTC.symId}`;
+  // Symbolzeile mit den Einheiten des Codes und der Untergrenze als Daten (wie 0017 in Betrieb);
+  // ohne Untergrenze verweigert import --db das Schreiben
+  await sql`INSERT INTO symbol (sym_id, name, price_unit, price_decimals, tick_ref_units, qty_unit,
+                                qty_decimals, data_from, big_floor_n)
+            VALUES (${BTC.symId}, ${BTC.name}, 0.01, 2, 10, 0.001, 3, ${BTC.dataFrom}::date, ${FLOOR})`;
   dataDir = archive();
 });
 afterAll(async () => {
@@ -963,40 +963,27 @@ describe('Big Orders (P5, Migration 0017)', () => {
     expect((await dayRows()).n).toBeGreaterThan(0);
   });
 
-  it('ohne Untergrenze (symbol.big_floor_n NULL): keine big orders, Summen trotzdem, NULL am Tag', async () => {
+  it('ohne Untergrenze (symbol.big_floor_n NULL) bricht import --db ab, ohne etwas zu schreiben; Lock frei', async () => {
+    const [before] =
+      await sql`SELECT version, digest FROM data_day WHERE sym_id = 1 AND day = ${DAY}::date`;
     await sql`UPDATE symbol SET big_floor_n = NULL WHERE sym_id = 1`;
-    const logs: string[] = [];
     try {
-      const w = new PostgresWriter(cfg, BTC);
-      await w.open();
-      try {
-        const [s] = await new Importer({
-          dataDir,
-          spec: BTC,
-          firstDay: parseDay(DAY),
-          lastDay: parseDay(DAY),
-          prefer: 'auto',
-          neighbours: true,
-          writer: w,
-          importerVersion: 'int-test',
-          sidecar: false,
-          log: (l) => logs.push(l),
-        }).run();
-        expect(s!.orders.big).toBe(0);
-        expect(s!.orders.bigFloorN).toBeNull();
-      } finally {
-        await w.close();
-      }
+      await expect(new PostgresWriter(cfg, BTC).open()).rejects.toThrow(
+        /big_floor_n für BTCUSDT ist NULL/,
+      );
+      // nur lesend (--plan) bleibt möglich
+      const plan = new PostgresWriter(cfg, BTC, { readOnly: true });
+      await plan.open();
+      expect(plan.bigFloorN()).toBeNull();
+      await plan.close();
     } finally {
       await sql`UPDATE symbol SET big_floor_n = ${FLOOR} WHERE sym_id = 1`;
     }
-    expect(logs.some((l) => /keine Untergrenze big_floor_n/.test(l))).toBe(true);
-    expect((await dayRows()).n).toBe(0);
-    const [dd] =
-      await sql`SELECT big_floor_n, orders_n FROM data_day WHERE sym_id = 1 AND day = ${DAY}::date`;
-    expect(dd!.big_floor_n).toBeNull();
-    expect(Number(dd!.orders_n)).toBeGreaterThan(0);
-    await run(new PostgresWriter(cfg, BTC), DAY, DAY); // wiederherstellen
-    expect((await dayRows()).n).toBeGreaterThan(0);
+    const [after] =
+      await sql`SELECT version, digest FROM data_day WHERE sym_id = 1 AND day = ${DAY}::date`;
+    expect(after).toEqual(before);
+    // der Lock wurde beim Abbruch freigegeben: ein Import läuft sofort
+    const [s] = await run(new PostgresWriter(cfg, BTC), DAY, DAY);
+    expect(s!.orders.bigFloorN).toBe(FLOOR);
   });
 });
