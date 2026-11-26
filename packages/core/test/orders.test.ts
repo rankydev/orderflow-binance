@@ -10,6 +10,7 @@ import {
   bigOrderDigest,
   DayAggregator,
   getSymbol,
+  initialBigFloorN,
   LiveDay,
   MINUTE_MS,
   orderDayDigest,
@@ -302,5 +303,14 @@ describe('Digest-Textform big_order / order_day', () => {
     expect(
       orderDayDigest(1, day, { ordersN: 5, ordersNotional: 123n, bigFloorN: 50_000_000_000 }),
     ).toBe(sha('(1,2026-11-20,5,123,50000000000)'));
+  });
+});
+
+describe('Untergrenze neuer Symbolzeilen', () => {
+  it('BTCUSDT 500 000 USDT und ETHUSDT 250 000 USDT exakt in price_unit·qty_unit; unbekanntes Symbol wirft', () => {
+    expect(initialBigFloorN(getSymbol('BTCUSDT'))).toBe(50_000_000_000);
+    expect(initialBigFloorN(getSymbol('ETHUSDT'))).toBe(250_000_000_000);
+    expect(() => getSymbol('XRPUSDT')).toThrow(/Unbekanntes Symbol/);
+    expect(() => initialBigFloorN({ ...getSymbol('BTCUSDT'), bigFloorUsdt: 0 })).toThrow();
   });
 });

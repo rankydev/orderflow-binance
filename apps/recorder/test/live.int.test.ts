@@ -177,6 +177,29 @@ describe('Recorder ↔ Datenbank', () => {
   });
 });
 
+describe('Neue Datenbank (Review 2, Punkt 1)', () => {
+  it('Recorder-Start auf einer frisch migrierten DB: Symbolzeilen mit Untergrenze, startState liefert sie', async () => {
+    const fresh: DbConfig = { ...base, database: `${base.database}_test_fresh_recorder` };
+    await dropAndCreateDatabase(fresh);
+    const f = connect(fresh);
+    try {
+      await migrateUp(f);
+      const w = new LiveWriter(fresh);
+      await w.open();
+      await w.checkSymbol(BTC);
+      await w.checkSymbol(getSymbol('ETHUSDT'));
+      expect((await w.startState(BTC)).bigFloorN).toBe(50_000_000_000);
+      expect((await w.startState(getSymbol('ETHUSDT'))).bigFloorN).toBe(250_000_000_000);
+      await w.close();
+    } finally {
+      await f.end();
+      const a = connect(cfg);
+      await a.unsafe(`DROP DATABASE IF EXISTS ${fresh.database} WITH (FORCE)`);
+      await a.end();
+    }
+  });
+});
+
 describe('Order-Daten nach einem Neustart (Review S1/S2)', () => {
   // Tag mit einem aggTrade alle 5 s; jeder ist eine eigene Order (verschiedene T), jeder zweite groß
   // (90 000 USDT · 0,010 = 900 USDT ≥ 300 USDT), die anderen klein (0,001 → 90 USDT).

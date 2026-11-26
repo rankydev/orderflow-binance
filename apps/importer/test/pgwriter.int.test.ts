@@ -993,3 +993,28 @@ describe('Big Orders (P5, Migration 0017)', () => {
     expect(s!.orders.bigFloorN).toBe(FLOOR);
   });
 });
+
+describe('Neue Datenbank (Review 2, Punkt 1)', () => {
+  it('import --db auf einer frisch migrierten DB legt die Symbolzeile mit Untergrenze an; eine bestehende Untergrenze bleibt', async () => {
+    const fresh: DbConfig = { ...base, database: `${base.database}_test_fresh_importer` };
+    await dropAndCreateDatabase(fresh);
+    const f = connect(fresh);
+    try {
+      await migrateUp(f);
+      const [s] = await run(new PostgresWriter(fresh, BTC), '2026-09-10', '2026-09-10');
+      expect(s!.orders.bigFloorN).toBe(50_000_000_000);
+      const [r] = await f`SELECT big_floor_n::text AS n FROM symbol WHERE sym_id = 1`;
+      expect(r!.n).toBe('50000000000');
+      await f`UPDATE symbol SET big_floor_n = 123 WHERE sym_id = 1`;
+      const w = new PostgresWriter(fresh, BTC);
+      await w.open();
+      expect(w.bigFloorN()).toBe(123); // die Datenbank ist maßgeblich
+      await w.close();
+    } finally {
+      await f.end();
+      const a = connect(cfg);
+      await a.unsafe(`DROP DATABASE IF EXISTS ${fresh.database} WITH (FORCE)`);
+      await a.end();
+    }
+  });
+});

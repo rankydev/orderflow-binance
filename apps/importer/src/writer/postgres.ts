@@ -20,6 +20,7 @@ import {
   DIGEST_VERSION,
   formatDay,
   FP_TABLES,
+  initialBigFloorN,
   MinuteClass,
   MINUTE_MS,
   pgTimestamptz,
@@ -299,10 +300,12 @@ export class PostgresWriter implements DayWriter {
     }
     const s = this.spec;
     await this.db`
-      INSERT INTO symbol (sym_id, name, price_unit, price_decimals, tick_ref_units, qty_unit, qty_decimals, data_from)
+      INSERT INTO symbol (sym_id, name, price_unit, price_decimals, tick_ref_units, qty_unit, qty_decimals,
+                          data_from, big_floor_n)
       VALUES (${s.symId}, ${s.name}, ${unitString(s.priceDecimals)}::numeric, ${s.priceDecimals},
-              ${s.tickRefUnits}, ${unitString(s.qtyDecimals)}::numeric, ${s.qtyDecimals}, ${s.dataFrom}::date)
-      ON CONFLICT (sym_id) DO NOTHING`;
+              ${s.tickRefUnits}, ${unitString(s.qtyDecimals)}::numeric, ${s.qtyDecimals}, ${s.dataFrom}::date,
+              ${initialBigFloorN(s)})
+      ON CONFLICT (sym_id) DO NOTHING`; // bestehende Zeile (auch ihre Untergrenze) bleibt maßgeblich
     const [row] = await this.db`
       SELECT name, price_unit::text AS pu, price_decimals, tick_ref_units, qty_unit::text AS qu, qty_decimals
         FROM symbol WHERE sym_id = ${s.symId}`;

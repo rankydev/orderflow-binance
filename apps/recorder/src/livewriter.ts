@@ -8,6 +8,7 @@
 import {
   DAY_MS,
   formatDay,
+  initialBigFloorN,
   MINUTE_MS,
   pgTimestamptz,
   unitString,
@@ -120,10 +121,12 @@ export class LiveWriter {
   /** Symbolzeile anlegen, falls sie fehlt (gleiche Werte wie der Importer, §3.2). */
   async ensureSymbol(spec: SymbolSpec): Promise<void> {
     await this.db`
-      INSERT INTO symbol (sym_id, name, price_unit, price_decimals, tick_ref_units, qty_unit, qty_decimals, data_from)
+      INSERT INTO symbol (sym_id, name, price_unit, price_decimals, tick_ref_units, qty_unit, qty_decimals,
+                          data_from, big_floor_n)
       VALUES (${spec.symId}, ${spec.name}, ${unitString(spec.priceDecimals)}::numeric, ${spec.priceDecimals},
-              ${spec.tickRefUnits}, ${unitString(spec.qtyDecimals)}::numeric, ${spec.qtyDecimals}, ${spec.dataFrom}::date)
-      ON CONFLICT (sym_id) DO NOTHING`;
+              ${spec.tickRefUnits}, ${unitString(spec.qtyDecimals)}::numeric, ${spec.qtyDecimals}, ${spec.dataFrom}::date,
+              ${initialBigFloorN(spec)})
+      ON CONFLICT (sym_id) DO NOTHING`; // bestehende Zeile (auch ihre Untergrenze) bleibt maßgeblich
   }
 
   /**

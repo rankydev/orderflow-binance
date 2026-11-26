@@ -12,6 +12,12 @@ export interface SymbolSpec {
   qtyDecimals: number;
   /** Datenbeginn (UTC-Tag, YYYY-MM-DD). */
   dataFrom: string;
+  /**
+   * Untergrenze big_order in ganzen USDT für eine NEU angelegte Symbolzeile (KONZEPT §3.7,
+   * Entscheidung 2026-11-26). Maßgeblich ist danach symbol.big_floor_n in der Datenbank; der Code
+   * überschreibt eine bestehende Zeile nie (Migration 0017 setzt dieselben Werte für bestehende).
+   */
+  bigFloorUsdt: number;
 }
 
 export const SYMBOLS: readonly SymbolSpec[] = [
@@ -22,6 +28,7 @@ export const SYMBOLS: readonly SymbolSpec[] = [
     tickRefUnits: 10,
     qtyDecimals: 3,
     dataFrom: '2025-01-01',
+    bigFloorUsdt: 500_000,
   },
   {
     symId: 2,
@@ -30,6 +37,7 @@ export const SYMBOLS: readonly SymbolSpec[] = [
     tickRefUnits: 10,
     qtyDecimals: 3,
     dataFrom: '2025-01-01',
+    bigFloorUsdt: 250_000,
   },
 ];
 
@@ -40,6 +48,19 @@ export function getSymbol(name: string): SymbolSpec {
       `Unbekanntes Symbol "${name}" (bekannt: ${SYMBOLS.map((x) => x.name).join(', ')})`,
     );
   return s;
+}
+
+/**
+ * big_floor_n einer neu angelegten Symbolzeile: bigFloorUsdt in price_unit·qty_unit, exakt
+ * (BTCUSDT 500 000 USDT → 5·10¹⁰, ETHUSDT 250 000 USDT → 2,5·10¹¹).
+ */
+export function initialBigFloorN(spec: SymbolSpec): number {
+  if (!Number.isSafeInteger(spec.bigFloorUsdt) || spec.bigFloorUsdt <= 0) {
+    throw new Error(`${spec.name}: bigFloorUsdt muss eine positive Ganzzahl sein`);
+  }
+  const n = BigInt(spec.bigFloorUsdt) * 10n ** BigInt(spec.priceDecimals + spec.qtyDecimals);
+  if (n > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`${spec.name}: big_floor_n zu groß`);
+  return Number(n);
 }
 
 /** Dezimalstring einer Einheit 10^-d, z. B. 2 → "0.01" (für die Tabelle `symbol`). */
