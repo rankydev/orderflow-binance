@@ -178,12 +178,24 @@ function readZstdTolerant(path: string): { text: string; truncated: boolean } {
   return { text: parts.join(''), truncated };
 }
 
-/** Liest die Spool eines Tages in Stundenreihenfolge (Zeilen, die nicht parsen, sind ein Fehler). */
-export async function readSpoolDay(
+/** Höchstens so viele Zeilen je Stück beim Wiedereinspielen der Spool (Startspeicher, s. u.). */
+export const SPOOL_REPLAY_CHUNK = 50_000;
+
+/**
+ * Liest die Spool eines Tages in Stundenreihenfolge, in Stücken zu höchstens `chunk` Zeilen
+ * (Zeilen, die nicht parsen, sind ein Fehler). Je Zeile kostet ein FeedItem (Trade-Objekt +
+ * Zeilenstring) ≈ 290 B Heap; ein ganzer Tag BTC (≈ 2–3 Mio. Zeilen) als ein Array sind 600–900 MB
+ * und sprengten beim Start spät am Tag das Heap-Limit (Vorfall 2026-11-27). Der Aufrufer verarbeitet
+ * jedes Stück, bevor das nächste gelesen wird; gehalten wird höchstens ein Stück und der
+ * dekomprimierte Text einer Stundendatei. `stats` zählt Zeilen und gekürzte Dateien mit.
+ */
+export function* readSpoolDayChunks(
   dir: string,
   symbol: string,
   day: number,
-): Promise<{ items: FeedItem[]; truncatedFiles: number }> {
+  stats: { rows: number; truncatedFiles: number } = { rows: 0, truncatedFiles: 0 },
+  chunk = SPOOL_REPLAY_CHUNK,
+): Generator<FeedItem[], void, undefined> {
   const spec = getSymbol(symbol);
   const d = join(dir, symbol, formatDay(day));
   let files: string[];
@@ -192,13 +204,11 @@ export async function readSpoolDay(
       .filter((f) => f.endsWith('.csv.zst'))
       .sort();
   } catch {
-    return { items: [], truncatedFiles: 0 };
+    return;
   }
-  const items: FeedItem[] = [];
-  let truncatedFiles = 0;
   for (const f of files) {
     const { text, truncated } = readZstdTolerant(join(d, f));
-    if (truncated) truncatedFiles++;
+    if (truncated) stats.truncatedFiles++;
     const ranges: [number, number][] = [];
     try {
       for (const l of readFileSync(join(d, f.replace('.csv.zst', '.rest')), 'utf8').split('\n')) {
@@ -209,14 +219,43 @@ export async function readSpoolDay(
     } catch {
       /* keine REST-Bereiche */
     }
-    for (const line of text.split('\n')) {
-      if (!line) continue;
-      const trade = parseAggTradeLine(line, spec);
-      const viaRest = ranges.some(([a, b]) => trade.a >= a && trade.a <= b);
-      items.push({ trade, line, viaRest });
+    let items: FeedItem[] = [];
+    let p = 0;
+    while (p < text.length) {
+      let e = text.indexOf('\n', p);
+      if (e < 0) e = text.length;
+      if (e > p) {
+        const line = text.slice(p, e);
+        const trade = parseAggTradeLine(line, spec);
+        const viaRest = ranges.some(([a, b]) => trade.a >= a && trade.a <= b);
+        items.push({ trade, line, viaRest });
+        if (items.length >= chunk) {
+          stats.rows += items.length;
+          yield items;
+          items = [];
+        }
+      }
+      p = e + 1;
+    }
+    if (items.length) {
+      stats.rows += items.length;
+      yield items;
     }
   }
-  return { items, truncatedFiles };
+}
+
+/** Ganze Spool eines Tages als ein Array (Tests, Werkzeuge; nicht im Recorder-Start verwenden). */
+export async function readSpoolDay(
+  dir: string,
+  symbol: string,
+  day: number,
+): Promise<{ items: FeedItem[]; truncatedFiles: number }> {
+  const stats = { rows: 0, truncatedFiles: 0 };
+  const items: FeedItem[] = [];
+  for (const part of readSpoolDayChunks(dir, symbol, day, stats)) {
+    for (const it of part) items.push(it);
+  }
+  return { items, truncatedFiles: stats.truncatedFiles };
 }
 
 /** Spool-Tage löschen, die `keep(day)` nicht mehr braucht; liefert gelöschte Tage. */

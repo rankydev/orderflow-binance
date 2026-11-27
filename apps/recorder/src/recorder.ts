@@ -18,7 +18,7 @@ import {
 import { isTooOld, toItem, type RestSource } from './binance.ts';
 import { SymbolFeed, type FeedItem } from './feed.ts';
 import type { LiveWriter, MinuteWriteResult, StoredFinal } from './livewriter.ts';
-import { pruneSpool, readSpoolDay, SpoolWriter } from './spool.ts';
+import { pruneSpool, readSpoolDayChunks, SpoolWriter } from './spool.ts';
 import { StreamClient, type SocketFactory } from './ws.ts';
 
 /** Schnittstelle des DB-Schreibers (LiveWriter oder Test-Double). */
@@ -190,19 +190,25 @@ export class Recorder {
           di.skipBefore = p.liveUntil ?? 0;
         }
       }
-      // Neustart: Spool der Tage nach dem letzten finalen Tag wieder einspielen (ohne erneutes Spoolen)
+      // Neustart: Spool der Tage nach dem letzten finalen Tag wieder einspielen (ohne erneutes
+      // Spoolen). Stückweise (Vorfall 2026-11-27: der ganze Tag als ein Array überschritt beim Start
+      // spät am Tag das Heap-Limit); Minuten werden erst nach dem ganzen Tag abgeschlossen – wie
+      // früher mit einem einzigen handle() je Tag, das Ergebnis ist dasselbe.
       if (this.o.spoolDir && st.final) {
         const today = dayIndex(this.o.now());
         for (let d = st.final.day + 1; d <= today; d++) {
-          const { items, truncatedFiles } = await readSpoolDay(this.o.spoolDir, name, d);
-          if (items.length) {
+          const stats = { rows: 0, truncatedFiles: 0 };
+          for (const items of readSpoolDayChunks(this.o.spoolDir, name, d, stats)) {
+            this.handle(s, items, false, false);
+          }
+          if (stats.rows) {
             this.o.log('spool replay', {
               symbol: name,
               day: formatDay(d),
-              rows: items.length,
-              truncatedFiles,
+              rows: stats.rows,
+              truncatedFiles: stats.truncatedFiles,
             });
-            this.handle(s, items, false);
+            this.completeMinutes(s, s.feed.lastT);
           }
         }
       }
@@ -300,8 +306,11 @@ export class Recorder {
       );
   }
 
-  /** Nachrichten in den Feed; lückenlose Folge spoolen, aggregieren, Minuten abschließen. */
-  handle(s: SymbolState, items: FeedItem[], spool: boolean): void {
+  /**
+   * Nachrichten in den Feed; lückenlose Folge spoolen, aggregieren, Minuten abschließen
+   * (`complete` = false: Abschließen übernimmt der Aufrufer, z. B. nach der ganzen Spool eines Tages).
+   */
+  handle(s: SymbolState, items: FeedItem[], spool: boolean, complete = true): void {
     const out = s.feed.push(items);
     if (out.length === 0) return;
     if (spool && this.spoolEnabled) s.spool?.append(out, this.o.now());
@@ -314,7 +323,7 @@ export class Recorder {
         this.freeze(s, di.live.day, `Aggregationsfehler: ${String(e)}`);
       }
     }
-    this.completeMinutes(s, s.feed.lastT);
+    if (complete) this.completeMinutes(s, s.feed.lastT);
   }
 
   /** Minuten abschließen, deren Ende + Marge ≤ `t` ist (t = letzter lückenloser Trade oder geprüfte Uhr). */
