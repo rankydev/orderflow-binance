@@ -24,12 +24,18 @@ import type { BarItem } from './types.ts';
 
 export type LiveUiState = 'live' | 'quiet' | 'delayed' | 'disconnected' | 'catchup' | 'frozen';
 
-/** Ohne tick so lange (ms, Zeitspanne im Browser – keine Uhrzeit) → „getrennt" (Tap: ≥ 1 tick/s). */
+/** Ohne tick so lange (ms, Zeitspanne im Browser – keine Uhrzeit) → Anzeige „getrennt" (Tap: ≥ 1 tick/s). */
 export const LIVE_TICK_SILENCE_MS = 5_000;
-/** Ohne jede Nachricht so lange → Verbindung tot, neu verbinden (die API sendet bei Ausfall alle 5 s status). */
-export const LIVE_SILENCE_MS = 8_000;
+/**
+ * Neu verbinden erst nach so langer Stille (ohne jede Nachricht, bzw. ohne tick bei „Recorder
+ * erreichbar"): länger als die Upstream-Stille, nach der die API selbst trennt (10 s, live-hub.ts)
+ * plus ihr status-Herzschlag (5 s) – sonst verbände der Browser neu, während die API noch wartet.
+ */
+export const LIVE_SILENCE_MS = 16_000;
 /** „verzögert": Verzögerung > 3 s in zwei aufeinanderfolgenden ticks … */
 export const LIVE_DELAY_ON_MS = LIVE_DELAY_MS;
+/** … von zwei verschiedenen Stream-Nachrichten, die mindestens so lange (Recorder-Zeit) auseinanderliegen … */
+export const LIVE_DELAY_HOLD_MS = 2_000;
 /** … endet, wenn sie mindestens LIVE_SETTLE_MS lang unter LIVE_DELAY_OFF_MS bleibt. */
 export const LIVE_DELAY_OFF_MS = 1_500;
 export const LIVE_SETTLE_MS = 5_000;
@@ -53,7 +59,8 @@ export const LIVE_LABELS: Record<LiveUiState, string> = {
  * Entprellte Live-Gesundheit, gemessen nur mit der Uhr des Recorders (serverMs, recvMs, eventMs der
  * ticks), nie mit der des Besuchers:
  *  - Verzögerung = recvMs − eventMs (Empfang beim Recorder minus Binance-Ereigniszeit; ohne recvMs,
- *    älterer Recorder: serverMs − eventMs). „verzögert" ab > 3 s in zwei aufeinanderfolgenden ticks,
+ *    älterer Recorder: serverMs − eventMs). „verzögert" ab > 3 s bei zwei aufeinanderfolgenden neuen
+ *    Stream-Nachrichten, die ≥ 2 s (Recorder-Zeit) auseinanderliegen (Herzschläge zählen nicht),
  *    vorbei nach ≥ 5 s ununterbrochen < 1,5 s.
  *  - Ruhe = serverMs − recvMs: bei verbundenem Stream kein Fehler; erst > 30 s → „ruhig".
  *  - Stream getrennt (status.stream false) zählt erst nach ≥ 5 s als „holt nach" (kurze Reconnects
@@ -66,6 +73,8 @@ export class LiveHealth {
   /** Ruhe (ms) beim letzten tick */
   quietMs = 0;
   private over = 0;
+  private overSince: number | null = null;
+  private lastRecv: number | null = null;
   private goodSince: number | null = null;
   private streamDownSince: number | null = null;
 
@@ -74,6 +83,8 @@ export class LiveHealth {
     this.serverMs = 0;
     this.quietMs = 0;
     this.over = 0;
+    this.overSince = null;
+    this.lastRecv = null;
     this.goodSince = null;
     this.streamDownSince = null;
   }
@@ -84,11 +95,17 @@ export class LiveHealth {
     this.quietMs = recvMs != null ? Math.max(0, serverMs - recvMs) : 0;
     const lag = eventMs === null ? null : recv - eventMs;
     if (lag !== null && lag > LIVE_DELAY_ON_MS) {
-      this.over++;
       this.goodSince = null;
-      if (this.over >= 2) this.delayed = true;
+      // nur neue Stream-Nachrichten zählen (Herzschläge wiederholen recvMs/eventMs der letzten)
+      if (recvMs != null && recvMs === this.lastRecv) return;
+      this.lastRecv = recvMs ?? null;
+      this.over++;
+      this.overSince ??= serverMs;
+      if (this.over >= 2 && serverMs - this.overSince >= LIVE_DELAY_HOLD_MS) this.delayed = true;
     } else {
       this.over = 0;
+      this.overSince = null;
+      this.lastRecv = recvMs ?? null;
       if (!this.delayed) return;
       if (lag !== null && lag < LIVE_DELAY_OFF_MS) {
         this.goodSince ??= serverMs;
@@ -477,7 +494,7 @@ export class LiveClient {
     if (
       this.connected &&
       (now - this.lastMsgAt > LIVE_SILENCE_MS ||
-        (now - this.lastTickAt > 2 * LIVE_TICK_SILENCE_MS && !!this.book?.status.recorder))
+        (now - this.lastTickAt > LIVE_SILENCE_MS && !!this.book?.status.recorder))
     ) {
       this.stats.silences++;
       this.reconnectNow();

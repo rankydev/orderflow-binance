@@ -10,7 +10,7 @@
 //  - Keepalive-Kommentar alle keepaliveMs (≤ 15 s; nginx proxy_read_timeout 75 s).
 //  - Upstream weg: Clients bekommen status {recorder: false} und alle statusEveryMs erneut (Herzschlag).
 //  - Stummer Upstream (Verbindung offen, aber keine Bytes – z. B. hängender Recorder, halb offene
-//    TCP-Verbindung): nach idleMs (5 s; die Tap sendet ≥ 1 tick/s je Symbol) abbrechen → wie Ausfall.
+//    TCP-Verbindung): nach idleMs (10 s; die Tap sendet ≥ 1 tick/s je Symbol) abbrechen → wie Ausfall.
 import type { ServerResponse } from 'node:http';
 import {
   LIVE_WIRE_VERSION,
@@ -24,7 +24,8 @@ export const LIVE_CLIENT_MAX_BUFFER = 256 * 1024;
 export const LIVE_KEEPALIVE_MS = 15_000;
 export const LIVE_STATUS_EVERY_MS = 5_000;
 /** Ohne ein Byte vom Upstream so lange (ms) → Verbindung gilt als tot. */
-export const LIVE_UPSTREAM_IDLE_MS = 5_000;
+// 10 s: der Recorder kann bei GC/Finalisierung kurz blockieren (Browser verbindet erst nach 16 s neu)
+export const LIVE_UPSTREAM_IDLE_MS = 10_000;
 /** Größte erwartete Nachricht des Recorders (snap mit 240 Minuten ≈ 45 kB) mit Reserve. */
 const UPSTREAM_MAX_EVENT = 1024 * 1024;
 

@@ -463,7 +463,7 @@ describe('Statuszustände', () => {
     expect(liveUiState({ ...base, tickSilentMs: LIVE_TICK_SILENCE_MS + 1 })).toBe('disconnected');
   });
 
-  it('LiveHealth: „verzögert" erst nach zwei ticks > 3 s, Ende nach ≥ 5 s < 1,5 s; Ruhe ≠ Verzögerung', () => {
+  it('LiveHealth: „verzögert" erst nach zwei neuen Nachrichten > 3 s im Abstand ≥ 2 s (Herzschläge zählen nicht), Ende nach ≥ 5 s < 1,5 s; Ruhe ≠ Verzögerung', () => {
     const h = new LiveHealth();
     let t = 1_000_000;
     // ruhiger Markt: letzte Trade-Nachricht 20 s alt, aber pünktlich empfangen → nicht verzögert
@@ -479,9 +479,19 @@ describe('Statuszustände', () => {
     t += 250;
     h.tick(t, t - 3_500, t);
     expect(h.delayed).toBe(false);
-    // zwei hintereinander → verzögert
+    // zwei neue Nachrichten > 3 s, aber nur 250 ms auseinander: noch nicht (Dauer < 2 s)
     t += 250;
     h.tick(t, t - 3_600, t);
+    expect(h.delayed).toBe(false);
+    // Herzschläge wiederholen dieselbe Nachricht (gleiches recvMs/eventMs): zählen nicht
+    const r0 = t;
+    for (let i = 0; i < 12; i++) {
+      t += 250;
+      h.tick(t, r0 - 3_600, r0);
+    }
+    expect(h.delayed).toBe(false);
+    // neue Nachricht, weiterhin > 3 s, ≥ 2 s nach der ersten → verzögert
+    h.tick(t, t - 3_400, t);
     expect(h.delayed).toBe(true);
     // gut, aber zwischendurch 2 s (≥ 1,5 s) → Frist beginnt neu
     for (let i = 0; i < 12; i++) {
@@ -511,6 +521,8 @@ describe('Statuszustände', () => {
     const o = new LiveHealth();
     o.tick(10_000, 6_000, undefined);
     o.tick(10_250, 6_000, null);
+    expect(o.delayed).toBe(false);
+    o.tick(12_000, 8_000, null);
     expect(o.delayed).toBe(true);
   });
 
@@ -672,13 +684,16 @@ describe('LiveClient', () => {
       serverMs: 5,
       status: { ...status, recorder },
     });
-    // Verteiler hängt am Upstream, meldet aber noch recorder: true → nach 5 s „getrennt", nach 10 s neu verbinden
+    // Verteiler hängt am Upstream, meldet aber noch recorder: true → nach 5 s „getrennt", nach 16 s neu verbinden
     h.advance(1_000);
     h.es[0]!.msg(st(1, true));
     h.advance(4_100);
     expect(h.c.uiState()).toBe('disconnected');
     h.es[0]!.msg(st(2, true));
+    // die API trennt einen stummen Upstream nach 10 s – bis dahin nicht selbst neu verbinden
     h.advance(7_000);
+    expect(h.es[0]!.closed).toBe(false);
+    h.advance(6_000); // > 16 s ohne tick, Recorder weiterhin als erreichbar gemeldet
     expect(h.es[0]!.closed).toBe(true);
     h.advance(0);
     expect(h.es).toHaveLength(2);

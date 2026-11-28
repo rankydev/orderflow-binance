@@ -18,7 +18,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { buildApp } from '../src/app.ts';
 import { parseApiConfig } from '../src/config.ts';
 import type { Deps } from '../src/context.ts';
-import { LiveHub } from '../src/live-hub.ts';
+import { LIVE_UPSTREAM_IDLE_MS, LiveHub } from '../src/live-hub.ts';
 
 const T0 = Date.UTC(2026, 10, 25, 12);
 const bar = (ts: number, close: number): LiveBar => ({
@@ -199,6 +199,8 @@ describe('LiveHub', () => {
     // ab jetzt schweigt der Upstream (Verbindung bleibt offen)
     await until(() => c.book.status.recorder === false, 3_000);
     expect(hub.stats.upstreamIdleAborts).toBeGreaterThanOrEqual(1);
+    // Standard 10 s (Recorder kann bei GC/Finalisierung kurz blockieren); der Browser wartet 16 s
+    expect(LIVE_UPSTREAM_IDLE_MS).toBe(10_000);
     expect(hub.stats.upstreamConnected).toBe(false);
     await until(() => up.connects() >= 2, 5_000); // verbindet neu
   });
