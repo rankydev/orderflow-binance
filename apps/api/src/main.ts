@@ -9,6 +9,7 @@ import { Catalog } from './catalog.ts';
 import { parseApiConfig, type ApiConfig } from './config.ts';
 import { createPool } from './db.ts';
 import { Limiter } from './limiter.ts';
+import { LiveHub } from './live-hub.ts';
 import { RecorderEvents } from './recorder-events.ts';
 
 export interface RunningApi {
@@ -45,11 +46,20 @@ export async function startApi(
   const events = cfg.recorderEventsUrl
     ? new RecorderEvents(cfg.recorderEventsUrl, () => catalog.poke())
     : null;
-  const deps: Deps = { cfg, sql, catalog, cache, limiter, events };
+  // Live-Verteiler (§5.7): eine Upstream-Verbindung zum Recorder, keine Datenbank
+  const live = cfg.recorderLiveUrl
+    ? new LiveHub({
+        url: cfg.recorderLiveUrl,
+        maxClients: cfg.liveMaxClients,
+        log: (level, msg, obj) => app?.log[level](obj ?? {}, msg),
+      })
+    : null;
+  const deps: Deps = { cfg, sql, catalog, cache, limiter, events, live };
   app = buildApp(deps, opt);
   catalog.on('dayChanged', (ev) => app?.log.debug(ev, 'dayChanged'));
   await catalog.start();
   events?.start();
+  live?.start();
   if (!catalog.ready) app.log.warn({ err: catalog.lastError }, 'Katalog beim Start nicht geladen');
   else
     app.log.info(
@@ -68,6 +78,7 @@ export async function startApi(
     await app.close();
     await admin?.close();
     await events?.stop();
+    await live?.stop();
     await catalog.stop();
     await Promise.all([sql.end({ timeout: 5 }), catSql.end({ timeout: 5 })]);
   };

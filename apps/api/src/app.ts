@@ -5,6 +5,7 @@ import { corsAllowed } from './config.ts';
 import { newCtx, type Deps } from './context.ts';
 import { HttpError } from './errors.ts';
 import { registerBigTradesRoutes } from './routes/bigtrades.ts';
+import { registerLiveRoutes } from './routes/live.ts';
 import { registerProfileRoutes } from './routes/profile.ts';
 import { healthDetail, registerStatusRoutes } from './routes/status.ts';
 import { registerTileRoutes } from './routes/tiles.ts';
@@ -136,6 +137,9 @@ export function buildApp(deps: Deps, opt: AppOptions = {}): FastifyInstance {
   registerProfileRoutes(app, deps);
   registerBigTradesRoutes(app, deps);
   registerStatusRoutes(app, deps);
+  registerLiveRoutes(app, deps);
+  // Live-Clients (SSE, gekapert) vor dem Schließen beenden – app.close wartete sonst auf sie
+  app.addHook('preClose', async () => deps.live?.closeClients());
   return app;
 }
 

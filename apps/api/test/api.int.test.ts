@@ -521,6 +521,12 @@ describe('Endpunkte gegen den Web-Client', () => {
         });
         // final nur, wenn jeder überdeckte UTC-Tag existiert und unveränderlich ist
         expect(dec.header.final).toBe(expFinal(from, to));
+        // Live-Naht: committedTo in [from, to], keine Zeile an/nach committedTo
+        const ct = dec.header.committedTo!;
+        expect(ct).toBeGreaterThanOrEqual(from);
+        expect(ct).toBeLessThanOrEqual(to);
+        if (dec.bars.time.length > 0)
+          expect(dec.bars.time[dec.bars.time.length - 1]! * 1000).toBeLessThan(ct);
         expect(res.headers.get('cache-control')).toBe(
           expFinal(from, to) ? 'public, max-age=604800' : 'no-cache',
         );

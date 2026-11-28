@@ -5,6 +5,7 @@ import type { ApiConfig } from './config.ts';
 import { DataInconsistency, readTx, type ReadStats, type ReadTx, type Sql } from './db.ts';
 import { HttpError, notFound } from './errors.ts';
 import type { Limiter } from './limiter.ts';
+import type { LiveHub } from './live-hub.ts';
 import type { RecorderEvents } from './recorder-events.ts';
 import { chunkLockList, type ReadRange } from './queries.ts';
 
@@ -16,6 +17,8 @@ export interface Deps {
   limiter: Limiter;
   /** Ereignis-Feed des Recorders (nur mit OF_API_RECORDER_EVENTS_URL). */
   events?: RecorderEvents | null;
+  /** Live-Verteiler (nur mit OF_API_RECORDER_LIVE_URL). */
+  live?: LiveHub | null;
 }
 
 export interface ReqCtx {

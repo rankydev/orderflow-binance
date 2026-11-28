@@ -75,6 +75,7 @@ export function healthDetail(deps: Deps, startedAt: number, reply: FastifyReply)
       failures: cat.failures,
     },
     recorderEvents: deps.events ? { ...deps.events.status } : null,
+    live: deps.live ? { ...deps.live.stats } : null,
     symbols: cat.symbols().map((x) => ({
       name: x.name,
       dataFrom: x.dataFrom,

@@ -38,6 +38,13 @@ export interface ApiConfig {
    * zur nächsten Abfrage (pollMs) zu warten. null = aus (die Abfrage allein genügt, nur langsamer).
    */
   recorderEventsUrl: string | null;
+  /**
+   * Live-Strom des Recorders (SSE GET /live, KONZEPT §5.7), z. B. http://recorder:7701/live; die API hält
+   * genau eine Verbindung und verteilt an GET /api/v1/live. null = aus (/api/v1/live antwortet 503).
+   */
+  recorderLiveUrl: string | null;
+  /** Höchstzahl gleichzeitiger Live-Clients (GET /api/v1/live). */
+  liveMaxClients: number;
   /** Höchstzahl geschätzter Quellzeilen je Anfrage (KONZEPT §1.4). */
   maxSourceRows: number;
   /**
@@ -151,6 +158,8 @@ export function parseApiConfig(env: Env): ApiConfig {
     cacheBytes: intIn(problems, env, 'OF_API_CACHE_MB', 200, 0, 4096) * 1024 * 1024,
     pollMs: intIn(problems, env, 'OF_API_POLL_MS', 1_000, 100, 600_000),
     recorderEventsUrl: eventsUrl(problems, env.OF_API_RECORDER_EVENTS_URL),
+    recorderLiveUrl: eventsUrl(problems, env.OF_API_RECORDER_LIVE_URL, 'OF_API_RECORDER_LIVE_URL'),
+    liveMaxClients: intIn(problems, env, 'OF_API_LIVE_MAX', 150, 1, 10_000),
     maxSourceRows: intIn(problems, env, 'OF_API_MAX_SOURCE_ROWS', 1_500_000, 1, 1e9),
     maxTileSourceRows: intIn(problems, env, 'OF_API_MAX_TILE_SOURCE_ROWS', 300_000, 1, 1e9),
     maxCells: intIn(problems, env, 'OF_API_MAX_CELLS', 60_000, 1, 1e7),
@@ -171,22 +180,26 @@ export function parseApiConfig(env: Env): ApiConfig {
   return cfg;
 }
 
-function eventsUrl(problems: string[], raw: string | undefined): string | null {
+function eventsUrl(
+  problems: string[],
+  raw: string | undefined,
+  key = 'OF_API_RECORDER_EVENTS_URL',
+): string | null {
   const v = raw?.trim();
   if (!v) return null;
   let u: URL;
   try {
     u = new URL(v);
   } catch {
-    problems.push(`OF_API_RECORDER_EVENTS_URL: "${v}" ist keine URL`);
+    problems.push(`${key}: "${v}" ist keine URL`);
     return null;
   }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-    problems.push('OF_API_RECORDER_EVENTS_URL: nur http(s)');
+    problems.push(`${key}: nur http(s)`);
     return null;
   }
   if (u.username || u.password) {
-    problems.push('OF_API_RECORDER_EVENTS_URL: ohne Zugangsdaten');
+    problems.push(`${key}: ohne Zugangsdaten`);
     return null;
   }
   return u.href;

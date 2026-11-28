@@ -113,14 +113,16 @@ export async function readDays(
 
 /**
  * Grenze der Live-Naht (wire.ts, TILE-FORMAT.md `committedTo`): Minuten davor stehen in der Datenbank,
- * danach (noch) nichts. Größtes data_day.live_until des Symbols bzw. das Ende eines finalen Tages
- * (importierte Tage ohne live_until), im Snapshot der laufenden Transaktion; null = keine Zeile.
+ * danach (noch) nichts. Je Tag live_until (vom Recorder geschriebener, nicht finaler Tag), sonst das
+ * Tagesende (finale Tage; Tage ohne live_until stammen nicht vom Recorder) – das Maximum über alle
+ * Tage des Symbols, im Snapshot der laufenden Transaktion; null = keine Zeile.
  */
 export async function readCommittedTo(tx: ReadTx, symId: number): Promise<number | null> {
   const rows = await tx.rows(
-    `SELECT (extract(epoch FROM max(greatest(live_until,
-              CASE WHEN state IN ('final_ok', 'final_bad')
-                   THEN (day + 1)::timestamp AT TIME ZONE 'UTC' END))) * 1000)::int8
+    `SELECT (extract(epoch FROM max(
+              CASE WHEN live_until IS NOT NULL AND state NOT IN ('final_ok', 'final_bad')
+                   THEN live_until
+                   ELSE (day + 1)::timestamp AT TIME ZONE 'UTC' END)) * 1000)::int8
        FROM data_day WHERE sym_id = $1`,
     [symId],
   );
