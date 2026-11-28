@@ -70,9 +70,10 @@ const dead = (): SocketLike => ({
   close() {},
 });
 
-function make(spoolDir: string | null, floor: number) {
+function make(spoolDir: string | null, floor: number, restRows: RawAgg[] = []) {
   const written: MinuteDelta[] = [];
   const handled: number[] = [];
+  const buffered: number[] = [];
   const sink: LiveSink = {
     startState: async () => ({
       final: { day: DAY - 1, lastAggId: A0 - 1, carry: null, cand: null },
@@ -91,7 +92,13 @@ function make(spoolDir: string | null, floor: number) {
     symbols: ['BTCUSDT'],
     wsUrl: 'wss://test.invalid',
     socketFactory: dead,
-    rest: { aggTrades: async () => [], klines: async () => [] },
+    rest: {
+      aggTrades: async (_s: string, fromId: number, limit: number) => {
+        const i = restRows.findIndex((r) => r.a >= fromId);
+        return i < 0 ? [] : restRows.slice(i, i + limit);
+      },
+      klines: async () => [],
+    },
     sink,
     spoolDir,
     log: () => {},
@@ -103,8 +110,9 @@ function make(spoolDir: string | null, floor: number) {
   rec.handle = (s, items: FeedItem[], spool: boolean, complete?: boolean) => {
     handled.push(items.length);
     orig(s, items, spool, complete);
+    buffered.push(s.feed.stats.buffered);
   };
-  return { rec, written, handled };
+  return { rec, written, handled, buffered };
 }
 
 /** Fingerabdruck (SHA-256 über die JSON-Form; bigint und Typed Arrays ausgeschrieben). */
@@ -180,4 +188,58 @@ describe('Start mit großer Tages-Spool (Vorfall 2026-11-27)', () => {
     const lastT = raw[raw.length - 1]!.T;
     expect(sa.days.get(DAY)!.completeBefore).toBe(Math.floor((lastT - 2000 - D0) / MINUTE_MS));
   }, 30_000);
+
+  it('Lücke mitten in der Spool: Einspielen endet dort, Puffer bleibt klein, REST holt nach – Ergebnis wie ohne Lücke', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'of-spool-replay-'));
+    const raw = dayRows();
+    const gapAt = 5_000;
+    // Spool ohne die aggId raw[gapAt] (z. B. verlorener Frame), danach geht sie weiter
+    writeSpool(dir, [...raw.slice(0, gapAt), ...raw.slice(gapAt + 1)]);
+    const one = toItem(raw[0]!, BTC, false).trade;
+    const floor = 3 * one.px * one.q;
+    const a = make(dir, floor, raw);
+    await a.rec.start();
+    const sa = a.rec.sym.get('BTCUSDT')!;
+    // der Rest des Tages (≈ 125 000 Zeilen) wurde weder gepuffert noch eingespielt
+    expect(Math.max(...a.buffered)).toBeLessThanOrEqual(SPOOL_REPLAY_CHUNK);
+    expect(sa.feed.stats.buffered).toBe(0);
+    expect(sa.feed.gapOpen()).toBe(false);
+    expect(sa.feed.expected).toBe(A0 + gapAt);
+    expect(a.handled.reduce((x, y) => x + y, 0)).toBeLessThan(raw.length / 2);
+    // die erste Stream-Nachricht nach dem Start öffnet die Lücke, REST holt ab der erwarteten ID nach
+    a.rec.handle(sa, [toItem(raw[raw.length - 1]!, BTC, false)], true);
+    while (await a.rec.catchUpOnce(sa)) {
+      /* nachholen */
+    }
+    a.rec.completeMinutes(sa, raw[raw.length - 1]!.T);
+    await a.rec.drain();
+    await a.rec.stop();
+    // Referenz: ganzer Tag lückenlos
+    const b = make(null, floor);
+    await b.rec.start();
+    const sb = b.rec.sym.get('BTCUSDT')!;
+    b.rec.handle(
+      sb,
+      raw.map((r) => toItem(r, BTC, false)),
+      false,
+    );
+    b.rec.completeMinutes(sb, raw[raw.length - 1]!.T);
+    await b.rec.drain();
+    await b.rec.stop();
+    expect(sa.feed.expected).toBe(A0 + raw.length);
+    expect(a.written.length).toBe(b.written.length);
+    // gleiche Minuten (bar_1m, big orders, fp) – viaRest unterscheidet sich (Nachgeholtes kam per REST)
+    const core = (d: MinuteDelta) =>
+      plain({ minute: d.minute, fp: d.fp, bars: d.bars, big: d.big, orders: d.orders });
+    expect(a.written.map(core)).toEqual(b.written.map(core));
+  }, 60_000);
+
+  it('Zeilen beim Start ohne Text (hält keine Stundentexte über slice fest)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'of-spool-replay-'));
+    writeSpool(dir, dayRows().slice(0, 1000));
+    const parts = [...readSpoolDayChunks(dir, 'BTCUSDT', DAY, undefined, undefined, false)];
+    expect(parts.flat().every((x) => x.line === '')).toBe(true);
+    const kept = [...readSpoolDayChunks(dir, 'BTCUSDT', DAY)];
+    expect(kept.flat().every((x) => x.line.length > 0)).toBe(true);
+  });
 });

@@ -188,6 +188,9 @@ export const SPOOL_REPLAY_CHUNK = 50_000;
  * und sprengten beim Start spät am Tag das Heap-Limit (Vorfall 2026-11-27). Der Aufrufer verarbeitet
  * jedes Stück, bevor das nächste gelesen wird; gehalten wird höchstens ein Stück und der
  * dekomprimierte Text einer Stundendatei. `stats` zählt Zeilen und gekürzte Dateien mit.
+ * `keepLines` = false: `line` bleibt leer (Recorder-Start spoolt nicht erneut). Ein per slice
+ * erzeugter Zeilenstring hält in V8 den ganzen Stundentext am Leben, solange er erreichbar ist –
+ * ohne Zeilen hält ein (z. B. im Feed gepuffertes) Item keine Stundentexte fest.
  */
 export function* readSpoolDayChunks(
   dir: string,
@@ -195,6 +198,7 @@ export function* readSpoolDayChunks(
   day: number,
   stats: { rows: number; truncatedFiles: number } = { rows: 0, truncatedFiles: 0 },
   chunk = SPOOL_REPLAY_CHUNK,
+  keepLines = true,
 ): Generator<FeedItem[], void, undefined> {
   const spec = getSymbol(symbol);
   const d = join(dir, symbol, formatDay(day));
@@ -228,7 +232,7 @@ export function* readSpoolDayChunks(
         const line = text.slice(p, e);
         const trade = parseAggTradeLine(line, spec);
         const viaRest = ranges.some(([a, b]) => trade.a >= a && trade.a <= b);
-        items.push({ trade, line, viaRest });
+        items.push({ trade, line: keepLines ? line : '', viaRest });
         if (items.length >= chunk) {
           stats.rows += items.length;
           yield items;

@@ -116,6 +116,17 @@ export class SymbolFeed {
     return r;
   }
 
+  /**
+   * Gepufferte Nachrichten (hinter einer Lücke) verwerfen; liefert ihre Anzahl. `expected` bleibt:
+   * REST holt ab dort nach (Recorder-Start: Spool mit Lücke, sonst puffert der Feed den Rest des Tages).
+   */
+  dropBuffered(): number {
+    const n = this.buffer.size;
+    this.buffer.clear();
+    this.stats.buffered = 0;
+    return n;
+  }
+
   /** Lücke ist per REST nicht füllbar (älter als 48 h): auf die erste gepufferte ID springen. */
   abandonGap(): { from: number; to: number } | null {
     const to = this.bufferedFrom();

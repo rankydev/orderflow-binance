@@ -194,12 +194,40 @@ export class Recorder {
       // Spoolen). Stückweise (Vorfall 2026-11-27: der ganze Tag als ein Array überschritt beim Start
       // spät am Tag das Heap-Limit); Minuten werden erst nach dem ganzen Tag abgeschlossen – wie
       // früher mit einem einzigen handle() je Tag, das Ergebnis ist dasselbe.
+      // Lücke mitten in der Spool (z. B. gekürzter Frame, danach weitergeschrieben): der Feed gibt
+      // nach der Lücke nichts mehr aus und puffert jede weitere Zeile – über einen ganzen Tag Hunderte
+      // MB (Review: 2,5 Mio. Zeilen, eine fehlende aggId → 756 MB). Daher nach jedem Stück prüfen:
+      // Lücke offen → Puffer verwerfen, Einspielen (auch späterer Tage) beenden; REST holt ab der
+      // erwarteten ID nach (48-h-Fenster), sonst greift die gewöhnliche Lückenbehandlung (Tag
+      // eingefroren). Nichts wird doppelt gezählt: der Feed gibt jede aggId genau einmal aus. Bis REST
+      // nachgeholt hat, ist der Tag im Speicher unvollständig; der Tagesabgleich des LiveWriters
+      // (Speicher = bar_1m der DB) schlägt dann fehl wie bei unvollständiger Spool → Ordersummen
+      // bleiben NULL bis zur Finalisierung.
       if (this.o.spoolDir && st.final) {
         const today = dayIndex(this.o.now());
-        for (let d = st.final.day + 1; d <= today; d++) {
+        let stopped = false;
+        for (let d = st.final.day + 1; d <= today && !stopped; d++) {
           const stats = { rows: 0, truncatedFiles: 0 };
-          for (const items of readSpoolDayChunks(this.o.spoolDir, name, d, stats)) {
+          for (const items of readSpoolDayChunks(
+            this.o.spoolDir,
+            name,
+            d,
+            stats,
+            undefined,
+            false,
+          )) {
             this.handle(s, items, false, false);
+            if (s.feed.gapOpen()) {
+              const dropped = s.feed.dropBuffered();
+              stopped = true;
+              this.o.log('spool replay stopped at gap, REST catches up', {
+                symbol: name,
+                day: formatDay(d),
+                expectedAggId: s.feed.expected,
+                droppedRows: dropped,
+              });
+              break;
+            }
           }
           if (stats.rows) {
             this.o.log('spool replay', {
