@@ -16,6 +16,8 @@
 //   OF_RECORDER_HTTP_HOST    Bind-Adresse (Standard 127.0.0.1; im Container 0.0.0.0 nur ohne Host-Port)
 //   OF_RECORDER_DB_USER / OF_RECORDER_DB_PASSWORD   eigene Rolle (Pflicht; OF_DB_* nur Host/Port/Name)
 //   OF_RECORDER_FINALISE     tägliche Finalisierung im Prozess (Standard 1)
+//   OF_LIVE                  Live-Tap GET /live (KONZEPT §5.7, Etappe 1; Standard 1, 0 = aus)
+//   OF_LIVE_HZ               Durchgänge der Live-Tap je Sekunde (Standard 4, 1…20)
 //
 // Betrieb (Review-Hinweise):
 //  - Speicher: Recorder ≈ 0,2–0,35 GB (gemessen, Nachholen zweier Symbole); die Finalisierung im
@@ -58,6 +60,7 @@ import { finaliseDay } from './finalize.ts';
 import { finaliseDue } from './finaliseloop.ts';
 import { PartialChunkTracker, type PartialChunkState } from './partialchunks.ts';
 import { LiveWriter } from './livewriter.ts';
+import { LIVE_HZ_DEFAULT, LiveTap } from './livetap.ts';
 import { Recorder } from './recorder.ts';
 import { replayDay } from './replay.ts';
 import { assertRawPrunable, freeBytes, pruneRaw } from './spool.ts';
@@ -78,6 +81,9 @@ export interface RecorderConfig {
   httpPort: number;
   httpHost: string;
   finalise: boolean;
+  /** Live-Tap an (GET /live). */
+  live: boolean;
+  liveHz: number;
 }
 
 /**
@@ -110,6 +116,8 @@ export function recorderConfig(env: Env): RecorderConfig {
     .filter(Boolean);
   for (const s of symbols) getSymbol(s);
   const weightPerMin = num('OF_REST_WEIGHT_PER_MIN', 1200);
+  const liveHz = num('OF_LIVE_HZ', LIVE_HZ_DEFAULT);
+  if (liveHz < 1 || liveHz > 20) throw new Error('OF_LIVE_HZ muss in 1…20 liegen');
   if (weightPerMin > 2400) throw new Error('OF_REST_WEIGHT_PER_MIN über dem IP-Limit 2400');
   return {
     symbols,
@@ -126,6 +134,8 @@ export function recorderConfig(env: Env): RecorderConfig {
     // aber nie auf dem Host veröffentlichen.
     httpHost: env.OF_RECORDER_HTTP_HOST?.trim() || '127.0.0.1',
     finalise: (env.OF_RECORDER_FINALISE ?? '1') !== '0',
+    live: (env.OF_LIVE ?? '1') !== '0',
+    liveHz,
   };
 }
 
@@ -178,6 +188,8 @@ async function run(): Promise<number> {
   }
   const rest = new BinanceRest(cfg.restBase, new WeightBudget(cfg.weightPerMin), getSymbol);
   const events = new EventHub();
+  // Live-Tap (§5.7): nur lesend; Fehler bleiben in der Tap (Zähler in /health)
+  let tap: LiveTap | null = null;
   const rec = new Recorder({
     symbols: cfg.symbols,
     wsUrl: cfg.wsBase,
@@ -192,9 +204,14 @@ async function run(): Promise<number> {
     onMinuteCommitted: (symbol, ms) => {
       // lokaler Ereignis-Feed für die API (§4.2 „Minute M committed")
       events.minute(symbol, ms);
+      tap?.commit(symbol, ms);
     },
   });
   await rec.start();
+  if (cfg.live) {
+    tap = new LiveTap(rec, { hz: cfg.liveHz, log: logLine });
+    tap.start();
+  }
   let lastFinalised: Record<string, string | null> = {};
   let rawPrunedFiles = 0;
   // Review H3/H3a: Fehler nach dem Festschreiben eines finalen Tages, mit Quelle
@@ -300,6 +317,7 @@ async function run(): Promise<number> {
       dbWriteErrors: rec.writeErrors,
       freeSpoolBytes: free,
       rssMb: Math.round(process.memoryUsage().rss / 2 ** 20),
+      live: tap ? { clients: tap.clients, dropped: tap.hub.dropped, ...tap.stats } : null,
       symbols,
     };
   };
@@ -312,6 +330,8 @@ async function run(): Promise<number> {
             res.end(JSON.stringify(h));
           } else if (req.url === '/events') {
             events.attach(req, res);
+          } else if (req.url === '/live' && tap) {
+            tap.attach(req, res);
           } else {
             res.writeHead(404).end();
           }
@@ -420,6 +440,7 @@ async function run(): Promise<number> {
   clearInterval(statsLog);
   clearInterval(fin);
   clearInterval(partialTimer);
+  tap?.stop();
   await rec.stop();
   server?.close();
   events.close();

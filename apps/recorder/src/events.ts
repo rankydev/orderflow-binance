@@ -35,7 +35,8 @@ export class EventHub {
     return this.clients.size;
   }
 
-  attach(req: IncomingMessage, res: ServerResponse): void {
+  /** `greeting`: erste Bytes nach den Kopfzeilen (Standard Kommentar `: ok`; /live: snap-Nachrichten). */
+  attach(_req: IncomingMessage, res: ServerResponse, greeting?: () => string): void {
     res.on('error', () => this.clients.delete(res)); // abgebrochene Verbindung: nie unbehandelt
     if (this.clients.size >= this.maxClients) {
       res.writeHead(503, { 'content-type': 'text/plain', 'retry-after': '10' });
@@ -47,7 +48,7 @@ export class EventHub {
       'cache-control': 'no-cache',
       connection: 'keep-alive',
     });
-    res.write(': ok\n\n');
+    res.write(greeting ? greeting() : ': ok\n\n');
     this.clients.add(res);
     res.on('close', () => this.clients.delete(res));
   }
@@ -60,6 +61,11 @@ export class EventHub {
     clearInterval(this.timer);
     for (const c of this.clients) c.end();
     this.clients.clear();
+  }
+
+  /** An alle Clients (ein bereits serialisierter SSE-Block). */
+  broadcast(s: string): void {
+    this.writeAll(s);
   }
 
   private writeAll(s: string): void {

@@ -82,7 +82,7 @@ export function isTransientDbError(e: unknown): boolean {
   return false;
 }
 
-interface DayInfo {
+export interface DayInfo {
   live: LiveDay;
   /** Minuten mit Start < diesem Zeitpunkt sind bereits in der DB (Neustart) → nicht erneut schreiben. */
   skipBefore: number;
@@ -411,7 +411,12 @@ export class Recorder {
         }
         const ms = job.d.day * DAY_MS + job.d.minute * MINUTE_MS;
         s.lastCommittedMinute = ms;
-        this.o.onMinuteCommitted?.(job.spec.name, ms);
+        try {
+          // Ereignis-Feed/Live-Tap: ein Fehler dort darf den Schreibpfad nie unterbrechen
+          this.o.onMinuteCommitted?.(job.spec.name, ms);
+        } catch (e) {
+          this.o.log('onMinuteCommitted failed', { symbol: job.spec.name, error: String(e) });
+        }
       }
     } finally {
       this.writing = false;
