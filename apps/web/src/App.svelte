@@ -967,9 +967,9 @@
         title={live.title}
       >
         <span class="dot">●</span>
-        {live.label}{#if live.price}
-          · {live.price}{/if}{#if live.vol}
-          · V {live.vol} · Δ {live.delta}{/if}
+        {live.label}{live.price ? ` · ${live.price}` : ''}{live.vol
+          ? ` · V ${live.vol} · Δ ${live.delta}`
+          : ''}
       </span>{/if}
     {#if dataTo}<span class="datato" title="Ende der Daten">
         Daten bis {fmtDataTo(dataTo, tzSet)}

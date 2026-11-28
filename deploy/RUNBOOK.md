@@ -323,6 +323,62 @@ Untergrenze ändern: `UPDATE symbol SET big_floor_n = …`. Der Recorder liest s
 laufenden Tages mit der neuen Untergrenze (Punkt 4). Finale Tage ändern sich erst beim nächsten
 Import (die Untergrenze ist Teil des Digests, sie werden dann neu geschrieben).
 
+## Release Live-Updates Etappe 1 – vorbereitet, nicht ausgeführt
+
+Neu: Live-Tap im Recorder (`GET :7701/live`, nur Compose-Netz), `LiveHub` + `GET /api/v1/live` in
+der API (SSE, keine DB), `committedTo` im `/bars`-Header (neue ETags: `RESPONSE_BUILD_VERSION` 3,
+einmal alle nicht finalen und finalen Antworten neu – der Server-Cache füllt sich wieder), Web-Overlay.
+Keine Migration. Variablen (compose.prod.yml): API `OF_API_RECORDER_LIVE_URL`, `OF_API_LIVE_MAX`
+(150); Recorder `OF_LIVE` (1), `OF_LIVE_HZ` (4). nginx: neue Zone `orderflow_live_conn`
+(conf.d/orderflow-binance.conf) und `location = /api/v1/live` im Site-File.
+
+Vorher prüfen (nur lesend):
+
+1. **worker_connections des gemeinsamen nginx:** `nginx -T 2>/dev/null | grep -E 'worker_(processes|connections)'`.
+   Jeder Live-Client belegt 2 Verbindungen (Browser + Upstream), dazu kommen die Nachbarn
+   (genius, takt, rankyhub). Bei 150 Live-Clients ≈ 300 zusätzlich. Liegt
+   `worker_processes × worker_connections` (Debian-Standard 768 je Worker) nicht deutlich darüber
+   (≥ 2× der heutigen Spitze + 300), `OF_API_LIVE_MAX` senken statt die globale nginx.conf zu ändern
+   (die gehört nicht uns). Aktuelle Spitze: `ss -Htn state established '( sport = :443 )' | wc -l`.
+2. Recorder läuft und ist gesund (`deploy/recorder.sh health`), sonst zeigt die Seite nur „getrennt".
+
+Reihenfolge (Recorder zuerst, damit die API beim Start schon einen Upstream hat; jede Stufe für
+sich rückwärtsverträglich: alte Clients ignorieren `committedTo`, eine neue Seite ohne `/live` zeigt
+„getrennt" und alles andere wie bisher):
+
+1. `ID=$(deploy/build-release.sh)` (Mac).
+2. Recorder neu starten mit dem neuen Image: `deploy/recorder.sh stop`, Release ausrollen
+   (`deploy/release.sh "$ID"` – startet die API neu und übernimmt compose.prod.yml), dann
+   `deploy/recorder.sh start`. Neustart des Recorders ist billig (Spool-Wiedergabe + REST); die API
+   verbindet sich mit Backoff (1–30 s) von selbst zum Recorder.
+3. nginx: `deploy/nginx-setup.sh` (idempotent; `nginx -t` vor dem Reload, bei Fehler werden die
+   eigenen Dateien zurückgenommen). Ohne diesen Schritt puffert der bisherige `/api/`-Block die
+   SSE-Antwort (proxy_buffering on, 35 s Lese-Zeitlimit) → Live kommt verzögert und reißt ab.
+
+Prüfen:
+
+- Recorder: `deploy/recorder.sh health` → `live.errors` 0, `live.clients` 1 (die API),
+  `live.ticks` steigt.
+- API (Loopback im Container): `/health` → `live.upstreamConnected: true`, `clients`, `dropped`.
+- Von außen (Mac): `curl -sN --max-time 5 https://orderflow.rankyhub.com/api/v1/live?sym=BTCUSDT`
+  → sofort `data: {"v":1,"t":"snap"…`, danach `tick`-Zeilen (≥ 1/s, je ≈ 0,2–0,6 kB). Kommt alles
+  erst am Ende gebündelt, puffert nginx (Schritt 3 fehlt/falsch).
+- `curl -s 'https://orderflow.rankyhub.com/api/v1/bars?sym=BTCUSDT&tf=1m&from=…&to=…' | head -c 400`
+  enthält `"committedTo"`.
+- Browser: Statuszeile „● live · Preis · V · Δ", die laufende Kerze bewegt sich, nach dem
+  Minutenwechsel erscheint die neue Kerze ohne Neuladen; Konsole ohne „Abweichung(en) beim Ablösen".
+- 5 Tabs von einer IP: der fünfte bekommt 429 (limit_conn 4) und zeigt „getrennt".
+
+Abschalten (ohne Release): Recorder `OF_LIVE: '0'` in compose.prod.yml bzw. auf dem Server in
+`/opt/orderflow-binance/compose.prod.yml`, `deploy/recorder.sh stop` + `start` – die API meldet den
+Clients „Recorder nicht erreichbar", alles andere läuft wie vorher. Nur die API: dort
+`OF_API_RECORDER_LIVE_URL` leeren und die API neu starten (`/api/v1/live` → 503).
+
+Rollback: `deploy/release.sh --rollback` (voriges Image + Web), danach `deploy/recorder.sh stop` +
+`start` (alter Recorder ohne Tap). Die nginx-Location kann bleiben (ein 404 der alten API geht
+ungepuffert durch); vollständig zurück mit dem nginx-Stand des vorigen Releases und
+`deploy/nginx-setup.sh`.
+
 ## Nach dem Rollout – wichtig
 
 - **Niemand wird alarmiert.** Der Monitor schreibt nur ins Journal (und markiert die Unit als

@@ -29,6 +29,8 @@ Typen: `i32` = Int32 LE, `f64` = Float64 LE. Mengen sind ganzzahlige Lots in `f6
   "tile": { "index": 29220, "n": 1024 },        // bei "bars" null
   "dataVersion": "…",            // Kachelversion (§5.4) = ETag
   "final": true,                 // alle überdeckten Tage final_* → unveränderlich
+  "committedTo": 1795395840000,  // nur bars, optional: Minuten < committedTo enthalten, spätere
+                                 // nicht (Live-Naht, KONZEPT §5.7; in [from, to] begrenzt)
   "nBars": 1003, "nLevels": 48211,
   "columns": [ { "name": "time", "type": "i32", "length": 1003 }, … ]
 }

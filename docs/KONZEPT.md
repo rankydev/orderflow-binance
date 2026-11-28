@@ -499,7 +499,7 @@ Vor dem Start wird der freie Plattenplatz geprüft (< 15 GB → Abbruch; Regel a
 - **Minutenabschluss:** Minute M ist abgeschlossen, wenn (a) ein Trade mit T ≥ M + 62 000 ms empfangen wurde oder die (per NTP synchronisierte) Uhr diese Zeit überschritten hat und ein REST-Abruf ab `last_a+1` nichts mit T < M + 60 000 liefert, und (b) keine offene Lücke mit IDs vor diesem Zeitpunkt existiert. Dann wird M **vollständig** in einer Transaktion geschrieben (Replace der Minute, inkl. laufender Rollup-Zeilen). Der formende Bar wird nie persistiert.
 - **Wiederanlauf nach Absturz:** Quelle ist die Spool, nicht die DB. Der Recorder liest die letzten vollständigen zstd-Frames der aktuellen und vorigen Stunde, setzt `last_a` auf die letzte gespoolte ID, baut alle Minuten nach der zuletzt committeten Minute (aus `bar_1m`, bei DB-Ausfall aus einem lokalen Commit-Journal) im Speicher neu auf und holt per REST ab `last_a + 1` nach.
 - **DB nicht erreichbar:** Recorder spoolt weiter, sammelt abgeschlossene Minuten und schreibt sie nach, sobald die DB zurück ist (Reihenfolge nach Zeit).
-- **Ein Rechenweg für abgeschlossene Bars:** Der Recorder sendet nach dem Commit „Minute M committed" über den localhost-Feed; die API liest daraufhin M aus der DB und schickt dem Client diesen Stand. Die API berechnet selbst nur den formenden Bar.
+- **Ein Rechenweg für alle Bars (Stand Live-Etappe 1):** Der Recorder rechnet auch den formenden Bar – nur lesend aus demselben `DayAggregator` (`openMinuteView()`, `minuteBar()`), der die Minuten schreibt – und sendet ihn über die Live-Tap (`GET :7701/live`, SSE, §5.7). Nach dem Commit sendet er im selben Strom `commit` (und weiter `event: minute` auf `/events` für den Katalog der API). Die API rechnet nichts: sie hält genau eine Verbindung zur Tap und verteilt; abgeschlossene Minuten kommen beim Client über `/bars` aus der DB.
 - Feed nur auf 127.0.0.1; die API verbindet sich nie selbst mit Binance.
 
 ### 4.3 Tageszustand und Ersatz durch die offizielle Datei
@@ -718,7 +718,7 @@ Querprüfung: Der Client prüft jede Footprint-Kachel auf finalen Daten gegen di
 | `GET /api/v1/thresholds` | sym, from, to, def, … | nur Schwellen-Zeitreihe |
 | `GET /api/v1/quality` | sym, from, to | §4.9 |
 | `GET /api/v1/health` | – | §2.5; nur von localhost erreichbar (nginx leitet ihn nicht nach außen) |
-| `WS /api/v1/live` | subscribe {sym, tf, R, features} | formender Bar (Diffs), committed Bars aus DB, Big Trades, Invalidierungen |
+| `GET /api/v1/live` | sym | SSE (§5.7): snap/tick/commit/status des Symbols; Etappe 1 ohne Level und Big Trades |
 
 Status: die lesende API für `symbols`/`bars`/`footprint` ist **in Arbeit**; bis dahin bedient eine Dev-Middleware Fixture-Kacheln in derselben URL-Form. Zeitparameter in ms UTC, `[from, to)`. Die API hat **ausschließlich lesende Endpunkte**; Import, Neuberechnung, Transfer und jede Wartungsaktion laufen nur per CLI/systemd auf dem Server und sind über HTTP nicht erreichbar.
 
@@ -728,9 +728,15 @@ Festgelegt in [`TILE-FORMAT.md`](TILE-FORMAT.md) (Format 1, gebaut mit Encoder/D
 
 ### 5.7 Live-Updates
 
-- Eine WS-Verbindung je Tab; Abo nur für das angezeigte Symbol/tf/R (Wechsel ersetzt das Abo).
-- Formender Bar in der API: committed Minuten des laufenden tf-Bars aus der DB + formende Minute aus dem Feed; Level als Map `row → {b,s,ba,sa}` (O(1) pro Trade). Diff höchstens alle 250 ms.
-- Nach „Minute M committed" (§4.2) sendet die API M aus der DB.
+Umgesetzt als **Etappe 1** (Kerze, Preis, neue Minuten, Status; ohne Footprint-Zellen und Big Orders). Abweichend vom ursprünglichen Plan (WebSocket, formender Bar in der API) gilt:
+
+- **Weg:** Recorder → API → Browser, beides **SSE**. Der Browser spricht nie mit Binance. Die DB bleibt die Wahrheit; Live-Daten sind vorläufig (nur im Tooltip gekennzeichnet).
+- **Recorder (Live-Tap, `apps/recorder/src/livetap.ts`):** liest nur (`openMinuteView`, `minuteBar`, Feed, Stream, Warteschlange) und bildet `OF_LIVE_HZ`-mal je Sekunde (Standard 4) einen Diff gegen den zuletzt gesendeten Stand; `GET :7701/live` (höchstens 2 Clients, nur Compose-Netz). Jeder Fehler bleibt in der Tap (gezählt in `/health`), Aggregation und Schreiben merken nichts. Abschaltbar mit `OF_LIVE=0`.
+- **Format (`packages/core/src/live/wire.ts`, gemeinsam für Recorder, API, Browser):** `snap` (seq, committedTo, Minuten ab committedTo − 10 min mit OHLC, buyQ/sellQ, Trade-Anzahlen, firstAgg/lastAgg, Status), `tick` (geänderte Minuten: laufende und abgeschlossene, noch nicht geschriebene; letzter Preis, Ereigniszeit, Serverzeit; mindestens 1 Hz), `commit {ts, committedTo}` im selben Strom, `status` (Stream, Lücke/Nachholen, eingefrorener Tag, Rückstand). Versionsfeld `v`; Erweiterungen (Level, Big Orders) kommen additiv. Lückenlose Folgenummer je Symbol: Sprung → neu verbinden (neuer snap).
+- **API (`LiveHub`, `GET /api/v1/live?sym=…`):** genau eine Upstream-Verbindung (`OF_API_RECORDER_LIVE_URL`), Zustand je Symbol, neuer Client bekommt sofort einen snap; einmal serialisieren, an alle schreiben; eigene Folgenummern; keine DB. Grenzen: `OF_API_LIVE_MAX` (150) Clients, > 256 KB Puffer → getrennt, Keepalive 15 s, `X-Accel-Buffering: no`. Upstream weg → `status {recorder: false}` an alle (alle 5 s wiederholt).
+- **Naht live → final:** `/bars` trägt im Header `committedTo` (max. `live_until` bzw. Ende finaler Tage, im selben Snapshot wie die Zeilen, auf den Abschnitt begrenzt). Bucket = DB-Anteil (Minuten < committedTo) + Live-Minuten mit ts ≥ committedTo – disjunkt, für jeden Zeitrahmen. Nach `commit` lädt der Client den letzten vorläufigen Abschnitt nach 0–2 s Zufallsverzug neu (nie eine Antwort mit älterem committedTo übernehmen; wegen des 10-s-Caches nicht finaler Antworten bis zu 4 Versuche) und prüft beim Ablösen Live gegen DB (OHLC, Volumen, Trade-Anzahl; Abweichungen gezählt, Konsole).
+- **Browser:** `series.update()` für die laufende Kerze (setData nur, wenn ein Bucket mitten im Fenster entstünde), Preislinie, Volumen/Delta der laufenden Kerze; Status „live" / „verzögert" (Ereigniszeit > 3 s hinter der Serverzeit des Recorders) / „getrennt" / „Recorder holt nach / Lücke" / „Tag eingefroren". Unsichtbarer Tab trennt nach 30 s; Neuverbinden mit Backoff 1–30 s.
+- Später (Etappe 2+): Level/Footprint-Zellen der laufenden Minute, Big Orders, Invalidierung beim Wechsel nach `final_*` über denselben Strom.
 
 ### 5.8 Messungen der Abfragen (Mac, warm, echte BTC-Daten, 34 Tage)
 

@@ -125,6 +125,44 @@ server {
         include /etc/nginx/snippets/orderflow-binance-proxy.conf;
     }
 
+    # Live-Updates (SSE, KONZEPT §5.7, Etappe 1): eine lange offene Antwort je Tab. Exakte Location vor
+    # /api/ (= hat Vorrang vor Präfixen). Nicht puffern (jede Nachricht sofort; die API setzt zusätzlich
+    # X-Accel-Buffering: no), nicht komprimieren (gzip puffert), Lese-Zeitlimit 75 s > Keepalive der
+    # API (15 s). HTTP/1.1 zum Upstream über den gemeinsamen Keep-Alive-Upstream; zum Browser bleibt es
+    # HTTP/1.1 (kein http2, siehe oben) – je Tab eine der ≤ 6 Verbindungen je Host.
+    # Je IP höchstens 4 gleichzeitige Live-Ströme (eigene Zone orderflow_live_conn in
+    # conf.d/orderflow-binance.conf); der Verbindungsaufbau zählt außerdem gegen orderflow_api.
+    # Gesamtgrenze in der API: OF_API_LIVE_MAX (150). Jeder Live-Client belegt in nginx 2
+    # Verbindungen (Client + Upstream) → worker_connections vor dem Rollout prüfen (RUNBOOK).
+    location = /api/v1/live {
+        limit_req zone=orderflow_api burst=90 nodelay;
+        limit_req_status 429;
+        limit_conn orderflow_live_conn 4;
+        limit_conn_status 429;
+        # Bewusst NICHT das Snippet orderflow-binance-proxy.conf: es setzt proxy_buffering on und
+        # proxy_read_timeout 35s, und nginx verweigert doppelte Direktiven in derselben location.
+        # Übrige Werte wie im Snippet.
+        proxy_pass http://orderflow_api_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 75s;
+        proxy_send_timeout 75s;
+        proxy_next_upstream off;
+        proxy_buffering off;
+        proxy_cache off;
+        gzip off;
+        proxy_hide_header X-Powered-By;
+        include /etc/nginx/snippets/orderflow-binance-headers.conf;
+        error_page 429 = @orderflow_429;
+        error_page 502 504 = @orderflow_502;
+        error_page 503 = @orderflow_503;
+    }
+
     location /api/ {
         # STELLSCHRAUBE 2/2: Burst (Rate = Stellschraube 1 in conf.d/orderflow-binance.conf).
         # 30 r/s + Burst 90 ohne Verzögerung: Seitenstart (≈ 30 Anfragen) und schnelles Schwenken

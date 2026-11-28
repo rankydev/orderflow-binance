@@ -134,6 +134,11 @@ services:
       # Minuten-Ereignisse des Recorders (SSE) nur über das Compose-Netz; ohne laufenden Recorder
       # verbindet die API mit Backoff (1–30 s) neu, die Abfrage läuft unabhängig weiter
       OF_API_RECORDER_EVENTS_URL: http://recorder:7701/events
+      # Live-Updates (Etappe 1): genau eine SSE-Verbindung zum Recorder, verteilt an /api/v1/live;
+      # leer = aus (/api/v1/live antwortet 503, die Seite zeigt „getrennt")
+      OF_API_RECORDER_LIVE_URL: http://recorder:7701/live
+      # Höchstzahl gleichzeitiger Live-Clients (darüber 503); je Client ≈ 1–2 kB/s
+      OF_API_LIVE_MAX: '150'
       # Antwort-Cache nicht-finaler Antworten (Standard 10 s) und Verbindungsgrenzen der API
       OF_API_NONFINAL_TTL_MS: '10000'
       OF_API_MAX_CONNECTIONS: '256'
@@ -265,6 +270,9 @@ services:
       OF_RECORDER_HTTP_HOST: 0.0.0.0
       OF_RECORDER_HTTP_PORT: '7701'
       OF_RECORDER_FINALISE: '1'
+      # Live-Tap GET /live (Etappe 1; nur Compose-Netz, max. 2 Clients): 1 = an, 0 = aus (Rollback)
+      OF_LIVE: '1'
+      OF_LIVE_HZ: '4'
       OF_LOG_LEVEL: info
       # Heap-Grenze explizit statt aus dem cgroup-Limit abgeleitet (V8-Standard bei 1536m: 864 MB
       # heap_size_limit). Gemessen im Release-Image unter 1536m (Finalisierung 2026-11-25, BTC+ETH):
