@@ -70,7 +70,12 @@ const dead = (): SocketLike => ({
   close() {},
 });
 
-function make(spoolDir: string | null, floor: number, restRows: RawAgg[] = []) {
+function make(
+  spoolDir: string | null,
+  floor: number,
+  restRows: RawAgg[] = [],
+  rest = { fail: false, calls: 0 },
+) {
   const written: MinuteDelta[] = [];
   const handled: number[] = [];
   const buffered: number[] = [];
@@ -94,6 +99,8 @@ function make(spoolDir: string | null, floor: number, restRows: RawAgg[] = []) {
     socketFactory: dead,
     rest: {
       aggTrades: async (_s: string, fromId: number, limit: number) => {
+        rest.calls++;
+        if (rest.fail) throw new Error('REST nicht erreichbar');
         const i = restRows.findIndex((r) => r.a >= fromId);
         return i < 0 ? [] : restRows.slice(i, i + limit);
       },
@@ -189,32 +196,25 @@ describe('Start mit großer Tages-Spool (Vorfall 2026-11-27)', () => {
     expect(sa.days.get(DAY)!.completeBefore).toBe(Math.floor((lastT - 2000 - D0) / MINUTE_MS));
   }, 30_000);
 
-  it('Lücke mitten in der Spool: Einspielen endet dort, Puffer bleibt klein, REST holt nach – Ergebnis wie ohne Lücke', async () => {
+  async function gapRun(restFail: boolean) {
     const dir = mkdtempSync(join(tmpdir(), 'of-spool-replay-'));
     const raw = dayRows();
     const gapAt = 5_000;
-    // Spool ohne die aggId raw[gapAt] (z. B. verlorener Frame), danach geht sie weiter
-    writeSpool(dir, [...raw.slice(0, gapAt), ...raw.slice(gapAt + 1)]);
+    // Spool ohne die aggIds raw[gapAt…gapAt+2] (z. B. verlorener Frame), danach geht sie weiter
+    writeSpool(dir, [...raw.slice(0, gapAt), ...raw.slice(gapAt + 3)]);
     const one = toItem(raw[0]!, BTC, false).trade;
     const floor = 3 * one.px * one.q;
-    const a = make(dir, floor, raw);
+    const rest = { fail: restFail, calls: 0 };
+    const a = make(dir, floor, raw, rest);
     await a.rec.start();
     const sa = a.rec.sym.get('BTCUSDT')!;
-    // der Rest des Tages (≈ 125 000 Zeilen) wurde weder gepuffert noch eingespielt
+    // Speicher begrenzt: nie mehr als ein Stück gepuffert
     expect(Math.max(...a.buffered)).toBeLessThanOrEqual(SPOOL_REPLAY_CHUNK);
     expect(sa.feed.stats.buffered).toBe(0);
-    expect(sa.feed.gapOpen()).toBe(false);
-    expect(sa.feed.expected).toBe(A0 + gapAt);
-    expect(a.handled.reduce((x, y) => x + y, 0)).toBeLessThan(raw.length / 2);
-    // die erste Stream-Nachricht nach dem Start öffnet die Lücke, REST holt ab der erwarteten ID nach
-    a.rec.handle(sa, [toItem(raw[raw.length - 1]!, BTC, false)], true);
-    while (await a.rec.catchUpOnce(sa)) {
-      /* nachholen */
-    }
-    a.rec.completeMinutes(sa, raw[raw.length - 1]!.T);
-    await a.rec.drain();
-    await a.rec.stop();
-    // Referenz: ganzer Tag lückenlos
+    return { raw, a, sa, rest, floor };
+  }
+
+  async function reference(raw: RawAgg[], floor: number) {
     const b = make(null, floor);
     await b.rec.start();
     const sb = b.rec.sym.get('BTCUSDT')!;
@@ -226,12 +226,45 @@ describe('Start mit großer Tages-Spool (Vorfall 2026-11-27)', () => {
     b.rec.completeMinutes(sb, raw[raw.length - 1]!.T);
     await b.rec.drain();
     await b.rec.stop();
+    return b.written;
+  }
+  // gleiche Minuten (bar_1m, big orders, fp) – viaRest unterscheidet sich (Nachgeholtes kam per REST)
+  const core = (d: MinuteDelta) =>
+    plain({ minute: d.minute, fp: d.fp, bars: d.bars, big: d.big, orders: d.orders });
+
+  it('Lücke mitten in der Spool: gezielt per REST gefüllt, Einspielen läuft weiter – Ergebnis wie ohne Lücke', async () => {
+    const { raw, a, sa, rest, floor } = await gapRun(false);
+    expect(rest.calls).toBe(1); // nur die 3 fehlenden IDs
+    expect(sa.catchUpRows).toBe(3);
+    expect(sa.feed.expected).toBe(A0 + raw.length); // ganze Spool eingespielt
+    // Spool-Zeilen (inkl. 300 Duplikate am Stundenende, writeSpool) + 3 REST-Zeilen
+    expect(a.handled.reduce((x, y) => x + y, 0)).toBe(raw.length + 300);
+    a.rec.completeMinutes(sa, raw[raw.length - 1]!.T);
+    await a.rec.drain();
+    await a.rec.stop();
+    const ref = await reference(raw, floor);
+    expect(a.written.length).toBe(ref.length);
+    expect(a.written.map(core)).toEqual(ref.map(core));
+  }, 60_000);
+
+  it('Lücke, REST scheitert: Einspielen endet dort, Puffer verworfen; später holt REST nach – Ergebnis wie ohne Lücke', async () => {
+    const { raw, a, sa, rest, floor } = await gapRun(true);
+    expect(rest.calls).toBe(1);
+    expect(sa.feed.gapOpen()).toBe(false);
+    expect(sa.feed.expected).toBe(A0 + 5_000);
+    expect(a.handled.reduce((x, y) => x + y, 0)).toBeLessThan(raw.length / 2);
+    // REST wieder erreichbar: die erste Stream-Nachricht öffnet die Lücke, die Nachholschleife füllt
+    rest.fail = false;
+    a.rec.handle(sa, [toItem(raw[raw.length - 1]!, BTC, false)], true);
+    while (await a.rec.catchUpOnce(sa)) {
+      /* nachholen */
+    }
+    a.rec.completeMinutes(sa, raw[raw.length - 1]!.T);
+    await a.rec.drain();
+    await a.rec.stop();
     expect(sa.feed.expected).toBe(A0 + raw.length);
-    expect(a.written.length).toBe(b.written.length);
-    // gleiche Minuten (bar_1m, big orders, fp) – viaRest unterscheidet sich (Nachgeholtes kam per REST)
-    const core = (d: MinuteDelta) =>
-      plain({ minute: d.minute, fp: d.fp, bars: d.bars, big: d.big, orders: d.orders });
-    expect(a.written.map(core)).toEqual(b.written.map(core));
+    const ref = await reference(raw, floor);
+    expect(a.written.map(core)).toEqual(ref.map(core));
   }, 60_000);
 
   it('Zeilen beim Start ohne Text (hält keine Stundentexte über slice fest)', () => {

@@ -63,6 +63,9 @@ export interface RecorderOptions {
   maxPermanentFailures?: number;
 }
 
+/** Spool-Lücke beim Start: höchstens so viele REST-Seiten (à 1 000 IDs) gezielt nachholen. */
+export const REPLAY_GAP_PAGES = 5;
+
 /** Maximale Länge einer als `gap` vermerkten Lücke (REST-Fenster 48 h + Reserve). */
 export const MAX_GAP_MS = 3 * DAY_MS;
 
@@ -197,7 +200,8 @@ export class Recorder {
       // Lücke mitten in der Spool (z. B. gekürzter Frame, danach weitergeschrieben): der Feed gibt
       // nach der Lücke nichts mehr aus und puffert jede weitere Zeile – über einen ganzen Tag Hunderte
       // MB (Review: 2,5 Mio. Zeilen, eine fehlende aggId → 756 MB). Daher nach jedem Stück prüfen:
-      // Lücke offen → Puffer verwerfen, Einspielen (auch späterer Tage) beenden; REST holt ab der
+      // Lücke offen → gezielt per REST füllen (fillReplayGap) und weiter einspielen; geht das nicht,
+      // Puffer verwerfen, Einspielen (auch späterer Tage) beenden; REST holt ab der
       // erwarteten ID nach (48-h-Fenster), sonst greift die gewöhnliche Lückenbehandlung (Tag
       // eingefroren). Nichts wird doppelt gezählt: der Feed gibt jede aggId genau einmal aus. Bis REST
       // nachgeholt hat, ist der Tag im Speicher unvollständig; der Tagesabgleich des LiveWriters
@@ -217,7 +221,9 @@ export class Recorder {
             false,
           )) {
             this.handle(s, items, false, false);
-            if (s.feed.gapOpen()) {
+            // erst gezielt per REST füllen (Stream und Nachholschleife laufen noch nicht: nichts
+            // konkurriert), erst wenn das scheitert, verwerfen und abbrechen
+            if (s.feed.gapOpen() && !(await this.fillReplayGap(s))) {
               const dropped = s.feed.dropBuffered();
               stopped = true;
               this.o.log('spool replay stopped at gap, REST catches up', {
@@ -260,6 +266,41 @@ export class Recorder {
       this.timers.push(setInterval(() => void this.tick(), 1000));
       if (this.o.klineCheck) this.timers.push(setInterval(() => void this.klineCheckAll(), 60_000));
     }
+  }
+
+  /**
+   * Lücke beim Einspielen der Spool: nur die fehlenden IDs [expected, erste gepufferte) per REST
+   * holen, höchstens REPLAY_GAP_PAGES Seiten zu 1 000 (im Gewichtsbudget von RestSource). Die
+   * nachgeholten Zeilen gehen sofort durch den Feed (der Puffer wächst nicht), jede aggId genau
+   * einmal; sie werden nicht erneut gespoolt (die Spool-Datei wird gerade gelesen) und sind als REST
+   * markiert. true = Lücke geschlossen; false bei Fehler (auch −4166, außerhalb des Fensters),
+   * leerer Antwort oder zu großer Lücke.
+   */
+  private async fillReplayGap(s: SymbolState): Promise<boolean> {
+    for (let i = 0; i < REPLAY_GAP_PAGES && s.feed.gapOpen(); i++) {
+      const from = s.feed.expected;
+      const to = s.feed.bufferedFrom();
+      if (from === null || to === null) return false;
+      let rows;
+      try {
+        rows = await this.o.rest.aggTrades(s.spec.name, from, Math.min(1000, to - from));
+      } catch (e) {
+        this.o.log('spool replay gap: REST failed', { symbol: s.spec.name, error: String(e) });
+        return false;
+      }
+      if (rows.length === 0) return false;
+      if (rows[0]!.a > from) s.feed.skipProvenMissing(rows[0]!.a);
+      s.catchUpRows += rows.length;
+      this.handle(
+        s,
+        rows.map((r) => toItem(r, s.spec, true)),
+        false,
+        false,
+      );
+    }
+    const ok = !s.feed.gapOpen();
+    if (ok) this.o.log('spool replay gap filled via REST', { symbol: s.spec.name });
+    return ok;
   }
 
   async stop(): Promise<void> {
