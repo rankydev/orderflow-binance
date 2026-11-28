@@ -81,6 +81,7 @@ $$;
 CREATE FUNCTION pg_temp.bt_lock_day(p_day date, p_mode text) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
   l text;
+  prev text;
 BEGIN
   SELECT string_agg(format('%I.%I', chunk_schema, chunk_name), ', ' ORDER BY chunk_schema, chunk_name)
     INTO l
@@ -91,7 +92,12 @@ BEGIN
      AND range_start < (p_day + 1)::timestamp AT TIME ZONE 'UTC'
      AND range_end > p_day::timestamp AT TIME ZONE 'UTC';
   IF l IS NOT NULL THEN
+    -- höchstens 500 ms warten (unter der lock_timeout der API, 1 s: API-Leser hinter einer wartenden
+    -- Sperre laufen nicht in ihre eigene Zeitüberschreitung); danach gilt wieder die des Aufrufers
+    prev := current_setting('lock_timeout');
+    PERFORM set_config('lock_timeout', '500ms', true);
     EXECUTE format('LOCK TABLE %s IN %s MODE', l, p_mode);
+    PERFORM set_config('lock_timeout', prev, true);
   END IF;
 END
 $$;

@@ -500,6 +500,10 @@ und Gegenprobe neuer v1-Digest = v1-Beweis-Schlüssel (sonst zurück, `fail`); d
 Migration 0017: der Importer (bzw. ein erneuter Lauf dieses Werkzeugs) würde die Tage regulär neu
 in Version 2 schreiben („Digest-Version 1→2"). Die Aggregattabellen werden weder beim Lauf noch bei
 der Rücknahme verändert.
+`--revert` exportiert dazu frisch die Tagesliste vom Mac und greift nur, solange der lokale Stand
+der Tage unverändert ist: wurde ein Tag auf dem Mac inzwischen neu importiert (anderer v2-Digest),
+passt er nicht mehr zum Serverstand und wird mit `skip` übergangen – eine Rücknahme also vor einem
+Neuimport auf dem Mac ausführen.
 
 ## Nach dem Rollout – wichtig
 

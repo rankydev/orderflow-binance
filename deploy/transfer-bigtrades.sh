@@ -29,6 +29,9 @@ die() {
   printf '\033[31m[%s] FEHLER: %s\033[0m\n' "$(date -u +%H:%M:%S)" "$*" >&2
   exit 5
 }
+# Unerwarteter Fehler (set -e) vor dem Server-Lauf: ebenfalls Exit 5 (vor Schritt 3 aufgehoben)
+set -E
+trap 'printf "\033[31m[%s] FEHLER: unerwarteter Fehler (Exit %s, Zeile %s) – nichts auf dem Server ausgeführt\033[0m\n" "$(date -u +%H:%M:%S)" "$?" "$LINENO" >&2; exit 5' ERR
 resolve_host "${1:-}"
 [ "$SHIFTED" = 1 ] && shift
 MODE=apply
@@ -115,7 +118,8 @@ case "$MODE" in
 esac
 
 log "3/4 $MODE auf dem Server"
-set +e
+trap - ERR
+set +E +e
 # stdout (Zeilen je Tag, fortlaufend) → result-<modus>.txt, stderr (Zusammenfassung, ABBRUCH: …)
 # zusätzlich → result-<modus>.err. Strg-C/SSH-Abbruch beendet die Server-Sitzung
 # (bigtrades-apply.sh: tee bekommt EPIPE → pg_terminate_backend der eigenen Sitzung).
