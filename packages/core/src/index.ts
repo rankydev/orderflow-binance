@@ -12,3 +12,4 @@ export * from './tile/index.ts';
 export * from './bigtrades/codec.ts';
 export * from './profile/index.ts';
 export * from './live/live-day.ts';
+export * from './live/wire.ts';

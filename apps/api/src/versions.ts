@@ -14,7 +14,8 @@ export interface DayVersion {
 /** Version des Antwortaufbaus (Inhalt bei gleichem Datenstand); erhöhen trennt alle ETags. */
 // 2: Quellzeilen-Schätzung (sourceRowsEstimate, X-Rows-Estimate) aus der Bar-Schranke (53af8a4) –
 //    gleicher Datenstand, anderer Antwortinhalt, also neue ETags
-export const RESPONSE_BUILD_VERSION = 2;
+// 3: /bars-Header mit committedTo (Live-Naht, Etappe 1) – gleicher Datenstand, anderer Inhalt
+export const RESPONSE_BUILD_VERSION = 3;
 
 export function versionOf(
   parts: (string | number)[],

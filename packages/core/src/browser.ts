@@ -7,3 +7,4 @@ export * from './tile/codec.ts';
 export * from './tile/timeframes.ts';
 export * from './bigtrades/codec.ts';
 export * from './profile/index.ts';
+export * from './live/wire.ts';

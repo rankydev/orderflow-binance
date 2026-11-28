@@ -45,6 +45,12 @@ export interface TileMeta {
   dataVersion: string;
   /** true, wenn alle überdeckten Tage final_* sind (Kachel unveränderlich). */
   final: boolean;
+  /**
+   * Nur bars (optional, seit Live Etappe 1): Minuten < committedTo sind in dieser Antwort enthalten,
+   * spätere nicht (Recorder-Grenze max(data_day.live_until) im selben Snapshot, auf [from, to]
+   * begrenzt). Naht für die Live-Anzeige (wire.ts); fehlt bei älteren Servern.
+   */
+  committedTo?: number;
 }
 
 export interface TileHeader extends TileMeta {
@@ -225,6 +231,11 @@ function validateHeader(h: TileHeader): void {
   if (h.from < 0 || h.to / 1000 > 2 ** 31) fail('Zeitraum außerhalb Int32-Sekunden');
   if (typeof h.dataVersion !== 'string') fail('dataVersion fehlt');
   if (typeof h.final !== 'boolean') fail('final fehlt');
+  if (
+    h.committedTo !== undefined &&
+    (!isInt(h.committedTo) || h.committedTo < h.from || h.committedTo > h.to)
+  )
+    fail('committedTo ungültig');
   if (!isInt(h.nBars) || h.nBars < 0 || !isInt(h.nLevels) || h.nLevels < 0)
     fail('Anzahlen ungültig');
   if (!Array.isArray(h.columns)) fail('columns fehlt');
@@ -432,6 +443,7 @@ export function decodeTile(input: Uint8Array | ArrayBuffer): DecodedTile {
     tile: header.tile,
     dataVersion: header.dataVersion,
     final: header.final,
+    ...(header.committedTo !== undefined ? { committedTo: header.committedTo } : {}),
   };
   const out: DecodedTile = { header, meta, bars };
   if (levels) out.levels = levels;

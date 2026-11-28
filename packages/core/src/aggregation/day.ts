@@ -343,6 +343,28 @@ export class DayAggregator {
     return this.big.slice(0, f.bigTo);
   }
 
+  /**
+   * Nur lesende Sicht für die Live-Anzeige (KONZEPT §5.7): Bar der laufenden, noch nicht
+   * abgeschlossenen Minute (neues Objekt) oder null. Verändert keinen Zustand; der schnelle Pfad in
+   * add() bleibt unberührt (BarAcc.finish liest nur).
+   */
+  openMinuteView(): { minute: number; bar: Bar } | null {
+    if (this.cur < 0 || this.finished || this.flushed.has(this.cur) || this.bar.count === 0)
+      return null;
+    return { minute: this.cur, bar: this.bar.finish(this.dayStart + this.cur * MINUTE_MS) };
+  }
+
+  /** Nur lesend: Bar einer abgeschlossenen Minute (Referenz, ohne Kopie der fp-Zeilen) oder undefined. */
+  minuteBar(m: number): Bar | undefined {
+    const f = this.flushed.get(m);
+    return f ? this.bars[f.bar] : undefined;
+  }
+
+  /** Minute des zuletzt hinzugefügten Trades (−1 vor dem ersten). */
+  get currentMinute(): number {
+    return this.cur;
+  }
+
   /** Kandidatensummen je Minute bisher (Live-Kline-Abgleich; Referenzen, nicht kopiert). */
   candidates(): { candQ: Float64Array; candB: Float64Array; count: number } {
     return { candQ: this.candQ, candB: this.candB, count: this.candCount };

@@ -19,8 +19,10 @@ import { allImmutable, checkCoverage, checkTile } from '../consistency.ts';
 import type { ReadTx } from '../db.ts';
 import type { BarTable } from '../plan.ts';
 import {
+  clampCommittedTo,
   queryBars,
   queryLevels,
+  readCommittedTo,
   querySubBars,
   queryTrades,
   readDays,
@@ -219,11 +221,13 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
         { table, from, to },
         ...(trades ? [{ table: 'kline_1m' as const, from, to }] : []),
       ];
-      const { days, bars, extra } = await guardedRead(
+      const { days, bars, extra, committedTo } = await guardedRead(
         deps,
         ctx,
         async (tx) => {
           const days = await readDays(tx, s.symId, d0, d1);
+          // Live-Naht: im selben Snapshot wie die Zeilen (Minuten < committedTo sind enthalten)
+          const committedTo = clampCommittedTo(await readCommittedTo(tx, s.symId), from, to);
           const bars = await queryBars(tx, s.symId, table, tfSec, from, to);
           checkCoverage(
             bars.time.map((t) => t * 1000),
@@ -239,7 +243,7 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
                 where: { sym: s.name, d0, d1, tf },
               })
             : undefined;
-          return { days, bars, extra };
+          return { days, bars, extra, committedTo };
         },
         lock,
       );
@@ -254,6 +258,7 @@ export function registerTileRoutes(app: FastifyInstance, deps: Deps): void {
         tile: null,
         dataVersion: ver.dataVersion,
         final: ver.final,
+        committedTo,
       };
       const body = asBuffer(
         encodeTile({ meta, bars: barColumns(bars), ...(extra ? { extra } : {}) }),

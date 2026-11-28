@@ -111,6 +111,28 @@ export async function readDays(
   return m;
 }
 
+/**
+ * Grenze der Live-Naht (wire.ts, TILE-FORMAT.md `committedTo`): Minuten davor stehen in der Datenbank,
+ * danach (noch) nichts. Größtes data_day.live_until des Symbols bzw. das Ende eines finalen Tages
+ * (importierte Tage ohne live_until), im Snapshot der laufenden Transaktion; null = keine Zeile.
+ */
+export async function readCommittedTo(tx: ReadTx, symId: number): Promise<number | null> {
+  const rows = await tx.rows(
+    `SELECT (extract(epoch FROM max(greatest(live_until,
+              CASE WHEN state IN ('final_ok', 'final_bad')
+                   THEN (day + 1)::timestamp AT TIME ZONE 'UTC' END))) * 1000)::int8
+       FROM data_day WHERE sym_id = $1`,
+    [symId],
+  );
+  return rows.length ? intOrNull(rows[0]![0]) : null;
+}
+
+/** committedTo einer Antwort [from, to): auf den Zeitraum begrenzt (null → to: nichts kommt live hinzu). */
+export function clampCommittedTo(c: number | null, from: number, to: number): number {
+  if (c === null) return to;
+  return Math.min(to, Math.max(from, c));
+}
+
 export interface BarRows {
   time: number[];
   open: number[];
