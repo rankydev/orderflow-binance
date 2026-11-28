@@ -26,4 +26,7 @@ done
 sleep 2 # Initialisierung startet den Server einmal neu
 echo "Wegwerf-DB $NAME auf 127.0.0.1:$PORT"
 export OF_DB_HOST=127.0.0.1 OF_DB_PORT="$PORT" OF_DB_USER=of_admin OF_DB_PASSWORD="$PW" OF_DB_NAME=orderflow
+# Name des Containers für Tests, die psql per `docker exec` aufrufen (Deploy-Skripte, z. B.
+# apps/importer/test/transfer-bigtrades.int.test.ts); ohne diese Variable überspringen sie sich.
+export OF_TEST_DB_CONTAINER="$NAME"
 if [ $# -gt 0 ]; then "$@"; else npm run test:db; fi

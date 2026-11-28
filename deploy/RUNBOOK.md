@@ -315,8 +315,8 @@ Reihenfolge:
    00:00, die der alte Recorder ohne big orders geschrieben hat) und setzt Ordersummen und
    Untergrenze. Stimmt er nicht (Spool unvollständig), bleiben Summen und `big_floor_n` NULL – der
    Tag gilt als ohne vollständige Order-Daten, bis der Import ihn finalisiert.
-5. Historie: alle Tage einmal neu importieren (Mac, dann Teilübertragung) – nicht Teil dieses
-   Releases.
+5. Historie: alle Tage einmal neu importieren (Mac, dann Teilübertragung, siehe „Historie Big
+   Trades übertragen") – nicht Teil dieses Releases.
 
 Untergrenze ändern: `UPDATE symbol SET big_floor_n = …`. Der Recorder liest sie nur beim Start
 (Review O1): danach `deploy/recorder.sh stop` + `start`; der erste Start ersetzt `big_order` des
@@ -385,6 +385,83 @@ Rollback: `deploy/release.sh --rollback` (voriges Image + Web), danach `deploy/r
 ungepuffert durch); vollständig zurück mit dem nginx-Stand des vorigen Releases und
 `deploy/nginx-setup.sh`.
 
+## Historie Big Trades übertragen (Teilübertragung, ohne API-Pause) – vorbereitet, nicht ausgeführt
+
+Ausgangslage: Auf dem Mac sind die finalen Tage nach 0017 neu importiert (Digest-Version 2,
+`big_order` gefüllt, `orders_n`/`orders_notional`/`big_floor_n` gesetzt); auf dem Server haben
+dieselben Tage noch Version 1 ohne Order-Daten. `transfer-db.sh --replace` ersetzte die ganze DB
+(20–25 min API-Pause, überschreibt Recorder-Tage) – stattdessen überträgt
+`deploy/transfer-bigtrades.sh` **nur** die Big-Trades-Ergänzung, Tag für Tag, neben laufender API
+und laufendem Recorder. Aufbau: `bin/bigtrades-export.sh` (Mac, eine lesende Momentaufnahme,
+`sql/bigtrades-export.sql`) → rsync nach `/var/lib/orderflow-binance/transfer/bigtrades-<zeit>/` +
+`sha256sum -c` → `bigtrades-apply.sh` aus diesem Verzeichnis (`docker exec orderflow-db psql` als
+`of_admin`; Nutzlast in **temporäre** Tabellen der Sitzung, `sql/bigtrades-stage.sql`, dann
+`sql/bigtrades-run.sql`) → Verzeichnis löschen. Nichts wird vorher auf dem Server installiert.
+
+Ein Tag wird nur geschrieben, wenn auf dem Server: Zustand `final_ok`/`final_bad` wie lokal, nicht
+`stale`, kein offener Import, Digest-Version 1 ohne Ordersummen, gespeicherter Digest **und** neu
+berechneter `day_digest_all_v(…, 1)` = lokal berechneter v1-Digest (Beweis: die zwölf
+Aggregattabellen sind identisch), gleiche Klassifikation (`quality_digest`), und `symbol.big_floor_n`
+= lokal (sonst Abbruch des ganzen Laufs, auch im Probelauf). Dann in **einer** Transaktion:
+`data_day`-Zeile `FOR UPDATE` → `symbol` `FOR SHARE` (Reihenfolge von Recorder/Importer) →
+`big_order` des Tages ersetzen → Ordersummen, Untergrenze, v2-Digest, `digest_version = 2`,
+`version + 1` (neue `dataVersion`/ETags; der API-Katalog sieht es nach ≤ `OF_API_POLL_MS`, Standard
+1 s) → Σ Notional = Σ `bar_1m.notional` → `day_digest_all_v(…, 2)` = lokaler v2-Digest, sonst
+Rücknahme dieses Tages (`fail`). Bereits v2 (übertragen oder vom Recorder finalisiert) → `same`
+bzw. `skip`, nie überschrieben. Sperren: Importer-Advisory-Lock 7042025 für den ganzen Lauf (die
+Recorder-Finalisierung meldet solange `lock_busy` und versucht es 15 min später erneut), je Tag
+`lock_timeout` 2 s (sonst `busy`, Tag unverändert). Chunks: direktes DML wie der Importer im
+Online-Betrieb (MVCC-sicher für Leser, kein `convert_to_rowstore`); danach unter dem Lock
+`of_recompress_chunk` (ACCESS EXCLUSIVE, je Versuch 500 ms, 10 Versuche) für alle teilweise
+komprimierten kalten Chunks und die neu angelegten kalten `big_order`-Chunks; offene Chunks bleiben
+im Rowstore (0015). Abbruch vor dem Schreiben: Fenster 05:00–06:00 UTC bzw. ab 06:00, solange der
+Vortag nicht final ist (`--ignore-window` übergeht das bewusst), offene komprimierte Chunks
+(zuerst `deploy/recorder.sh repair`), laufende Admin-/psql-/Dump-Sitzungen (kein Prüfbericht
+parallel), Importer-Lock länger als `--lock-wait` (120 s) belegt.
+
+Befehlsfolge (Mac, Repo-Wurzel; Mac-DB währenddessen nicht ändern):
+
+```bash
+deploy/transfer-bigtrades.sh --dry-run          # nur lesend; Erwartung: Tage=340 would=340, Exit 0
+deploy/transfer-bigtrades.sh                    # Lauf (Abfrage; OF_YES=1 überspringt); Erwartung ok=340, Exit 0
+deploy/transfer-bigtrades.sh --verify           # nur lesend; Erwartung „verify: 340/340 Tage v2 identisch", Exit 0
+deploy/recorder.sh hot                          # hot_count|0
+deploy/recorder.sh report nach-bigtrades        # digest|days=…|match=…|mismatch=0, digest_version|2|…
+deploy/postcheck.sh "$BASE"                     # Nachbarn unverändert, Site 200
+```
+
+Bericht je Modus: `~/.cache/orderflow-binance/bigtrades/<name>/result-<modus>.txt` (Zeilen
+`day|…`, `verify|…`, `chunk|…`, am Ende `partial_chunks|0`, `hot_compressed_chunks|0`).
+Exit: 0 ok · 2 Tage übersprungen/`busy` (Gründe im Bericht; erneut ausführen ist sicher) · 1 `fail`
+bzw. verify-Abweichung (nicht übergehen) · 4 Chunks teilweise komprimiert geblieben (erneut
+ausführen) · 3 Abbruch (`ABBRUCH: …`).
+
+Dauer und Menge (gemessen am 2026-11-28 lokal an einer Kopie der Mac-DB in Server-Zustand – alle
+340 Tage v1, keine historischen `big_order`-Chunks –, Container mit 2 CPUs/2 GB; 1 305 965 big
+orders): Export ≈ 1,5 min je Modus (v1 + v2 aller Tage), Nutzlast 36 MB gzip (118 MB roh; für
+`--dry-run`/`--verify` 128 KB); Probelauf ≈ 45 s, Lauf ≈ 90 s (je Tag ≤ 1 s Transaktion, 5 neue
+kalte `big_order`-Chunks je ≈ 0,1 s komprimiert, danach `partial_chunks|0`), verify ≈ 45 s;
+Wiederholung ≈ 2 s (340 × `same`). Auf dem VPS (2 vCPU, geteilt) mit ≈ 2× rechnen: Lauf
+einschließlich Export und Upload ≈ 5–8 min. Der Lauf hält den Importer-Lock die ganze Zeit;
+außerhalb des Finalisierungsfensters starten.
+
+**Abbruch** (Strg-C, SSH weg, Exit 3/4): `bigtrades-apply.sh` beendet dann die eigene Server-Sitzung
+(`pg_terminate_backend`, sobald die Ausgabe ins Leere geht bzw. bei HUP/INT/TERM) – der laufende
+Tag wird zurückgerollt, Lock und temporäre Tabellen verschwinden; festgeschriebene Tage sind
+vollständig (v2, geprüft). Während des Wartens auf den Lock gibt es keine Ausgabe; dort kann das
+Ende bis zu `--lock-wait` dauern. Prüfen und notfalls von Hand beenden (auf dem Server):
+`docker exec orderflow-db psql -U of_admin -d orderflow -Atc "SELECT pid, state FROM pg_stat_activity WHERE application_name = 'orderflow-bigtrades'"`
+bzw. `… -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'orderflow-bigtrades'"`.
+Kalte Chunks können teilweise komprimiert bleiben (lesbar, konsistent; auch wenn vor dem
+Chunk-Abschluss eine andere lange Transaktion offen war: `check|chunk_abschluss|zurückgestellt`,
+Exit 4). Abhilfe: denselben Befehl erneut ausführen – übertragene Tage melden `same`, der Rest wird
+übertragen, der Chunk-Abschluss läuft erneut; danach `--verify`. Bleibt ein Transferverzeichnis
+liegen: `rm -rf /var/lib/orderflow-binance/transfer/bigtrades-*` auf dem Server.
+**Rücknahme** ist nicht vorgesehen: die zwölf Aggregattabellen bleiben unverändert (v1 bewiesen),
+es kommen nur `big_order`-Zeilen und Ordersummen hinzu, die ein Neuimport auf dem Server genauso
+schriebe. Den Probelauf und `--verify` nicht parallel zum Lauf starten (der Lauf stellt dann den
+Chunk-Abschluss zurück).
+
 ## Nach dem Rollout – wichtig
 
 - **Niemand wird alarmiert.** Der Monitor schreibt nur ins Journal (und markiert die Unit als
@@ -423,6 +500,7 @@ ungepuffert durch); vollständig zurück mit dem nginx-Stand des vorigen Release
 | 5       | `nginx -t && systemctl reload nginx` (zweimal)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | 5       | `certbot certonly --account <id aus renewal/*.conf> --webroot -w /var/www/orderflow-acme -d orderflow.rankyhub.com --cert-name orderflow.rankyhub.com --non-interactive --keep-until-expiring --deploy-hook 'nginx -t && systemctl reload nginx'` (legt `/etc/letsencrypt/{live,archive,renewal}/orderflow.rankyhub.com*` an)                                                                                                                                                                                                                                                                                                           |
 | 6       | `systemctl enable --now orderflow-monitor.timer`; `systemctl start orderflow-monitor.service`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| BT      | `transfer-bigtrades.sh` (nicht mit `--dry-run`/`--verify`, die nur lesen und nur Sitzungs-temporäre Tabellen/Funktionen anlegen): `mkdir` + `rsync` `/var/lib/orderflow-binance/transfer/bigtrades-<zeit>/`; `psql` als of_admin: `pg_advisory_lock(7042025)` (Importer-Lock), je Tag `DELETE`/`INSERT` `big_order` des Tages und `UPDATE data_day SET orders_n, orders_notional, big_floor_n, digest, digest_version = 2, version + 1`; `of_recompress_chunk(…)` für teilweise komprimierte bzw. neu angelegte kalte Chunks; `rm -rf` des Transferverzeichnisses                                                                       |
 
 ## Risiken für die Nachbardienste und Schutz
 
