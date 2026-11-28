@@ -41,7 +41,13 @@ import { maskOf } from '../src/minutes.ts';
 import { mirrorApiRole } from './api-role.ts';
 import { startApi, type RunningApi } from '../src/main.ts';
 import { FP_TABLE_NAMES } from '../src/plan.ts';
-import { chunkLockList, queryLevels, tsLit } from '../src/queries.ts';
+import {
+  chunkLockList,
+  clampCommittedTo,
+  queryLevels,
+  readCommittedTo,
+  tsLit,
+} from '../src/queries.ts';
 import {
   BAD_DAY,
   DAY_MS,
@@ -452,6 +458,54 @@ describe('Katalogstart: Budget unabhängig von der Zahl der Tage, nie ein Footpr
       for (const c of clients) c.destroy();
       await new Promise((r) => srv.close(r));
     }
+  });
+});
+
+describe('readCommittedTo (Live-Naht, im Lese-Snapshot)', () => {
+  /** In einer Transaktion ändern, prüfen, zurückrollen (der Seed bleibt unverändert). */
+  async function inTx(fn: (rtx: ReadTx, tx: Sql) => Promise<void>): Promise<void> {
+    const ROLLBACK = new Error('rollback');
+    await admin
+      .begin(async (tx) => {
+        await fn(
+          new ReadTx(tx as never, new AbortController().signal, {
+            queries: 0,
+            attempts: 0,
+            dbMs: 0,
+          }),
+          tx as unknown as Sql,
+        );
+        throw ROLLBACK;
+      })
+      .catch((e: unknown) => {
+        if (e !== ROLLBACK) throw e;
+      });
+  }
+  const day = (d: number) => new Date(d * DAY_MS).toISOString().slice(0, 10);
+
+  it('provisorisch mit live_until, eingefroren ohne live_until, final gemischt', async () => {
+    await inTx(async (rtx, tx) => {
+      // Seed: finale Tage + ein provisorischer Tag ohne live_until (nicht vom Recorder) → Tagesende
+      expect(await readCommittedTo(rtx, SYM_ID)).toBe((PROVISIONAL_DAY + 1) * DAY_MS);
+      // Recorder-Tag: live_until zählt (auch wenn kleiner als das Ende des Vortags + Minuten)
+      const lu = PROVISIONAL_DAY * DAY_MS + 600 * MINUTE_MS;
+      await tx`UPDATE data_day SET live_until = ${new Date(lu)} WHERE sym_id = ${SYM_ID} AND day = ${day(PROVISIONAL_DAY)}::date`;
+      expect(await readCommittedTo(rtx, SYM_ID)).toBe(lu);
+      // eingefrorener Folgetag ohne live_until (z. B. markFrozen vor dem ersten Schreiben) → Tagesende
+      await tx`INSERT INTO data_day (sym_id, day, state, version, live_frozen)
+               VALUES (${SYM_ID}, ${day(PROVISIONAL_DAY + 1)}::date, 'provisional', 1, 'Test')`;
+      expect(await readCommittedTo(rtx, SYM_ID)).toBe((PROVISIONAL_DAY + 2) * DAY_MS);
+      await tx`DELETE FROM data_day WHERE sym_id = ${SYM_ID} AND day = ${day(PROVISIONAL_DAY + 1)}::date`;
+      // finalisiert: live_until bleibt als Herkunft stehen, zählt aber nicht mehr → Tagesende
+      await tx`UPDATE data_day SET state = 'final_ok' WHERE sym_id = ${SYM_ID} AND day = ${day(PROVISIONAL_DAY)}::date`;
+      expect(await readCommittedTo(rtx, SYM_ID)).toBe((PROVISIONAL_DAY + 1) * DAY_MS);
+      // Symbol ohne Zeilen
+      expect(await readCommittedTo(rtx, 999)).toBeNull();
+    });
+    expect(clampCommittedTo(null, 10, 20)).toBe(20);
+    expect(clampCommittedTo(5, 10, 20)).toBe(10);
+    expect(clampCommittedTo(15, 10, 20)).toBe(15);
+    expect(clampCommittedTo(25, 10, 20)).toBe(20);
   });
 });
 

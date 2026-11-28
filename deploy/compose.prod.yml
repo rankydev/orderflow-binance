@@ -137,8 +137,9 @@ services:
       # Live-Updates (Etappe 1): genau eine SSE-Verbindung zum Recorder, verteilt an /api/v1/live;
       # leer = aus (/api/v1/live antwortet 503, die Seite zeigt „getrennt")
       OF_API_RECORDER_LIVE_URL: http://recorder:7701/live
-      # Höchstzahl gleichzeitiger Live-Clients (darüber 503); je Client ≈ 1–2 kB/s
-      OF_API_LIVE_MAX: '150'
+      # Höchstzahl gleichzeitiger Live-Clients (darüber 503); je Client ≈ 1–2 kB/s. Muss
+      # ≤ OF_API_MAX_CONNECTIONS − 64 sein (256 − 64 = 192; die API prüft das beim Start)
+      OF_API_LIVE_MAX: '100'
       # Antwort-Cache nicht-finaler Antworten (Standard 10 s) und Verbindungsgrenzen der API
       OF_API_NONFINAL_TTL_MS: '10000'
       OF_API_MAX_CONNECTIONS: '256'

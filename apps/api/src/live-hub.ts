@@ -9,6 +9,8 @@
 //    (liest nicht), wird getrennt. Höchstens maxClients gleichzeitig (darüber 503).
 //  - Keepalive-Kommentar alle keepaliveMs (≤ 15 s; nginx proxy_read_timeout 75 s).
 //  - Upstream weg: Clients bekommen status {recorder: false} und alle statusEveryMs erneut (Herzschlag).
+//  - Stummer Upstream (Verbindung offen, aber keine Bytes – z. B. hängender Recorder, halb offene
+//    TCP-Verbindung): nach idleMs (5 s; die Tap sendet ≥ 1 tick/s je Symbol) abbrechen → wie Ausfall.
 import type { ServerResponse } from 'node:http';
 import {
   LIVE_WIRE_VERSION,
@@ -21,6 +23,8 @@ import {
 export const LIVE_CLIENT_MAX_BUFFER = 256 * 1024;
 export const LIVE_KEEPALIVE_MS = 15_000;
 export const LIVE_STATUS_EVERY_MS = 5_000;
+/** Ohne ein Byte vom Upstream so lange (ms) → Verbindung gilt als tot. */
+export const LIVE_UPSTREAM_IDLE_MS = 5_000;
 /** Größte erwartete Nachricht des Recorders (snap mit 240 Minuten ≈ 45 kB) mit Reserve. */
 const UPSTREAM_MAX_EVENT = 1024 * 1024;
 
@@ -30,6 +34,7 @@ export interface LiveHubOptions {
   maxBuffer?: number;
   keepaliveMs?: number;
   statusEveryMs?: number;
+  idleMs?: number;
   fetchFn?: typeof fetch;
   log?: (level: 'info' | 'warn', msg: string, obj?: Record<string, unknown>) => void;
 }
@@ -40,6 +45,7 @@ export interface LiveHubStats {
   upstreamMessages: number;
   upstreamGaps: number;
   upstreamInvalid: number;
+  upstreamIdleAborts: number;
   lastError: string | null;
   clients: number;
   accepted: number;
@@ -56,6 +62,7 @@ export class LiveHub {
     upstreamMessages: 0,
     upstreamGaps: 0,
     upstreamInvalid: 0,
+    upstreamIdleAborts: 0,
     lastError: null,
     clients: 0,
     accepted: 0,
@@ -72,6 +79,7 @@ export class LiveHub {
   private conn: AbortController | null = null;
   private loop: Promise<void> | null = null;
   private keepalive: ReturnType<typeof setInterval> | null = null;
+  private lastInvalidLog = 0;
   private statusTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(o: LiveHubOptions) {
@@ -79,6 +87,7 @@ export class LiveHub {
       maxBuffer: LIVE_CLIENT_MAX_BUFFER,
       keepaliveMs: LIVE_KEEPALIVE_MS,
       statusEveryMs: LIVE_STATUS_EVERY_MS,
+      idleMs: LIVE_UPSTREAM_IDLE_MS,
       fetchFn: (u, i) => fetch(u, i),
       ...o,
     };
@@ -292,17 +301,40 @@ export class LiveHub {
   private async consume(body: ReadableStream<Uint8Array>, conn: AbortController): Promise<void> {
     const dec = new TextDecoder();
     let buf = '';
-    for await (const chunk of body) {
-      buf += dec.decode(chunk, { stream: true }).replace(/\r\n?/g, '\n');
-      for (let i = buf.indexOf('\n\n'); i >= 0; i = buf.indexOf('\n\n')) {
-        const block = buf.slice(0, i);
-        buf = buf.slice(i + 2);
-        if (!this.dispatch(block)) {
+    let lastByte = Date.now();
+    let idle = false;
+    const watch = setInterval(
+      () => {
+        if (Date.now() - lastByte > this.o.idleMs) {
+          idle = true;
           conn.abort();
-          throw new Error('Folgenummer des Upstreams gesprungen');
         }
+      },
+      Math.max(50, Math.floor(this.o.idleMs / 5)),
+    );
+    watch.unref();
+    try {
+      for await (const chunk of body) {
+        lastByte = Date.now();
+        buf += dec.decode(chunk, { stream: true }).replace(/\r\n?/g, '\n');
+        for (let i = buf.indexOf('\n\n'); i >= 0; i = buf.indexOf('\n\n')) {
+          const block = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          if (!this.dispatch(block)) {
+            conn.abort();
+            throw new Error('Folgenummer des Upstreams gesprungen');
+          }
+        }
+        if (buf.length > UPSTREAM_MAX_EVENT) throw new Error('Upstream-Nachricht zu lang');
       }
-      if (buf.length > UPSTREAM_MAX_EVENT) throw new Error('Upstream-Nachricht zu lang');
+    } catch (e) {
+      if (idle) {
+        this.stats.upstreamIdleAborts++;
+        throw new Error(`Upstream stumm (> ${this.o.idleMs} ms ohne Daten)`, { cause: e });
+      }
+      throw e;
+    } finally {
+      clearInterval(watch);
     }
   }
 
@@ -321,6 +353,19 @@ export class LiveHub {
     const m = parseLiveMsg(v);
     if (!m) {
       this.stats.upstreamInvalid++;
+      // unbekannte Formatversion (Recorder neuer als die API): sichtbar machen, gedrosselt
+      const ver = (v as { v?: unknown } | null)?.v;
+      const now = Date.now();
+      if (now - this.lastInvalidLog > 60_000) {
+        this.lastInvalidLog = now;
+        this.o.log?.(
+          'warn',
+          ver !== LIVE_WIRE_VERSION
+            ? 'live upstream: unbekannte Formatversion, Nachrichten verworfen'
+            : 'live upstream: ungültige Nachricht verworfen',
+          { version: ver, expected: LIVE_WIRE_VERSION, invalid: this.stats.upstreamInvalid },
+        );
+      }
       return true;
     }
     return this.onUpstream(m);

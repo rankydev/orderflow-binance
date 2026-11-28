@@ -13,6 +13,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   DAY_MS,
+  LIVE_MAX_MINUTES,
   LIVE_RETAIN_MS,
   LIVE_WIRE_VERSION,
   LiveBook,
@@ -217,12 +218,14 @@ export class LiveTap {
     const c = recorderCommittedTo(s);
     let first: number | null = null;
     for (const d of s.days.keys()) if (first === null || d < first) first = d;
+    // ohne bekannte Grenze (frische Installation): höchstens LIVE_MAX_MINUTES vor jetzt
     const from =
       c !== null
         ? c - LIVE_RETAIN_MS
-        : first !== null
-          ? first * DAY_MS
-          : this.now() - LIVE_RETAIN_MS;
+        : Math.max(
+            first !== null ? first * DAY_MS : 0,
+            this.now() - Math.max(LIVE_RETAIN_MS, LIVE_MAX_MINUTES * MINUTE_MS),
+          );
     st = { book: new LiveBook(name), scan: new Map(), lastSentAt: 0 };
     const r = st.book.apply({
       v: LIVE_WIRE_VERSION,
@@ -234,6 +237,7 @@ export class LiveTap {
       from: from - (from % MINUTE_MS),
       price: null,
       eventMs: this.eventMs(s),
+      recvMs: s.wsLastMsg > 0 ? s.wsLastMsg : null,
       bars: [],
       status: this.status(s),
     });
@@ -266,7 +270,10 @@ export class LiveTap {
       st.scan.set(day, dayStart + cur * MINUTE_MS);
     }
     for (const d of st.scan.keys()) if (!s.days.has(d)) st.scan.delete(d);
-    return out.sort((a, b) => a.ts - b.ts);
+    out.sort((a, b) => a.ts - b.ts);
+    // Rückstand (DB steht) oder erster Durchgang: nie mehr als LIVE_MAX_MINUTES in einer Nachricht;
+    // das LiveBook verwirft die ältesten ohnehin (from rückt nach)
+    return out.length > LIVE_MAX_MINUTES ? out.slice(out.length - LIVE_MAX_MINUTES) : out;
   }
 
   private pollSym(name: string): void {
@@ -301,6 +308,7 @@ export class LiveTap {
       serverMs: now,
       price: top ? top.close : null,
       eventMs,
+      recvMs: s.wsLastMsg > 0 ? s.wsLastMsg : null,
       bars,
     });
     this.stats.ticks++;

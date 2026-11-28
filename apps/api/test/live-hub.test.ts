@@ -172,6 +172,37 @@ describe('LiveHub', () => {
     expect(c2.book.status.recorder).toBe(false);
   });
 
+  it('stummer Upstream (Verbindung offen, keine Bytes) → nach idleMs getrennt, Clients bekommen recorder: false; unbekannte Version wird geloggt', async () => {
+    const up = await fakeRecorder();
+    cleanup.push(() => up.close());
+    const logs: string[] = [];
+    const hub = new LiveHub({
+      url: up.url,
+      maxClients: 10,
+      idleMs: 300,
+      statusEveryMs: 60_000,
+      log: (_l, msg) => logs.push(msg),
+    });
+    cleanup.push(() => hub.stop());
+    hub.start();
+    await until(() => up.clients.size === 1);
+    const { url, srv } = await hubServer(hub);
+    cleanup.push(() => new Promise<void>((r) => (srv.closeAllConnections(), srv.close(() => r()))));
+    const ac = new AbortController();
+    cleanup.push(() => ac.abort());
+    up.send(sse(snap(0, [bar(T0, 5)])));
+    up.send(`data: ${JSON.stringify({ ...tick(1, 6), v: 2 })}\n\n`); // künftige Formatversion
+    await until(() => hub.stats.upstreamMessages === 1 && hub.stats.upstreamInvalid === 1);
+    expect(logs.some((l) => /Formatversion/.test(l))).toBe(true);
+    const c = await reader(url, ac);
+    await until(() => c.book.ready && c.book.status.recorder);
+    // ab jetzt schweigt der Upstream (Verbindung bleibt offen)
+    await until(() => c.book.status.recorder === false, 3_000);
+    expect(hub.stats.upstreamIdleAborts).toBeGreaterThanOrEqual(1);
+    expect(hub.stats.upstreamConnected).toBe(false);
+    await until(() => up.connects() >= 2, 5_000); // verbindet neu
+  });
+
   it('langsamer Client (liest nicht) wird getrennt; die anderen bekommen weiter alles', async () => {
     const hub = new LiveHub({
       url: 'http://127.0.0.1:9/never',
@@ -234,6 +265,22 @@ describe('Route /api/v1/live', () => {
       OF_API_RECORDER_LIVE_URL: 'http://127.0.0.1:9/live',
     });
     expect(cfg.liveMaxClients).toBe(1);
+    // H1: Live-Clients lassen 64 Verbindungen für die übrigen Anfragen frei
+    const base = {
+      OF_DB_HOST: 'localhost',
+      OF_DB_PORT: '5432',
+      OF_DB_USER: 'admin',
+      OF_DB_PASSWORD: 'x',
+      OF_DB_NAME: 'orderflow',
+      OF_API_DB_PASSWORD: 'y',
+    };
+    expect(() =>
+      parseApiConfig({ ...base, OF_API_MAX_CONNECTIONS: '256', OF_API_LIVE_MAX: '193' }),
+    ).toThrow(/OF_API_LIVE_MAX/);
+    expect(
+      parseApiConfig({ ...base, OF_API_MAX_CONNECTIONS: '256', OF_API_LIVE_MAX: '100' })
+        .liveMaxClients,
+    ).toBe(100);
     expect(cfg.recorderLiveUrl).toBe('http://127.0.0.1:9/live');
     const hub = new LiveHub({ url: cfg.recorderLiveUrl!, maxClients: cfg.liveMaxClients });
     const catalog = { symbol: (n: string) => (n === 'BTCUSDT' ? {} : undefined) };

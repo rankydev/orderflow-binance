@@ -22,10 +22,19 @@ import {
 import type { UTCTimestamp } from 'lightweight-charts';
 import type { BarItem } from './types.ts';
 
-export type LiveUiState = 'live' | 'delayed' | 'disconnected' | 'catchup' | 'frozen';
+export type LiveUiState = 'live' | 'quiet' | 'delayed' | 'disconnected' | 'catchup' | 'frozen';
 
-/** Ohne jede Nachricht so lange (ms, Zeitspanne im Browser – keine Uhrzeit) → Verbindung gilt als tot. */
+/** Ohne tick so lange (ms, Zeitspanne im Browser – keine Uhrzeit) → „getrennt" (Tap: ≥ 1 tick/s). */
+export const LIVE_TICK_SILENCE_MS = 5_000;
+/** Ohne jede Nachricht so lange → Verbindung tot, neu verbinden (die API sendet bei Ausfall alle 5 s status). */
 export const LIVE_SILENCE_MS = 8_000;
+/** „verzögert": Verzögerung > 3 s in zwei aufeinanderfolgenden ticks … */
+export const LIVE_DELAY_ON_MS = LIVE_DELAY_MS;
+/** … endet, wenn sie mindestens LIVE_SETTLE_MS lang unter LIVE_DELAY_OFF_MS bleibt. */
+export const LIVE_DELAY_OFF_MS = 1_500;
+export const LIVE_SETTLE_MS = 5_000;
+/** Stream verbunden, aber so lange keine Trades → „ruhig" (nicht „verzögert"). */
+export const LIVE_QUIET_MS = 30_000;
 /** Unsichtbarer Tab: nach so langer Zeit trennen. */
 export const LIVE_HIDDEN_DISCONNECT_MS = 30_000;
 /** Nach einem commit den letzten vorläufigen Abschnitt nach 0…LIVE_RELOAD_JITTER_MS neu laden. */
@@ -33,6 +42,7 @@ export const LIVE_RELOAD_JITTER_MS = 2_000;
 
 export const LIVE_LABELS: Record<LiveUiState, string> = {
   live: 'live',
+  quiet: 'ruhig / keine Trades',
   delayed: 'verzögert',
   disconnected: 'getrennt',
   catchup: 'Recorder holt nach / Lücke',
@@ -40,23 +50,86 @@ export const LIVE_LABELS: Record<LiveUiState, string> = {
 };
 
 /**
- * Fünf Zustände (Reihenfolge = Vorrang). „verzögert" misst Ereigniszeit gegen Serverzeit desselben
- * ticks (beides Uhr des Recorders), nie gegen die Uhr des Besuchers.
+ * Entprellte Live-Gesundheit, gemessen nur mit der Uhr des Recorders (serverMs, recvMs, eventMs der
+ * ticks), nie mit der des Besuchers:
+ *  - Verzögerung = recvMs − eventMs (Empfang beim Recorder minus Binance-Ereigniszeit; ohne recvMs,
+ *    älterer Recorder: serverMs − eventMs). „verzögert" ab > 3 s in zwei aufeinanderfolgenden ticks,
+ *    vorbei nach ≥ 5 s ununterbrochen < 1,5 s.
+ *  - Ruhe = serverMs − recvMs: bei verbundenem Stream kein Fehler; erst > 30 s → „ruhig".
+ *  - Stream getrennt (status.stream false) zählt erst nach ≥ 5 s als „holt nach" (kurze Reconnects
+ *    lassen kein Banner blinken).
  */
+export class LiveHealth {
+  delayed = false;
+  /** Recorder-Zeit des letzten ticks */
+  serverMs = 0;
+  /** Ruhe (ms) beim letzten tick */
+  quietMs = 0;
+  private over = 0;
+  private goodSince: number | null = null;
+  private streamDownSince: number | null = null;
+
+  reset(): void {
+    this.delayed = false;
+    this.serverMs = 0;
+    this.quietMs = 0;
+    this.over = 0;
+    this.goodSince = null;
+    this.streamDownSince = null;
+  }
+
+  tick(serverMs: number, eventMs: number | null, recvMs: number | null | undefined): void {
+    this.serverMs = serverMs;
+    const recv = recvMs ?? serverMs;
+    this.quietMs = recvMs != null ? Math.max(0, serverMs - recvMs) : 0;
+    const lag = eventMs === null ? null : recv - eventMs;
+    if (lag !== null && lag > LIVE_DELAY_ON_MS) {
+      this.over++;
+      this.goodSince = null;
+      if (this.over >= 2) this.delayed = true;
+    } else {
+      this.over = 0;
+      if (!this.delayed) return;
+      if (lag !== null && lag < LIVE_DELAY_OFF_MS) {
+        this.goodSince ??= serverMs;
+        if (serverMs - this.goodSince >= LIVE_SETTLE_MS) {
+          this.delayed = false;
+          this.goodSince = null;
+        }
+      } else this.goodSince = null;
+    }
+  }
+
+  status(serverMs: number, st: LiveStatus): void {
+    if (st.stream) this.streamDownSince = null;
+    else this.streamDownSince ??= serverMs;
+  }
+
+  /** wie lange (ms, Recorder-Uhr) der Stream schon getrennt ist; 0 = verbunden */
+  streamDownMs(): number {
+    return this.streamDownSince === null ? 0 : Math.max(0, this.serverMs - this.streamDownSince);
+  }
+}
+
+/** Zustände (Reihenfolge = Vorrang). */
 export function liveUiState(x: {
   connected: boolean;
   ready: boolean;
   status: LiveStatus;
-  eventMs: number | null;
-  serverMs: number;
-  /** ms seit der letzten Nachricht (Browser-Zeitspanne, performance.now) */
-  silentMs: number;
+  /** ms seit dem letzten tick (Browser-Zeitspanne, performance.now) */
+  tickSilentMs: number;
+  delayed: boolean;
+  /** Ruhe beim Recorder (serverMs − recvMs) */
+  quietMs: number;
+  /** Stream getrennt seit (Recorder-Uhr) */
+  streamDownMs: number;
 }): LiveUiState {
-  if (!x.connected || !x.ready || !x.status.recorder || x.silentMs > LIVE_SILENCE_MS)
+  if (!x.connected || !x.ready || !x.status.recorder || x.tickSilentMs > LIVE_TICK_SILENCE_MS)
     return 'disconnected';
   if (x.status.frozen) return 'frozen';
-  if (x.status.catchUp || !x.status.stream) return 'catchup';
-  if (x.eventMs === null || x.serverMs - x.eventMs > LIVE_DELAY_MS) return 'delayed';
+  if (x.status.catchUp || (!x.status.stream && x.streamDownMs >= LIVE_SETTLE_MS)) return 'catchup';
+  if (x.delayed) return 'delayed';
+  if (x.quietMs > LIVE_QUIET_MS) return 'quiet';
   return 'live';
 }
 
@@ -259,6 +332,9 @@ export class LiveClient {
   private es: EventSourceLike | null = null;
   private attempt = 0;
   private lastMsgAt = 0;
+  private lastTickAt = 0;
+  /** Entprellte Verzögerung/Ruhe/Stream (Recorder-Uhr) */
+  readonly health = new LiveHealth();
   private retry: unknown = null;
   private hiddenTimer: unknown = null;
   private watchdog: unknown = null;
@@ -298,6 +374,11 @@ export class LiveClient {
     return this.connected ? this.o.now() - this.lastMsgAt : Infinity;
   }
 
+  /** ms seit dem letzten tick bzw. snap (status-Herzschläge der API zählen nicht). */
+  tickSilentMs(): number {
+    return this.connected ? this.o.now() - this.lastTickAt : Infinity;
+  }
+
   uiState(): LiveUiState {
     const b = this.book;
     return liveUiState({
@@ -311,9 +392,10 @@ export class LiveClient {
         frozen: null,
         backlog: 0,
       },
-      eventMs: b?.eventMs ?? null,
-      serverMs: b?.serverMs ?? 0,
-      silentMs: this.silentMs(),
+      tickSilentMs: this.tickSilentMs(),
+      delayed: this.health.delayed,
+      quietMs: this.health.quietMs,
+      streamDownMs: this.health.streamDownMs(),
     });
   }
 
@@ -363,11 +445,14 @@ export class LiveClient {
     this.es = es;
     this.stats.connects++;
     this.book = new LiveBook(sym);
+    this.health.reset();
     this.lastMsgAt = this.o.now();
+    this.lastTickAt = this.o.now();
     es.onopen = () => {
       if (this.es !== es) return;
       this.connected = true;
       this.lastMsgAt = this.o.now();
+      this.lastTickAt = this.o.now();
       this.o.onChange('conn');
     };
     es.onmessage = (ev) => {
@@ -386,7 +471,14 @@ export class LiveClient {
 
   private watch(es: EventSourceLike): void {
     if (this.es !== es) return;
-    if (this.connected && this.o.now() - this.lastMsgAt > LIVE_SILENCE_MS) {
+    // tot: gar nichts mehr (die API sendet auch bei Recorder-Ausfall alle 5 s status) – oder keine
+    // ticks, obwohl der Recorder laut letztem Stand erreichbar ist (hängender Verteiler)
+    const now = this.o.now();
+    if (
+      this.connected &&
+      (now - this.lastMsgAt > LIVE_SILENCE_MS ||
+        (now - this.lastTickAt > 2 * LIVE_TICK_SILENCE_MS && !!this.book?.status.recorder))
+    ) {
       this.stats.silences++;
       this.reconnectNow();
       return;
@@ -417,7 +509,15 @@ export class LiveClient {
       return;
     }
     if (r !== 'ok') return;
-    if (m.t === 'snap') this.attempt = 0;
+    if (m.t === 'snap') {
+      this.attempt = 0;
+      this.health.reset();
+      this.health.status(m.serverMs, m.status);
+    }
+    if (m.t === 'snap' || m.t === 'tick') {
+      this.lastTickAt = this.lastMsgAt;
+      this.health.tick(m.serverMs, m.eventMs, m.recvMs);
+    } else if (m.t === 'status') this.health.status(m.serverMs, m.status);
     this.o.onChange(m.t, m);
   }
 

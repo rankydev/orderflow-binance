@@ -132,7 +132,7 @@ server {
     # HTTP/1.1 (kein http2, siehe oben) – je Tab eine der ≤ 6 Verbindungen je Host.
     # Je IP höchstens 4 gleichzeitige Live-Ströme (eigene Zone orderflow_live_conn in
     # conf.d/orderflow-binance.conf); der Verbindungsaufbau zählt außerdem gegen orderflow_api.
-    # Gesamtgrenze in der API: OF_API_LIVE_MAX (150). Jeder Live-Client belegt in nginx 2
+    # Gesamtgrenze in der API: OF_API_LIVE_MAX (compose 100). Jeder Live-Client belegt in nginx 2
     # Verbindungen (Client + Upstream) → worker_connections vor dem Rollout prüfen (RUNBOOK).
     location = /api/v1/live {
         limit_req zone=orderflow_api burst=90 nodelay;

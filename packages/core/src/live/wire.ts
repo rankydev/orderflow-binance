@@ -85,6 +85,12 @@ export interface SnapMsg extends MsgBase {
   price: number | null;
   /** Ereigniszeit E der letzten Stream-Nachricht (ms) oder null. */
   eventMs: number | null;
+  /**
+   * Empfangszeit der letzten Stream-Nachricht beim Recorder (ms, Uhr des Recorders) oder null; seit
+   * Etappe 1b, additiv (fehlt bei älteren Recordern). Verzögerung = recvMs − eventMs; Ruhe =
+   * serverMs − recvMs.
+   */
+  recvMs?: number | null;
   bars: LiveBar[];
   status: LiveStatus;
 }
@@ -93,6 +99,8 @@ export interface TickMsg extends MsgBase {
   t: 'tick';
   price: number | null;
   eventMs: number | null;
+  /** siehe SnapMsg.recvMs */
+  recvMs?: number | null;
   bars: LiveBar[];
 }
 
@@ -164,10 +172,12 @@ export function parseLiveMsg(x: unknown): LiveMsg | null {
     case 'snap':
       if (!isNumOrNull(o.committedTo) || !isNum(o.from) || !isNumOrNull(o.price)) return null;
       if (!isNumOrNull(o.eventMs) || !Array.isArray(o.bars) || !o.bars.every(validBar)) return null;
+      if (o.recvMs !== undefined && !isNumOrNull(o.recvMs)) return null;
       if (!validStatus(o.status)) return null;
       return o as unknown as SnapMsg;
     case 'tick':
       if (!isNumOrNull(o.price) || !isNumOrNull(o.eventMs)) return null;
+      if (o.recvMs !== undefined && !isNumOrNull(o.recvMs)) return null;
       if (!Array.isArray(o.bars) || !o.bars.every(validBar)) return null;
       return o as unknown as TickMsg;
     case 'commit':
@@ -216,6 +226,8 @@ export class LiveBook {
   readonly bars = new Map<number, LiveBar>();
   price: number | null = null;
   eventMs: number | null = null;
+  /** Empfangszeit der letzten Stream-Nachricht beim Recorder (null: unbekannt/älterer Recorder) */
+  recvMs: number | null = null;
   serverMs = 0;
   status: LiveStatus = { ...STATUS_UNKNOWN };
 
@@ -237,6 +249,7 @@ export class LiveBook {
       for (const b of m.bars) this.put(b);
       this.price = m.price;
       this.eventMs = m.eventMs;
+      this.recvMs = m.recvMs ?? null;
       this.serverMs = m.serverMs;
       this.status = { ...m.status };
       this.cap();
@@ -251,6 +264,7 @@ export class LiveBook {
         for (const b of m.bars) this.put(b);
         this.price = m.price;
         this.eventMs = m.eventMs;
+        this.recvMs = m.recvMs ?? null;
         // Verzögerung = serverMs − eventMs desselben ticks (beides Uhr des Recorders); status- und
         // commit-Nachrichten verschieben serverMs nicht (eine API-Uhr mit Versatz zählt nicht)
         this.serverMs = m.serverMs;
@@ -313,6 +327,7 @@ export class LiveBook {
       from: this.from,
       price: this.price,
       eventMs: this.eventMs,
+      recvMs: this.recvMs,
       bars: this.sortedBars(),
       status: { ...this.status },
     };

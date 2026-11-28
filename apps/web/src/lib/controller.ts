@@ -132,6 +132,11 @@ export interface LiveInfo {
   delta: string;
 }
 
+/** Live-Bucket nicht sichtbar: höchstens so oft (ms) einarbeiten. */
+export const LIVE_OFFSCREEN_APPLY_MS = 1_000;
+/** Fenster zum Live-Rand wachsen lassen: höchstens so oft (ms). */
+export const LIVE_BEYOND_ENSURE_MS = 5_000;
+
 /** Neuladen des letzten vorläufigen Bar-Abschnitts nach commit (höchstens so viele Versuche). */
 export const LIVE_RELOAD_ATTEMPTS = 4;
 
@@ -271,6 +276,9 @@ export class ChartController {
     again: boolean;
     attempts: number;
   } | null = null;
+  private lastBeyondEnsure = 0;
+  private lastOffscreenApply = 0;
+  private liveRetry: ReturnType<typeof setTimeout> | null = null;
   /** „Abschnitt älter als der Live-Vorhalt" je (Abschnitt, from) nur einmal neu laden */
   private reloadedFor = '';
   /** Zähler: Ablösen live → DB, Abweichungen (auch in der Konsole), Neuladen */
@@ -280,6 +288,7 @@ export class ChartController {
     rebuilds: 0,
     reloads: 0,
     reloadsStale: 0,
+    reloadsSkipped: 0,
     handovers: 0,
     mismatches: 0,
     lastMismatch: '',
@@ -547,6 +556,7 @@ export class ChartController {
     this.destroyed = true;
     this.live.close();
     if (this.liveReq) cancelAnimationFrame(this.liveReq);
+    if (this.liveRetry) clearTimeout(this.liveRetry);
     this.cancelReload();
     if (this.hoverReq) cancelAnimationFrame(this.hoverReq);
     this.barQueue.cancelAll();
@@ -1896,7 +1906,14 @@ export class ChartController {
         this.reloadedFor = key;
         this.scheduleReload(0, c);
       }
-      if (r.beyond && !beforeSetData && !this.gestureActive) this.ensureWindow();
+      // Live-Rand hat das Fenster verlassen: Fenster wachsen lassen, höchstens alle 5 s
+      if (r.beyond && !beforeSetData && !this.gestureActive) {
+        const now = performance.now();
+        if (now - this.lastBeyondEnsure >= LIVE_BEYOND_ENSURE_MS) {
+          this.lastBeyondEnsure = now;
+          this.ensureWindow();
+        }
+      }
       return mergeLive(items, r.items, beforeSetData);
     } catch (e) {
       console.warn('Live-Einarbeitung fehlgeschlagen', e);
@@ -1907,6 +1924,20 @@ export class ChartController {
   /** Live-Stand auf die Serien (series.update), Preislinie; höchstens einmal je Frame. */
   private applyLive(): void {
     if (this.destroyed) return;
+    // Live-Rand außerhalb des sichtbaren Bereichs (Historie): höchstens 1 Hz einarbeiten
+    const lr = this.logicalRange();
+    const offscreen = !!lr && lr.to < this.items.length - 2;
+    const now = performance.now();
+    if (offscreen && now - this.lastOffscreenApply < LIVE_OFFSCREEN_APPLY_MS) {
+      this.updatePriceLine();
+      if (!this.liveRetry)
+        this.liveRetry = setTimeout(() => {
+          this.liveRetry = null;
+          this.scheduleLiveApply();
+        }, LIVE_OFFSCREEN_APPLY_MS);
+      return;
+    }
+    if (offscreen) this.lastOffscreenApply = now;
     if (!this.suspended && this.sym && this.win && this.items.length > 0) {
       const res = this.overlayLive(this.items, this.win, false);
       if (res) {
@@ -2010,6 +2041,12 @@ export class ChartController {
       })
       .then((buf) => {
         if (this.destroyed || this.reload !== r || store !== this.bars) return;
+        // Verbindung wird gerade neu aufgebaut (kein snap): nicht ablösen – der snap lädt erneut
+        if (!this.live.book?.ready) {
+          done = true;
+          this.liveStats.reloadsSkipped++;
+          return;
+        }
         const oldC = store.committedTo(r.c);
         const oldCols = store.columns(r.c);
         const took = store.addEncoded(r.c, buf, { sym: sym.name, tf, from, to }, sym.dataTo, true);
@@ -2122,8 +2159,10 @@ export class ChartController {
       );
     if (st && !st.stream && state !== 'disconnected') title.push('Binance-Stream getrennt');
     if (book?.ready && book.eventMs !== null && state !== 'disconnected') {
-      const lag = (book.serverMs - book.eventMs) / 1000;
-      title.push(`Ereigniszeit ${lag.toFixed(1)} s hinter der Serverzeit`);
+      const lag = ((book.recvMs ?? book.serverMs) - book.eventMs) / 1000;
+      title.push(`Verzögerung Binance → Recorder ${lag.toFixed(1)} s`);
+      const quiet = this.live.health.quietMs / 1000;
+      if (quiet >= 5) title.push(`seit ${quiet.toFixed(0)} s keine Trades`);
     }
     if (st && st.backlog > 1) title.push(`${st.backlog} Minuten noch nicht geschrieben`);
     if (this.liveStats.mismatches > 0)

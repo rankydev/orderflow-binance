@@ -241,6 +241,16 @@ describe('parseLiveMsg', () => {
     expect(parseLiveMsg({ ...tick(1, []), price: 'x' })).toBeNull();
     expect(parseLiveMsg(null)).toBeNull();
     expect(parseLiveMsg(commit(3, 120_000))).not.toBeNull();
+    // recvMs (additiv): optional, Zahl oder null; im LiveBook und im snapshot erhalten
+    expect(parseLiveMsg({ ...tick(1, []), recvMs: 5 })).not.toBeNull();
+    expect(parseLiveMsg({ ...tick(1, []), recvMs: null })).not.toBeNull();
+    expect(parseLiveMsg({ ...tick(1, []), recvMs: 'x' })).toBeNull();
+    const b = new LiveBook('BTCUSDT');
+    b.apply(snap(0, 60_000 * 1000));
+    expect(b.recvMs).toBeNull();
+    b.apply({ ...(tick(1, []) as object), recvMs: 7 } as LiveMsg);
+    expect(b.recvMs).toBe(7);
+    expect(b.snapshot(1).recvMs).toBe(7);
   });
 });
 

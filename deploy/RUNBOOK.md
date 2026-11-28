@@ -329,29 +329,33 @@ Neu: Live-Tap im Recorder (`GET :7701/live`, nur Compose-Netz), `LiveHub` + `GET
 der API (SSE, keine DB), `committedTo` im `/bars`-Header (neue ETags: `RESPONSE_BUILD_VERSION` 3,
 einmal alle nicht finalen und finalen Antworten neu – der Server-Cache füllt sich wieder), Web-Overlay.
 Keine Migration. Variablen (compose.prod.yml): API `OF_API_RECORDER_LIVE_URL`, `OF_API_LIVE_MAX`
-(150); Recorder `OF_LIVE` (1), `OF_LIVE_HZ` (4). nginx: neue Zone `orderflow_live_conn`
+(100; die API verlangt ≤ `OF_API_MAX_CONNECTIONS` − 64 = 192); Recorder `OF_LIVE` (1), `OF_LIVE_HZ` (4). nginx: neue Zone `orderflow_live_conn`
 (conf.d/orderflow-binance.conf) und `location = /api/v1/live` im Site-File.
 
 Vorher prüfen (nur lesend):
 
 1. **worker_connections des gemeinsamen nginx:** `nginx -T 2>/dev/null | grep -E 'worker_(processes|connections)'`.
    Jeder Live-Client belegt 2 Verbindungen (Browser + Upstream), dazu kommen die Nachbarn
-   (genius, takt, rankyhub). Bei 150 Live-Clients ≈ 300 zusätzlich. Liegt
+   (genius, takt, rankyhub). Bei 100 Live-Clients ≈ 200 zusätzlich. Liegt
    `worker_processes × worker_connections` (Debian-Standard 768 je Worker) nicht deutlich darüber
-   (≥ 2× der heutigen Spitze + 300), `OF_API_LIVE_MAX` senken statt die globale nginx.conf zu ändern
+   (≥ 2× der heutigen Spitze + 200), `OF_API_LIVE_MAX` senken statt die globale nginx.conf zu ändern
    (die gehört nicht uns). Aktuelle Spitze: `ss -Htn state established '( sport = :443 )' | wc -l`.
 2. Recorder läuft und ist gesund (`deploy/recorder.sh health`), sonst zeigt die Seite nur „getrennt".
 
-Reihenfolge (Recorder zuerst, damit die API beim Start schon einen Upstream hat; jede Stufe für
-sich rückwärtsverträglich: alte Clients ignorieren `committedTo`, eine neue Seite ohne `/live` zeigt
-„getrennt" und alles andere wie bisher):
+Reihenfolge (jede Stufe für sich rückwärtsverträglich: alte Clients ignorieren `committedTo`, eine
+neue Seite ohne erreichbaren Live-Strom zeigt „getrennt" und alles andere wie bisher):
 
 1. `ID=$(deploy/build-release.sh)` (Mac).
-2. Recorder neu starten mit dem neuen Image: `deploy/recorder.sh stop`, Release ausrollen
-   (`deploy/release.sh "$ID"` – startet die API neu und übernimmt compose.prod.yml), dann
-   `deploy/recorder.sh start`. Neustart des Recorders ist billig (Spool-Wiedergabe + REST); die API
-   verbindet sich mit Backoff (1–30 s) von selbst zum Recorder.
-3. nginx: `deploy/nginx-setup.sh` (idempotent; `nginx -t` vor dem Reload, bei Fehler werden die
+2. Release ausrollen: `deploy/release.sh "$ID"` (startet die API mit dem neuen Image neu und
+   übernimmt compose.prod.yml). Die neue API findet beim alten Recorder noch kein `/live` und
+   versucht es mit Backoff (1–30 s) weiter – harmlos.
+3. **Sofort danach** den Recorder mit dem neuen Image neu starten: `deploy/recorder.sh stop`, dann
+   `deploy/recorder.sh start`. **Nur außerhalb des Finalisierungsfensters** (nicht zwischen 06:00 UTC
+   und dem Abschluss des Vortags, siehe `deploy/recorder.sh health` → `lastFinalisedDay`): ein
+   Neustart mitten in der Finalisierung bricht diese ab (sie läuft beim nächsten Durchgang erneut,
+   dauert dann aber noch einmal). Der Neustart selbst ist billig (Spool-Wiedergabe + REST); die API
+   verbindet sich danach von selbst.
+4. nginx: `deploy/nginx-setup.sh` (idempotent; `nginx -t` vor dem Reload, bei Fehler werden die
    eigenen Dateien zurückgenommen). Ohne diesen Schritt puffert der bisherige `/api/`-Block die
    SSE-Antwort (proxy_buffering on, 35 s Lese-Zeitlimit) → Live kommt verzögert und reißt ab.
 
@@ -362,12 +366,14 @@ Prüfen:
 - API (Loopback im Container): `/health` → `live.upstreamConnected: true`, `clients`, `dropped`.
 - Von außen (Mac): `curl -sN --max-time 5 https://orderflow.rankyhub.com/api/v1/live?sym=BTCUSDT`
   → sofort `data: {"v":1,"t":"snap"…`, danach `tick`-Zeilen (≥ 1/s, je ≈ 0,2–0,6 kB). Kommt alles
-  erst am Ende gebündelt, puffert nginx (Schritt 3 fehlt/falsch).
+  erst am Ende gebündelt, puffert nginx (Schritt 4 fehlt/falsch).
 - `curl -s 'https://orderflow.rankyhub.com/api/v1/bars?sym=BTCUSDT&tf=1m&from=…&to=…' | head -c 400`
   enthält `"committedTo"`.
 - Browser: Statuszeile „● live · Preis · V · Δ", die laufende Kerze bewegt sich, nach dem
   Minutenwechsel erscheint die neue Kerze ohne Neuladen; Konsole ohne „Abweichung(en) beim Ablösen".
-- 5 Tabs von einer IP: der fünfte bekommt 429 (limit_conn 4) und zeigt „getrennt".
+- 5 Tabs von einer IP: der fünfte bekommt 429 (limit_conn 4) und zeigt „getrennt". Achtung: das
+  trifft auch mehrere Nutzer hinter derselben NAT-Adresse (Büro, Mobilfunk-CGNAT); bei Beschwerden
+  die Grenze im Site-File anheben (`limit_conn orderflow_live_conn …`) statt die Zone zu ändern.
 
 Abschalten (ohne Release): Recorder `OF_LIVE: '0'` in compose.prod.yml bzw. auf dem Server in
 `/opt/orderflow-binance/compose.prod.yml`, `deploy/recorder.sh stop` + `start` – die API meldet den

@@ -19,7 +19,10 @@ import {
   checkHandover,
   composeLive,
   LIVE_HIDDEN_DISCONNECT_MS,
+  LIVE_QUIET_MS,
   LIVE_SILENCE_MS,
+  LIVE_TICK_SILENCE_MS,
+  LiveHealth,
   LiveClient,
   liveUiState,
   mergeLive,
@@ -106,21 +109,25 @@ function barsTile(mins: Min[], tf: string, tfSec: number, from: number, to: numb
 
 const live = (m: Min, a: number): LiveBar => ({ ...m, firstAgg: a, lastAgg: a + m.buyA + m.sellA });
 
+// Beginn zufällig im Tag (auch kurz vor 00:00 UTC → Naht über den Tageswechsel), auf Wunsch fest
 const minutesArb = fc
-  .array(
-    fc.record({
-      gap: fc.integer({ min: 1, max: 4 }),
-      o: fc.integer({ min: 900, max: 1100 }),
-      up: fc.integer({ min: 0, max: 30 }),
-      dn: fc.integer({ min: 0, max: 30 }),
-      c: fc.integer({ min: -30, max: 30 }),
-      b: fc.integer({ min: 0, max: 50 }),
-      s: fc.integer({ min: 0, max: 50 }),
-    }),
-    { minLength: 1, maxLength: 90 },
+  .tuple(
+    fc.oneof(fc.integer({ min: 0, max: 1439 }), fc.integer({ min: 1380, max: 1439 })),
+    fc.array(
+      fc.record({
+        gap: fc.integer({ min: 1, max: 4 }),
+        o: fc.integer({ min: 900, max: 1100 }),
+        up: fc.integer({ min: 0, max: 30 }),
+        dn: fc.integer({ min: 0, max: 30 }),
+        c: fc.integer({ min: -30, max: 30 }),
+        b: fc.integer({ min: 0, max: 50 }),
+        s: fc.integer({ min: 0, max: 50 }),
+      }),
+      { minLength: 1, maxLength: 90 },
+    ),
   )
-  .map((rows) => {
-    let t = T0 + 600 * MINUTE_MS;
+  .map(([start, rows]) => {
+    let t = T0 + start * MINUTE_MS;
     return rows.map((r): Min => {
       t += r.gap * MINUTE_MS;
       const close = Math.min(r.o + r.up, Math.max(r.o - r.dn, r.o + r.c));
@@ -165,12 +172,16 @@ describe('Naht im Browser: BarStore + composeLive + mergeLive', () => {
       ['5m', 300],
       ['15m', 900],
       ['1h', 3600],
+      ['2h', 7200],
+      ['4h', 14_400],
+      ['1d', 86_400],
     ];
     fc.assert(
       fc.property(
         minutesArb,
         fc.integer({ min: 0, max: 100 }),
-        fc.integer({ min: 0, max: 12 }),
+        // negativ: DB-Antwort neuer als der Live-Stand (Cdb > Crec); > 10: älter als der Vorhalt
+        fc.integer({ min: -5, max: 12 }),
         (mins, cPct, lagMin) => {
           const first = mins[0]!.ts;
           const last = mins[mins.length - 1]!.ts;
@@ -194,7 +205,7 @@ describe('Naht im Browser: BarStore + composeLive + mergeLive', () => {
               );
             const items: BarItem[] = store.items(c, c1);
             const r = composeLive(book.sortedBars(), book.from, tfSec, span, [c, c1], store, PD);
-            expect(r.reload.length > 0).toBe(Cdb < book.from);
+            if (Cdb >= book.from) expect(r.reload).toEqual([]);
             if (Cdb < book.from) continue; // dort fehlen Minuten beiden Seiten → neu laden
             mergeLive(items, r.items, true);
             const ref = [...refBuckets(mins, tfSec).values()];
@@ -225,6 +236,55 @@ describe('Naht im Browser: BarStore + composeLive + mergeLive', () => {
       ),
       { numRuns: 150 },
     );
+  });
+
+  it('committedTo genau auf der Abschnittsgrenze (1m): Live-Minuten ab der Grenze im neuen Abschnitt', () => {
+    const tfSec = 60;
+    const span = 1000 * tfSec;
+    const B = Math.ceil(T0 / 1000 / span) * span * 1000; // erste Abschnittsgrenze nach T0
+    const cB = B / 1000 / span;
+    const mins: Min[] = [-3, -2, -1, 0, 1, 2].map((k) => ({
+      ts: B + k * MINUTE_MS,
+      open: 1000 + k,
+      high: 1010 + k,
+      low: 990 + k,
+      close: 1001 + k,
+      buyQ: 3,
+      sellQ: 1,
+      buyA: 2,
+      sellA: 1,
+    }));
+    for (const C of [B, B - MINUTE_MS, B + MINUTE_MS]) {
+      const store = new BarStore('BTCUSDT|1m', PD);
+      for (const k of [cB - 1, cB])
+        store.addEncoded(k, barsTile(mins, '1m', tfSec, k * span * 1000, (k + 1) * span * 1000, C));
+      if (C === B) {
+        expect(store.committedTo(cB - 1)).toBe(B); // = to
+        expect(store.committedTo(cB)).toBe(B); // = from
+      }
+      const book = bookWith(
+        mins.map((x, i) => live(x, i * 10)),
+        C,
+      );
+      const items = store.items(cB - 1, cB);
+      const r = composeLive(book.sortedBars(), book.from, tfSec, span, [cB - 1, cB], store, PD);
+      expect(r.reload).toEqual([]);
+      mergeLive(items, r.items, true);
+      expect(items.map((x) => [x.time * 1000, x.c, x.b, !!x.live])).toEqual(
+        mins.map((x) => [x.ts, x.close, x.buyQ, x.ts >= C]),
+      );
+      // Fenster endet vor dem Live-Abschnitt → beyond
+      const r2 = composeLive(
+        book.sortedBars(),
+        book.from,
+        tfSec,
+        span,
+        [cB - 1, cB - 1],
+        store,
+        PD,
+      );
+      expect(r2.beyond).toBe(true);
+    }
   });
 
   it('mergeLive: ersetzen, anhängen (series.update), mittendrin → rebuild bzw. einfügen', () => {
@@ -364,13 +424,13 @@ describe('Statuszustände', () => {
     connected: true,
     ready: true,
     status,
-    eventMs: 1_000_000,
-    serverMs: 1_000_500,
-    silentMs: 100,
+    tickSilentMs: 100,
+    delayed: false,
+    quietMs: 0,
+    streamDownMs: 0,
   };
-  it('fünf Zustände mit Vorrang; Verzögerung aus Server- gegen Ereigniszeit', () => {
+  it('Zustände mit Vorrang (Uhr des Besuchers spielt keine Rolle)', () => {
     expect(liveUiState(base)).toBe('live');
-    // die Uhr des Besuchers spielt keine Rolle (Date.now weit daneben)
     const realNow = Date.now;
     Date.now = () => 0;
     try {
@@ -378,12 +438,20 @@ describe('Statuszustände', () => {
     } finally {
       Date.now = realNow;
     }
-    expect(liveUiState({ ...base, serverMs: 1_003_001 })).toBe('delayed');
-    expect(liveUiState({ ...base, eventMs: null })).toBe('delayed');
+    expect(liveUiState({ ...base, delayed: true })).toBe('delayed');
+    expect(liveUiState({ ...base, quietMs: LIVE_QUIET_MS - 1 })).toBe('live');
+    expect(liveUiState({ ...base, quietMs: LIVE_QUIET_MS + 1 })).toBe('quiet');
+    expect(liveUiState({ ...base, quietMs: LIVE_QUIET_MS + 1, delayed: true })).toBe('delayed');
     expect(liveUiState({ ...base, status: { ...status, catchUp: true, gapFrom: 5 } })).toBe(
       'catchup',
     );
-    expect(liveUiState({ ...base, status: { ...status, stream: false } })).toBe('catchup');
+    // Stream kurz weg (< 5 s): kein Banner; danach „holt nach"
+    expect(
+      liveUiState({ ...base, status: { ...status, stream: false }, streamDownMs: 4_000 }),
+    ).toBe('live');
+    expect(
+      liveUiState({ ...base, status: { ...status, stream: false }, streamDownMs: 5_000 }),
+    ).toBe('catchup');
     expect(liveUiState({ ...base, status: { ...status, catchUp: true, frozen: 'Lücke' } })).toBe(
       'frozen',
     );
@@ -392,7 +460,58 @@ describe('Statuszustände', () => {
     );
     expect(liveUiState({ ...base, connected: false })).toBe('disconnected');
     expect(liveUiState({ ...base, ready: false })).toBe('disconnected');
-    expect(liveUiState({ ...base, silentMs: LIVE_SILENCE_MS + 1 })).toBe('disconnected');
+    expect(liveUiState({ ...base, tickSilentMs: LIVE_TICK_SILENCE_MS + 1 })).toBe('disconnected');
+  });
+
+  it('LiveHealth: „verzögert" erst nach zwei ticks > 3 s, Ende nach ≥ 5 s < 1,5 s; Ruhe ≠ Verzögerung', () => {
+    const h = new LiveHealth();
+    let t = 1_000_000;
+    // ruhiger Markt: letzte Trade-Nachricht 20 s alt, aber pünktlich empfangen → nicht verzögert
+    h.tick(t, t - 20_000 - 100, t - 20_000);
+    expect(h.delayed).toBe(false);
+    expect(h.quietMs).toBe(20_000);
+    // ein einzelner Ausreißer > 3 s: nichts
+    t += 250;
+    h.tick(t, t - 3_500, t);
+    expect(h.delayed).toBe(false);
+    t += 250;
+    h.tick(t, t - 200, t);
+    t += 250;
+    h.tick(t, t - 3_500, t);
+    expect(h.delayed).toBe(false);
+    // zwei hintereinander → verzögert
+    t += 250;
+    h.tick(t, t - 3_600, t);
+    expect(h.delayed).toBe(true);
+    // gut, aber zwischendurch 2 s (≥ 1,5 s) → Frist beginnt neu
+    for (let i = 0; i < 12; i++) {
+      t += 250;
+      h.tick(t, t - (i === 6 ? 2_000 : 300), t);
+    }
+    expect(h.delayed).toBe(true);
+    // gute Frist läuft seit dem tick nach dem 2-s-Ausreißer (1 s bisher); weitere 3,5 s → 4,5 s
+    for (let i = 0; i < 14; i++) {
+      t += 250;
+      h.tick(t, t - 300, t);
+    }
+    expect(h.delayed).toBe(true);
+    t += 250;
+    h.tick(t, t - 300, t);
+    t += 250;
+    h.tick(t, t - 300, t);
+    expect(h.delayed).toBe(false);
+    // Stream-Ausfall entprellt
+    h.status(t, { ...status, stream: false });
+    t += 3_000;
+    h.tick(t, t - 300, t - 3_000);
+    expect(h.streamDownMs()).toBe(3_000);
+    h.status(t, status);
+    expect(h.streamDownMs()).toBe(0);
+    // älterer Recorder ohne recvMs: Verzögerung = serverMs − eventMs
+    const o = new LiveHealth();
+    o.tick(10_000, 6_000, undefined);
+    o.tick(10_250, 6_000, null);
+    expect(o.delayed).toBe(true);
   });
 
   it('Backoff 1 s, 2 s, 4 s … ≤ 30 s (+ ≤ 30 % Streuung)', () => {
@@ -538,6 +657,41 @@ describe('LiveClient', () => {
     h.es[2]!.onerror?.({});
     h.advance(1_300);
     expect(h.es).toHaveLength(4);
+  });
+
+  it('Stille wird an ticks gemessen: nur status-Herzschläge → „getrennt" (ohne Neuverbindungs-Schleife bei Recorder-Ausfall)', () => {
+    const h = harness();
+    h.c.setSymbol('BTCUSDT');
+    h.es[0]!.onopen?.({});
+    h.es[0]!.msg(m(0, 'snap'));
+    const st = (seq: number, recorder: boolean): LiveMsg => ({
+      v: LIVE_WIRE_VERSION,
+      t: 'status',
+      sym: 'BTCUSDT',
+      seq,
+      serverMs: 5,
+      status: { ...status, recorder },
+    });
+    // Verteiler hängt am Upstream, meldet aber noch recorder: true → nach 5 s „getrennt", nach 10 s neu verbinden
+    h.advance(1_000);
+    h.es[0]!.msg(st(1, true));
+    h.advance(4_100);
+    expect(h.c.uiState()).toBe('disconnected');
+    h.es[0]!.msg(st(2, true));
+    h.advance(7_000);
+    expect(h.es[0]!.closed).toBe(true);
+    h.advance(0);
+    expect(h.es).toHaveLength(2);
+    // Recorder-Ausfall: status recorder:false alle 5 s → „getrennt", aber kein Neuverbinden
+    h.es[1]!.onopen?.({});
+    h.es[1]!.msg(m(0, 'snap'));
+    for (let i = 1; i <= 8; i++) {
+      h.es[1]!.msg(st(i, false));
+      h.advance(5_000);
+    }
+    expect(h.c.uiState()).toBe('disconnected');
+    expect(h.es).toHaveLength(2);
+    expect(h.es[1]!.closed).toBe(false);
   });
 
   it('Stille > 8 s → neu verbinden; unsichtbarer Tab trennt nach 30 s und verbindet beim Sichtbarwerden', () => {

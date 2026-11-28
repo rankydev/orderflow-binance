@@ -174,6 +174,11 @@ export function parseApiConfig(env: Env): ApiConfig {
     diagHeaders: /^(1|true|on)$/i.test(env.OF_API_DIAG_HEADERS?.trim() ?? ''),
     staleAfterMs: intIn(problems, env, 'OF_API_STALE_AFTER_MS', 30_000, 1_000, 3_600_000),
   };
+  // Live-Clients halten je eine Verbindung dauerhaft: 64 bleiben für Kacheln/Bars/Profile frei
+  if (cfg.liveMaxClients > cfg.maxConnections - 64)
+    problems.push(
+      `OF_API_LIVE_MAX (${cfg.liveMaxClients}) muss ≤ OF_API_MAX_CONNECTIONS − 64 (${cfg.maxConnections - 64}) sein`,
+    );
   if (cfg.adminPort !== 0 && cfg.adminPort === cfg.port)
     problems.push('OF_API_ADMIN_PORT muss sich von OF_API_PORT unterscheiden');
   if (problems.length > 0) throw new ConfigError(problems);

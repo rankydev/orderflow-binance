@@ -352,3 +352,137 @@ describe('Konfiguration OF_LIVE / OF_LIVE_HZ', () => {
     expect(() => recorderConfig({ OF_LIVE_HZ: '50' })).toThrow(/OF_LIVE_HZ/);
   });
 });
+
+describe('LiveTap: Rückstand, frische Installation, eingefrorener Tag', () => {
+  /** Recorder mit zurückhaltbaren Schreibvorgängen (DB steht) */
+  function blocked(final: boolean, now: () => number) {
+    const written: MinuteDelta[] = [];
+    let release: (() => void)[] = [];
+    const block = { on: true };
+    const sink: LiveSink = {
+      startState: async () => ({
+        final: final ? { day: DAY - 1, lastAggId: A0 - 1, carry: null, cand: null } : null,
+        provisional: [],
+        bigFloorN: null,
+      }),
+      writeMinute: async (_s, d) => {
+        if (block.on) await new Promise<void>((r) => release.push(r));
+        written.push(d);
+        return 'written';
+      },
+      markGap: async () => {},
+      markFrozen: async () => {},
+      writeKlineChecks: async () => {},
+    };
+    const hooks = { onCommit: (_s: string, _m: number) => {} };
+    const rec = new Recorder({
+      symbols: ['BTCUSDT'],
+      wsUrl: 'wss://test.invalid',
+      socketFactory: dead,
+      rest: { aggTrades: async () => [], klines: async () => [] },
+      sink,
+      spoolDir: null,
+      log: () => {},
+      autoLoops: false,
+      klineCheck: false,
+      now,
+      onMinuteCommitted: (s, m) => hooks.onCommit(s, m),
+    });
+    const releaseAll = () => {
+      block.on = false;
+      const r = release;
+      release = [];
+      for (const f of r) f();
+    };
+    return { rec, written, hooks, releaseAll };
+  }
+  const row = (i: number, T: number): RawAgg => ({
+    a: A0 + i,
+    p: (60000 + (i % 13) / 10).toFixed(1),
+    q: '0.010',
+    f: (A0 + i) * 2,
+    l: (A0 + i) * 2,
+    T,
+    m: i % 2 === 0,
+  });
+
+  for (const final of [true, false]) {
+    it(`Schreibrückstand über 300 Minuten (${final ? 'mit' : 'ohne'} bekannte Grenze): höchstens 240 Minuten, Nachrichten klein, danach commits`, async () => {
+      const t0 = D0 + 60 * MINUTE_MS;
+      let clock = t0;
+      const { rec, written, hooks, releaseAll } = blocked(final, () => clock);
+      await rec.start();
+      const s = rec.sym.get('BTCUSDT')!;
+      // frische Installation: die ersten 300 Minuten liegen schon im Speicher, bevor die Tap startet
+      let i = 0;
+      const feed = (until: number) => {
+        for (; t0 + i * 20_000 < until; i++) {
+          const T = t0 + i * 20_000;
+          clock = T + 50;
+          rec.handle(s, [toItem(row(i, T), BTC, false)], true);
+        }
+      };
+      feed(t0 + 300 * MINUTE_MS);
+      const tap = new LiveTap(rec, { now: () => clock });
+      hooks.onCommit = (sym, ms) => tap.commit(sym, ms);
+      const c = new FakeClient();
+      let maxBlock = 0;
+      const res = c.res as unknown as { write: (s: string) => boolean };
+      const w = res.write;
+      res.write = (x: string) => {
+        maxBlock = Math.max(maxBlock, x.length);
+        return w(x);
+      };
+      tap.attach({} as never, c.res);
+      tap.poll();
+      feed(t0 + 320 * MINUTE_MS);
+      tap.poll();
+      c.drain();
+      expect(c.book.bars.size).toBeLessThanOrEqual(240);
+      expect(c.book.from).toBeGreaterThanOrEqual(t0 + 320 * MINUTE_MS - 241 * MINUTE_MS);
+      expect(maxBlock).toBeLessThan(80_000); // ≤ 240 Minuten à ≈ 200 B
+      expect(s.unwritten).toBeGreaterThan(240);
+      releaseAll();
+      await new Promise((r) => setTimeout(r, 20));
+      await rec.drain();
+      tap.poll();
+      c.drain();
+      expect(c.results.every((r) => r === 'ok')).toBe(true);
+      expect(c.book.committedTo).toBe(
+        written.at(-1)!.day * DAY_MS + (written.at(-1)!.minute + 1) * MINUTE_MS,
+      );
+      expect(tap.stats.errors).toBe(0);
+      tap.stop();
+      await rec.stop();
+    });
+  }
+
+  it('eingefrorener Tag: status.frozen, keine Live-Minuten mehr; recvMs im tick', async () => {
+    let clock = D0 + 5 * MINUTE_MS;
+    const { rec, hooks } = blocked(true, () => clock);
+    await rec.start();
+    const s = rec.sym.get('BTCUSDT')!;
+    const tap = new LiveTap(rec, { now: () => clock });
+    hooks.onCommit = (sym, ms) => tap.commit(sym, ms);
+    const c = new FakeClient();
+    tap.attach({} as never, c.res);
+    s.wsLastMsg = clock - 20;
+    s.eventLagMs = 30;
+    rec.handle(s, [toItem(row(0, clock - 100), BTC, false)], true);
+    tap.poll();
+    c.drain();
+    expect(c.book.recvMs).toBe(clock - 20);
+    expect(c.book.eventMs).toBe(clock - 50);
+    expect(c.book.bars.size).toBe(1);
+    rec.freeze(s, DAY, 'Test');
+    clock += 30_000;
+    rec.handle(s, [toItem(row(1, clock - 100), BTC, false)], true);
+    tap.poll();
+    c.drain();
+    expect(c.book.status.frozen).toBe('Test');
+    expect([...c.book.bars.values()].map((b) => b.lastAgg)).toEqual([A0]); // nichts Neues
+    expect(c.results.every((r) => r === 'ok')).toBe(true);
+    tap.stop();
+    await rec.stop();
+  });
+});

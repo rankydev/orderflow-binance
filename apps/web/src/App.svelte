@@ -1185,6 +1185,9 @@
   .live-live .dot {
     color: #3fb950;
   }
+  .live-quiet .dot {
+    color: #8b949e;
+  }
   .live-delayed .dot {
     color: #d29922;
   }
