@@ -15,7 +15,8 @@
 #
 # 1. lokal (nur lesend, eine Momentaufnahme): deploy/bin/bigtrades-export.sh → Nutzlast + SQL +
 #    Server-Skript + SHA256SUMS (für --dry-run/--verify/--revert nur die Tagesliste ohne big_order)
-# 2. rsync (0700/0600) nach /var/lib/orderflow-binance/transfer/bigtrades-<zeit>/, `sha256sum -c`
+# 2. rsync nach /var/lib/orderflow-binance/transfer/bigtrades-<zeit>/ (Rechte 0700/0600 lokal und dort
+#    erneut gesetzt), `sha256sum -c`
 # 3. bigtrades-apply.sh dort (psql als of_admin per docker exec, wie recorder-ctl.sh): Bericht nach
 #    $OF_RELEASE_DIR/bigtrades/<name>/result-<modus>.txt (+ .err)
 # 4. Transferverzeichnis auf dem Server und lokale Nutzlast löschen (außer --keep)
@@ -106,9 +107,14 @@ set -euo pipefail
 umask 077
 mkdir -p "$1"
 EOF
-rsync -a --chmod=D700,F600 --partial -e "ssh ${SSH_OPTS[*]}" "$WORK/" "$DEPLOY_HOST:$REMOTE_DIR/" || die "Upload fehlgeschlagen"
+# Rechte lokal setzen (rsync -a überträgt sie): Verzeichnis 0700, Dateien 0600. Kein --chmod=D…,F…:
+# das macOS-rsync (openrsync, „2.6.9 compatible") kennt diese Syntax nicht. bigtrades-apply.sh wird
+# per `bash <datei>` aufgerufen und braucht kein Ausführungsrecht. Auf dem Server danach nochmals.
+chmod 700 "$WORK" && find "$WORK" -type f -exec chmod 600 {} + || die "Rechte lokal nicht gesetzt"
+rsync -a --partial -e "ssh ${SSH_OPTS[*]}" "$WORK/" "$DEPLOY_HOST:$REMOTE_DIR/" || die "Upload fehlgeschlagen"
 remote "$REMOTE_DIR" <<'EOF' || die "Prüfsummen auf dem Server falsch"
 set -euo pipefail
+chmod 700 "$1" && find "$1" -type f -exec chmod 600 {} +
 cd "$1" && sha256sum --quiet -c SHA256SUMS && echo "SHA256SUMS ok ($(wc -l < SHA256SUMS) Dateien)" >&2
 EOF
 
