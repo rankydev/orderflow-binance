@@ -410,7 +410,7 @@ Aggregattabellen sind identisch), gleiche Klassifikation (`quality_digest`), und
 Rücknahme dieses Tages (`fail`). Bereits v2 (übertragen oder vom Recorder finalisiert) → `same`
 bzw. `skip`, nie überschrieben. Sperren: Importer-Advisory-Lock 7042025 für den ganzen Lauf (die
 Recorder-Finalisierung meldet solange `lock_busy` und versucht es 15 min später erneut), je Tag
-`lock_timeout` 2 s (sonst `busy`, Tag unverändert). Chunks: direktes DML wie der Importer im
+`lock_timeout` 2 s (sonst bzw. bei Deadlock `busy`, Tag unverändert). Chunks: direktes DML wie der Importer im
 Online-Betrieb (MVCC-sicher für Leser, kein `convert_to_rowstore`); danach unter dem Lock
 `of_recompress_chunk` (ACCESS EXCLUSIVE, je Versuch 500 ms, 10 Versuche) für alle teilweise
 komprimierten kalten Chunks und die neu angelegten kalten `big_order`-Chunks; offene Chunks bleiben
@@ -419,22 +419,47 @@ Vortag nicht final ist (`--ignore-window` übergeht das bewusst), offene komprim
 (zuerst `deploy/recorder.sh repair`), laufende Admin-/psql-/Dump-Sitzungen (kein Prüfbericht
 parallel), Importer-Lock länger als `--lock-wait` (120 s) belegt.
 
+Probelauf und `--verify` sperren je Tag die Chunks des Tages (ACCESS SHARE, wie die API) und
+lesen danach mit frischem Snapshot – eine gleichzeitige Chunk-Konvertierung (Finalisierung,
+`recorder.sh repair`) erzeugt so keine falsche Abweichung; ein Tag, dessen Sperre nicht binnen 2 s
+kommt, erscheint als `busy`.
+
+**Zeitfenster:** 07:00–12:00 UTC, nachdem der Recorder den Vortag finalisiert hat
+(`deploy/recorder.sh health` → `lastFinalisedDay` = gestern). Währenddessen **kein**
+`recorder.sh report`/`repair`, kein `transfer-db.sh`, kein zweiter Probelauf/`--verify` parallel.
+
 Befehlsfolge (Mac, Repo-Wurzel; Mac-DB währenddessen nicht ändern):
 
 ```bash
-deploy/transfer-bigtrades.sh --dry-run          # nur lesend; Erwartung: Tage=340 would=340, Exit 0
-deploy/transfer-bigtrades.sh                    # Lauf (Abfrage; OF_YES=1 überspringt); Erwartung ok=340, Exit 0
-deploy/transfer-bigtrades.sh --verify           # nur lesend; Erwartung „verify: 340/340 Tage v2 identisch", Exit 0
+deploy/recorder.sh health                       # lastFinalisedDay = gestern, healthy
+deploy/transfer-bigtrades.sh --dry-run          # nur lesend; Ergebnis lesen (siehe unten)
+deploy/transfer-bigtrades.sh                    # Lauf (Abfrage; OF_YES=1 überspringt); Bericht result-apply.txt AUFHEBEN
+deploy/transfer-bigtrades.sh --verify           # nur lesend; „verify: N/N Tage v2 identisch", Exit 0
 deploy/recorder.sh hot                          # hot_count|0
-deploy/recorder.sh report nach-bigtrades        # digest|days=…|match=…|mismatch=0, digest_version|2|…
+deploy/recorder.sh report nach-bigtrades        # digest|…|mismatch=0 bis auf provisorische Tage, digest_version|2|…
 deploy/postcheck.sh "$BASE"                     # Nachbarn unverändert, Site 200
 ```
 
+Erwartung des Probelaufs: idealerweise `would` für alle 340 Tage, Exit 0. Das ist **nicht
+gesichert**: vom Recorder auf dem Server finalisierte oder neu importierte Tage sind dort schon v2
+(→ `same`, bei anderem Digest `skip`), ein Tag mit anderem Zustand oder anderer Klassifikation →
+`skip`. Die `skip`-Gründe im Bericht einmal prüfen, bevor der Lauf startet; der Lauf überträgt nur
+die `would`-Tage und lässt alle anderen unverändert.
+
 Bericht je Modus: `~/.cache/orderflow-binance/bigtrades/<name>/result-<modus>.txt` (Zeilen
-`day|…`, `verify|…`, `chunk|…`, am Ende `partial_chunks|0`, `hot_compressed_chunks|0`).
-Exit: 0 ok · 2 Tage übersprungen/`busy` (Gründe im Bericht; erneut ausführen ist sicher) · 1 `fail`
-bzw. verify-Abweichung (nicht übergehen) · 4 Chunks teilweise komprimiert geblieben (erneut
-ausführen) · 3 Abbruch (`ABBRUCH: …`).
+`day|…`, `verify|…`, `chunk|…`, `partial_chunks|0`, `hot_compressed_chunks|0`) und `.err`
+(Zusammenfassung, `ABBRUCH: …`, Schlusszeile `ergebnis|exit=…|fail=…|busy=…|skip=…|partial_chunks=…`).
+Exit (Vorrang von oben nach unten):
+
+| Exit | Bedeutung                                                                                              | Handlung                                                                                                                                                |
+| ---- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 5    | nichts auf dem Server ausgeführt (Argumente, Vorprüfung, Export, Upload/SHA256, Bestätigung abgelehnt) | Meldung lesen, beheben, erneut                                                                                                                          |
+| 3    | Abbruch (`ABBRUCH: …`, SSH weg, Sitzung beendet)                                                       | Meldung lesen; festgeschriebene Tage sind gültig; erneut ausführen                                                                                      |
+| 1    | `fail` (Gegenprobe gescheitert, Tag zurückgerollt) bzw. verify-Abweichung                              | nicht übergehen: Tag lokal und auf dem Server prüfen                                                                                                    |
+| 4    | Chunks teilweise komprimiert geblieben                                                                 | erneut ausführen; sonst meldet der Recorder nach 1 h `partialChunkAlert`, und die nächste Finalisierung verdichtet sie ohnehin (`PostgresWriter.close`) |
+| 6    | `busy`: Tage vorübergehend gesperrt, unverändert                                                       | denselben Befehl erneut ausführen                                                                                                                       |
+| 2    | `skip`: Tage passen dauerhaft nicht, unverändert                                                       | Gründe einmal prüfen; Wiederholung ändert daran nichts                                                                                                  |
+| 0    | alles übertragen bzw. identisch                                                                        | –                                                                                                                                                       |
 
 Dauer und Menge (gemessen am 2026-11-28 lokal an einer Kopie der Mac-DB in Server-Zustand – alle
 340 Tage v1, keine historischen `big_order`-Chunks –, Container mit 2 CPUs/2 GB; 1 305 965 big
@@ -454,13 +479,27 @@ Ende bis zu `--lock-wait` dauern. Prüfen und notfalls von Hand beenden (auf dem
 bzw. `… -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'orderflow-bigtrades'"`.
 Kalte Chunks können teilweise komprimiert bleiben (lesbar, konsistent; auch wenn vor dem
 Chunk-Abschluss eine andere lange Transaktion offen war: `check|chunk_abschluss|zurückgestellt`,
-Exit 4). Abhilfe: denselben Befehl erneut ausführen – übertragene Tage melden `same`, der Rest wird
+Exit 4; ohne Eingriff meldet der Recorder nach 1 h `partialChunkAlert`, die nächste Finalisierung
+räumt auf). Abhilfe: denselben Befehl erneut ausführen – übertragene Tage melden `same`, der Rest wird
 übertragen, der Chunk-Abschluss läuft erneut; danach `--verify`. Bleibt ein Transferverzeichnis
 liegen: `rm -rf /var/lib/orderflow-binance/transfer/bigtrades-*` auf dem Server.
-**Rücknahme** ist nicht vorgesehen: die zwölf Aggregattabellen bleiben unverändert (v1 bewiesen),
-es kommen nur `big_order`-Zeilen und Ordersummen hinzu, die ein Neuimport auf dem Server genauso
-schriebe. Den Probelauf und `--verify` nicht parallel zum Lauf starten (der Lauf stellt dann den
-Chunk-Abschluss zurück).
+**Rücknahme** (`--revert`, nur für Tage, die ein Lauf mit `ok` gemeldet hat):
+
+```bash
+deploy/transfer-bigtrades.sh --revert ~/.cache/orderflow-binance/bigtrades/<name>/result-apply.txt
+deploy/transfer-bigtrades.sh --verify           # zurückgenommene Tage erscheinen als v1
+```
+
+Gleiche Vorprüfungen und Sperren wie der Lauf (Importer-Lock 7042025, Fenster, Chunk-Prüfungen).
+Je Tag der Liste in einer Transaktion: Chunks des Tages ROW EXCLUSIVE, `data_day` `FOR UPDATE`;
+nur wenn der Tag **noch genau den übertragenen Stand** hat (`digest_version = 2` und `digest` =
+v2-Digest der Nutzlast, sonst `skip`, unverändert): `DELETE FROM big_order` des Tages,
+`UPDATE data_day SET orders_n = NULL, orders_notional = NULL, big_floor_n = NULL, digest = day_digest_all_v(sym_id, day, 1), digest_version = 1, version = version + 1`
+und Gegenprobe neuer v1-Digest = v1-Beweis-Schlüssel (sonst zurück, `fail`); danach Chunk-Abschluss
+(`of_recompress_chunk` für teilweise komprimierte Chunks). Der Stand entspricht dann wieder dem nach
+Migration 0017: der Importer (bzw. ein erneuter Lauf dieses Werkzeugs) würde die Tage regulär neu
+in Version 2 schreiben („Digest-Version 1→2"). Die Aggregattabellen werden weder beim Lauf noch bei
+der Rücknahme verändert.
 
 ## Nach dem Rollout – wichtig
 
@@ -500,7 +539,8 @@ Chunk-Abschluss zurück).
 | 5       | `nginx -t && systemctl reload nginx` (zweimal)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | 5       | `certbot certonly --account <id aus renewal/*.conf> --webroot -w /var/www/orderflow-acme -d orderflow.rankyhub.com --cert-name orderflow.rankyhub.com --non-interactive --keep-until-expiring --deploy-hook 'nginx -t && systemctl reload nginx'` (legt `/etc/letsencrypt/{live,archive,renewal}/orderflow.rankyhub.com*` an)                                                                                                                                                                                                                                                                                                           |
 | 6       | `systemctl enable --now orderflow-monitor.timer`; `systemctl start orderflow-monitor.service`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| BT      | `transfer-bigtrades.sh` (nicht mit `--dry-run`/`--verify`, die nur lesen und nur Sitzungs-temporäre Tabellen/Funktionen anlegen): `mkdir` + `rsync` `/var/lib/orderflow-binance/transfer/bigtrades-<zeit>/`; `psql` als of_admin: `pg_advisory_lock(7042025)` (Importer-Lock), je Tag `DELETE`/`INSERT` `big_order` des Tages und `UPDATE data_day SET orders_n, orders_notional, big_floor_n, digest, digest_version = 2, version + 1`; `of_recompress_chunk(…)` für teilweise komprimierte bzw. neu angelegte kalte Chunks; `rm -rf` des Transferverzeichnisses                                                                       |
+| BT      | `transfer-bigtrades.sh` (nicht mit `--dry-run`/`--verify`, die nur lesen und nur Sitzungs-temporäre Tabellen/Funktionen anlegen): `mkdir` + `rsync` (0700/0600) `/var/lib/orderflow-binance/transfer/bigtrades-<zeit>/`; `psql` als of_admin: `pg_advisory_lock(7042025)` (Importer-Lock), je Tag `LOCK` der Chunks des Tages, `DELETE`/`INSERT` `big_order` des Tages und `UPDATE data_day SET orders_n, orders_notional, big_floor_n, digest, digest_version = 2, version + 1`; `of_recompress_chunk(…)` für teilweise komprimierte bzw. neu angelegte kalte Chunks; `rm -rf` des Transferverzeichnisses                              |
+| BT-R    | `transfer-bigtrades.sh --revert <result-apply.txt>`: wie BT, je Tag der Liste (nur bei unverändertem übertragenem Stand) `DELETE` `big_order` des Tages und `UPDATE data_day SET orders_n = NULL, orders_notional = NULL, big_floor_n = NULL, digest = day_digest_all_v(…, 1), digest_version = 1, version + 1`; `of_recompress_chunk(…)`                                                                                                                                                                                                                                                                                               |
 
 ## Risiken für die Nachbardienste und Schutz
 

@@ -53,3 +53,9 @@ CREATE TEMP TABLE bt_order (
   agg_n        integer     NOT NULL,
   PRIMARY KEY (sym_id, ts, first_agg_id)
 );
+-- Rücknahmeliste (nur Modus revert; bigtrades-apply.sh lädt sie aus revert.tsv, sonst leer)
+CREATE TEMP TABLE bt_revert (
+  name text NOT NULL,
+  day  date NOT NULL,
+  PRIMARY KEY (name, day)
+);

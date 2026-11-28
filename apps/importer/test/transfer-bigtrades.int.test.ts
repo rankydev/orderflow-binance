@@ -31,6 +31,7 @@ const REPO = resolve(import.meta.dirname, '../../..');
 const base = parseConfig(process.env).db;
 const srcCfg: DbConfig = { ...base, database: `${base.database}_test_bt_src` };
 const dstCfg: DbConfig = { ...base, database: `${base.database}_test_bt_dst` };
+const dst2Cfg: DbConfig = { ...base, database: `${base.database}_test_bt_dst2` };
 const BTC = getSymbol('BTCUSDT');
 const FLOOR = 30_000_000; // wie pgwriter.int.test.ts (synthetische Einzel-aggTrades)
 const DAYS = ['2026-09-10', '2026-09-11', '2026-09-12', '2026-09-13', '2026-09-14'];
@@ -40,6 +41,7 @@ const NOON = '2026-11-28T12:00:00Z'; // feste Uhr außerhalb des Finalisierungsf
 let src: Sql;
 let dst: Sql;
 let work: string;
+let dataDir: string;
 
 interface Run {
   status: number | null;
@@ -104,7 +106,7 @@ async function dayRow(sql: Sql, day: string) {
   return r!;
 }
 
-async function prepare(cfg: DbConfig, dataDir: string): Promise<Sql> {
+async function prepare(cfg: DbConfig, dataDir: string, lastDay = DAYS.at(-1)!): Promise<Sql> {
   await dropAndCreateDatabase(cfg);
   const sql = connect(cfg);
   await migrateUp(sql);
@@ -118,7 +120,7 @@ async function prepare(cfg: DbConfig, dataDir: string): Promise<Sql> {
       dataDir,
       spec: BTC,
       firstDay: parseDay(DAYS[0]!),
-      lastDay: parseDay(DAYS.at(-1)!),
+      lastDay: parseDay(lastDay),
       prefer: 'auto',
       neighbours: true,
       writer: w,
@@ -135,7 +137,7 @@ async function prepare(cfg: DbConfig, dataDir: string): Promise<Sql> {
 suite('transfer-bigtrades (Export → Ziel in Digest-Version 1)', () => {
   beforeAll(async () => {
     work = tmpDir('bt-');
-    const dataDir = archive();
+    dataDir = archive();
     src = await prepare(srcCfg, dataDir);
     dst = await prepare(dstCfg, dataDir);
     // Ziel wie nach Migration 0017 auf dem Server: Tage in Version 1 ohne Order-Daten
@@ -288,6 +290,7 @@ suite('transfer-bigtrades (Export → Ziel in Digest-Version 1)', () => {
       expect(dayLines(r.stdout, 'fail')).toEqual(['2026-09-11']);
       expect(r.stdout).toContain('v2-Digest ≠ lokal (big_order abweichend, order_day gleich)');
       expect(dayLines(r.stdout, 'busy')).toEqual(['2026-09-14']);
+      expect(r.stderr).toMatch(/^ergebnis\|exit=1\|fail=1\|busy=1\|/m);
     } finally {
       await holder`ROLLBACK`;
       holder.release();
@@ -345,5 +348,83 @@ suite('transfer-bigtrades (Export → Ziel in Digest-Version 1)', () => {
       v.stdout.split('\n').filter((l) => l.startsWith('verify|') && !l.endsWith('|match')),
     ).toEqual([`verify|BTCUSDT|${TAMPERED}|v1`]);
     expect(await fingerprint(dst)).toBe(before);
+  }, 120_000);
+
+  it('Rücknahme (revert): ok-Tage zurück auf v1, Rest unverändert; erneuter Lauf stellt v2 wieder her', async () => {
+    const dir = join(work, 'revert');
+    cpSync(join(work, 'manifest'), dir, { recursive: true });
+    // Liste passt nicht zur Nutzlast → Abbruch ohne Änderung
+    const before = await fingerprint(dst);
+    writeFileSync(join(dir, 'revert.tsv'), 'BTCUSDT\t2026-09-20\n');
+    const bad = apply(dir, 'revert');
+    expect(bad.status).toBe(3);
+    expect(bad.stderr).toContain('Rücknahmeliste');
+    expect(await fingerprint(dst)).toBe(before);
+    // 09-11 wurde übertragen; 09-12 ist v1 (nicht der übertragene Stand) → skip
+    writeFileSync(join(dir, 'revert.tsv'), `BTCUSDT\t2026-09-11\nBTCUSDT\t${TAMPERED}\n`);
+    const b11 = await dayRow(dst, '2026-09-11');
+    const b12 = await dayRow(dst, TAMPERED);
+    const r = apply(dir, 'revert');
+    expect(r.status, r.stderr).toBe(2);
+    expect(dayLines(r.stdout, 'reverted')).toEqual(['2026-09-11']);
+    expect(dayLines(r.stdout, 'skip')).toEqual([TAMPERED]);
+    expect(r.stderr).toMatch(/^ergebnis\|exit=2\|/m);
+    const a11 = await dayRow(dst, '2026-09-11');
+    expect(a11).toMatchObject({ digest_version: 1, orders_n: null, big_floor_n: null, n_big: 0 });
+    expect(a11.actual).toBe(a11.digest);
+    expect(a11.version).toBe(b11.version + 1);
+    expect(await dayRow(dst, TAMPERED)).toEqual(b12);
+    expect(await partialChunks(dst)).toBe(0);
+    // wieder einspielen
+    const again = apply(join(work, 'full'), 'apply');
+    expect(again.status).toBe(2);
+    expect(dayLines(again.stdout, 'ok')).toEqual(['2026-09-11']);
+    expect((await dayRow(dst, '2026-09-11')).digest).toBe(b11.digest);
+    expect(await partialChunks(dst)).toBe(0);
+  }, 120_000);
+
+  it('Ziel ohne historische big_order-Chunks; Abweichungen Zustand/Klassifikation/v2/fehlender Tag', async () => {
+    // Wie der Server: big_order erst seit 0017, für die Historie gibt es keinen Chunk
+    const t = await prepare(dst2Cfg, dataDir, '2026-09-13'); // 09-14 fehlt auf dem Ziel
+    try {
+      await t.begin(async (tx) => {
+        await tx`SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0`;
+        await tx`DELETE FROM big_order`;
+        await tx`UPDATE data_day SET orders_n = NULL, orders_notional = NULL, big_floor_n = NULL,
+                        digest = day_digest_all_v(sym_id, day, 1), digest_version = 1`;
+        await tx`UPDATE data_day SET state = 'final_bad' WHERE day = '2026-09-11'`;
+        await tx`UPDATE data_day SET quality_digest = 'anders' WHERE day = '2026-09-12'`;
+        await tx`UPDATE data_day SET digest = repeat('0', 64), digest_version = 2 WHERE day = '2026-09-13'`;
+      });
+      await t`SELECT drop_chunks('big_order', older_than => now())`;
+      const [c0] =
+        await t`SELECT count(*)::int AS n FROM timescaledb_information.chunks WHERE hypertable_name = 'big_order'`;
+      expect(c0!.n).toBe(0);
+      const r = apply(join(work, 'full'), 'apply', [], { OF_BT_DB: dst2Cfg.database });
+      expect(r.status, r.stderr).toBe(2);
+      expect(dayLines(r.stdout, 'ok')).toEqual(['2026-09-10']);
+      const skips = r.stdout
+        .split('\n')
+        .filter((l) => l.startsWith('day|') && l.split('|')[3] === 'skip');
+      expect(skips.map((l) => `${l.split('|')[2]} ${l.split('|')[4]}`)).toEqual([
+        '2026-09-11 Zustand final_bad ≠ lokal final_ok',
+        '2026-09-12 Klassifikation (quality_digest) ≠ lokal',
+        '2026-09-13 Ziel hat schon Digest-Version 2 mit anderem Digest/Zustand (final_ok)',
+        '2026-09-14 Tag fehlt auf dem Ziel',
+      ]);
+      // neuer kalter Chunk angelegt und vollständig komprimiert
+      expect(r.stdout).toMatch(/^chunk\|.*\|columnstore\|/m);
+      const [c] = await t`
+        SELECT count(*)::int AS n, count(*) FILTER (WHERE is_compressed)::int AS z
+          FROM timescaledb_information.chunks WHERE hypertable_name = 'big_order'`;
+      expect(c).toEqual({ n: 1, z: 1 });
+      expect(await partialChunks(t)).toBe(0);
+      const s10 = await dayRow(src, '2026-09-10');
+      const t10 = await dayRow(t, '2026-09-10');
+      expect(t10.actual).toBe(s10.digest);
+      expect(t10.n_big).toBe(s10.n_big);
+    } finally {
+      await t.end();
+    }
   }, 120_000);
 });

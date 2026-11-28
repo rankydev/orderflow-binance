@@ -4,6 +4,9 @@
 --   -v mode=dry-run   nur lesend: je Tag „would/same/skip“ mit Grund (inkl. v1-Neuberechnung)
 --   -v mode=apply     schreibend: je Tag eine Transaktion (siehe bt_apply_day), danach Chunk-Abschluss
 --   -v mode=verify    nur lesend: je Tag v2-Digest des Ziels (gespeichert und neu berechnet) = Quelle
+--   -v mode=revert    schreibend: Rücknahme der Tage aus bt_revert (Tage mit „ok“ eines früheren
+--                     Laufs) auf Digest-Version 1, nur wenn das Ziel noch genau den übertragenen
+--                     v2-Stand hat; danach Chunk-Abschluss wie apply
 -- weitere Variablen: ignore_window (0/1), lock_wait (s, Warten auf den Importer-Lock, Standard 120),
 -- lock_timeout (je Tagestransaktion, Standard 2s). Nur für Tests: abort_after (n > 0: die Sitzung
 -- beendet sich selbst mitten in der Transaktion des Tages n+1), now_override (Uhrzeit der
@@ -13,7 +16,8 @@
 -- verify|<sym>|<tag>|<ergebnis>, chunk|…, partial_chunks|n, hot_compressed_chunks|n.
 -- Urteile: ok (übertragen), would (dry-run: würde übertragen), same (Ziel hat schon genau diese
 -- v2-Daten), skip (passt nicht, unverändert), fail (v2-Gegenprobe gescheitert, zurückgerollt),
--- busy (Sperre nicht in lock_timeout, unverändert – erneut ausführen).
+-- busy (Sperre nicht in lock_timeout bzw. Deadlock, unverändert – erneut ausführen),
+-- reverted (revert: auf Version 1 zurückgesetzt).
 -- Harte Abbrüche (ABBRUCH: …, psql-Exit 3): Untergrenze/Symbol abweichend, Nutzlast unvollständig,
 -- Migration 0017 fehlt, Finalisierungsfenster, offene komprimierte Chunks, Importer-Lock belegt
 -- oder verloren, andere Admin-/Dump-Sitzungen aktiv.
@@ -67,6 +71,29 @@ RETURNS text LANGUAGE sql AS $$
   SELECT 'day|' || coalesce((SELECT name FROM pg_temp.bt_floor WHERE sym_id = p_sym), p_sym::text) || '|'
          || p_day || '|' || p_verdict || '|' || coalesce(p_detail, '') || '|'
          || round(extract(epoch FROM clock_timestamp() - p_t0) * 1000) || 'ms'
+$$;
+
+-- Chunks aller Projekttabellen, die den Tag überdecken, sperren (wie die API, apps/api/src/db.ts
+-- readTx: erst sperren, dann lesen): eine gleichzeitige Chunk-Konvertierung (ACCESS EXCLUSIVE)
+-- läuft dann entweder ganz vorher oder ganz nachher. In READ COMMITTED nimmt jede folgende
+-- Anweisung der aufrufenden Funktion einen frischen Snapshot nach der Sperre. Lesen: ACCESS SHARE;
+-- Schreiben: ROW EXCLUSIVE (kein Sperr-Upgrade hinter einem wartenden ACCESS EXCLUSIVE).
+CREATE FUNCTION pg_temp.bt_lock_day(p_day date, p_mode text) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+  l text;
+BEGIN
+  SELECT string_agg(format('%I.%I', chunk_schema, chunk_name), ', ' ORDER BY chunk_schema, chunk_name)
+    INTO l
+    FROM timescaledb_information.chunks
+   WHERE hypertable_schema = 'public'
+     AND hypertable_name IN ('fp_1m', 'fp_1m_b10', 'fp_5m_b10', 'fp_15m_b100', 'fp_1h_b10', 'fp_1h_b100',
+                             'fp_1d_b100', 'fp_1d_b1000', 'bar_1m', 'bar_1h', 'bar_1d', 'kline_1m', 'big_order')
+     AND range_start < (p_day + 1)::timestamp AT TIME ZONE 'UTC'
+     AND range_end > p_day::timestamp AT TIME ZONE 'UTC';
+  IF l IS NOT NULL THEN
+    EXECUTE format('LOCK TABLE %s IN %s MODE', l, p_mode);
+  END IF;
+END
 $$;
 
 -- Urteil für einen Tag, ohne zu schreiben. p_lock: data_day-Zeile FOR UPDATE sperren (zuerst
@@ -160,6 +187,7 @@ BEGIN
   END IF;
   SELECT * INTO l FROM pg_temp.bt_day WHERE sym_id = p_sym AND day = p_day;
   BEGIN
+    PERFORM pg_temp.bt_lock_day(p_day, 'ROW EXCLUSIVE');
     c := pg_temp.bt_classify(p_sym, p_day, true);
     PERFORM 1 FROM symbol WHERE sym_id = p_sym AND big_floor_n = l.big_floor_n FOR SHARE;
     IF NOT FOUND THEN
@@ -202,9 +230,9 @@ BEGIN
       RETURN pg_temp.bt_line('fail', p_sym, p_day, SQLERRM || ' – zurückgerollt', t0);
     END;
     RETURN pg_temp.bt_line('ok', p_sym, p_day, format('orders=%s ersetzt=%s', n_ins, n_del), t0);
-  EXCEPTION WHEN lock_not_available OR deadlock_detected THEN
+  EXCEPTION WHEN lock_not_available OR deadlock_detected OR undefined_table THEN
     RETURN pg_temp.bt_line('busy', p_sym, p_day, SQLSTATE || ' (Sperre nicht binnen '
-                           || current_setting('ofb_bt.lock_timeout') || ' bzw. Deadlock) – unverändert', t0);
+                           || current_setting('ofb_bt.lock_timeout') || ', Deadlock oder Chunk ersetzt) – unverändert', t0);
   END;
 END
 $$;
@@ -242,6 +270,8 @@ DECLARE
   c record;
   n bigint;
 BEGIN
+  PERFORM set_config('lock_timeout', current_setting('ofb_bt.lock_timeout'), true);
+  PERFORM pg_temp.bt_lock_day(p_day, 'ACCESS SHARE');
   c := pg_temp.bt_classify(p_sym, p_day, false);
   IF c.verdict <> 'transfer' THEN
     RETURN pg_temp.bt_line(c.verdict, p_sym, p_day, c.detail, t0);
@@ -251,6 +281,8 @@ BEGIN
      AND o.ts < (p_day + 1)::timestamp AT TIME ZONE 'UTC';
   RETURN pg_temp.bt_line('would', p_sym, p_day, format('%s orders=%s ziel_vorhanden=%s', c.detail,
                          (SELECT n_orders FROM pg_temp.bt_day WHERE sym_id = p_sym AND day = p_day), n), t0);
+EXCEPTION WHEN lock_not_available OR deadlock_detected OR undefined_table THEN
+  RETURN pg_temp.bt_line('busy', p_sym, p_day, SQLSTATE || ' – Probelauf für diesen Tag erneut', t0);
 END
 $$;
 CREATE FUNCTION pg_temp.bt_verify_day(p_sym smallint, p_day date) RETURNS text LANGUAGE plpgsql AS $$
@@ -259,6 +291,8 @@ DECLARE
   d record;
   r text;
 BEGIN
+  PERFORM set_config('lock_timeout', current_setting('ofb_bt.lock_timeout'), true);
+  PERFORM pg_temp.bt_lock_day(p_day, 'ACCESS SHARE');
   SELECT * INTO b FROM pg_temp.bt_day WHERE sym_id = p_sym AND day = p_day;
   SELECT digest, digest_version, state INTO d FROM data_day WHERE sym_id = p_sym AND day = p_day;
   r := CASE WHEN NOT FOUND THEN 'fehlt'
@@ -268,12 +302,66 @@ BEGIN
             WHEN day_digest_all_v(p_sym, p_day, 2) IS DISTINCT FROM b.digest_v2 THEN 'tabellen_abweichend'
             ELSE 'match' END;
   RETURN 'verify|' || (SELECT name FROM pg_temp.bt_floor WHERE sym_id = p_sym) || '|' || p_day || '|' || r;
+EXCEPTION WHEN lock_not_available OR deadlock_detected OR undefined_table THEN
+  RETURN 'verify|' || (SELECT name FROM pg_temp.bt_floor WHERE sym_id = p_sym) || '|' || p_day || '|busy';
+END
+$$;
+
+-- Rücknahme eines Tages (revert): nur wenn das Ziel genau den übertragenen v2-Stand hat
+-- (digest = v2 der Nutzlast). big_order des Tages löschen, Ordersummen/Untergrenze NULL, Digest
+-- neu in Version 1 berechnen (muss dem v1-Beweis-Schlüssel gleichen, sonst zurück), version + 1.
+-- Der Importer schriebe einen solchen Tag beim nächsten Lauf regulär neu („Digest-Version 1→2").
+CREATE FUNCTION pg_temp.bt_revert_day(p_sym smallint, p_day date) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  t0 timestamptz := clock_timestamp();
+  l pg_temp.bt_day%ROWTYPE;
+  s record;
+  n_del bigint;
+  v1 text;
+  d0 timestamptz := p_day::timestamp AT TIME ZONE 'UTC';
+  d1 timestamptz := (p_day + 1)::timestamp AT TIME ZONE 'UTC';
+BEGIN
+  PERFORM set_config('lock_timeout', current_setting('ofb_bt.lock_timeout'), true);
+  PERFORM set_config('timescaledb.max_tuples_decompressed_per_dml_transaction', '0', true);
+  IF NOT pg_temp.bt_lock_held() THEN
+    PERFORM pg_temp.bt_abort('Importer-Lock nicht mehr gehalten (Verbindung neu aufgebaut?)');
+  END IF;
+  SELECT * INTO l FROM pg_temp.bt_day WHERE sym_id = p_sym AND day = p_day;
+  BEGIN
+    PERFORM pg_temp.bt_lock_day(p_day, 'ROW EXCLUSIVE');
+    SELECT state, digest, digest_version INTO s FROM data_day WHERE sym_id = p_sym AND day = p_day FOR UPDATE;
+    IF NOT FOUND THEN
+      RETURN pg_temp.bt_line('skip', p_sym, p_day, 'Tag fehlt auf dem Ziel', t0);
+    END IF;
+    IF s.digest_version IS DISTINCT FROM 2 OR s.digest IS DISTINCT FROM l.digest_v2 THEN
+      RETURN pg_temp.bt_line('skip', p_sym, p_day, 'Ziel hat nicht den übertragenen v2-Stand (v'
+                             || coalesce(s.digest_version::text, 'NULL') || ') – unverändert', t0);
+    END IF;
+    BEGIN
+      DELETE FROM big_order WHERE sym_id = p_sym AND ts >= d0 AND ts < d1;
+      GET DIAGNOSTICS n_del = ROW_COUNT;
+      UPDATE data_day
+         SET orders_n = NULL, orders_notional = NULL, big_floor_n = NULL,
+             digest = day_digest_all_v(sym_id, day, 1), digest_version = 1, version = version + 1
+       WHERE sym_id = p_sym AND day = p_day
+      RETURNING digest INTO v1;
+      IF v1 IS DISTINCT FROM l.digest_v1 THEN
+        RAISE EXCEPTION 'v1-Digest nach Rücknahme ≠ lokal' USING ERRCODE = 'OFB02';
+      END IF;
+    EXCEPTION WHEN SQLSTATE 'OFB02' THEN
+      RETURN pg_temp.bt_line('fail', p_sym, p_day, SQLERRM || ' – zurückgerollt', t0);
+    END;
+    RETURN pg_temp.bt_line('reverted', p_sym, p_day, format('gelöscht=%s', n_del), t0);
+  EXCEPTION WHEN lock_not_available OR deadlock_detected OR undefined_table THEN
+    RETURN pg_temp.bt_line('busy', p_sym, p_day, SQLSTATE || ' – unverändert', t0);
+  END;
 END
 $$;
 
 -- ---------------------------------------------------------------- gemeinsame Prüfungen
 SELECT :'mode' = 'apply' AS is_apply, :'mode' = 'dry-run' AS is_dry, :'mode' = 'verify' AS is_verify,
-       :'mode' IN ('apply', 'dry-run', 'verify') AS mode_ok \gset
+       :'mode' = 'revert' AS is_revert, :'mode' IN ('apply', 'revert') AS is_write,
+       :'mode' IN ('apply', 'dry-run', 'verify', 'revert') AS mode_ok \gset
 \if :mode_ok
 \else
 SELECT pg_temp.bt_abort('unbekannter Modus ' || :'mode');
@@ -372,11 +460,23 @@ SELECT format('SELECT pg_temp.bt_verify_day(%s::smallint, %L::date)', sym_id, da
 RESET default_transaction_read_only;
 \endif
 
--- ---------------------------------------------------------------- apply
+-- ---------------------------------------------------------------- apply / revert
+\if :is_write
 \if :is_apply
 \if :payload_full
 \else
 SELECT pg_temp.bt_abort('Nutzlast ohne big_order-Zeilen (manifest) – für den Lauf mit Orders exportieren');
+\endif
+\else
+-- revert: Liste (Name, Tag) muss vorhanden sein und vollständig zur Nutzlast passen
+SELECT count(*) AS n_rev,
+       count(*) FILTER (WHERE f.sym_id IS NULL OR NOT EXISTS (
+         SELECT 1 FROM pg_temp.bt_day b WHERE b.sym_id = f.sym_id AND b.day = r.day)) AS n_rev_bad
+  FROM pg_temp.bt_revert r LEFT JOIN pg_temp.bt_floor f ON f.name = r.name \gset
+SELECT :n_rev = 0 OR :n_rev_bad > 0 AS rev_bad \gset
+\if :rev_bad
+SELECT pg_temp.bt_abort(format('Rücknahmeliste leer oder passt nicht zur Nutzlast (%s Einträge, %s unbekannt)', :n_rev, :n_rev_bad));
+\endif
 \endif
 \if :window_ok
 \else
@@ -418,12 +518,19 @@ BEGIN
 END
 $$;
 SELECT 'check|importer_lock|erworben';
-SELECT 'info|start|' || count(*) || ' Tage' FROM pg_temp.bt_day;
+SELECT 'info|start|' || CASE WHEN :'is_apply' = 't' THEN (SELECT count(*) FROM pg_temp.bt_day)
+                            ELSE (SELECT count(*) FROM pg_temp.bt_revert) END || ' Tage';
 -- je Tag eine Transaktion; Reihenfolge Tag, Symbol
+\if :is_apply
 SELECT format('SELECT pg_temp.bt_apply_day(%s::smallint, %L::date, %L::boolean)', sym_id, day,
               :abort_after > 0 AND rn = :abort_after + 1)
   FROM (SELECT sym_id, day, row_number() OVER (ORDER BY day, sym_id) AS rn FROM pg_temp.bt_day) x
  ORDER BY rn \gexec
+\else
+SELECT format('SELECT pg_temp.bt_revert_day(%s::smallint, %L::date)', f.sym_id, r.day)
+  FROM pg_temp.bt_revert r JOIN pg_temp.bt_floor f ON f.name = r.name
+ ORDER BY r.day, f.sym_id \gexec
+\endif
 -- Chunk-Abschluss (unter dem Importer-Lock): alle teilweise komprimierten kalten Chunks der
 -- Projekttabellen (wie PostgresWriter.close) und kalte, nicht komprimierte big_order-Chunks im
 -- Zeitraum der Nutzlast (neu angelegt). Offene Chunks bleiben im Rowstore (Migration 0015).
