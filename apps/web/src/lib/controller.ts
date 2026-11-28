@@ -14,7 +14,9 @@ import {
   ColorType,
   createChart,
   CrosshairMode,
+  LineStyle,
   PriceScaleMode,
+  type IPriceLine,
   type TickMarkType,
   type IChartApi,
   type ISeriesApi,
@@ -88,7 +90,22 @@ import {
 import { isTransient, RequestQueue, type Want } from './request-queue.ts';
 import { BAR_CHUNK_BARS, chunkIndexAt, chunkSpanSec, wantedTiles, windowChunks } from './tiles.ts';
 import type { BarItem, ColorMode, ColorScope, FootprintType, Lod, SymbolInfo } from './types.ts';
-import { isTimeframe, tfSeconds } from '@orderflow/core/browser';
+import {
+  bucketOf,
+  isTimeframe,
+  MINUTE_MS,
+  tfSeconds,
+  type CommitMsg,
+} from '@orderflow/core/browser';
+import {
+  checkHandover,
+  composeLive,
+  LIVE_LABELS,
+  LIVE_RELOAD_JITTER_MS,
+  LiveClient,
+  mergeLive,
+  type LiveUiState,
+} from './live.ts';
 
 export type Mode = 'footprint' | 'candle';
 
@@ -102,6 +119,21 @@ export const CHUNK_REQUEST_THROTTLE_MS = 250;
 export const FOOTPRINT_OFF_NOTE = 'Footprint aus – nur Kerzen';
 /** Profil-Querprüfung mit vorläufigen Bar-Abschnitten erst für Tage, die so lange vor dem Laden endeten. */
 export const PROFILE_SETTLE_MS = 86_400_000;
+
+/** Live-Anzeige (KONZEPT §5.7): Zustand und laufende Kerze, für die Statuszeile. */
+export interface LiveInfo {
+  state: LiveUiState;
+  label: string;
+  /** Erläuterung (Tooltip der Anzeige) */
+  title: string;
+  /** Letzter Preis, Volumen und Delta der laufenden Kerze (Basiswährung) oder '' */
+  price: string;
+  vol: string;
+  delta: string;
+}
+
+/** Neuladen des letzten vorläufigen Bar-Abschnitts nach commit (höchstens so viele Versuche). */
+export const LIVE_RELOAD_ATTEMPTS = 4;
 
 export interface Readout {
   sym: string;
@@ -224,8 +256,38 @@ export class ChartController {
     maxPrepareMs: 0,
   };
 
+  /** Live-Strom (SSE /api/v1/live) des aktuellen Symbols */
+  private readonly live: LiveClient;
+  private liveReq = 0;
+  /** Ende der neuesten Live-Minute (ms): Fenster darf bis hierher wachsen (dataTo kommt aus /symbols) */
+  private liveEdgeMs = 0;
+  private priceLines: { candle: IPriceLine; fp: IPriceLine } | null = null;
+  private priceLineKey = '';
+  private reload: {
+    c: number;
+    target: number;
+    timer: ReturnType<typeof setTimeout> | null;
+    inFlight: boolean;
+    again: boolean;
+    attempts: number;
+  } | null = null;
+  /** „Abschnitt älter als der Live-Vorhalt" je (Abschnitt, from) nur einmal neu laden */
+  private reloadedFor = '';
+  /** Zähler: Ablösen live → DB, Abweichungen (auch in der Konsole), Neuladen */
+  readonly liveStats = {
+    applies: 0,
+    updates: 0,
+    rebuilds: 0,
+    reloads: 0,
+    reloadsStale: 0,
+    handovers: 0,
+    mismatches: 0,
+    lastMismatch: '',
+  };
+
   constructor(container: HTMLElement, api = new ApiClient()) {
     this.api = api;
+    this.live = new LiveClient({ base: api.base, onChange: (k, m) => this.onLive(k, m) });
     this.chart = createChart(container, {
       autoSize: true,
       layout: {
@@ -258,6 +320,17 @@ export class ChartController {
       priceLineVisible: false,
     });
     this.fp = this.chart.addCustomSeries(new FootprintSeriesView(this.rc), {});
+    // Preislinie des Live-Preises (an beiden Serien, sichtbar nur an der gezeichneten)
+    const pl = {
+      price: 0,
+      color: '#d29922',
+      lineWidth: 1 as const,
+      lineStyle: LineStyle.Dashed,
+      lineVisible: false,
+      axisLabelVisible: false,
+      title: '',
+    };
+    this.priceLines = { candle: this.candle.createPriceLine(pl), fp: this.fp.createPriceLine(pl) };
     this.rc.palette = palette(this.rc.colorMode);
     this.rc.onFirstFootprint = () => performance.mark('of:first-footprint');
 
@@ -427,9 +500,14 @@ export class ChartController {
       const it = this.items[indexAtOrBefore(this.items, p.t)];
       if (!it || it.time !== p.t) return `${time}`;
       const px2 = (u: number) => exactDecimal(u, this.sym.priceDecimals);
-      return `${time} · O ${px2(it.o)} · H ${px2(it.h)} · L ${px2(it.l)} · C ${px2(it.c)}`;
+      const ohlc = `${time} · O ${px2(it.o)} · H ${px2(it.h)} · L ${px2(it.l)} · C ${px2(it.c)}`;
+      if (!it.live) return ohlc;
+      const q2 = (lots: number) => exactDecimal(lots, this.sym.qtyDecimals);
+      return `${ohlc} · V ${q2(it.v)} · Δ ${q2(it.b - it.s)} · vorläufig (live)`;
     }
-    if (!hit) return `${time}`;
+    const liveIt = this.items[indexAtOrBefore(this.items, p.t)];
+    const liveNote = liveIt?.time === p.t && liveIt.live ? ' · Kerze vorläufig (live)' : '';
+    if (!hit) return `${time}${liveNote}`;
     const [tile, bi, width] = hit;
     const row = Math.floor(unit / width);
     let lo = tile.levelOffset[bi]!;
@@ -446,10 +524,10 @@ export class ChartController {
     const q = (lots: number) => `${lots} Lots = ${exactDecimal(lots, qd)} ${base}`;
     const iv = `[${px(row * width)}, ${px((row + 1) * width)})`;
     if (lo >= tile.levelOffset[bi + 1]! || tile.row[lo] !== row)
-      return `${time} · Zeile ${iv}: keine Trades`;
+      return `${time} · Zeile ${iv}: keine Trades${liveNote}`;
     const b = tile.buy[lo]!;
     const sl = tile.sell[lo]!;
-    return `${time} · Zeile ${iv} · Bid (Verkäufer) ${q(sl)} · Ask (Käufer) ${q(b)} · Delta ${q(b - sl)}`;
+    return `${time} · Zeile ${iv} · Bid (Verkäufer) ${q(sl)} · Ask (Käufer) ${q(b)} · Delta ${q(b - sl)}${liveNote}`;
   }
 
   /** Kachel und Bar-Index zur Zeit t (aktuelle Zeilengröße, sonst die vorige), mit Zeilenbreite. */
@@ -467,6 +545,9 @@ export class ChartController {
 
   destroy(): void {
     this.destroyed = true;
+    this.live.close();
+    if (this.liveReq) cancelAnimationFrame(this.liveReq);
+    this.cancelReload();
     if (this.hoverReq) cancelAnimationFrame(this.hoverReq);
     this.barQueue.cancelAll();
     this.fpQueue.cancelAll();
@@ -643,6 +724,7 @@ export class ChartController {
   resume(): void {
     if (!this.suspended) return;
     this.suspended = false;
+    this.scheduleLiveApply();
     this.profile.suspended = false;
     this.bigTrades.suspended = false;
     const p = this.pending;
@@ -895,6 +977,15 @@ export class ChartController {
       fpBytes: this.fpStore?.bytes ?? 0,
       gestureActive: this.gestureActive,
       watchdogReleases: this.gesture.watchdogReleases,
+      live: {
+        state: this.live.uiState(),
+        ...this.liveStats,
+        client: { ...this.live.stats },
+        seq: this.live.book?.seq ?? null,
+        committedTo: this.live.book?.committedTo ?? null,
+        bars: this.live.book?.bars.size ?? 0,
+        edge: this.liveEdgeMs,
+      },
     };
   }
 
@@ -953,7 +1044,11 @@ export class ChartController {
     // H-1: Stats-Pane gehört zur alten Serie
     this.statsSeries?.setData([]);
     this.statsCtx.reset();
+    this.liveEdgeMs = 0;
+    this.cancelReload();
+    this.reloadedFor = '';
     this.ensureWindow();
+    this.live.setSymbol(s.name);
   }
 
   private currentAnchor(): Anchor | null {
@@ -976,8 +1071,9 @@ export class ChartController {
     return [this.timeAtLogical(lr.from), this.timeAtLogical(lr.to)];
   }
 
+  /** Datenbereich der Serie; das Ende folgt dem Live-Rand (dataTo aus /symbols ist bis 5 min alt). */
   private dataRangeSec(): [number, number] {
-    return [this.sym.dataFrom / 1000, this.sym.dataTo / 1000];
+    return [this.sym.dataFrom / 1000, Math.max(this.sym.dataTo, this.liveEdgeMs) / 1000];
   }
 
   private capChunks(): number {
@@ -1037,6 +1133,8 @@ export class ChartController {
     const lr = this.logicalRange();
     const oldItems = this.items;
     const items = this.bars.items(run[0], run[1]);
+    // Live-Buckets (vorläufig) gleich mit setzen: DB-Anteil < committedTo + Live-Minuten ≥ committedTo
+    this.overlayLive(items, run, true);
     // K1: neuer Ausschnitt aus der Zeit der Bildmitte (auch weit außerhalb des alten Fensters),
     // begrenzt auf das neue Fenster (rangeAfterRebuild, getestet)
     let range: { from: number; to: number };
@@ -1212,6 +1310,7 @@ export class ChartController {
     this.fp.setData(m === 'footprint' ? this.items : []);
     if (lr) this.setRange(lr);
     this.bigTrades.redraw(); // Sweep-Linie nur im Footprint-Modus
+    this.updatePriceLine();
     this.colorRefDirty = true;
     this.scheduleFrame();
   }
@@ -1743,6 +1842,304 @@ export class ChartController {
     const pBot = s.coordinateToPrice(h);
     if (pTop === null || pBot === null || h <= 0 || pTop <= pBot) return;
     this.profile.evaluate(h / ((pTop - pBot) * this.rc.priceScale));
+  }
+
+  // ---------------------------------------------------------------- Live (KONZEPT §5.7, Etappe 1)
+
+  private onLive(kind: string, m?: unknown): void {
+    if (this.destroyed) return;
+    if (kind === 'commit') this.scheduleReload((m as CommitMsg).committedTo);
+    // neuer Stand (Verbindung, Neustart des Recorders): letzten vorläufigen Abschnitt auffrischen
+    else if (kind === 'snap') this.scheduleReload(this.live.book?.committedTo ?? 0);
+    this.scheduleLiveApply();
+  }
+
+  private scheduleLiveApply(): void {
+    if (this.liveReq || this.destroyed) return;
+    this.liveReq = requestAnimationFrame(() => {
+      this.liveReq = 0;
+      this.applyLive();
+    });
+  }
+
+  /**
+   * Live-Buckets in `items` einarbeiten (Fenster `run`). `beforeSetData`: Liste wird gleich gesetzt
+   * (einfügen erlaubt, keine series.update). Liefert die Aktualisierungen bzw. null (nichts zu tun).
+   * Wirft nie: ein Fehler hier darf die DB-Ansicht nicht stören.
+   */
+  private overlayLive(
+    items: BarItem[],
+    run: [number, number],
+    beforeSetData: boolean,
+  ): ReturnType<typeof mergeLive> | null {
+    try {
+      const book = this.live.book;
+      if (!book?.ready || !this.sym) return null;
+      const latest = book.latest();
+      if (latest) {
+        const edge = latest.ts + MINUTE_MS;
+        // Live-Rand nur plausibel weit (Serverzeit + 2 min), nie zurück
+        if (edge > this.liveEdgeMs && edge <= book.serverMs + 2 * MINUTE_MS) this.liveEdgeMs = edge;
+      }
+      const r = composeLive(
+        book.sortedBars(),
+        book.from,
+        this.tfSec,
+        chunkSpanSec(this.tfSec),
+        run,
+        this.bars,
+        this.sym.priceDecimals,
+      );
+      for (const c of r.reload) {
+        const key = `${this.bars.series}#${c}|${book.from}`;
+        if (key === this.reloadedFor) continue;
+        this.reloadedFor = key;
+        this.scheduleReload(0, c);
+      }
+      if (r.beyond && !beforeSetData && !this.gestureActive) this.ensureWindow();
+      return mergeLive(items, r.items, beforeSetData);
+    } catch (e) {
+      console.warn('Live-Einarbeitung fehlgeschlagen', e);
+      return null;
+    }
+  }
+
+  /** Live-Stand auf die Serien (series.update), Preislinie; höchstens einmal je Frame. */
+  private applyLive(): void {
+    if (this.destroyed) return;
+    if (!this.suspended && this.sym && this.win && this.items.length > 0) {
+      const res = this.overlayLive(this.items, this.win, false);
+      if (res) {
+        this.liveStats.applies++;
+        if (res.rebuild) {
+          this.liveStats.rebuilds++;
+          this.rebuildWindow(this.win);
+        } else {
+          for (const u of res.updates) {
+            this.candle.update(u.item, u.historical);
+            if (this.mode === 'footprint') this.fp.update(u.item, u.historical);
+          }
+          this.liveStats.updates += res.updates.length;
+        }
+      }
+    }
+    this.updatePriceLine();
+  }
+
+  private updatePriceLine(): void {
+    const pl = this.priceLines;
+    if (!pl || !this.sym) return;
+    const book = this.live.book;
+    const st = this.live.uiState();
+    const p = book?.ready ? book.price : null;
+    const show = p !== null && !this.suspended && st !== 'disconnected' && st !== 'frozen';
+    const price = (p ?? 0) / 10 ** this.sym.priceDecimals;
+    const key = `${show}|${price}|${this.mode}`;
+    if (key === this.priceLineKey) return;
+    this.priceLineKey = key;
+    pl.candle.applyOptions({
+      price,
+      lineVisible: show && this.mode === 'candle',
+      axisLabelVisible: show && this.mode === 'candle',
+    });
+    pl.fp.applyOptions({
+      price,
+      lineVisible: show && this.mode === 'footprint',
+      axisLabelVisible: show && this.mode === 'footprint',
+    });
+  }
+
+  private cancelReload(): void {
+    if (this.reload?.timer) clearTimeout(this.reload.timer);
+    this.reload = null;
+  }
+
+  /**
+   * Letzten vorläufigen Bar-Abschnitt neu laden (nach commit 0…2 s Zufallsverzug, damit nicht alle
+   * Besucher gleichzeitig kommen). `target`: committedTo, das die Antwort mindestens haben soll (der
+   * Server-Cache hält nicht finale Antworten bis 10 s, der Katalog folgt dem commit nach ≤ pollMs) –
+   * sonst später erneut, höchstens LIVE_RELOAD_ATTEMPTS Mal.
+   */
+  private scheduleReload(target: number, chunk?: number): void {
+    if (!this.sym || !this.win || this.suspended) return;
+    const span = chunkSpanSec(this.tfSec);
+    const c =
+      chunk ??
+      (target > 0 ? Math.floor(bucketOf(target - 1, this.tfSec) / 1000 / span) : this.win[1]);
+    if (this.bars.committedTo(c) === undefined) return; // nicht geladen (kommt beim Fensterbedarf frisch)
+    const r = this.reload;
+    if (r && r.c === c) {
+      r.target = Math.max(r.target, target);
+      if (r.inFlight) r.again = true;
+      return;
+    }
+    this.cancelReload();
+    const nr: NonNullable<ChartController['reload']> = {
+      c,
+      target,
+      timer: null,
+      inFlight: false,
+      again: false,
+      attempts: 0,
+    };
+    this.reload = nr;
+    nr.timer = setTimeout(() => this.runReload(nr), Math.random() * LIVE_RELOAD_JITTER_MS);
+  }
+
+  private runReload(r: NonNullable<ChartController['reload']>): void {
+    if (this.reload !== r || this.destroyed) return;
+    r.timer = null;
+    r.inFlight = true;
+    r.again = false;
+    r.attempts++;
+    const store = this.bars;
+    const sym = this.sym;
+    const tf = this.tf;
+    const span = chunkSpanSec(this.tfSec) * 1000;
+    const from = r.c * span;
+    const to = from + span;
+    this.liveStats.reloads++;
+    let done = false;
+    fetch(this.api.barsUrl(sym.name, tf, from, to, this.barsStats), {
+      cache: 'no-cache',
+      signal: timeoutSignal(REFETCH_TIMEOUT_MS),
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.arrayBuffer();
+      })
+      .then((buf) => {
+        if (this.destroyed || this.reload !== r || store !== this.bars) return;
+        const oldC = store.committedTo(r.c);
+        const oldCols = store.columns(r.c);
+        const took = store.addEncoded(r.c, buf, { sym: sym.name, tf, from, to }, sym.dataTo, true);
+        const newC = store.committedTo(r.c);
+        if (!took || oldC === undefined || newC === undefined || !oldCols) {
+          this.liveStats.reloadsStale++;
+        } else {
+          this.afterReload(r.c, oldC, newC, oldCols);
+          if (newC >= r.target) done = true;
+          else this.liveStats.reloadsStale++;
+        }
+      })
+      .catch((e: unknown) => console.warn('Live: Abschnitt neu laden fehlgeschlagen', e))
+      .finally(() => {
+        if (this.reload !== r) return;
+        r.inFlight = false;
+        if (done && !r.again) {
+          this.reload = null;
+          return;
+        }
+        if (done) r.attempts = 0; // neuer commit während des Ladens
+        if (r.attempts >= LIVE_RELOAD_ATTEMPTS) {
+          this.reload = null;
+          return;
+        }
+        r.timer = setTimeout(() => this.runReload(r), done ? 0 : 2_000 * r.attempts);
+      });
+  }
+
+  /**
+   * Neu geladener Abschnitt: Ablösen prüfen (alter DB-Anteil + Live-Minuten in [oldC, newC) = neuer
+   * DB-Anteil; Abweichungen zählen und melden), dann die Items ab dem älteren committedTo aus DB +
+   * Live neu (series.update; nur wenn nötig setData).
+   */
+  private afterReload(
+    c: number,
+    oldC: number,
+    newC: number,
+    oldCols: NonNullable<ReturnType<BarStore['columns']>>,
+  ): void {
+    const book = this.live.book;
+    if (book?.ready) {
+      const h = checkHandover(
+        book.sortedBars(),
+        book.from,
+        oldC,
+        newC,
+        this.tfSec,
+        (t) => this.bars.itemAt(c, t, oldCols),
+        (t) => this.bars.itemAt(c, t),
+      );
+      this.liveStats.handovers += h.checked;
+      if (h.diffs.length > 0) {
+        this.liveStats.mismatches += h.diffs.length;
+        this.liveStats.lastMismatch = h.diffs[0]!;
+        console.warn(`Live → Datenbank: ${h.diffs.length} Abweichung(en) beim Ablösen`, h.diffs);
+      }
+    }
+    if (!this.win || c < this.win[0] || c > this.win[1] || this.suspended) return;
+    const fromSec = bucketOf(Math.min(oldC, newC), this.tfSec) / 1000;
+    const toSec = (c + 1) * chunkSpanSec(this.tfSec);
+    const db = this.bars.itemsFrom(c, fromSec);
+    const i0 = indexAtOrBefore(this.items, fromSec - 1) + 1;
+    // ein Bucket des alten Stands ohne Gegenstück in der neuen Antwort (DB + Live) → neu aufbauen
+    const have = new Set(db.map((x) => x.time as number));
+    const liveTimes = new Set<number>();
+    const r = this.overlayLive(db, this.win, true); // DB-Items + Live (eingefügt)
+    for (const x of db) if (x.live) liveTimes.add(x.time);
+    let missing = false;
+    for (let i = i0; i < this.items.length && this.items[i]!.time < toSec; i++) {
+      const t = this.items[i]!.time;
+      if (!have.has(t) && !liveTimes.has(t)) missing = true;
+    }
+    if (!r || missing) {
+      this.rebuildWindow(this.win);
+      return;
+    }
+    const res = mergeLive(this.items, db);
+    if (res.rebuild) {
+      this.liveStats.rebuilds++;
+      this.rebuildWindow(this.win);
+      return;
+    }
+    for (const u of res.updates) {
+      this.candle.update(u.item, u.historical);
+      if (this.mode === 'footprint') this.fp.update(u.item, u.historical);
+    }
+    this.liveStats.updates += res.updates.length;
+  }
+
+  /** Zustand der Live-Anzeige (Statuszeile; ≤ 4 Hz abgefragt). */
+  liveInfo(): LiveInfo | null {
+    if (!this.sym) return null;
+    const book = this.live.book;
+    const state = this.live.uiState();
+    const st = book?.status;
+    const title: string[] = [];
+    if (state === 'disconnected')
+      title.push(
+        st && book?.ready && !st.recorder
+          ? 'Recorder nicht erreichbar'
+          : this.live.paused
+            ? 'Tab im Hintergrund – getrennt'
+            : 'Live-Verbindung getrennt, verbinde neu …',
+      );
+    if (st?.frozen) title.push(`Tag wird nicht live geschrieben: ${st.frozen}`);
+    if (st?.catchUp)
+      title.push(
+        `Lücke im Datenstrom – Recorder holt per REST nach; keine Live-Daten ab ${st.gapFrom ? fmtShown(st.gapFrom) : '?'}`,
+      );
+    if (st && !st.stream && state !== 'disconnected') title.push('Binance-Stream getrennt');
+    if (book?.ready && book.eventMs !== null && state !== 'disconnected') {
+      const lag = (book.serverMs - book.eventMs) / 1000;
+      title.push(`Ereigniszeit ${lag.toFixed(1)} s hinter der Serverzeit`);
+    }
+    if (st && st.backlog > 1) title.push(`${st.backlog} Minuten noch nicht geschrieben`);
+    if (this.liveStats.mismatches > 0)
+      title.push(`${this.liveStats.mismatches} Abweichung(en) live ↔ Datenbank (Konsole)`);
+    let price = '';
+    let vol = '';
+    let delta = '';
+    const last = this.items[this.items.length - 1];
+    if (book?.ready && book.price !== null && state !== 'disconnected') {
+      price = exactDecimal(book.price, this.sym.priceDecimals);
+      if (last?.live) {
+        vol = exactDecimal(last.v, this.sym.qtyDecimals);
+        delta = exactDecimal(last.b - last.s, this.sym.qtyDecimals);
+      }
+    }
+    return { state, label: LIVE_LABELS[state], title: title.join(' · '), price, vol, delta };
   }
 
   /** Bars von [fromMs, toMs) vollständig, unveränderlich und lückenlos im aktuellen Fenster? */

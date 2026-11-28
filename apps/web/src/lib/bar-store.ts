@@ -48,7 +48,14 @@ export class BarStore {
    * Dekodiert und prüft gegen die Anfrage (K2): Art, Symbol, tf, Zeitraum; wirft bei Abweichung.
    * `dataToMs`: Datenende laut Server (/symbols) beim Laden – Datenzeit statt Uhr des Besuchers (W-3).
    */
-  addEncoded(c: number, buf: ArrayBuffer, expect?: ChunkExpectation, dataToMs = 0): void {
+  addEncoded(
+    c: number,
+    buf: ArrayBuffer,
+    expect?: ChunkExpectation,
+    dataToMs = 0,
+    /** nur übernehmen, wenn committedTo nicht älter ist als das gehaltene (Live-Neuladen) */
+    onlyNewer = false,
+  ): boolean {
     const dec = decodeTile(buf);
     if (expect) {
       const h = dec.header;
@@ -60,6 +67,9 @@ export class BarStore {
       if (bad.length > 0)
         throw new Error(`Bar-Abschnitt ${c} passt nicht zur Anfrage: ${bad.join(', ')}`);
     }
+    const held = this.committed.get(c);
+    const got = dec.header.committedTo;
+    if (onlyNewer && held !== undefined && (got === undefined || got < held)) return false;
     // W-1: Stats-Spalten sind Zusätze – eine unbrauchbare Spalte wird verworfen (mit Hinweis), der
     // Abschnitt (Zeit, OHLC, Mengen) bleibt
     for (const [name, why] of statsColumnProblems(dec.extra, dec.bars.time.length)) {
@@ -74,6 +84,78 @@ export class BarStore {
     else this.extra.delete(c);
     this.state.set(c, dec.header.final ? 'final' : 'provisional');
     this.dataToAt.set(c, dataToMs);
+    if (got !== undefined) this.committed.set(c, got);
+    else this.committed.delete(c);
+    return true;
+  }
+
+  /** committedTo je Abschnitt (Live-Naht, TILE-FORMAT.md); fehlt bei älteren Servern */
+  private readonly committed = new Map<number, number>();
+
+  /** committedTo des geladenen Abschnitts c (ms) oder undefined. */
+  committedTo(c: number): number | undefined {
+    return this.chunks.has(c) ? this.committed.get(c) : undefined;
+  }
+
+  /** Spalten des Abschnitts c (Referenz; ein Neuladen ersetzt das Objekt, das alte bleibt gültig). */
+  columns(c: number): BarColumns | undefined {
+    return this.chunks.get(c);
+  }
+
+  /** DB-Item des Abschnitts c zur Bar-Zeit tSec (ohne Zusatzspalten) oder null. */
+  itemAt(c: number, tSec: number, cols = this.chunks.get(c)): BarItem | null {
+    if (!cols) return null;
+    let lo = 0;
+    let hi = cols.time.length;
+    while (lo < hi) {
+      const m = (lo + hi) >>> 1;
+      if (cols.time[m]! < tSec) lo = m + 1;
+      else hi = m;
+    }
+    if (lo >= cols.time.length || cols.time[lo] !== tSec) return null;
+    return this.itemFrom(cols, lo, cols === this.chunks.get(c) ? this.extra.get(c) : undefined);
+  }
+
+  /** DB-Items des Abschnitts c mit Zeit ≥ fromSec (aufsteigend, ohne Zusatzspalten). */
+  itemsFrom(c: number, fromSec: number): BarItem[] {
+    const cols = this.chunks.get(c);
+    if (!cols) return [];
+    const out: BarItem[] = [];
+    const ex = this.extra.get(c);
+    for (let i = 0; i < cols.time.length; i++)
+      if (cols.time[i]! >= fromSec) out.push(this.itemFrom(cols, i, ex));
+    return out;
+  }
+
+  private itemFrom(
+    b: BarColumns,
+    i: number,
+    ex?: Record<string, Int32Array | Float64Array>,
+  ): BarItem {
+    const exKeys = ex ? Object.keys(ex).filter((k) => ex[k]!.length === b.time.length) : [];
+    const f = 10 ** this.priceDecimals;
+    const o = b.open[i]!;
+    const h = b.high[i]!;
+    const l = b.low[i]!;
+    const cl = b.close[i]!;
+    return {
+      time: b.time[i]! as UTCTimestamp,
+      t: b.time[i]!,
+      open: o / f,
+      high: h / f,
+      low: l / f,
+      close: cl / f,
+      o,
+      h,
+      l,
+      c: cl,
+      v: b.buyQ[i]! + b.sellQ[i]!,
+      b: b.buyQ[i]!,
+      s: b.sellQ[i]!,
+      ba: b.buyA[i]!,
+      sa: b.sellA[i]!,
+      ...(exKeys.length > 0 ? { x: Object.fromEntries(exKeys.map((k) => [k, ex![k]![i]!])) } : {}),
+    };
   }
 
   private readonly dataToAt = new Map<number, number>();
@@ -108,6 +190,7 @@ export class BarStore {
     this.chunks.delete(c);
     this.state.delete(c);
     this.dataToAt.delete(c);
+    this.committed.delete(c);
   }
 
   /** Abschnitte in c0…c1, die als Lücke (ohne Daten) geführt werden. */

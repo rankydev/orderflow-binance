@@ -75,4 +75,6 @@ export interface BarItem {
   sa: number;
   /** Zusatzspalten `x.*` der Bar-Kachel je Bar (falls die API sie liefert) */
   x?: Record<string, number>;
+  /** Bucket enthält vorläufige Live-Minuten (live.ts); nur im Tooltip gekennzeichnet */
+  live?: boolean;
 }

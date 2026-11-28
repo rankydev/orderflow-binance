@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { APP_TITLE, CHARTS_ATTRIBUTION, CHARTS_URL } from './app-info.ts';
-  import { ChartController, rowLabel, type Readout } from './lib/controller.ts';
+  import { ChartController, rowLabel, type LiveInfo, type Readout } from './lib/controller.ts';
   import { exactDecimal } from './lib/format.ts';
   import type { ColorMode, ColorScope, FootprintType, SymbolInfo } from './lib/types.ts';
   import type { ProfileReadout, RangeSummary } from './lib/profile/layer.ts';
@@ -85,6 +85,8 @@
   let rOptions = $state.raw<number[]>([]);
   let symInfo = $state.raw<SymbolInfo | null>(null);
   let ro = $state.raw<Readout | null>(null);
+  // Live-Anzeige (Zustand, laufende Kerze), 4×/s mit der Anzeige aufgefrischt
+  let live = $state.raw<LiveInfo | null>(null);
   let error = $state('');
   // Volume-Profile-Einstellungen (URL: pm, pv, va, oh, pr, pe, pl, pf/pt)
   let prof = $state<ProfileParams>(parseProfileParams(params));
@@ -192,6 +194,7 @@
     timer = setInterval(() => {
       if (!ctl) return;
       ro = ctl.readout();
+      live = ctl.liveInfo();
       if (tpoView) tro = tpoView.readout();
       pro = ctl.profile.readout();
       bro = ctl.bigTrades.readout();
@@ -882,6 +885,14 @@
       <!-- A: nicht zoombedingte Gründe ohne Footprint dauerhaft sichtbar -->
       <div class="banner" role="alert">{error || ro?.blocked}</div>
     {/if}
+    {#if view === 'chart' && live && (live.state === 'catchup' || live.state === 'frozen')}
+      <!-- Nachholen/Lücke bzw. eingefrorener Tag: deutlicher Hinweis, keine Live-Daten in der Lücke -->
+      <div class="live-warn" role="status" data-testid="live-warn" title={live.title}>
+        {live.state === 'catchup'
+          ? 'Recorder holt nach – Live-Daten in der Lücke fehlen noch'
+          : 'Laufender Tag eingefroren – keine Live-Daten'}
+      </div>
+    {/if}
     {#if view === 'chart' && btOn && bro}
       <!-- Legende Big Trades: Schwelle, Marker, Ausdünnung, Abdeckung (keine Daten ≠ keine Big Trades) -->
       <div class="bt-legend" data-testid="bt-legend">
@@ -949,6 +960,17 @@
 
   <footer class="readout" data-testid="readout">
     {#if error}<span class="err">{error}</span>{/if}
+    {#if live && view === 'chart'}<span
+        class="live live-{live.state}"
+        data-testid="live-state"
+        data-state={live.state}
+        title={live.title}
+      >
+        <span class="dot">●</span>
+        {live.label}{#if live.price}
+          · {live.price}{/if}{#if live.vol}
+          · V {live.vol} · Δ {live.delta}{/if}
+      </span>{/if}
     {#if dataTo}<span class="datato" title="Ende der Daten">
         Daten bis {fmtDataTo(dataTo, tzSet)}
       </span>{/if}
@@ -1153,6 +1175,43 @@
   }
   .datato {
     color: #8b949e;
+  }
+  .live {
+    color: #8b949e;
+  }
+  .live .dot {
+    color: #6e7681;
+  }
+  .live-live .dot {
+    color: #3fb950;
+  }
+  .live-delayed .dot {
+    color: #d29922;
+  }
+  .live-disconnected .dot {
+    color: #f85149;
+  }
+  .live-catchup,
+  .live-frozen {
+    color: #e3b341;
+  }
+  .live-catchup .dot,
+  .live-frozen .dot {
+    color: #e3b341;
+  }
+  .live-warn {
+    position: absolute;
+    z-index: 4;
+    bottom: 34px;
+    left: 8px;
+    padding: 3px 8px;
+    background: rgba(59, 45, 10, 0.92);
+    border: 1px solid #e3b341;
+    color: #f8e3a1;
+    font:
+      12px/1.5 ui-monospace,
+      Menlo,
+      monospace;
   }
   .tz {
     color: #8b949e;
